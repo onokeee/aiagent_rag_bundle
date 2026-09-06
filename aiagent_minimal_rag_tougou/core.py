@@ -3437,7 +3437,8 @@ _CACHE_SEC = 300
 # メール設定と同じ考え方で、env は「まだ画面で決めていないときの値」。
 # =============================================================================
 
-ADMIN_KEYS = ("models", "default", "vision", "context_overrides", "api_key")
+ADMIN_KEYS = ("models", "default", "vision", "context_overrides", "api_key",
+              "chat_url", "models_url")
 
 #: カタログのインライン上限として認める範囲。
 #: 下限は「1DBぶんの詳細（実測で平均5.3K字）が入る」ことを目安にした。
@@ -3490,6 +3491,28 @@ def llm_api_key_source() -> str:
     if str(_read_admin().get("api_key") or "").strip():
         return "screen"
     return "env" if config.OPENAI_API_KEY else ""
+
+
+# --- 接続先URL（フルパス2本。画面保存 > env の OPENAI_BASE_URL から導出）------------
+
+def _env_chat_url() -> str:
+    base = (config.OPENAI_BASE_URL or "").strip().rstrip("/")
+    return base + "/chat/completions" if base else ""
+
+
+def _env_models_url() -> str:
+    base = (config.OPENAI_BASE_URL or "").strip().rstrip("/")
+    return base + "/models" if base else ""
+
+
+def llm_chat_url() -> str:
+    """チャット（AI呼び出し）のフルURL。「モデル設定」画面で保存した値 > env の順。"""
+    return str(_read_admin().get("chat_url") or "").strip() or _env_chat_url()
+
+
+def llm_models_url() -> str:
+    """モデル一覧取得のフルURL。「モデル設定」画面で保存した値 > env の順。"""
+    return str(_read_admin().get("models_url") or "").strip() or _env_models_url()
 
 
 def is_vision(model: str) -> bool:
@@ -3591,7 +3614,7 @@ def _from_api() -> list[str]:
         if _models_cache["models"] and now - _models_cache["at"] < _CACHE_SEC:
             return list(_models_cache["models"])
     try:
-        got = sorted(m.id for m in llm.client().models.list().data)
+        got = sorted(m.id for m in llm.models_client().models.list().data)
     except Exception as e:
         print(f"[models] 一覧を取得できませんでした: {e}")
         got = []
@@ -3762,6 +3785,15 @@ def admin_status(refresh: bool = False, scope: list[dict] | None = None) -> dict
         # APIキーは値を返さない。設定済みかどうかと出所だけ（画面表示用）
         "api_key_set": bool(llm_api_key()),
         "api_key_source": llm_api_key_source(),
+        # 接続先URL（フルパス）。URLは秘密ではないので値も返す
+        "chat_url": llm_chat_url(),
+        "models_url": llm_models_url(),
+        "chat_url_source": ("screen" if str(_read_admin().get("chat_url") or "").strip()
+                            else "env"),
+        "models_url_source": ("screen" if str(_read_admin().get("models_url") or "").strip()
+                              else "env"),
+        "env_chat_url": _env_chat_url(),
+        "env_models_url": _env_models_url(),
         "context_overrides": context_overrides(),
         "env_context_default": config.MODEL_CONTEXT_DEFAULT,
         "catalog_chars": catalog_total_chars(),
@@ -3849,18 +3881,47 @@ def save_admin(data: dict, user: str | None = None) -> dict:
     keep = _read_admin()  # 保存済みのAPIキーを巻き添えで消さないため、上書きで重ねる
     keep.update({"models": models, "default": default, "vision": vision,
                  "context_overrides": overrides})
+
+    # 接続先URL（フルパス2本）。空欄で保存すると env の値に戻る。
+    # env と同じ値なら上書きとして持たない（envを変えたとき追随できるように）。
+    url_changed = False
+    for field, suffix, envval, label in (
+            ("chat_url", "/chat/completions", _env_chat_url(), "チャット"),
+            ("models_url", "/models", _env_models_url(), "モデル一覧")):
+        if field not in data:
+            continue
+        u = str(data.get(field) or "").strip().rstrip("/")
+        if u:
+            if any(c.isspace() for c in u):
+                raise ValueError(f"{label}のURLに空白が入っています。")
+            if not (u.startswith("http://") or u.startswith("https://")):
+                raise ValueError(f"{label}のURLは http:// か https:// で始めてください。")
+            if not u.endswith(suffix):
+                raise ValueError(
+                    f"{label}のURLは {suffix} で終わるフルパスで入力してください"
+                    f"（例: https://api.openai.com/v1{suffix}）。")
+        old = str(keep.get(field) or "").strip()
+        new = "" if u == envval else u
+        if new:
+            keep[field] = new
+        else:
+            keep.pop(field, None)
+        if old != new:
+            url_changed = True
+
     if key_clear:
         keep.pop("api_key", None)
     elif key_new:
         keep["api_key"] = key_new
     _write_admin(keep)
-    if key_clear or key_new:
-        reset_llm_client()  # 次のAI呼び出しから新しいキーを使う（再起動不要）
+    if key_clear or key_new or url_changed:
+        reset_llm_client()  # 次のAI呼び出しから新しい接続先・キーを使う（再起動不要）
     print(f"[models] モデル設定を更新しました（{user or '不明'}）: "
           f"候補{len(models)}件 / 既定={default} / 画像判定={len(vision)}件 / "
           f"文脈量の登録={len(overrides)}件"
           + (" / APIキーを更新" if key_new else "")
-          + (" / APIキーをenvに戻した" if key_clear else ""))
+          + (" / APIキーをenvに戻した" if key_clear else "")
+          + (" / 接続先URLを変更" if url_changed else ""))
     return admin_status()
 
 
@@ -17791,27 +17852,50 @@ import custom_tools
 import tools
 
 _client: OpenAI | None = None
+_models_client: OpenAI | None = None
+
+
+def _derived_base(full_url: str, suffix: str) -> str:
+    """フルパスのURLから、SDKに渡す base_url を導出する（SDKが末尾を自動付与するため）。"""
+    u = str(full_url or "").strip().rstrip("/")
+    return u[: -len(suffix)] if u.endswith(suffix) else ""
 
 
 def is_configured() -> bool:
-    # キーは「モデル設定」画面で保存した値 > env の順（models.llm_api_key）
-    return bool(config.OPENAI_BASE_URL and llm_api_key())
+    # 接続先・キーとも「モデル設定」画面で保存した値 > env の順
+    return bool(llm_chat_url() and llm_api_key())
 
 
 def client() -> OpenAI:
+    """チャット（AI呼び出し）用クライアント。"""
     global _client
     if _client is None:
         _client = OpenAI(
-            base_url=config.OPENAI_BASE_URL or None,
+            base_url=_derived_base(llm_chat_url(), "/chat/completions") or None,
             api_key=llm_api_key() or "not-set",
         )
     return _client
 
 
+def models_client() -> OpenAI:
+    """モデル一覧（/models）用クライアント。チャットと接続先を分けられるよう別に持つ。
+    2本のURLが同じ場所を指しているあいだは、チャット用と同じものを使い回す。"""
+    global _models_client
+    if _models_client is None:
+        base = _derived_base(llm_models_url(), "/models")
+        if base == _derived_base(llm_chat_url(), "/chat/completions"):
+            _models_client = client()
+        else:
+            _models_client = OpenAI(base_url=base or None,
+                                    api_key=llm_api_key() or "not-set")
+    return _models_client
+
+
 def reset_llm_client() -> None:
-    """画面からAPIキーが変更されたときに呼ぶ。次回の呼び出しで作り直す。"""
-    global _client
+    """画面から接続先URLやAPIキーが変更されたときに呼ぶ。次回の呼び出しで作り直す。"""
+    global _client, _models_client
     _client = None
+    _models_client = None
 
 
 # --- モデルごとの作法の違いを吸収する ---------------------------------------------
@@ -26890,6 +26974,26 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
   </div>
 
   <div class="card">
+    <div class="card__title">接続先URL</div>
+    <div class="card__desc">
+      AIサービス（OpenAI互換API）のエンドポイントを、用途ごとに<b>フルパス</b>で指定します。
+      ここで保存したURLが <code>env</code>（OPENAI_BASE_URL）より優先され、
+      保存すると次の呼び出しから反映されます（再起動不要）。
+      <b>空欄にして保存すると env の値に戻ります。</b>
+    </div>
+    <div class="mb" style="max-width:640px">
+      <label class="field">チャット（AI呼び出し）のURL</label>
+      <input type="text" id="chatUrl" placeholder="例: https://api.openai.com/v1/chat/completions">
+      <div class="small muted mt" id="chatUrlNote"></div>
+    </div>
+    <div style="max-width:640px">
+      <label class="field">モデル一覧の取得URL（この画面の「一覧を取得」が使います）</label>
+      <input type="text" id="modelsUrl" placeholder="例: https://api.openai.com/v1/models">
+      <div class="small muted mt" id="modelsUrlNote"></div>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card__title">APIキー</div>
     <div class="card__desc">
       AIサービス（OpenAI互換API）への接続に使うキーです。ここで保存したキーが
@@ -35238,6 +35342,15 @@ function renderApiKey() {
                 ? el('div', { class: 'alert alert--info' }, 'env ファイルのキーを使用中です。')
                 : el('div', { class: 'alert alert--warn' },
                      'APIキーが未設定です。AIを呼び出せません。'));
+    // 接続先URL（値も出所も表示する。入力中は上書きしない）
+    [['#chatUrl', '#chatUrlNote', state.chat_url, state.chat_url_source, state.env_chat_url],
+     ['#modelsUrl', '#modelsUrlNote', state.models_url, state.models_url_source, state.env_models_url]]
+        .forEach(([inp, note, val, source, envval]) => {
+            if (document.activeElement !== $(inp)) $(inp).value = val || '';
+            $(note).textContent = source === 'screen'
+                ? `この画面で保存したURLを使用中（envの値: ${envval || '未設定'}）`
+                : (val ? 'env の値を使用中です。' : 'env が未設定です。URLを入力してください。');
+        });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -35287,7 +35400,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 vision: state.vision || [],
                 context_overrides: state.context_overrides || {},
                 api_key_clear: true,
-            });
+            });  // URLは送らない＝変更しない
             state = { ...state, ...r };
             toast('envのキーに戻しました。', 'ok');
             render();
@@ -35305,6 +35418,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 default: state.default,
                 vision: state.vision || [],
                 context_overrides: state.context_overrides || {},
+                chat_url: $('#chatUrl').value,
+                models_url: $('#modelsUrl').value,
                 ...(key ? { api_key: key } : {}),
             });
             state = { ...state, ...r };

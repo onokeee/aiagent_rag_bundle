@@ -151,6 +151,9 @@ SMTP_DRY_RUN = (os.getenv("SMTP_DRY_RUN", "true").strip().lower()
 # OpenAI SDK は base_url の末尾に "/chat/completions" を付けて呼ぶ。
 # 公式OpenAIなら base_url は .../v1。/v1 以外のパスのOpenAI互換エンドポイントを使う
 # 場合は、そのパスまで（末尾の /chat/completions は付けない）で設定する。
+# 管理者が「モデル設定」画面で接続先URL（チャット用・モデル一覧用のフルパス2本）を
+# 保存した場合はそちらが優先され、この値は初期値になる
+# （実際の参照は models.llm_chat_url / llm_models_url）。
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 # APIキー。管理者が「モデル設定」画面で保存したキー（model_settings.yaml の api_key）が
 # あればそちらが優先され、この env の値は初期値になる（実際の参照は models.llm_api_key）。
