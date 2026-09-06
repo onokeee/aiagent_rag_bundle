@@ -3437,7 +3437,7 @@ _CACHE_SEC = 300
 # メール設定と同じ考え方で、env は「まだ画面で決めていないときの値」。
 # =============================================================================
 
-ADMIN_KEYS = ("models", "default", "vision", "context_overrides")
+ADMIN_KEYS = ("models", "default", "vision", "context_overrides", "api_key")
 
 #: カタログのインライン上限として認める範囲。
 #: 下限は「1DBぶんの詳細（実測で平均5.3K字）が入る」ことを目安にした。
@@ -3478,6 +3478,18 @@ def _vision_keys() -> list[str]:
 def default_model() -> str:
     """未選択のユーザーが使うモデル。"""
     return str(_read_admin().get("default") or config.OPENAI_MODEL or "").strip()
+
+
+def llm_api_key() -> str:
+    """LLM接続に実際に使うAPIキー。「モデル設定」画面で保存した値 > env の順。"""
+    return str(_read_admin().get("api_key") or "").strip() or config.OPENAI_API_KEY
+
+
+def llm_api_key_source() -> str:
+    """キーの出所（"screen"=画面 / "env" / ""=未設定）。キー本体は決して返さない。"""
+    if str(_read_admin().get("api_key") or "").strip():
+        return "screen"
+    return "env" if config.OPENAI_API_KEY else ""
 
 
 def is_vision(model: str) -> bool:
@@ -3747,6 +3759,9 @@ def admin_status(refresh: bool = False, scope: list[dict] | None = None) -> dict
         "env_default": config.OPENAI_MODEL,
         "settings_file": str(config.MODEL_SETTINGS_FILE),
         "llm_ready": _llm_ready(),
+        # APIキーは値を返さない。設定済みかどうかと出所だけ（画面表示用）
+        "api_key_set": bool(llm_api_key()),
+        "api_key_source": llm_api_key_source(),
         "context_overrides": context_overrides(),
         "env_context_default": config.MODEL_CONTEXT_DEFAULT,
         "catalog_chars": catalog_total_chars(),
@@ -3821,11 +3836,31 @@ def save_admin(data: dict, user: str | None = None) -> dict:
             raise ValueError(f"「{k}」の文脈量 {n:,} は範囲外です（1,000〜10,000,000）。")
         overrides[name] = n
 
-    _write_admin({"models": models, "default": default, "vision": vision,
-                  "context_overrides": overrides})
+    # APIキー。値が来たときだけ更新する。応答にもログにもキーの値は出さない
+    key_in = data.get("api_key")
+    key_new = str(key_in).strip() if isinstance(key_in, str) else ""
+    key_clear = bool(data.get("api_key_clear"))
+    if key_new:
+        if any(c.isspace() for c in key_new):
+            raise ValueError("APIキーに空白や改行が入っています。コピーし直してください。")
+        if not (8 <= len(key_new) <= 500):
+            raise ValueError("APIキーの長さが不自然です。値を確かめてください。")
+
+    keep = _read_admin()  # 保存済みのAPIキーを巻き添えで消さないため、上書きで重ねる
+    keep.update({"models": models, "default": default, "vision": vision,
+                 "context_overrides": overrides})
+    if key_clear:
+        keep.pop("api_key", None)
+    elif key_new:
+        keep["api_key"] = key_new
+    _write_admin(keep)
+    if key_clear or key_new:
+        reset_llm_client()  # 次のAI呼び出しから新しいキーを使う（再起動不要）
     print(f"[models] モデル設定を更新しました（{user or '不明'}）: "
           f"候補{len(models)}件 / 既定={default} / 画像判定={len(vision)}件 / "
-          f"文脈量の登録={len(overrides)}件")
+          f"文脈量の登録={len(overrides)}件"
+          + (" / APIキーを更新" if key_new else "")
+          + (" / APIキーをenvに戻した" if key_clear else ""))
     return admin_status()
 
 
@@ -11546,7 +11581,8 @@ SERVER_KEYS = ("host", "port", "timeout")
 # 差出人と宛先まわり
 EDITABLE_KEYS = SERVER_KEYS + ("sender", "sender_name", "senders",
                                "allow_addresses", "max_recipients", "dry_run",
-                               "alert_to", "alert_enabled", "alert_kinds")
+                               "alert_to", "alert_enabled", "alert_kinds",
+                               "ok_domains")
 
 
 def _read_overrides() -> dict:
@@ -11600,24 +11636,49 @@ def settings() -> SmtpSettings:
     )
 
 
-# --- 宛先に登録してよいドメイン（env の SEND_OK_MAIL_DOMAIN）------------------------
+# --- 宛先に登録してよいドメイン（「メール設定」画面で変更。config.py は初期値）--------
 
-def domain_ok(address: str) -> bool:
+def _parse_domains(value) -> list:
+    """入力（"@a.co.jp; b.jp" のような文字列、またはリスト）を正規化して返す。"""
+    if isinstance(value, str):
+        parts = re.split(r"[;,、\s]+", value)
+    else:
+        parts = list(value or [])
+    out = []
+    for d in parts:
+        d = str(d).strip().lstrip("@").rstrip(".").lower()
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def send_ok_domains() -> list:
+    """宛先に登録してよいドメイン。画面で保存した値 > config.py の初期値。"""
+    ov = _read_overrides()
+    if "ok_domains" in ov:
+        return _parse_domains(ov.get("ok_domains"))
+    return list(config.SEND_OK_MAIL_DOMAIN)
+
+
+def domain_ok(address: str, allowed: list | None = None) -> bool:
     """このアドレスを許可リストに登録してよいか。
 
-    env が空なら制限なし（それでも許可リストへの登録自体は必要）。
+    許可ドメインが空なら制限なし（それでも許可リストへの登録自体は必要）。
     サブドメイン（sales.example.co.jp）も対象に含める。
     """
-    allowed = config.SEND_OK_MAIL_DOMAIN
+    if allowed is None:
+        allowed = send_ok_domains()
     if not allowed:
         return True
     dom = str(address).strip().lower().rsplit("@", 1)[-1]
     return any(dom == d or dom.endswith("." + d) for d in allowed)
 
 
-def allowed_domains_label() -> str:
+def allowed_domains_label(allowed: list | None = None) -> str:
     """画面に出す「登録できるドメイン」の表記。"""
-    return "、".join("@" + d for d in config.SEND_OK_MAIL_DOMAIN) or "すべてのドメイン"
+    if allowed is None:
+        allowed = send_ok_domains()
+    return "、".join("@" + d for d in allowed) or "すべてのドメイン"
 
 
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
@@ -11654,6 +11715,13 @@ def _validate_server(data: dict) -> list[str]:
 def validate_settings(data: dict) -> list[str]:
     """画面から来た設定の点検。1つでも返ったら保存しない。"""
     errors = _validate_server(data)
+
+    # 許可ドメイン。宛先・通知先の検査は「これから保存する値」で行う
+    doms = (_parse_domains(data.get("ok_domains")) if "ok_domains" in data
+            else send_ok_domains())
+    for d in doms:
+        if not _HOSTNAME_RE.match(d) or "." not in d:
+            errors.append(f"ドメインの形式が正しくありません: {d}（例: example.co.jp）")
     senders = [str(s).strip() for s in (data.get("senders") or []) if str(s).strip()]
     for s in senders:
         if not EMAIL_RE.match(s):
@@ -11671,18 +11739,18 @@ def validate_settings(data: dict) -> list[str]:
         addr = str(a).strip()
         if not EMAIL_RE.match(addr):
             errors.append(f"宛先として登録できない形式です: {a}")
-        elif not domain_ok(addr):
+        elif not domain_ok(addr, doms):
             errors.append(f"{addr} は登録できません。"
-                          f"登録できるのは {allowed_domains_label()} のアドレスだけです"
-                          "（env の SEND_OK_MAIL_DOMAIN）。")
+                          f"登録できるのは {allowed_domains_label(doms)} のアドレスだけです"
+                          "（「登録してよいドメイン」で変更できます）。")
     # 通知先の管理者も同じ縛り（許可ドメイン）。社外へは飛ばさない
     for a in (data.get("alert_to") or []):
         addr = str(a).strip()
         if not EMAIL_RE.match(addr):
             errors.append(f"通知先として登録できない形式です: {a}")
-        elif not domain_ok(addr):
+        elif not domain_ok(addr, doms):
             errors.append(f"{addr} は通知先に登録できません。"
-                          f"登録できるのは {allowed_domains_label()} のアドレスだけです。")
+                          f"登録できるのは {allowed_domains_label(doms)} のアドレスだけです。")
 
     try:
         n = int(data.get("max_recipients") or 0)
@@ -11706,7 +11774,7 @@ def _with_current(data: dict) -> dict:
               "senders": s.senders, "allow_addresses": s.allow_addresses,
               "max_recipients": s.max_recipients, "dry_run": s.dry_run,
               "alert_to": s.alert_to, "alert_enabled": s.alert_enabled,
-              "alert_kinds": s.alert_kinds}
+              "alert_kinds": s.alert_kinds, "ok_domains": send_ok_domains()}
     # None は「指定なし」。空文字や空リストは「消したい」なので通す。
     merged.update({k: v for k, v in (data or {}).items()
                    if k in merged and v is not None})
@@ -11735,6 +11803,7 @@ def save_settings(data: dict, user: str | None = None) -> SmtpSettings:
                      if str(a).strip()],
         "alert_enabled": bool(merged.get("alert_enabled", True)),
         "alert_kinds": [k for k in (merged.get("alert_kinds") or []) if k in ALERT_KINDS],
+        "ok_domains": _parse_domains(merged.get("ok_domains")),
     })
     _write_overrides(keep)
     print(f"[mailer] 設定を更新しました（{user or '不明'}）: "
@@ -11757,8 +11826,10 @@ def mail_status() -> dict:
             "alert_enabled": s.alert_enabled, "alert_kinds": s.alert_kinds,
             "alert_kind_labels": dict(ALERT_KIND_LABELS),
             "restricted": s.restricted, "timeout": s.timeout,
-            "allowed_domains": list(config.SEND_OK_MAIL_DOMAIN),
+            "allowed_domains": send_ok_domains(),
             "allowed_domains_label": allowed_domains_label(),
+            "ok_domains_source": ("screen" if "ok_domains" in _read_overrides()
+                                  else "config"),
             "max_recipients": s.max_recipients, "problems": s.problems(),
             "settings_file": str(config.SMTP_SETTINGS_FILE)}
 
@@ -17723,7 +17794,8 @@ _client: OpenAI | None = None
 
 
 def is_configured() -> bool:
-    return bool(config.OPENAI_BASE_URL and config.OPENAI_API_KEY)
+    # キーは「モデル設定」画面で保存した値 > env の順（models.llm_api_key）
+    return bool(config.OPENAI_BASE_URL and llm_api_key())
 
 
 def client() -> OpenAI:
@@ -17731,9 +17803,15 @@ def client() -> OpenAI:
     if _client is None:
         _client = OpenAI(
             base_url=config.OPENAI_BASE_URL or None,
-            api_key=config.OPENAI_API_KEY or "not-set",
+            api_key=llm_api_key() or "not-set",
         )
     return _client
+
+
+def reset_llm_client() -> None:
+    """画面からAPIキーが変更されたときに呼ぶ。次回の呼び出しで作り直す。"""
+    global _client
+    _client = None
 
 
 # --- モデルごとの作法の違いを吸収する ---------------------------------------------
@@ -26650,9 +26728,18 @@ window.KB_INIT = {
     <div class="card__title">送信できる宛先</div>
     <div class="card__desc">
       ここに登録したアドレスにだけ送れます。<b>1件も登録していないあいだは、どこにも送れません。</b>
-      登録できるドメインは <code>env</code> の <code>SEND_OK_MAIL_DOMAIN</code> で決まります。
+      登録できるドメインは、下の「登録してよいドメイン」で決まります。
     </div>
     <div id="allowState"></div>
+
+    <div class="mt" style="max-width:520px">
+      <label class="field">登録してよいドメイン</label>
+      <input type="text" id="okDomains"
+             placeholder="例: @example.co.jp（複数は ; 区切り。空欄なら制限なし）">
+      <div class="small muted mt">
+        宛先・通知先に登録できるアドレスを、このドメイン（サブドメイン含む）に限定します。
+      </div>
+    </div>
 
     <div class="mt" style="max-width:520px">
       <label class="field">送信を許可するアドレス</label>
@@ -26799,6 +26886,25 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
     </div>
     <div style="max-width:320px">
       <select id="defaultModel"></select>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card__title">APIキー</div>
+    <div class="card__desc">
+      AIサービス（OpenAI互換API）への接続に使うキーです。ここで保存したキーが
+      <code>env</code> のキーより優先されます。<b>保存済みのキーは画面に表示されません</b>
+      （変更するときだけ入力します）。
+    </div>
+    <div id="apiKeyState" class="mb"></div>
+    <div class="row" style="gap:8px;max-width:560px">
+      <input type="password" id="apiKeyInput" class="grow" autocomplete="new-password"
+             placeholder="変更する場合だけ入力し、「設定を保存」で反映">
+      <button class="btn btn--sm" id="apiKeyClear"
+              title="画面で保存したキーを消して、env のキーに戻します">envのキーに戻す</button>
+    </div>
+    <div class="small muted mt">
+      保存すると次のAI呼び出しから新しいキーが使われます（再起動不要）。
     </div>
   </div>
 
@@ -34728,9 +34834,13 @@ function render() {
             `登録した ${n} 件のアドレスにだけ送信できます。`)
         : el('div', { class: 'alert alert--warn' },
             '宛先が1件も登録されていません。いまの状態ではどこにも送信できません。'));
+    if (document.activeElement !== $('#okDomains')) {
+        $('#okDomains').value = (s.allowed_domains || []).map(d => '@' + d).join('; ');
+    }
+    $('#okDomains').disabled = !editable();
     $('#domainNote').textContent = (s.allowed_domains || []).length
-        ? `登録できるのは ${s.allowed_domains_label} のアドレスだけです（env の SEND_OK_MAIL_DOMAIN）。`
-        : 'env の SEND_OK_MAIL_DOMAIN が未設定のため、ドメインの制限はかかっていません。';
+        ? `登録できるのは ${s.allowed_domains_label} のアドレスだけです。`
+        : 'ドメインの制限はかかっていません（上の「登録してよいドメイン」で設定できます）。';
 
     $('#maxRecipients').value = s.max_recipients ?? 20;
     $('#dryRun').checked = !!s.dry_run;
@@ -34863,6 +34973,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 alert_kinds: state.alert_kinds || [],
                 max_recipients: state.max_recipients,
                 dry_run: state.dry_run,
+                ok_domains: $('#okDomains').value,
             });
             state = { ...state, ...r };
             toast('保存しました。', 'ok');
@@ -35113,11 +35224,26 @@ function addTo(key, input, normalize) {
 async function load(refresh) {
     state = await api(`/api/models/admin${refresh ? '?refresh=1': '' }`, undefined, 'GET');
     render();
+    renderApiKey();
+}
+
+function renderApiKey() {
+    const box = $('#apiKeyState');
+    if (!box) return;
+    const src = state.api_key_source;
+    box.replaceChildren(
+        src === 'screen'
+            ? el('div', { class: 'alert alert--ok' }, 'この画面で保存したキーを使用中です。')
+            : src === 'env'
+                ? el('div', { class: 'alert alert--info' }, 'env ファイルのキーを使用中です。')
+                : el('div', { class: 'alert alert--warn' },
+                     'APIキーが未設定です。AIを呼び出せません。'));
 }
 
 document.addEventListener('DOMContentLoaded', () => {
     state = window.MODELS || {};
     render();
+    renderApiKey();
 
     $('#pickModel').addEventListener('click', openPicker);
     $('#addModel').addEventListener('click', () => addTo('models', $('#newModel')));
@@ -35147,7 +35273,12 @@ document.addEventListener('DOMContentLoaded', () => {
         ev.target.disabled = false;
     });
 
-    $('#save').addEventListener('click', async ev => {
+    $('#apiKeyClear').addEventListener('click', async ev => {
+        if (state.api_key_source !== 'screen') {
+            toast('画面で保存したキーはありません（envのキーを使用中）。', 'warn');
+            return;
+        }
+        if (!confirm('画面で保存したAPIキーを消して、envのキーに戻します。よろしいですか？')) return;
         ev.target.disabled = true;
         try {
             const r = await api('/api/models/admin', {
@@ -35155,10 +35286,32 @@ document.addEventListener('DOMContentLoaded', () => {
                 default: state.default,
                 vision: state.vision || [],
                 context_overrides: state.context_overrides || {},
+                api_key_clear: true,
             });
             state = { ...state, ...r };
-            toast('保存しました。', 'ok');
+            toast('envのキーに戻しました。', 'ok');
             render();
+            renderApiKey();
+        } catch (e) { toast(e.message, 'err', 9000); }
+        ev.target.disabled = false;
+    });
+
+    $('#save').addEventListener('click', async ev => {
+        ev.target.disabled = true;
+        try {
+            const key = ($('#apiKeyInput').value || '').trim();
+            const r = await api('/api/models/admin', {
+                models: state.models || [],
+                default: state.default,
+                vision: state.vision || [],
+                context_overrides: state.context_overrides || {},
+                ...(key ? { api_key: key } : {}),
+            });
+            state = { ...state, ...r };
+            $('#apiKeyInput').value = '';
+            toast(key ? '保存しました（APIキーも更新）。' : '保存しました。', 'ok');
+            render();
+            renderApiKey();
         } catch (e) { toast(e.message, 'err', 9000); }
         ev.target.disabled = false;
     });

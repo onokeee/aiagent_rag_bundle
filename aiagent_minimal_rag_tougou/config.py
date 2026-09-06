@@ -127,7 +127,9 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_SENDER = os.getenv("SMTP_SENDER", "").strip()
 SMTP_SENDER_NAME = os.getenv("SMTP_SENDER_NAME", "DB分析アシスタント").strip()
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20") or 20)
-# 「メール設定」画面で宛先として登録してよいドメイン。ここで直接指定する（env では設定しない）。
+# 「メール設定」画面で宛先として登録してよいドメインの【初期値】（env では設定しない）。
+# 管理者が「メール設定」画面の「登録してよいドメイン」で変更でき、画面で保存した値が
+# こちらより優先される（data/mail_settings.yaml の ok_domains）。
 # ここに書いたドメイン以外のアドレスは、そもそも許可リストに追加できない。
 #   "@example.co.jp"    先頭の @ は付けても付けなくてもよい
 #   "a.co.jp;b.co.jp"   複数なら ; か , で区切る
@@ -150,6 +152,8 @@ SMTP_DRY_RUN = (os.getenv("SMTP_DRY_RUN", "true").strip().lower()
 # 公式OpenAIなら base_url は .../v1。/v1 以外のパスのOpenAI互換エンドポイントを使う
 # 場合は、そのパスまで（末尾の /chat/completions は付けない）で設定する。
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
+# APIキー。管理者が「モデル設定」画面で保存したキー（model_settings.yaml の api_key）が
+# あればそちらが優先され、この env の値は初期値になる（実際の参照は models.llm_api_key）。
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 # 既定のモデル。ここで直接指定する（env では設定しない）。
 # 使われるのは次の2通り:
