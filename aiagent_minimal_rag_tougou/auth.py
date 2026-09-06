@@ -7,6 +7,10 @@ LDAPを繋ぐとき・管理者パスワードを変えるときは、このフ�
   local … auth_users.yaml のユーザーで認証（既定。LDAP導入前の暫定）
   http  … 社内の認証API（LDAP連携API）にHTTPで問い合わせる
 
+どちらのプロバイダでも、常設アカウントは常に使える:
+  admin（ADMIN_USER / ADMIN_PASS）        … 管理者。LDAP障害時の非常口
+  user1・user2・user3（BUILTIN_USERS）    … 一般ユーザー。ID とパスワードが同じ
+
 アプリ本体（core.py）はこのファイルの User / authenticate / get_provider などを
 使うだけなので、画面やカタログ側のコードは変更不要。
 
@@ -58,6 +62,13 @@ AUTH_ADMIN_GROUP = "admin"
 # （空パスワードでログインできてしまう事故を防ぐため）。
 ADMIN_USER = "admin"
 ADMIN_PASS = "adminpass"
+
+# 常設の一般ユーザー（チャットだけ使える権限）。ID とパスワードは同じ文字列
+# （例: user1 / user1）。増減はこのリストを書き換えるだけで、空にすれば
+# この仕組みごと無効になる。
+# ※ パスワード＝ID なので推測は容易。社内ネットワーク限定で使う前提の
+#    簡易アカウントであり、LDAP へ切り替えたらリストを空にすること。
+BUILTIN_USERS = ["user1", "user2", "user3"]
 
 # --- http プロバイダ用（社内APIの仕様に合わせて書き換える） -------------------
 AUTH_API_URL = ""                        # 例: "https://auth.example.co.jp/api/login"
@@ -154,9 +165,9 @@ class LocalAuthProvider(AuthProvider):
     def authenticate(self, username: str, password: str) -> User | None:
         users = self._load()
         if not users:
-            raise AuthError(
-                "ユーザーが1人も登録されていません。"
-                "`python core.py users add <ユーザー名>` で追加してください。")
+            # ファイルにユーザーが居なくても異常ではない（常設の admin と
+            # BUILTIN_USERS だけで運用できるため）。通常の「一致せず」として返す
+            return None
         for u in users:
             if str(u.get("username", "")).lower() != str(username).lower():
                 continue
@@ -291,11 +302,24 @@ def _try_builtin_admin(username: str, password: str) -> User | None:
                 groups=[AUTH_ADMIN_GROUP], is_admin=True)
 
 
-def authenticate(username: str, password: str) -> User | None:
-    """ログインの入口。常設の管理者を先に見て、その後プロバイダに渡す。
+def _try_builtin_user(username: str, password: str) -> User | None:
+    """常設の一般ユーザー（BUILTIN_USERS）。ID とパスワードが同じなら成功。"""
+    name = str(username).strip().lower()
+    for u in BUILTIN_USERS:
+        if name != str(u).strip().lower():
+            continue
+        if hmac.compare_digest(str(password).encode("utf-8"),
+                               str(u).encode("utf-8")):
+            return User(username=str(u), display_name="", groups=[], is_admin=False)
+        return None  # ID一致・パスワード違い
+    return None
 
-    画面からはこの関数だけを呼ぶ。プロバイダを差し替えても、管理者の非常口は
-    そのまま残る。
+
+def authenticate(username: str, password: str) -> User | None:
+    """ログインの入口。常設の管理者→常設の一般ユーザー→プロバイダの順に見る。
+
+    画面からはこの関数だけを呼ぶ。プロバイダを差し替えても、管理者の非常口と
+    常設の一般ユーザーはそのまま残る（不要になったら BUILTIN_USERS を空にする）。
     """
     admin = _try_builtin_admin(username, password)
     if admin is not None:
@@ -303,6 +327,10 @@ def authenticate(username: str, password: str) -> User | None:
     # 常設管理者と同じIDなら、パスワード違いとして扱いプロバイダには渡さない
     if admin_enabled() and str(username).strip().lower() == ADMIN_USER.lower():
         return None
+    # 常設の一般ユーザーも同様に、IDが一致したらここで確定させる
+    if any(str(username).strip().lower() == str(u).strip().lower()
+           for u in BUILTIN_USERS):
+        return _try_builtin_user(username, password)
     return get_provider().authenticate(username, password)
 
 
