@@ -135,7 +135,9 @@ SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20") or 20)
 #   "a.co.jp;b.co.jp"   複数なら ; か , で区切る
 #   ""                  空にすると、この制限だけが外れる
 #                       （宛先の許可リスト自体は必要なまま）
-_SEND_OK_MAIL_DOMAIN = "@gmail.com"
+# 既定は空（制限なし）。本番でメールを使うときは、メール設定画面の
+# 「登録してよいドメイン」で社内ドメインを設定してから宛先を登録すること。
+_SEND_OK_MAIL_DOMAIN = ""
 SEND_OK_MAIL_DOMAIN = [d.strip().lstrip("@").lower() for d
                        in re.split(r"[;,]", _SEND_OK_MAIL_DOMAIN)
                        if d.strip()]
