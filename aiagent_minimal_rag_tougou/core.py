@@ -22870,7 +22870,7 @@ def _ensure_default_db() -> None:
 def _warn_if_no_admin() -> None:
     """管理者が1人も居ない設定なら、起動時に知らせる。
 
-    認証APIがグループを返さない構成では、管理者になれるのは env の ADMIN_PASS で
+    認証APIがグループを返さない構成では、管理者になれるのは auth.py の ADMIN_PASS で
     入る admin だけになる。これを設定し忘れると、カタログ・取り込み・モデル・メールの
     画面に誰も入れないまま動き続ける。気づけるのは「設定を直したいとき」なので、
     起動時に言う。
@@ -22882,16 +22882,16 @@ def _warn_if_no_admin() -> None:
     except auth.AuthError:
         return
     if provider.name == "local":
-        has_admin = any(config.AUTH_ADMIN_GROUP in (u.get("groups") or [])
+        has_admin = any(auth.AUTH_ADMIN_GROUP in (u.get("groups") or [])
                         for u in (auth.load_users_file().get("users") or []))
         if has_admin:
             return
-        how = "manage_users.py add <ユーザー名> --admin で管理者を作るか、"
+        how = "python core.py users add <ユーザー名> --admin で管理者を作るか、"
     else:
         # 認証APIがグループを返さないなら、ここに来た時点で管理者は現れない
-        how = f"認証APIが '{config.AUTH_ADMIN_GROUP}' グループを返すようにするか、"
+        how = f"認証APIが '{auth.AUTH_ADMIN_GROUP}' グループを返すようにするか、"
     print(f"[auth] 警告: 管理者が1人も居ません。{how}"
-          "env の ADMIN_PASS を設定してください。"
+          "auth.py の ADMIN_PASS を設定してください。"
           "このままではデータカタログ・データ取り込み・モデル設定・メール設定を"
           "誰も開けません（チャットは使えます）。")
 
@@ -23008,8 +23008,8 @@ def _mu_cmd_add(args):
     if _mu_find(users, args.username) >= 0:
         sys.exit(f"'{args.username}' は既に存在します。パスワード変更は passwd を使ってください。")
     groups = [g.strip() for g in (args.groups or "").split(",") if g.strip()]
-    if args.admin and config.AUTH_ADMIN_GROUP not in groups:
-        groups.append(config.AUTH_ADMIN_GROUP)
+    if args.admin and auth.AUTH_ADMIN_GROUP not in groups:
+        groups.append(auth.AUTH_ADMIN_GROUP)
     users.append({
         "username": args.username,
         "display_name": args.display_name or args.username,
@@ -23019,7 +23019,7 @@ def _mu_cmd_add(args):
     auth.save_users_file(data)
     print(f"追加しました: {args.username}"
           + (f"（{', '.join(groups)}）" if groups else ""))
-    print(f"保存先: {config.AUTH_USERS_FILE}")
+    print(f"保存先: {auth.AUTH_USERS_FILE}")
 
 
 def _mu_cmd_passwd(args):
@@ -23056,7 +23056,7 @@ def users_cli(argv=None):
     a.add_argument("--display-name", default="")
     a.add_argument("--groups", default="", help="カンマ区切り")
     a.add_argument("--admin", action="store_true",
-                   help=f"管理者グループ({config.AUTH_ADMIN_GROUP})に入れる")
+                   help=f"管理者グループ({auth.AUTH_ADMIN_GROUP})に入れる")
     a.add_argument("--password", help="非対話で渡す（履歴に残るので非推奨）")
     a.set_defaults(func=_mu_cmd_add)
 

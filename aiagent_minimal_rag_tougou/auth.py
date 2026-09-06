@@ -1,31 +1,20 @@
 # -*- coding: utf-8 -*-
 """ログイン（認証）。社内LDAP認証APIへ差し替えることを前提に、この1ファイルに分離してある。
 
+ログイン関係の設定は env や config.py には置かず、**すべてこのファイルの冒頭**にある。
+LDAPを繋ぐとき・管理者パスワードを変えるときは、このファイルだけを編集すればよい。
+
   local … auth_users.yaml のユーザーで認証（既定。LDAP導入前の暫定）
   http  … 社内の認証API（LDAP連携API）にHTTPで問い合わせる
 
-切り替えは env の AUTH_PROVIDER。アプリ本体（core.py）はこのファイルの
-User / authenticate / get_provider だけを使うので、LDAPを繋ぐときは
-このファイルだけを差し替えればよい。
-"""
-
-# ==========================================================================
-# ===== 元 auth.py（認証。local=auth_users.yaml / http=社内API）
-# ==========================================================================
-"""認証。社内LDAP認証APIへ差し替えることを前提にした作り。
-
-差し替えるときに触るのは **このファイルの Provider 1クラスと env だけ** で、
-画面やカタログ側のコードは変更不要。
-
-  env の AUTH_PROVIDER で切り替える
-    local … auth_users.yaml のユーザーで認証（既定。LDAP導入前の暫定）
-    http  … 社内の認証APIにHTTPで問い合わせる（LDAP API用）
+アプリ本体（core.py）はこのファイルの User / authenticate / get_provider などを
+使うだけなので、画面やカタログ側のコードは変更不要。
 
 アプリ側が認証結果に求めるのは User だけ:
     username     … カタログとチャット履歴の保存先フォルダ名に使う識別子
     display_name … 画面表示名
     groups       … 所属グループ（LDAP側の情報をそのまま持つ）
-    is_admin     … AUTH_ADMIN_GROUP に属しているか（今は表示のみ）
+    is_admin     … AUTH_ADMIN_GROUP に属しているか（管理者画面に入れるかの判定に使う）
 
 ※ このログインは「ユーザーごとにカタログとチャット履歴を分ける」ための仕組みであって、
    OSレベルのアクセス制御ではない。data/ のファイルを直接読める人には効かない。
@@ -45,7 +34,41 @@ from pathlib import Path
 
 import yaml
 
-import config
+# ==========================================================================
+# ===== 設定（ログイン関係はすべてここ。env や config.py には置かない）
+# ==========================================================================
+
+# どの方式で認証するか。
+#   "local" … auth_users.yaml のユーザーで認証（既定。LDAP導入前の暫定）
+#   "http"  … 社内の認証API（LDAP連携API）にHTTPで問い合わせる
+AUTH_PROVIDER = "local"
+
+# local 用: ユーザー定義ファイルの置き場所（python core.py users で管理する）
+AUTH_USERS_FILE = Path(__file__).resolve().parent / "auth_users.yaml"
+
+# 管理者とみなすグループ名。
+# http では認証APIが返すグループ名の実物と完全一致させること（部分一致はしない）。
+AUTH_ADMIN_GROUP = "admin"
+
+# 常設の管理者アカウント。LDAPや auth_users.yaml とは別枠で、どのプロバイダを
+# 使っていても必ずログインできる「非常口」。LDAPが落ちても設定画面に入れる。
+# このアカウントで入ると、データの取り込み・テーブルの削除・メール設定の
+# 変更ができるため、**本番では必ず ADMIN_PASS を強いパスワードに変えること**。
+# ADMIN_PASS を空文字にすると、このアカウント自体が無効になる
+# （空パスワードでログインできてしまう事故を防ぐため）。
+ADMIN_USER = "admin"
+ADMIN_PASS = "adminpass"
+
+# --- http プロバイダ用（社内APIの仕様に合わせて書き換える） -------------------
+AUTH_API_URL = ""                        # 例: "https://auth.example.co.jp/api/login"
+AUTH_API_USER_FIELD = "username"         # 送信JSONの、ユーザーIDを入れる項目名
+AUTH_API_PASS_FIELD = "password"         # 送信JSONの、パスワードを入れる項目名
+AUTH_API_SUCCESS_FIELD = ""              # 応答の成功フラグの場所（空 = HTTP 200 なら成功扱い）
+AUTH_API_DISPLAY_FIELD = "display_name"  # 応答の表示名の場所（"user.name" のような入れ子指定も可）
+# 応答のどこにグループ一覧があるか。グループを返さないAPIでは空のままにする
+# （空なら全員が一般ユーザーになり、管理者は ADMIN_PASS の admin だけになる）。
+AUTH_API_GROUPS_FIELD = ""
+AUTH_API_TIMEOUT = 10                    # 認証APIの応答を待つ秒数
 
 # --- ユーザー ------------------------------------------------------------------
 
@@ -110,14 +133,14 @@ class AuthError(RuntimeError):
 class LocalAuthProvider(AuthProvider):
     """auth_users.yaml のユーザーで認証する（LDAP導入までの暫定）。
 
-    ユーザーの追加は manage_users.py で行う（パスワードはハッシュ化して保存）。
+    ユーザーの追加は python core.py users add で行う（パスワードはハッシュ化して保存）。
     """
 
     name = "local"
     hint = "社内LDAP導入までの暫定アカウントです。"
 
     def __init__(self, path: Path | None = None):
-        self.path = Path(path or config.AUTH_USERS_FILE)
+        self.path = Path(path or AUTH_USERS_FILE)
 
     def _load(self) -> list:
         if not self.path.exists():
@@ -133,7 +156,7 @@ class LocalAuthProvider(AuthProvider):
         if not users:
             raise AuthError(
                 "ユーザーが1人も登録されていません。"
-                "`python manage_users.py add <ユーザー名>` で追加してください。")
+                "`python core.py users add <ユーザー名>` で追加してください。")
         for u in users:
             if str(u.get("username", "")).lower() != str(username).lower():
                 continue
@@ -141,15 +164,15 @@ class LocalAuthProvider(AuthProvider):
                 return None
             groups = list(u.get("groups") or [])
             return User(username=str(u["username"]), display_name=str(u.get("display_name") or ""),
-                        groups=groups, is_admin=config.AUTH_ADMIN_GROUP in groups)
+                        groups=groups, is_admin=AUTH_ADMIN_GROUP in groups)
         return None
 
 
 class HttpApiAuthProvider(AuthProvider):
     """社内の認証API（LDAP連携API）にHTTPで問い合わせる。
 
-    エンドポイントの仕様に合わせて env の AUTH_API_* を設定するだけで動く想定。
-    レスポンスのJSONからどのキーを読むかも env で指定できる。
+    エンドポイントの仕様に合わせて、このファイル冒頭の AUTH_API_* を
+    書き換えるだけで動く想定。レスポンスのJSONからどのキーを読むかも指定できる。
 
       AUTH_API_URL           = https://example.co.jp/api/auth
       AUTH_API_USER_FIELD    = username     # 送信するJSONのキー
@@ -166,20 +189,20 @@ class HttpApiAuthProvider(AuthProvider):
     hint = "社内アカウントでログインしてください。"
 
     def authenticate(self, username: str, password: str) -> User | None:
-        url = config.AUTH_API_URL
+        url = AUTH_API_URL
         if not url:
-            raise AuthError("AUTH_API_URL が設定されていません（env を確認してください）。")
+            raise AuthError("AUTH_API_URL が設定されていません（auth.py 冒頭を確認してください）。")
 
         payload = json.dumps({
-            config.AUTH_API_USER_FIELD: username,
-            config.AUTH_API_PASS_FIELD: password,
+            AUTH_API_USER_FIELD: username,
+            AUTH_API_PASS_FIELD: password,
         }).encode()
         req = urllib.request.Request(
             url, data=payload, method="POST",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=config.AUTH_API_TIMEOUT) as res:
+            with urllib.request.urlopen(req, timeout=AUTH_API_TIMEOUT) as res:
                 body = res.read().decode("utf-8", "replace")
                 status = res.status
         except urllib.error.HTTPError as e:
@@ -195,7 +218,7 @@ class HttpApiAuthProvider(AuthProvider):
         except json.JSONDecodeError:
             raise AuthError("認証APIの応答がJSONではありません。")
 
-        ok_field = config.AUTH_API_SUCCESS_FIELD
+        ok_field = AUTH_API_SUCCESS_FIELD
         if ok_field:
             if not bool(_dig(data, ok_field)):
                 return None
@@ -203,17 +226,17 @@ class HttpApiAuthProvider(AuthProvider):
             return None
 
         # グループを返さない認証APIは珍しくない。その場合は全員を一般ユーザーとして扱う
-        # （管理者は env の ADMIN_PASS で入る admin だけになる）。
+        # （管理者は上記 ADMIN_PASS で入る admin だけになる）。
         # 応答に無いものを推測して管理者にするのは危険なので、迷ったら一般にする。
         groups = []
-        if config.AUTH_API_GROUPS_FIELD:
-            raw = _dig(data, config.AUTH_API_GROUPS_FIELD) or []
+        if AUTH_API_GROUPS_FIELD:
+            raw = _dig(data, AUTH_API_GROUPS_FIELD) or []
             groups = [str(g) for g in ([raw] if isinstance(raw, str) else raw)]
         return User(
-            username=str(_dig(data, config.AUTH_API_USER_FIELD) or username),
-            display_name=str(_dig(data, config.AUTH_API_DISPLAY_FIELD) or ""),
+            username=str(_dig(data, AUTH_API_USER_FIELD) or username),
+            display_name=str(_dig(data, AUTH_API_DISPLAY_FIELD) or ""),
             groups=groups,
-            is_admin=bool(config.AUTH_ADMIN_GROUP) and config.AUTH_ADMIN_GROUP in groups,
+            is_admin=bool(AUTH_ADMIN_GROUP) and AUTH_ADMIN_GROUP in groups,
         )
 
 
@@ -234,14 +257,14 @@ _PROVIDERS = {"local": LocalAuthProvider, "http": HttpApiAuthProvider}
 
 def get_provider(name: str | None = None) -> AuthProvider:
     """設定に応じた認証プロバイダを返す。"""
-    key = (name or config.AUTH_PROVIDER or "local").strip().lower()
+    key = (name or AUTH_PROVIDER or "local").strip().lower()
     cls = _PROVIDERS.get(key)
     if cls is None:
         raise AuthError(f"未知の AUTH_PROVIDER です: {key} / 使えるのは {', '.join(_PROVIDERS)}")
     return cls()
 
 
-# --- 常設の管理者（env の ADMIN_PASS） -------------------------------------------
+# --- 常設の管理者（冒頭の ADMIN_USER / ADMIN_PASS） -------------------------------------------
 #
 # LDAPにも auth_users.yaml にも依存しない固定アカウント。
 # LDAPが落ちている・まだ繋いでいない状況でも設定画面に入れるようにするための口。
@@ -252,20 +275,20 @@ def get_provider(name: str | None = None) -> AuthProvider:
 #   3. 通常のプロバイダより先に判定する（LDAP側に同名ユーザーがいても取り違えない）
 
 def admin_enabled() -> bool:
-    return bool(config.ADMIN_USER and config.ADMIN_PASS)
+    return bool(ADMIN_USER and ADMIN_PASS)
 
 
 def _try_builtin_admin(username: str, password: str) -> User | None:
     if not admin_enabled():
         return None
-    if str(username).strip().lower() != config.ADMIN_USER.lower():
+    if str(username).strip().lower() != ADMIN_USER.lower():
         return None
     # compare_digest は非ASCIIの str を受け付けない（TypeError）ため bytes で比べる
     if not hmac.compare_digest(str(password).encode("utf-8"),
-                               str(config.ADMIN_PASS).encode("utf-8")):
+                               str(ADMIN_PASS).encode("utf-8")):
         return None
-    return User(username=config.ADMIN_USER, display_name="管理者",
-                groups=[config.AUTH_ADMIN_GROUP], is_admin=True)
+    return User(username=ADMIN_USER, display_name="管理者",
+                groups=[AUTH_ADMIN_GROUP], is_admin=True)
 
 
 def authenticate(username: str, password: str) -> User | None:
@@ -278,22 +301,22 @@ def authenticate(username: str, password: str) -> User | None:
     if admin is not None:
         return admin
     # 常設管理者と同じIDなら、パスワード違いとして扱いプロバイダには渡さない
-    if admin_enabled() and str(username).strip().lower() == config.ADMIN_USER.lower():
+    if admin_enabled() and str(username).strip().lower() == ADMIN_USER.lower():
         return None
     return get_provider().authenticate(username, password)
 
 
-# --- ユーザー定義ファイルの操作（manage_users.py から使う） --------------------------
+# --- ユーザー定義ファイルの操作（core.py の users CLI から使う） --------------------------
 
 def load_users_file(path: Path | None = None) -> dict:
-    p = Path(path or config.AUTH_USERS_FILE)
+    p = Path(path or AUTH_USERS_FILE)
     if not p.exists():
         return {"users": []}
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {"users": []}
 
 
 def save_users_file(data: dict, path: Path | None = None) -> None:
-    p = Path(path or config.AUTH_USERS_FILE)
+    p = Path(path or AUTH_USERS_FILE)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
                  encoding="utf-8")

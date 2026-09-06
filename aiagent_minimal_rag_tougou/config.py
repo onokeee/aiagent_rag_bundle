@@ -333,35 +333,9 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "40") or 40)
 RAG_MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000") or 12000)
 
 # --- 認証 -------------------------------------------------------------------
-# local … auth_users.yaml のユーザーで認証（LDAP導入までの暫定）
-# http  … 社内の認証API(LDAP連携)にHTTPで問い合わせる
-# 切り替えは env の AUTH_PROVIDER だけ。詳細は auth.py を参照。
-AUTH_PROVIDER = os.getenv("AUTH_PROVIDER", "local").strip().lower()
-AUTH_USERS_FILE = Path(os.getenv("AUTH_USERS_FILE", str(BASE_DIR / "auth_users.yaml")))
-# 管理者とみなすグループ名
-AUTH_ADMIN_GROUP = os.getenv("AUTH_ADMIN_GROUP", "admin").strip()
-
-# 常設の管理者アカウント。LDAPや auth_users.yaml とは別枠で、どのプロバイダを
-# 使っていても必ずログインできる「非常口」。LDAPが落ちても設定画面に入れる。
-# ここで直接指定する（env では設定しない）。
-#
-# このアカウントで入ると、データの取り込み・テーブル/DBの削除・メール設定の
-# 変更ができる。変えるときはこの行を書き換える。
-# ADMIN_PASS を空文字にすると、このアカウント自体が無効になる
-# （空パスワードでログインできてしまう事故を防ぐため）。
-ADMIN_USER = "admin"
-ADMIN_PASS = "adminpass"
-
-# http プロバイダ用（社内APIの仕様に合わせる）
-AUTH_API_URL = os.getenv("AUTH_API_URL", "").strip()
-AUTH_API_USER_FIELD = os.getenv("AUTH_API_USER_FIELD", "username").strip()
-AUTH_API_PASS_FIELD = os.getenv("AUTH_API_PASS_FIELD", "password").strip()
-AUTH_API_SUCCESS_FIELD = os.getenv("AUTH_API_SUCCESS_FIELD", "").strip()
-AUTH_API_DISPLAY_FIELD = os.getenv("AUTH_API_DISPLAY_FIELD", "display_name").strip()
-# 応答のどこにグループ一覧があるか。グループを返さないAPIでは空のままにする
-# （空なら全員が一般ユーザーになり、管理者は ADMIN_PASS の admin だけになる）。
-AUTH_API_GROUPS_FIELD = os.getenv("AUTH_API_GROUPS_FIELD", "").strip()
-AUTH_API_TIMEOUT = int(os.getenv("AUTH_API_TIMEOUT", "10") or 10)
+# ログイン関係の設定（認証方式・常設管理者・認証APIの項目名）は、env でも
+# ここでもなく **auth.py の冒頭にすべて集約** してある。LDAP切替や管理者
+# パスワードの変更は auth.py を編集する（触るファイルを1つに閉じるため）。
 
 # ユーザーごとのカタログ／チャット履歴の置き場所（data/users/<ユーザー名>/）
 USER_META_DIR = DATA_DIR / "users"
