@@ -3,3 +3,6 @@
 
 # Claude Code（開発ツール）のローカル設定
 .claude/
+
+# 開発用の自前LightRAGサーバ一式（本番はIT払い出しのURL/キーを画面登録するだけ）
+LightRAG_servers/
