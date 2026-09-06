@@ -24911,13 +24911,15 @@ window.CHAT_INIT = {
                   機能ごとに11個のブループリント（チャット／カタログ／取り込み／メール／モデル／
                   ナレッジ／表示／ヘルプ／認証ほか）に分かれています。</td></tr>
           <tr><td>起動</td>
-              <td><code>python core.py</code>。ホストは全アドレス（0.0.0.0）、ポートは <b>8000</b>、
+              <td><code>python core.py</code>。内部では waitress（1プロセス・マルチスレッドの
+                  本番用サーバ・スレッド8）が待ち受けるため、<b>開発も本番も同じコマンド</b>で起動できます。
+                  ホストは全アドレス（0.0.0.0）、ポートは <b>8000</b>、
                   デバッグは常に無効（有効にするとブラウザからサーバ上のコードを実行できてしまうため）。
-                  リローダーは無効（二重起動でスケジューラが増えるのを防ぐ）。
                   <b>起動コード（core.py 末尾）は環境変数を読みません</b>（他のソフトが設定した PORT を拾う事故を避けるため）。</td></tr>
           <tr><td>本番向けの起動</td>
-              <td><code>waitress-serve --host=0.0.0.0 --port=8000 --threads=8 --call core:create_app</code> または
-                  <code>gunicorn -w 1 -b 0.0.0.0:8000 'core:create_app()'</code>。
+              <td>同じ <code>python core.py</code> のままで本番運用できます。コマンドから直接起動する
+                  <code>waitress-serve --host=0.0.0.0 --port=8000 --threads=8 --call core:create_app</code> や
+                  <code>gunicorn -w 1 -b 0.0.0.0:8000 'core:create_app()'</code> も同等です。
                   <b>ワーカーは必ず1本</b>（スケジューラのスレッドがワーカー数だけ立ち、同じ取り込みを
                   多重実行するため）。同時アクセスはスレッド数で稼ぎます。
                   前段にnginxを置く場合は逐次表示のため <code>proxy_buffering off;</code> が必要です。</td></tr>
@@ -26433,7 +26435,7 @@ window.CHAT_INIT = {
                     同類の道具として、画面の雛形に値を流し込むJinja2（ジンジャ）、機能単位の部品であるブループリントという名前も出てきます。
                     <b>このアプリでは</b>Python+Flaskの1プロセスで画面とAPIの両方を返し、チャット／カタログ／取り込みなど11個のブループリントに分かれています（3-1参照）。</td></tr>
             <tr><td>本番用サーバとリバースプロキシ</td>
-                <td><code>python core.py</code> での起動はFlask付属の簡易サーバで、開発や小規模の利用向けです。本番ではwaitress（ウェイトレス）やgunicorn（ガニコーン）といった本番用サーバにアプリを載せ替えます（簡易サーバは多数の同時アクセスを想定していないため）。
+                <td>本番用サーバは、多数の同時アクセスを安定してさばくためのWebサーバで、waitress（ウェイトレス）やgunicorn（ガニコーン）が代表です（Flask付属の簡易サーバは開発向けのため）。このアプリの <code>python core.py</code> は内部でwaitressを使って待ち受けるので、本番でも同じコマンドのまま載せ替えは不要です。
                     リバースプロキシは利用者とアプリの間に置く中継サーバのことで、代表がnginx（エンジンエックス）です。
                     <b>このアプリでは</b>nginxを前段に置く場合、回答の逐次表示（ストリーミング）が中継でため込まれないよう <code>proxy_buffering off;</code> の指定が必要です（切らないと回答がまとめて一度に届くため）。起動コマンドは3-1を参照してください。</td></tr>
             <tr><td>プロセス・スレッド・ワーカー</td>
@@ -35698,16 +35700,19 @@ document.addEventListener('DOMContentLoaded', () => {
 # 特に PORT は他のソフトが環境変数として設定していることがあり、それを読むと
 # ここに 8000 と書いてあるのに違うポートで起動する、という事故が起きる。
 #
-# より頑丈なサーバで動かしたくなったときは、下記も使える（任意）。
+# 待ち受けは waitress（1プロセス・マルチスレッドの本番用サーバ）。
+# つまり開発も本番も同じ「python core.py」で起動できる。
+# DEBUG = True にしたときだけ、エラー詳細が見える Flask 開発サーバに切り替わる。
+#
+# コマンドから直接起動したい場合は、下記も同等に使える（任意）。
 # その場合 HOST / PORT はコマンド側で指定するので、ここの値は使われない。
 #
 #   waitress-serve --host=0.0.0.0 --port=8000 --threads=8 --call core:create_app
 #   gunicorn -w 1 -b 0.0.0.0:8000 'core:create_app()'
 #
-# gunicorn でワーカーを増やす場合は必ず 1 にすること。定期取り込みのスレッド
-# （scheduler）がワーカーの数だけ立ち、同じジョブを多重に実行してしまうため。
-# 同時アクセス数を稼ぎたいときはスレッド数（waitress の --threads）で増やす。
-# waitress は元から1プロセスなので、この問題は起きない。
+# ワーカー（プロセス）は必ず 1 にすること。定期取り込みのスレッド（scheduler）が
+# ワーカーの数だけ立ち、同じジョブを多重に実行してしまうため。
+# 同時アクセス数を稼ぎたいときは、スレッド数（下の THREADS）で増やす。
 #
 # 回答の逐次表示（Server-Sent Events）を使うので、前段に nginx などを置く場合は
 # そのパスだけバッファリングを切ること（proxy_buffering off;）。
@@ -35723,6 +35728,8 @@ document.addEventListener('DOMContentLoaded', () => {
 # ポートが他のアプリと重なると起動に失敗する。その場合は PORT を変える。
 HOST = "0.0.0.0"
 PORT = 8000
+# 同時にさばくリクエスト数（waitressのスレッド数）
+THREADS = 8
 
 # エラー画面に詳細を出すか。本番では必ず False のままにすること。
 # True にすると、ブラウザからサーバ上で任意のコードを実行できてしまう。
@@ -35747,6 +35754,23 @@ if __name__ == "__main__":
                  "サーバ起動は引数なしの python core.py）")
 
     app = create_app()
-    # reloader を切っているのは、二重起動でスケジューラのスレッドが増えるのを避けるため
-    app.run(host=HOST, port=PORT, debug=DEBUG,
-            use_reloader=False, threaded=True)
+    if DEBUG:
+        # デバッグ時だけ Flask 開発サーバ（エラー画面に詳細が出る）。
+        # reloader を切っているのは、二重起動でスケジューラのスレッドが増えるのを避けるため
+        app.run(host=HOST, port=PORT, debug=True,
+                use_reloader=False, threaded=True)
+    else:
+        # 通常運転。waitress（本番用サーバ）で待ち受ける
+        try:
+            from waitress import serve
+        except ImportError:
+            print("[app] waitress が見つからないため、Flask開発サーバで起動します"
+                  "（pip install -r requirements.txt で本番用サーバが入ります）")
+            app.run(host=HOST, port=PORT, debug=False,
+                    use_reloader=False, threaded=True)
+        else:
+            # flush: リダイレクト先がファイルだと serve() が先にブロックして
+            # このメッセージがいつまでも書き出されないため
+            print(f"[app] http://{HOST}:{PORT} で起動しました"
+                  f"（waitress / threads={THREADS}）", flush=True)
+            serve(app, host=HOST, port=PORT, threads=THREADS)
