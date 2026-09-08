@@ -3955,6 +3955,8 @@ def save_admin(data: dict, user: str | None = None) -> dict:
 #   relationships:
 #     - { from: orders.customer_id, to: customers.id, cardinality: "N:1" }
 #       # to には "他DBエイリアス.テーブル.列" の3要素形式も書ける
+#     - { from: "明細.(工場CD, 受注NO)", to: "受注.(工場CD, 受注NO)", cardinality: "N:1" }
+#       # 複合キーは括弧で列をまとめる（from/to の列数は同じ・対応順）
 #   glossary:                   # テーブルをまたぐ業務用語だけをここに書く
 #     稼働率: { description: 実働時間÷所定時間 }
 #   examples:
@@ -4360,15 +4362,22 @@ def drift_warnings(profile: dict, meta: dict) -> list[str]:
             if cname not in pcols:
                 warns.append(f"指定された主キーの列 '{tname}.{cname}' はDBに存在しません。")
     for rel in (meta.get("relationships") or []):
+        eps = []
         for end in (rel.get("from", ""), rel.get("to", "")):
-            parts = str(end).split(".")
-            if len(parts) == 2:  # table.col（同一DB内）のみ検証。db付き3要素は他DBなので対象外
-                tname, cname = parts
-                if tname in ptables:
-                    if cname not in {c["name"] for c in ptables[tname]["columns"]}:
+            ep = parse_endpoint_cols(end, "@own")
+            eps.append(ep)
+            if not ep or ep[0] != "@own":
+                continue  # 解けないか、db付き＝他DBなので対象外
+            tname, cols = ep[1], ep[2]
+            if tname in ptables:
+                have = {c["name"] for c in ptables[tname]["columns"]}
+                for cname in cols:
+                    if cname not in have:
                         warns.append(f"結合定義の '{end}' に対応する列がありません。")
-                else:
-                    warns.append(f"結合定義の '{end}' に対応するテーブルがありません。")
+            else:
+                warns.append(f"結合定義の '{end}' に対応するテーブルがありません。")
+        if eps[0] and eps[1] and len(eps[0][2]) != len(eps[1][2]):
+            warns.append(f"結合定義 '{rel.get('from')} → {rel.get('to')}' の列数が合っていません。")
     # 例文・検算・用語のSQLが、存在しないテーブルを使っていないか。
     # 削除の掃除が中断された（アプリ停止・強制終了）ときの取り残しはここで見つける
     def _missing(sql: str):
@@ -4437,7 +4446,13 @@ def join_suggestions(profile: dict, meta: dict, db_path=None) -> list[dict]:
     ptables = profile.get("tables", {})
     existing = set()
     for rel in (meta.get("relationships") or []):
-        existing.add((str(rel.get("from", "")).lower(), str(rel.get("to", "")).lower()))
+        pr = rel_pairs(rel, "@own")
+        if pr:  # 複合キーは列ペアごとに「既存」とみなす（片列の候補を出さない）
+            (fa, ftb), (ta, ttb), pairs = pr
+            for fc, tc in pairs:
+                existing.add((f"{ftb}.{fc}".lower(), f"{ttb}.{tc}".lower()))
+        else:
+            existing.add((str(rel.get("from", "")).lower(), str(rel.get("to", "")).lower()))
     for tname, t in ptables.items():
         for fk in t.get("fks", []):
             existing.add((f"{tname}.{fk['from']}".lower(), f"{fk['table']}.{fk['to']}".lower()))
@@ -4609,6 +4624,51 @@ def parse_endpoint(end: str, default_alias: str):
     return None
 
 
+def parse_endpoint_cols(end: str, default_alias: str):
+    """端点を (alias, table, [列, ...]) に解く。複合キーの括弧形式にも対応。
+
+      'table.col'            → (default_alias, table, [col])
+      'alias.table.col'      → (alias, table, [col])
+      'table.(c1, c2)'       → (default_alias, table, [c1, c2])   ※複合キー
+      'alias.table.(c1, c2)' → (alias, table, [c1, c2])
+    """
+    raw = str(end).strip()
+    m = re.match(r"^(.+?)\.\(([^()]*)\)$", raw)
+    if m:
+        cols = [c.strip() for c in m.group(2).split(",") if c.strip()]
+        parts = [p.strip() for p in m.group(1).split(".")]
+        if not cols:
+            return None
+        if len(parts) == 1:
+            return default_alias, parts[0], cols
+        if len(parts) == 2:
+            return parts[0], parts[1], cols
+        return None
+    p = parse_endpoint(raw, default_alias)
+    return (p[0], p[1], [p[2]]) if p else None
+
+
+def format_endpoint(alias: str, table: str, cols: list, own_alias: str) -> str:
+    """(alias, table, 列リスト) を保存用の文字列に戻す。自DBなら alias は書かない。"""
+    head = table if alias == own_alias else f"{alias}.{table}"
+    if len(cols) == 1:
+        return f"{head}.{cols[0]}"
+    return f"{head}.({', '.join(cols)})"
+
+
+def rel_pairs(rel: dict, own_alias: str):
+    """関連1件を ((from側 alias, table), (to側 alias, table), [(from列, to列), ...]) に解く。
+
+    解けない・列数が合わないときは None（乖離検知が別途知らせる）。
+    単一列の関連は列ペア1つのリストになるので、呼び出し側は形を区別しなくてよい。
+    """
+    a = parse_endpoint_cols(rel.get("from", ""), own_alias)
+    b = parse_endpoint_cols(rel.get("to", ""), own_alias)
+    if not a or not b or len(a[2]) != len(b[2]):
+        return None
+    return (a[0], a[1]), (b[0], b[1]), list(zip(a[2], b[2]))
+
+
 def node_id(alias: str, table: str) -> str:
     """テーブル（親ノード）のID。"""
     return f"{alias}.{table}"
@@ -4642,22 +4702,23 @@ def collect_edges(entries: list[dict]) -> list[dict]:
     """
     nodes = {node_id(e["alias"], t) for e in entries for t in e["profile"].get("tables", {})}
 
-    # メタ側の端点集合（FKと重複したら FK 側を出さない）
+    # メタ側の端点集合（FKと重複したら FK 側を出さない）。複合キーは列ペアごとに持つ
     meta_pairs = set()
     for e in entries:
         for rel in (e["meta"].get("relationships") or []):
-            a = parse_endpoint(rel.get("from", ""), e["alias"])
-            b = parse_endpoint(rel.get("to", ""), e["alias"])
-            if a and b:
-                meta_pairs.add((a, b))
+            pr = rel_pairs(rel, e["alias"])
+            if pr:
+                (fa, ftb), (ta, ttb), pairs = pr
+                for fc, tc in pairs:
+                    meta_pairs.add(((fa, ftb, fc), (ta, ttb, tc)))
 
-    def valid(p):
-        """端点(alias, table, column)が実在し、キャンバス上にあるか。"""
-        if node_id(p[0], p[1]) not in nodes:
+    def valid(alias_, table_, cols_):
+        """端点のテーブルがキャンバス上にあり、列もすべて実在するか。"""
+        if node_id(alias_, table_) not in nodes:
             return False
-        e = next((x for x in entries if x["alias"] == p[0]), None)
-        cols = {c["name"] for c in (e["profile"]["tables"].get(p[1]) or {}).get("columns", [])}
-        return p[2] in cols
+        e = next((x for x in entries if x["alias"] == alias_), None)
+        have = {c["name"] for c in (e["profile"]["tables"].get(table_) or {}).get("columns", [])}
+        return all(c in have for c in cols_)
 
     edges: list[dict] = []
     for e in entries:
@@ -4666,25 +4727,37 @@ def collect_edges(entries: list[dict]) -> list[dict]:
             for fk in t.get("fks", []):
                 a = (alias, tname, fk["from"])
                 b = (alias, fk["table"], fk["to"])
-                if not valid(a) or not valid(b) or (a, b) in meta_pairs:
+                if (not valid(a[0], a[1], [a[2]]) or not valid(b[0], b[1], [b[2]])
+                        or (a, b) in meta_pairs):
                     continue
                 edges.append({
                     "id": f"fk||{a[0]}.{a[1]}.{a[2]}||{b[0]}.{b[1]}.{b[2]}",
                     "source": col_node_id(*a), "target": col_node_id(*b),
                     "from": a, "to": b,
+                    "pairs": [[a[2], b[2]]],
+                    "from_ref": format_endpoint(a[0], a[1], [a[2]], alias),
+                    "to_ref": format_endpoint(b[0], b[1], [b[2]], alias),
                     "label": edge_label("N:1"), "cardinality": "N:1",
                     "kind": "fk", "owner": alias, "index": None,
                 })
         for i, rel in enumerate(e["meta"].get("relationships") or []):
-            a = parse_endpoint(rel.get("from", ""), alias)
-            b = parse_endpoint(rel.get("to", ""), alias)
-            if not a or not b or not valid(a) or not valid(b):
+            pr = rel_pairs(rel, alias)
+            if not pr:
+                continue
+            (fa, ftb), (ta, ttb), pairs = pr
+            if (not valid(fa, ftb, [p_[0] for p_ in pairs])
+                    or not valid(ta, ttb, [p_[1] for p_ in pairs])):
                 continue
             card = rel.get("cardinality") or "N:1"
+            # 線は先頭の列ペアに係留する（複合キーでも線は1本）
+            a = (fa, ftb, pairs[0][0])
+            b = (ta, ttb, pairs[0][1])
             edges.append({
                 "id": f"rel||{alias}||{i}",
                 "source": col_node_id(*a), "target": col_node_id(*b),
                 "from": a, "to": b,
+                "pairs": [[fc, tc] for fc, tc in pairs],
+                "from_ref": rel.get("from"), "to_ref": rel.get("to"),
                 "label": edge_label(card), "cardinality": card,
                 "kind": "meta", "owner": alias, "index": i,
             })
@@ -4725,9 +4798,9 @@ def fk_columns(entries: list[dict], alias: str, tname: str) -> set:
             for fk in t.get("fks", []):
                 out.add(fk["from"])
         for rel in (e["meta"].get("relationships") or []):
-            p = parse_endpoint(rel.get("from", ""), e["alias"])
+            p = parse_endpoint_cols(rel.get("from", ""), e["alias"])
             if p and p[0] == alias and p[1] == tname:
-                out.add(p[2])
+                out.update(p[2])
     return out
 
 
@@ -4832,6 +4905,9 @@ def er_payload(path, profile: dict | None = None,
         edges.append({"id": e["id"], "kind": e["kind"], "label": e["label"],
                       "cardinality": e["cardinality"], "index": e.get("index"),
                       "from": list(e["from"]), "to": list(e["to"]),
+                      "pairs": [list(p) for p in (e.get("pairs")
+                                                  or [[e["from"][2], e["to"][2]]])],
+                      "from_ref": e.get("from_ref"), "to_ref": e.get("to_ref"),
                       "owner": owner, "editable": e["kind"] == "meta"})
     return {"nodes": nodes, "edges": edges, "alias": alias}
 
@@ -4892,6 +4968,26 @@ def _sample_values(profile: dict, table: str, column: str) -> list:
     st = ((profile or {}).get("tables", {}).get(table) or {}).get("col_stats", {}).get(column) or {}
     vals = st.get("values") or []
     return [v[0] if isinstance(v, (list, tuple)) else v for v in vals]
+
+
+def tuple_unique(path, table: str, cols: list) -> bool:
+    """その表で「列の組」ごとに1行しかない（＝組として一意）か。実データで数える。
+
+    複合キーの判定に使う。単独の列では重複していても、組で一意なら
+    N:1 の親として成立する。数えられないときは False（安全側）。
+    """
+    try:
+        conn = db.connect_scope([(str(path), "p")])
+        try:
+            q = lambda x: '"' + str(x).replace('"', '""') + '"'
+            sql = (f"SELECT 1 FROM p.{q(table)} GROUP BY "
+                   + ", ".join(q(c) for c in cols)
+                   + " HAVING COUNT(*) > 1 LIMIT 1")
+            return conn.execute(sql).fetchone() is None
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
 def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
@@ -5230,7 +5326,17 @@ def db_text(alias: str, db_path, tables: list[str] | None, full: bool) -> str:
         lines.extend(fk_lines)
         for r in rels:
             card = f" ({r['cardinality']})" if r.get("cardinality") else ""
-            lines.append(f"- {r.get('from')} = {r.get('to')}{card}")
+            pr = rel_pairs(r, "")
+            if pr and len(pr[2]) > 1:
+                (fa, ftb), (ta, ttb), pairs = pr
+                fh = ftb if not fa else f"{fa}.{ftb}"
+                th = ttb if not ta else f"{ta}.{ttb}"
+                conds = " AND ".join(f"{fh}.{fc} = {th}.{tc}" for fc, tc in pairs)
+                lines.append(f"- {conds}{card}"
+                             f" ※複合キー: {len(pairs)}列すべてを同時に結合条件へ。"
+                             "片方の列だけで結ばない")
+            else:
+                lines.append(f"- {r.get('from')} = {r.get('to')}{card}")
         lines.append("")
 
     def _no_hidden_tables(text: str) -> bool:
@@ -5934,7 +6040,10 @@ def _declared_pairs(entries: list[dict]) -> set:
                     "meta": catalog.load_meta(e["path"])} for e in entries]
     out = set()
     for edge in catalog.collect_edges(cat_entries):
-        out.add(_edge_key(edge["from"], edge["to"]))
+        fa, ftb, _ = edge["from"]
+        ta, ttb, _ = edge["to"]
+        for fc, tc in (edge.get("pairs") or [[edge["from"][2], edge["to"][2]]]):
+            out.add(_edge_key((fa, ftb, fc), (ta, ttb, tc)))
     return out
 
 
@@ -11127,7 +11236,7 @@ def _rel_text(rel: dict) -> str:
 def _ep_hits(rel: dict, own_alias: str, alias: str, table: str | None) -> bool:
     """関連の端点が (alias, table) を指しているか。table=None ならDB丸ごと。"""
     for key in ("from", "to"):
-        ep = catalog.parse_endpoint(rel.get(key, ""), own_alias)
+        ep = catalog.parse_endpoint_cols(rel.get(key, ""), own_alias)
         if ep and ep[0] == alias and (table is None or ep[1] == table):
             return True
     return False
@@ -15701,10 +15810,12 @@ def _show_er_diagram(args: dict, scope: list[dict]) -> dict:
         return _err(f"ER図データの組み立てに失敗しました: {e}")
 
     own = [n for n in payload["nodes"] if not n.get("external")]
-    rels = [{"from": ".".join(str(x) for x in e["from"]),
-             "to": ".".join(str(x) for x in e["to"]),
+    rels = [{"from": e.get("from_ref") or ".".join(str(x) for x in e["from"]),
+             "to": e.get("to_ref") or ".".join(str(x) for x in e["to"]),
              "cardinality": e.get("cardinality") or "",
-             "kind": "FOREIGN KEY宣言" if e.get("kind") == "fk" else "カタログ登録"}
+             "kind": "FOREIGN KEY宣言" if e.get("kind") == "fk" else "カタログ登録",
+             **({"note": f"複合キー（{len(e['pairs'])}列すべてを同時に結合条件にする）"}
+                if len(e.get("pairs") or []) > 1 else {})}
             for e in payload["edges"]]
     return {
         "ok": True,
@@ -18159,8 +18270,8 @@ def expand_tables_by_relations(picked: dict, scope: list[dict]) -> dict:
         meta = load_meta(s["path"])
         for rel in (meta.get("relationships") or []):
             try:
-                fa, ft, _fc = parse_endpoint(rel.get("from", ""), s["alias"])
-                ta, tt, _tc = parse_endpoint(rel.get("to", ""), s["alias"])
+                fa, ft, _fc = parse_endpoint_cols(rel.get("from", ""), s["alias"])
+                ta, tt, _tc = parse_endpoint_cols(rel.get("to", ""), s["alias"])
             except Exception:
                 continue
             f_scope = by_alias.get(fa)
@@ -20798,16 +20909,44 @@ def relationship():
         # ER図は矢印を描かないので、人はどちら向きにもドラッグする。
         # from/to は描画順ではなく参照の向きで、整合性チェックがこれに依存する。
         a, b, card = catalog.normalize_direction(a, b, body.get("cardinality"), lookup)
+
+        # 同じ表ペアの既存の関連（複合キーとして合流できる相手）。向きが逆でも拾い、
+        # 逆なら既存の向きに合わせる（1つの関連の中で向きが混ざらないように）
+        same = []
+        for i, r in enumerate(rels):
+            pr = catalog.rel_pairs(r, alias)
+            if not pr:
+                continue
+            if (pr[0], pr[1]) == ((a[0], a[1]), (b[0], b[1])):
+                same.append((i, r))
+            elif (pr[0], pr[1]) == ((b[0], b[1]), (a[0], a[1])):
+                a, b = b, a
+                card = catalog._CARD_FLIP.get(card, card)
+                same.append((i, r))
+
         if a[0] != alias:
-            # 入れ替えた結果、子が他DBになった。その関連は相手のDBが持つべき
+            # 子（from側）が他DBになった。その関連は相手のDBが持つべき
             return jsonify({"error":
                             f"この向きの関連は {a[0]} 側で登録してください"
                             f"（外部キーを持つのは {a[0]}.{a[1]} です）。"
                             "DBを切り替えてから、同じようにつないでください。"}), 400
 
-        new = {"from": _ref(a, alias), "to": _ref(b, alias), "cardinality": card}
-        if any(r.get("from") == new["from"] and r.get("to") == new["to"] for r in rels):
-            return jsonify({"error": "この関連はすでに登録されています。"}), 400
+        for _i, r in same:
+            if (a[2], b[2]) in catalog.rel_pairs(r, alias)[2]:
+                return jsonify({"error": "この関連はすでに登録されています。"}), 400
+
+        mode = body.get("mode")
+        if same and mode not in ("merge", "new"):
+            # 既存の線に列を足して複合キーにするのか、独立した別の関連なのかは
+            # 人にしか決められない。一度返して画面に選ばせる
+            return jsonify({"ok": False, "ask": "merge_or_new",
+                            "from": _ref(a, alias), "to": _ref(b, alias),
+                            "cardinality": card,
+                            "existing": [{"from": r.get("from"), "to": r.get("to"),
+                                          "cardinality": r.get("cardinality") or "N:1",
+                                          "pairs": [[fc, tc] for fc, tc
+                                                    in catalog.rel_pairs(r, alias)[2]]}
+                                         for _i, r in same]})
 
         # 結んでよい列か、実データを見て確かめる。
         #   block … 保存しない（値が全く重ならない等。JOINが成立しない線をAIに教えない）
@@ -20815,12 +20954,52 @@ def relationship():
         def _path_of(al):
             return next((f for f in db.list_db_files() if db.alias_for(f) == al), path)
         check = catalog.link_check(a, b, lookup, _path_of)
+        if mode == "merge" and same:
+            # 複合キーへの合流では「親が単独では一意でない」警告が的外れになり得る。
+            # 合流後の列の組で一意なら、その警告を情報の行に置き換える
+            tgt_pairs = catalog.rel_pairs(same[0][1], alias)[2] + [(a[2], b[2])]
+            parent_cols = [p_[1] for p_ in tgt_pairs]
+            if catalog.tuple_unique(_path_of(b[0]), b[1], parent_cols):
+                kept = [i_ for i_ in check["issues"]
+                        if "一意ではありません" not in str(i_.get("title", ""))]
+                if len(kept) != len(check["issues"]):
+                    kept.append({"level": "info", "title": "複合キーとして一意です",
+                                 "detail": f"{b[1]} は ({', '.join(parent_cols)}) の組み合わせで"
+                                           "1行が一意になるため、単独列の重複は問題ありません。"})
+                check = {"level": ("block" if any(i_["level"] == "block" for i_ in kept)
+                                   else "warn" if any(i_["level"] == "warn" for i_ in kept)
+                                   else "ok"),
+                         "issues": kept}
         if check["level"] == "block" or (check["level"] == "warn" and not body.get("force")):
             # 200 で返す: 画面の api() は非2xxだと本文を捨てて例外にするため
             return jsonify({"ok": False, "check": check,
-                            "from": new["from"], "to": new["to"], "cardinality": card})
-        rels.append(new)
-        extra = {"added": new}
+                            "from": _ref(a, alias), "to": _ref(b, alias),
+                            "cardinality": card, "mode": mode or ""})
+
+        if mode == "merge" and same:
+            tgt_i, tgt = same[0]
+            if body.get("merge_from") and body.get("merge_to"):
+                tgt_i, tgt = next(((i, r) for i, r in same
+                                   if r.get("from") == body["merge_from"]
+                                   and r.get("to") == body["merge_to"]), same[0])
+            pr = catalog.rel_pairs(tgt, alias)
+            pairs = pr[2] + [(a[2], b[2])]
+            tgt["from"] = catalog.format_endpoint(a[0], a[1], [p_[0] for p_ in pairs], alias)
+            tgt["to"] = catalog.format_endpoint(b[0], b[1], [p_[1] for p_ in pairs], alias)
+            extra = {"merged": {"from": tgt["from"], "to": tgt["to"],
+                                "cardinality": tgt.get("cardinality") or "N:1",
+                                "pair": [a[2], b[2]],
+                                # 画面の「元に戻す／やり直す」が同じ列ペアを付け外し
+                                # できるよう、addで送り直せる形も返す
+                                "add_body": {
+                                    "from_table": a[1] if a[0] == alias else f"{a[0]}.{a[1]}",
+                                    "from_column": a[2],
+                                    "to_table": b[1] if b[0] == alias else f"{b[0]}.{b[1]}",
+                                    "to_column": b[2]}}}
+        else:
+            new = {"from": _ref(a, alias), "to": _ref(b, alias), "cardinality": card}
+            rels.append(new)
+            extra = {"added": new}
     elif action in ("update", "delete"):
         # 位置（index）でも、保存済みの from/to 文字列でも指せる。
         # 「元に戻す」は index がずれるので from/to で来る
@@ -20837,6 +21016,41 @@ def relationship():
             prev = rels[i].get("cardinality")
             rels[i]["cardinality"] = body.get("cardinality") or prev
             extra = {"updated": {**rels[i], "previous": prev}}
+    elif action == "remove_pair":
+        # 複合キーの関連から列ペアを1つ外す。残り1ペアなら単独形式へ、0なら関連ごと削除。
+        # 探すのは「表の組が同じで、その列ペアを含む関連」。from/to の文字列は
+        # 列を足し引きするたびに変わるので、文字列の完全一致では「元に戻す／やり直す」で
+        # 見失う（同じ表ペアに複数の関連があっても、列ペアで一意に決まる）
+        pair = [str(x) for x in (body.get("pair") or [])]
+        fep = catalog.parse_endpoint_cols(body.get("from", ""), alias)
+        tep = catalog.parse_endpoint_cols(body.get("to", ""), alias)
+        if not fep or not tep or len(pair) != 2:
+            return jsonify({"error": "列ペアの指定が正しくありません。"}), 400
+        i, pr = -1, None
+        for k, r in enumerate(rels):
+            cand = catalog.rel_pairs(r, alias)
+            if (cand and cand[0] == (fep[0], fep[1]) and cand[1] == (tep[0], tep[1])
+                    and (pair[0], pair[1]) in cand[2]):
+                i, pr = k, cand
+                break
+        if i < 0:
+            return jsonify({"error": "この関連は既に変更されています。ページを更新してください。"}), 400
+        pairs = [p_ for p_ in pr[2] if [p_[0], p_[1]] != pair]
+        if pairs:
+            (fa, ftb), (ta, ttb) = pr[0], pr[1]
+            rels[i]["from"] = catalog.format_endpoint(fa, ftb, [p_[0] for p_ in pairs], alias)
+            rels[i]["to"] = catalog.format_endpoint(ta, ttb, [p_[1] for p_ in pairs], alias)
+            (fa2, ftb2), (ta2, ttb2) = pr[0], pr[1]
+            extra = {"pair_removed": {"from": rels[i]["from"], "to": rels[i]["to"],
+                                      "cardinality": rels[i].get("cardinality") or "N:1",
+                                      "pair": pair,
+                                      "add_body": {
+                                          "from_table": ftb2 if fa2 == alias else f"{fa2}.{ftb2}",
+                                          "from_column": pair[0],
+                                          "to_table": ttb2 if ta2 == alias else f"{ta2}.{ttb2}",
+                                          "to_column": pair[1]}}}
+        else:
+            extra = {"removed": rels.pop(i)}
     else:
         return jsonify({"error": "不正な操作です。"}), 400
 
@@ -23769,6 +23983,7 @@ TEMPLATES = {
       <div class="er__legend">
         <b>IPA表記</b>　<u>下線</u>＝主キー　<u style="text-decoration-style:dashed">破線</u>＝外部キー
         線の両端の <b>1</b>・<b>*</b>＝多重度　実線＝登録済み／短い破線＝FOREIGN KEY
+        「複合キー(n列)」の印＝複数列の組で1つの結合（線は先頭の列に係留）
         <span id="erUsageLegend" class="hidden">　｜　<b>利用状況</b>:
           線の色が濃いほど分析でよく使われた結合　薄い灰色＝未使用（検算されていない経路）。
           線の上の数字は累積の使用回数</span>
@@ -25339,6 +25554,14 @@ window.CHAT_INIT = {
               <td>from/to は描画順ではなく「どちらが参照している側か」を表します。
                   片方だけが単独主キーなら、そちらを親側にして<b>自動で入れ替え、多重度も反転</b>します
                   （逆向きに登録されると参照整合性の検査が反対の意味になるため）。</td></tr>
+          <tr><td>複合キーの結合</td>
+              <td>複数列の組で1つの結合になる関連（複合キー）は、<b>1本の線</b>として登録します。
+                  すでに関連がある表ペアへ2組目の列をドラッグすると「複合キーとして列を追加するか、
+                  別の関連か」を確認します（作成者と承認者のように、同じ表を別の意味で2回参照する
+                  関連は「別」が正解のため、機械では決めず人が選びます）。保存形式は
+                  <code>表.(列1, 列2)</code> のように括弧で列をまとめ、AIには「全列を同時に
+                  結合条件にする」と明示して渡します。列の組で一意になる場合は、
+                  単独列の重複警告を出しません。</td></tr>
           <tr><td>登録時の実データ検証</td>
               <td>保存前に必ず実データを照合し、結果を3段階で返します。
                   <b>阻止</b>=値が1件も一致しない。<b>警告</b>=一致しない値が30%以上／型が違う／
@@ -26134,7 +26357,8 @@ window.CHAT_INIT = {
                     まずは箱＝表・線＝結合できる関係、と読んでください。</td></tr>
             <tr><td>関連（リレーション）</td>
                 <td>「この表のこの列と、あの表のあの列が対応する」というつながりの登録のことです。
-                    ER図の線1本が、この登録1件にあたります。
+                    ER図の線1本が、この登録1件にあたります。複合キー（複数列の組で結ぶ関連）も
+                    線は1本のままで、線の中ほどに「複合キー(n列)」の印が付きます。
                     <b>このアプリでは</b>AIが<code>JOIN</code>（表の結合）を書くときの根拠になるため、
                     関連の登録の充実がそのまま回答の正確さに効きます
                     （登録が無い結合は、AIが列名などから推測するしかなくなるため）。詳細は3-14を参照。</td></tr>
@@ -28839,10 +29063,18 @@ const ER = (() => {
         return { d: `M ${a.x} ${a.y} C ${c1} ${a.y}, ${c2} ${b.y}, ${b.x} ${b.y}`, a, b, mid };
     }
 
-    /* 利用状況のキー。端点の並び順に依らないよう、文字列順で正規化する */
-    function usageKey(e) {
-        const a = e.from.join('.'), b = e.to.join('.');
-        return a <= b ? `${a}||${b}` : `${b}||${a}`;
+    /* 利用状況のキー。端点の並び順に依らないよう、文字列順で正規化する。
+       複合キーの線は列ペアごとにキーを作り、いちばん使われたペアの回数で塗る */
+    function usageKeys(e) {
+        const [fa, ft] = e.from, [ta, tt] = e.to;
+        return (e.pairs || [[e.from[2], e.to[2]]]).map(([fc, tc]) => {
+            const a = `${fa}.${ft}.${fc}`, b = `${ta}.${tt}.${tc}`;
+            return a <= b ? `${a}||${b}` : `${b}||${a}`;
+        });
+    }
+
+    function usageCount(e) {
+        return Math.max(...usageKeys(e).map(k => usage[k] || 0));
     }
 
     /* --- 利用回数の色（濃さ）------------------------------------------------------
@@ -28871,7 +29103,7 @@ const ER = (() => {
     /** その図の中で、いちばん多く使われた回数（濃さの基準）。 */
     function usageMax() {
         if (!usage) return 0;
-        return data.edges.reduce((m, e) => Math.max(m, usage[usageKey(e)] || 0), 0);
+        return data.edges.reduce((m, e) => Math.max(m, usageCount(e)), 0);
     }
 
     function drawEdges() {
@@ -28883,7 +29115,7 @@ const ER = (() => {
             if (!p) return;
             const on = selected?.type === 'edge' && selected.id === e.id;
             // 実際に使われた回数。null は「重ね表示オフ or 未取得」
-            const count = usage ? (usage[usageKey(e)] || 0) : null;
+            const count = usage ? usageCount(e) : null;
 
             // 当たり判定用の太い透明な線。見える線は細いので、
             // これが無いと1px幅を狙わされて実質クリックできない。
@@ -28893,11 +29125,18 @@ const ER = (() => {
             hit.setAttribute('stroke', 'transparent');
             hit.setAttribute('stroke-width', '16');
             hit.style.cursor = 'pointer';
+            const tipLines = [];
+            if ((e.pairs || []).length > 1) {
+                tipLines.push('複合キー: ' + e.pairs.map(pp => `${pp[0]} = ${pp[1]}`).join(' AND '));
+            }
             if (count !== null) {
-                const tip = document.createElementNS(NS, 'title');
-                tip.textContent = count
+                tipLines.push(count
                     ? `過去の分析で ${count} 回使われた結合`
-                    : '過去の分析では一度も使われていない結合（検算されていない経路）';
+                    : '過去の分析では一度も使われていない結合（検算されていない経路）');
+            }
+            if (tipLines.length) {
+                const tip = document.createElementNS(NS, 'title');
+                tip.textContent = tipLines.join('\n');
                 hit.append(tip);
             }
             // pointerdown を止めるのが肝。止めないとキャンバスのパン処理が走り、
@@ -28933,6 +29172,18 @@ const ER = (() => {
             const [l, r] = parts.length === 2 ? parts : ['*', '1'];
             marks.push([p.a, l, p.a.x < p.b.x ? 14 : -14, on],
                        [p.b, r, p.b.x > p.a.x ? -14 : 14, on]);
+
+            // 複合キーの線は、列の組で1つの結合だと分かる印を中ほどに置く
+            if ((e.pairs || []).length > 1) {
+                const bg = document.createElementNS(NS, 'text');
+                bg.setAttribute('x', p.mid.x);
+                bg.setAttribute('y', p.mid.y - 8);
+                bg.setAttribute('text-anchor', 'middle');
+                bg.setAttribute('class', 'er__edgelabel' + (on ? ' is-selected' : ''));
+                bg.setAttribute('pointer-events', 'none');
+                bg.textContent = `複合キー(${e.pairs.length}列)`;
+                svg.append(bg);
+            }
 
             // 累積の使用回数を線の中ほどに置く。0 は「一度も検算されていない経路」
             if (count !== null) counts.push([p.mid, count]);
@@ -29190,9 +29441,13 @@ const ER = (() => {
     function selectEdge(e) {
         selected = { type: 'edge', id: e.id, edge: e };
         drawEdges(); syncSelection();
-        showPanel('関連', [
+        const comp = (e.pairs || []).length > 1;
+        showPanel(comp ? '関連（複合キー）' : '関連', [
             el('div', { class: 'small mono mb' },
-                `${e.from.join('.')}\n${e.to.join('.')}`),
+                `${e.from_ref || e.from.join('.')}\n${e.to_ref || e.to.join('.')}`),
+            comp ? el('div', { class: 'alert alert--info small mb' },
+                `${e.pairs.length}列の組で1つの結合です。JOINでは全列を同時に条件にします: `
+                + e.pairs.map(pp => `${pp[0]} = ${pp[1]}`).join(' AND ')) : null,
             e.kind === 'fk'
                 ? el('div', { class: 'alert alert--info small' },
                     'DBに FOREIGN KEY として宣言された関連です。ここからは変更・削除できません。')
@@ -29209,10 +29464,20 @@ const ER = (() => {
                             title: CARD_JA[c],
                             onclick: () => mutate({ action: 'update', index: e.index, cardinality: c }),
                         }, `${c}（${CARD_JA[c]}）`))),
+                    comp ? el('div', { class: 'mb' },
+                        el('div', { class: 'small muted mb' },
+                            '列の組（「外す」でその列だけ複合キーから抜けます）'),
+                        ...e.pairs.map(pp => el('div', { class: 'row mb', style: 'gap:6px;align-items:center' },
+                            el('span', { class: 'small mono grow' }, `${pp[0]} = ${pp[1]}`),
+                            el('button', { class: 'btn btn--sm btn--ghost',
+                                onclick: () => mutate({ action: 'remove_pair',
+                                                        from: e.from_ref, to: e.to_ref,
+                                                        pair: pp }) }, '外す')))) : null,
                     el('button', {
                         class: 'btn btn--sm btn--danger',
-                        onclick: () => { if (confirm('この関連を削除しますか？')) mutate({ action: 'delete', index: e.index }); },
-                    }, '削除'))]);
+                        onclick: () => { if (confirm(comp ? 'この関連を（全列まとめて）削除しますか？'
+                                                          : 'この関連を削除しますか？')) mutate({ action: 'delete', index: e.index }); },
+                    }, comp ? '関連ごと削除' : '削除'))]);
     }
 
     function selectTable(id) {
@@ -29396,6 +29661,8 @@ const ER = (() => {
     async function mutate(body) {
         try {
             const r = await relApi(body);
+            // 同じ表ペアに既存の関連がある。複合キーに合流するか、別の関連かを人に選ばせる
+            if (r.ask === 'merge_or_new') { showMergeAsk(r, body); return; }
             // 実データを見て「結ぶべきでない／要確認」と判定されたら、理由を出して止める
             if (r.check) { showLinkCheck(r, body); return; }
             if (body.action === 'add' && r.added) {
@@ -29405,7 +29672,17 @@ const ER = (() => {
                          // 一度通した線なので、やり直しでは確認（warn）を飛ばす。block は元々通らない
                          redo: () => relApi({ action: 'add', from: a.from, to: a.to,
                                               cardinality: a.cardinality, force: true }) });
-            } else if (body.action === 'delete' && r.removed) {
+            } else if (r.merged) {
+                const m = r.merged;
+                record({ label: `複合キーに列を追加（${m.pair[0]} = ${m.pair[1]}）`,
+                         undo: () => relApi({ action: 'remove_pair', from: m.from, to: m.to, pair: m.pair }),
+                         redo: () => relApi({ action: 'add', ...m.add_body, mode: 'merge', force: true }) });
+            } else if (r.pair_removed) {
+                const m = r.pair_removed;
+                record({ label: `複合キーから列を外す（${m.pair[0]} = ${m.pair[1]}）`,
+                         undo: () => relApi({ action: 'add', ...m.add_body, mode: 'merge', force: true }),
+                         redo: () => relApi({ action: 'remove_pair', from: m.from, to: m.to, pair: m.pair }) });
+            } else if ((body.action === 'delete' || body.action === 'remove_pair') && r.removed) {
                 const a = r.removed;
                 record({ label: `関連を削除（${a.from} → ${a.to}）`,
                          undo: () => relApi({ action: 'add', from: a.from, to: a.to,
@@ -29430,6 +29707,26 @@ const ER = (() => {
        なぜだめかを実データの数字つきで並べる。警告どまりなら「それでも登録する」を出す。
        ER図の線は「この列で JOIN してよい」というAIへの指示なので、成立しない線を
        黙って登録させない。 */
+    function showMergeAsk(r, body) {
+        const ex = (r.existing || [])[0] || {};
+        showPanel('複合キーにしますか？', [
+            el('div', { class: 'small mono mb' }, `${r.from}\n${r.to}`),
+            el('div', { class: 'small muted mb' },
+                'この2つのテーブルの間には、すでに関連があります: '
+                + (ex.pairs || []).map(pp => `${pp[0]} = ${pp[1]}`).join(' AND ')),
+            el('div', { class: 'alert alert--info small mb' },
+                '複合キー（複数列の組で1つの結合。JOINで全列を同時に条件にする）なら'
+                + '「列を追加」を、意味の異なる独立した結合なら「別の関連」を選んでください。'),
+            el('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap' },
+                el('button', { class: 'btn btn--sm btn--primary',
+                    onclick: () => mutate({ ...body, mode: 'merge' }) }, '複合キーとして列を追加'),
+                el('button', { class: 'btn btn--sm',
+                    onclick: () => mutate({ ...body, mode: 'new' }) }, '別の関連として登録'),
+                el('div', { class: 'spacer' }),
+                el('button', { class: 'btn btn--sm btn--ghost', onclick: closePanel }, 'やめる')),
+        ]);
+    }
+
     function showLinkCheck(r, body) {
         const check = r.check;
         const blocked = check.level === 'block';
