@@ -23983,7 +23983,7 @@ TEMPLATES = {
       <div class="er__legend">
         <b>IPA表記</b>　<u>下線</u>＝主キー　<u style="text-decoration-style:dashed">破線</u>＝外部キー
         線の両端の <b>1</b>・<b>*</b>＝多重度　実線＝登録済み／短い破線＝FOREIGN KEY
-        「複合キー(n列)」の印＝複数列の組で1つの結合（線は先頭の列に係留）
+        複数の列から出た線が1本に合流＝複合キー（その組で1つの結合。「複合キー(n列)」の印つき）
         <span id="erUsageLegend" class="hidden">　｜　<b>利用状況</b>:
           線の色が濃いほど分析でよく使われた結合　薄い灰色＝未使用（検算されていない経路）。
           線の上の数字は累積の使用回数</span>
@@ -25556,6 +25556,9 @@ window.CHAT_INIT = {
                   （逆向きに登録されると参照整合性の検査が反対の意味になるため）。</td></tr>
           <tr><td>複合キーの結合</td>
               <td>複数列の組で1つの結合になる関連（複合キー）は、<b>1本の線</b>として登録します。
+                  ER図では、対象の列それぞれから出た線がいったん合流し、1本の幹で相手側へ渡り、
+                  相手側でまた各列へ分かれる形で描きます（1つの結合であることと、使っている列の
+                  両方が分かるように）。
                   すでに関連がある表ペアへ2組目の列をドラッグすると「複合キーとして列を追加するか、
                   別の関連か」を確認します（作成者と承認者のように、同じ表を別の意味で2回参照する
                   関連は「別」が正解のため、機械では決めず人が選びます）。保存形式は
@@ -26357,8 +26360,9 @@ window.CHAT_INIT = {
                     まずは箱＝表・線＝結合できる関係、と読んでください。</td></tr>
             <tr><td>関連（リレーション）</td>
                 <td>「この表のこの列と、あの表のあの列が対応する」というつながりの登録のことです。
-                    ER図の線1本が、この登録1件にあたります。複合キー（複数列の組で結ぶ関連）も
-                    線は1本のままで、線の中ほどに「複合キー(n列)」の印が付きます。
+                    ER図の線1本が、この登録1件にあたります。複合キー（複数列の組で結ぶ関連）は、
+                    <b>対象の列それぞれから出た線が合流して1本になる</b>形で描かれ、
+                    どの列で結んでいるかが目で追えます（中ほどに「複合キー(n列)」の印つき）。
                     <b>このアプリでは</b>AIが<code>JOIN</code>（表の結合）を書くときの根拠になるため、
                     関連の登録の充実がそのまま回答の正確さに効きます
                     （登録が無い結合は、AIが列名などから推測するしかなくなるため）。詳細は3-14を参照。</td></tr>
@@ -29047,20 +29051,53 @@ const ER = (() => {
     }
 
     function edgePath(e) {
-        const [fa, ft, fc] = e.from, [ta, tt, tc] = e.to;
+        const [fa, ft] = e.from, [ta, tt] = e.to;
         const fid = `${fa}.${ft}`, tid = `${ta}.${tt}`;
         const fn = data.nodes.find(n => n.id === fid), tn = data.nodes.find(n => n.id === tid);
         if (!fn || !tn) return null;
         const fromRight = fn.x <= tn.x;
-        const a = anchor(fid, fc, fromRight ? 'right' : 'left');
-        const b = anchor(tid, tc, fromRight ? 'left' : 'right');
-        if (!a || !b) return null;
-        const dx = Math.max(40, Math.abs(b.x - a.x) * 0.45);
-        const c1 = fromRight ? a.x + dx : a.x - dx;
-        const c2 = fromRight ? b.x - dx : b.x + dx;
-        // 3次ベジェの中点。t=0.5 を代入すると (P0 + 3P1 + 3P2 + P3) / 8 になる
-        const mid = { x: (a.x + 3 * c1 + 3 * c2 + b.x) / 8, y: (a.y + 3 * a.y + 3 * b.y + b.y) / 8 };
-        return { d: `M ${a.x} ${a.y} C ${c1} ${a.y}, ${c2} ${b.y}, ${b.x} ${b.y}`, a, b, mid };
+        const fSide = fromRight ? 'right' : 'left', tSide = fromRight ? 'left' : 'right';
+        // 複合キーは列の数だけ端点がある。単一列の関連も同じ形で扱う
+        const pairs = (e.pairs && e.pairs.length) ? e.pairs : [[e.from[2], e.to[2]]];
+        const as = [], bs = [];
+        pairs.forEach(([fc, tc]) => {
+            const a = anchor(fid, fc, fSide), b = anchor(tid, tc, tSide);
+            if (a && b) { as.push(a); bs.push(b); }
+        });
+        if (!as.length) return null;
+
+        const dir = fromRight ? 1 : -1;
+        const curve = (p, q, k) => {          // p → q を横向きの3次ベジェで
+            // 制御点は距離の半分まで。超えると線が行き過ぎて膨らむ
+            const len = Math.abs(q.x - p.x);
+            const d2 = Math.max(6, Math.min(len * k, len / 2));
+            return `M ${p.x} ${p.y} C ${p.x + dir * d2} ${p.y}, ${q.x - dir * d2} ${q.y}, ${q.x} ${q.y}`;
+        };
+        const midOf = (p, q, k) => {          // その曲線の中点（t=0.5）
+            const len = Math.abs(q.x - p.x);
+            const d2 = Math.max(6, Math.min(len * k, len / 2));
+            const c1 = p.x + dir * d2, c2 = q.x - dir * d2;
+            return { x: (p.x + 3 * c1 + 3 * c2 + q.x) / 8, y: (p.y + 3 * p.y + 3 * q.y + q.y) / 8 };
+        };
+
+        if (as.length === 1) {                // 単一列: 従来どおり1本の曲線
+            const a = as[0], b = bs[0];
+            return { d: curve(a, b, 0.45), a, b, mid: midOf(a, b, 0.45) };
+        }
+
+        // 複合キー: 各列から出た線をいったん合流させ、1本の幹で相手側へ渡し、
+        // 相手側でまた各列へ分かれる。どの列の組で結んでいるかが目で追える
+        const avgY = arr => arr.reduce((t, p) => t + p.y, 0) / arr.length;
+        const gap = Math.abs(bs[0].x - as[0].x);
+        const stub = Math.max(12, Math.min(46, gap * 0.22));
+        const ja = { x: as[0].x + dir * stub, y: avgY(as) };
+        const jb = { x: bs[0].x - dir * stub, y: avgY(bs) };
+        const d = [
+            ...as.map(p => curve(p, ja, 0.6)),
+            curve(ja, jb, 0.45),
+            ...bs.map(p => curve(jb, p, 0.6)),
+        ].join(' ');
+        return { d, a: ja, b: jb, mid: midOf(ja, jb, 0.45), fan: true };
     }
 
     /* 利用状況のキー。端点の並び順に依らないよう、文字列順で正規化する。
