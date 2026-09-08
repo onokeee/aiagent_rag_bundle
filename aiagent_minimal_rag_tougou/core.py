@@ -2654,8 +2654,13 @@ def _blocks(rows: list, header_row: int) -> int:
 # 判定
 # =============================================================================
 
-def inspect(path, sheet: str | None = None) -> dict:
-    """1ファイル（Excelは1シート）の形を見て、取り込めるかを判定する。"""
+def inspect_file(path, sheet: str | None = None) -> dict:
+    """1ファイル（Excelは1シート）の形を見て、取り込めるかを判定する。
+
+    名前を inspect ではなく inspect_file にしているのは、後ろの画面セクションが
+    標準ライブラリの inspect を使うため。1ファイルに統合してスコープが1つに
+    なった今、同じ名前だと後から書かれた import が勝ってこの関数が消える。
+    """
     p = Path(path)
     ext = p.suffix.lower()
     out = {"file": p.name, "sheet": sheet, "sheets": [], "header_row": 0,
@@ -5052,29 +5057,32 @@ def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
         pc_path, pp_path = path_of(ca), path_of(pa)
         conn = db.connect_scope([(pc_path, "c"), (pp_path, "p")] if pc_path != pp_path
                                 else [(pc_path, "c")])
-        pal = "c" if pc_path == pp_path else "p"
-        q = lambda s: '"' + str(s).replace('"', '""') + '"'
-        C = f'"c".{q(ct)}', q(cc)
-        P = f'"{pal}".{q(pt)}', q(pc)
+        # どこで落ちても閉じる。外側の except が拾うので、finally が無いと接続が残る
+        try:
+            pal = "c" if pc_path == pp_path else "p"
+            q = lambda s: '"' + str(s).replace('"', '""') + '"'
+            C = f'"c".{q(ct)}', q(cc)
+            P = f'"{pal}".{q(pt)}', q(pc)
 
-        n_child = conn.execute(f"SELECT COUNT(*) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
-        n_parent = conn.execute(f"SELECT COUNT(*) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
-        n_parent_distinct = conn.execute(
-            f"SELECT COUNT(DISTINCT {P[1]}) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
-        # 子の値のうち親に存在するもの / しないもの
-        matched = conn.execute(
-            f"SELECT COUNT(*) FROM {C[0]} c0 WHERE c0.{C[1]} IS NOT NULL "
-            f"AND EXISTS (SELECT 1 FROM {P[0]} p0 WHERE p0.{P[1]} = c0.{C[1]})").fetchone()[0]
-        # 子の「異なる値」の数と、親の値のうち子から参照されている数（親側のカバー率）。
-        # 「status(1,2,3,9) → product_id(1〜40)」のような偶然の一致は、子の値は全部
-        # 親に見つかるのに、親の値はほとんど参照されない。本物の外部キーなら親の多くが
-        # 参照される。値の一致だけでは見抜けないので、この角度を足す。
-        n_child_distinct = conn.execute(
-            f"SELECT COUNT(DISTINCT {C[1]}) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
-        parent_hit = conn.execute(
-            f"SELECT COUNT(DISTINCT p0.{P[1]}) FROM {P[0]} p0 "
-            f"WHERE EXISTS (SELECT 1 FROM {C[0]} c0 WHERE c0.{C[1]} = p0.{P[1]})").fetchone()[0]
-        conn.close()
+            n_child = conn.execute(f"SELECT COUNT(*) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
+            n_parent = conn.execute(f"SELECT COUNT(*) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
+            n_parent_distinct = conn.execute(
+                f"SELECT COUNT(DISTINCT {P[1]}) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
+            # 子の値のうち親に存在するもの / しないもの
+            matched = conn.execute(
+                f"SELECT COUNT(*) FROM {C[0]} c0 WHERE c0.{C[1]} IS NOT NULL "
+                f"AND EXISTS (SELECT 1 FROM {P[0]} p0 WHERE p0.{P[1]} = c0.{C[1]})").fetchone()[0]
+            # 子の「異なる値」の数と、親の値のうち子から参照されている数（親側のカバー率）。
+            # 「status(1,2,3,9) → product_id(1〜40)」のような偶然の一致は、子の値は全部
+            # 親に見つかるのに、親の値はほとんど参照されない。本物の外部キーなら親の多くが
+            # 参照される。値の一致だけでは見抜けないので、この角度を足す。
+            n_child_distinct = conn.execute(
+                f"SELECT COUNT(DISTINCT {C[1]}) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
+            parent_hit = conn.execute(
+                f"SELECT COUNT(DISTINCT p0.{P[1]}) FROM {P[0]} p0 "
+                f"WHERE EXISTS (SELECT 1 FROM {C[0]} c0 WHERE c0.{C[1]} = p0.{P[1]})").fetchone()[0]
+        finally:
+            conn.close()
 
         if n_child and n_parent and matched == 0:
             add("block", "値が1件も一致しません",
@@ -15159,7 +15167,7 @@ def _listing(args: dict) -> dict:
         elif check and checked < _MAX_CHECK:
             checked += 1
             try:
-                shape = filecheck.summary_line(filecheck.inspect(p))
+                shape = filecheck.summary_line(filecheck.inspect_file(p))
             except Exception as e:
                 shape = f"判定できず（{type(e).__name__}）"
         else:
@@ -15230,7 +15238,7 @@ def _preview(args: dict) -> dict:
     target = raw.resolve()
 
     if not _supported(target):
-        res = filecheck.inspect(target)
+        res = filecheck.inspect_file(target)
         return _report_result({
             "title": f"{target.name} は取り込みに対応していない形式です",
             "tables": [_issues_table(res)],
@@ -15250,7 +15258,7 @@ def _preview(args: dict) -> dict:
 
     # まず形を見る。見出しが1行目に無ければ、その行で読み直す
     try:
-        res = filecheck.inspect(target, sheet=sheet)
+        res = filecheck.inspect_file(target, sheet=sheet)
     except Exception as e:
         res = {"verdict": "判定できず", "issues": [
             {"level": "低", "text": f"形を調べられませんでした: {e}", "fix": ""}],
@@ -17722,8 +17730,8 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
     # 必要なぶんは繋いでから実行する（結果を預ける先も同じ範囲にする）。
     scope = db.widen_scope(sql, scope)
     # ファイルに出すツールは全行（Excelはシート上限で丸める）。画面用は2,000行。
-    kind_ = tool.get("render") or "table"
-    cap = (min(config.EXPORT_MAX_ROWS, 1_048_575) if kind_ in ("excel", "csv")
+    kind = tool.get("render") or "table"
+    cap = (min(config.EXPORT_MAX_ROWS, 1_048_575) if kind in ("excel", "csv")
            else None)
     try:
         columns, rows, truncated = db.run_select(sql, scope, params=params,
@@ -17731,7 +17739,6 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
     except Exception as e:
         return _err(f"ツール '{tool.get('name')}' のSQL実行エラー: {e}")
 
-    kind = tool.get("render") or "table"
     chart = tool.get("chart") or {}
     sample = rows[: config.SAMPLE_ROWS_FOR_LLM]
 
@@ -17761,7 +17768,7 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
     if kind in ("excel", "csv"):
         sheet = {"name": chart.get("title") or tool.get("name") or "Sheet1",
                  "columns": columns, "rows": rows,
-                 "note": f"{config.MAX_RESULT_ROWS}行で切り詰め" if truncated else ""}
+                 "note": f"{cap:,}行で切り詰め" if truncated else ""}
         base = chart.get("filename") or tool.get("name")
         try:
             if kind == "excel":
@@ -21436,6 +21443,11 @@ def view_save():
     if existing and existing.get("type") != "view" and name != old:
         return jsonify({"error": f"'{name}' は既にテーブルとして存在します。"}), 400
 
+    # 改名は「旧名が本当にビューのとき」だけ許す。drop_table は DROP VIEW のあとに
+    # DROP TABLE も撃つので、ここを通さないと old に実テーブル名を入れられて中身ごと消える
+    if old and old != name and old not in {v["name"] for v in importer.list_views(path)}:
+        return jsonify({"error": f"'{old}' はビューではありません。改名できるのはビューだけです。"}), 400
+
     try:
         _view_run(path, sql, limit=1)     # 保存前に必ず動かす
     except Exception as e:
@@ -21534,7 +21546,9 @@ def save_layout():
 def primary_key():
     body = request.json or {}
     path = db.path_for(body["db"])
-    profile, meta = catalog.profile_db(path), catalog.load_meta(path)
+    # 書き換えるので load_meta_for_edit（控え）を使う。load_meta は共有キャッシュ
+    # そのものなので、書き換えると保存前に他の画面・プロンプトへ漏れる
+    profile, meta = catalog.profile_db(path), catalog.load_meta_for_edit(path)
     tm = meta.setdefault("tables", {}).setdefault(body["table"], {})
     declared = catalog.declared_pk(profile, body["table"])
     cols = body.get("columns") or []
@@ -21984,7 +21998,11 @@ def _w_draft_tool():
             if last_err is None:
                 return jsonify({"ok": False, "refused": True,
                                 "reason": draft.get("reason", "")})
-            tried.append(str(draft.get("reason") or "")[:200])
+            # 拒否オブジェクトには sql も name も無い。そのまま下書きとして
+            # 返すと画面の編集欄が壊れるので、理由だけを残して下書きは捨てる
+            last_err = str(draft.get("reason") or "")[:200]
+            tried.append(last_err)
+            draft = None
             break
         draft["name"] = custom_tools.custom_tool_safe_name(draft.get("name") or purpose, taken)
         sql = draft.get("sql") or ""
@@ -22013,7 +22031,7 @@ def _w_draft_tool():
                         "home_db": _home_db(sql, path),
                         "attempts": attempt + 1, "tried": tried})
 
-    # 2回とも通らなかった。下書きは返す（人が直せるように）
+    # 2回とも通らなかった。下書きがあれば返す（人が直せるように）
     return jsonify({"ok": False, "tool": draft, "error": last_err, "tried": tried})
 
 
@@ -27476,7 +27494,7 @@ window.KB_INIT = {
       <div class="alert alert--err">{{ fatal }}</div>
     {% else %}
       {% for category, message in get_flashed_messages(with_categories=true) %}
-        <div class="alert alert--{{ 'err' if category == 'error' else category }}">{{ message }}</div>
+        <div class="alert alert--{{ 'err' if category == 'error' else 'warn' if category == 'warning' else category }}">{{ message }}</div>
       {% endfor %}
 
       <div class="card">
@@ -31464,8 +31482,9 @@ async function openChat(id) {
     clearLog();
     replaying = true;
     lastRole = null;
-    r.items.forEach(addItem);
-    replaying = false;
+    // finally で必ず戻す。1件でも描画に失敗すると true のまま固定され、
+    // 以降ずっと「再描画中」扱いになってファイルの自動保存が止まる
+    try { r.items.forEach(addItem); } finally { replaying = false; }
     // このチャットの質問を送信中なら「考えています…」を出し直す
     // （開始時刻は busyStart から続き）。clearLog で表示ごと消えるため、
     // これが無いと切替後は待ち秒数が見えない。よそのチャットの質問のときは
@@ -31972,8 +31991,8 @@ async function rewindTo(item, text, wrap) {
         clearLog();
         lastRole = null;
         replaying = true;                    // 再描画なのでファイルの自動保存は走らせない
-        (r.items || []).forEach(addItem);
-        replaying = false;
+        // finally で必ず戻す（1件でも描画に失敗すると true のまま固定される）
+        try { (r.items || []).forEach(addItem); } finally { replaying = false; }
         if (!send) {
             // 巻き戻しだけのときは、消した発言を入力欄に戻す
             $('#input').value = r.restored || '';
@@ -32384,7 +32403,12 @@ async function sendStreaming(text, imageTokens) {
                     else if (line.startsWith('data: ')) payload += line.slice(6);
                 }
                 if (!payload) continue;
-                try { handle(ev, JSON.parse(payload)); } catch (e) { /* 壊れた行は捨てる */ }
+                // 捨ててよいのは「行が壊れていて読めない」ときだけ。描画側で起きた
+                // 例外まで飲み込むと、画面が黙って欠けて原因も残らない
+                let data;
+                try { data = JSON.parse(payload); }
+                catch (e) { continue; }      // 壊れた行は捨てる
+                handle(ev, data);
             }
         }
     } catch (e) {
