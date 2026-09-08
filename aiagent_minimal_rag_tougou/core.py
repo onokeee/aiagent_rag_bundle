@@ -17792,6 +17792,36 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
     }}
 
 
+#: SQLを組み立てるツールに共通で足す「日本語の解説」の引数。
+#: 画面ではSQLの下に出る。SQLを読めない人が、根拠を読み解けるようにするためのもの。
+#: 定義を1か所に置いて build_tools で配るので、SQLツールを足しても自動で付く。
+_EXPLANATION_PARAM = {
+    "type": "string",
+    "description": (
+        "組み立てたSQLの日本語の解説（3〜5行）。SQLを読めない人にも分かる言葉で、"
+        "「どの表を使うか」「どうつないだか（結合の条件と、なぜその条件か）」"
+        "「どう絞ったか・集計したか」「1行が何を表すか」の順に書く。"
+        "INNER JOIN のような構文用語を並べるのではなく、何をしているかを説明すること。"
+    ),
+}
+
+
+def _with_explanation(t: dict) -> dict:
+    """SQLツールの宣言に explanation 引数を足したものを返す。"""
+    fn = t.get("function") or {}
+    params = fn.get("parameters") or {}
+    props = params.get("properties") or {}
+    if "explanation" in props:
+        return t
+    return {**t, "function": {**fn, "parameters": {
+        **params,
+        "properties": {**props, "explanation": _EXPLANATION_PARAM},
+        # 必須にはしない。解説が無くてもSQLは実行できるべきで、
+        # 必須にすると解説を書き損ねただけで質問全体が止まる
+        "required": list(params.get("required") or ()),
+    }}}
+
+
 def build_tools(entries: list[dict], admin: bool = False) -> list[dict]:
     """組み込み（無効化・説明上書きを反映）＋ナレッジ検索＋ユーザー定義 のツール定義一覧。
 
@@ -17811,7 +17841,7 @@ def build_tools(entries: list[dict], admin: bool = False) -> list[dict]:
             continue
         if o.get("description"):
             t = {**t, "function": {**t["function"], "description": o["description"]}}
-        out.append(t)
+        out.append(_with_explanation(t) if name in SQL_TOOLS else t)
     # ナレッジ検索。登録が1件も無ければ渡さない（存在しない情報源を
     # 探しに行かせても、往復と費用が増えるだけで何も出てこない）。
     for t in knowledge_tool_schemas():
@@ -19877,6 +19907,7 @@ def _call_previews(calls: list[dict], scope: list[dict], question: str) -> list[
         if c["name"] in tools.SQL_TOOLS and "sql" in args:
             out.append({"role": "assistant", "kind": "sql", "tool": c["name"],
                         "sql": args["sql"], "purpose": args.get("purpose", ""),
+                        "explanation": args.get("explanation", ""),
                         "question": question,
                         "tables": tables_in_sql(args["sql"], scope)})
         elif custom is not None:
@@ -19885,6 +19916,8 @@ def _call_previews(calls: list[dict], scope: list[dict], question: str) -> list[
             out.append({"role": "assistant", "kind": "sql", "tool": c["name"],
                         "sql": sql,
                         "purpose": f"{custom.get('description', '')[:60]} / 引数: {binds}",
+                        # SQLは人が登録したものなので、AIの解説ではなく登録時の説明を出す
+                        "explanation": custom.get("description", ""),
                         "question": question,
                         "tables": tables_in_sql(sql, scope)})
         elif c["name"] == "describe_table":
@@ -24806,7 +24839,9 @@ window.CHAT_INIT = {
         <tbody>
           <tr><td>質問する</td>
               <td>日本語で入力して送信（Enter）。AIが必要なテーブルを自分で選び、SELECT文を書いて
-                  集計します。実行したSQLは回答に必ず表示されるので、根拠をその場で確認できます。
+                  集計します。実行したSQLは回答に必ず表示され、その下に
+                  <b>「このSQLがしていること」</b>の日本語の解説が付きます（SQLを読めなくても、
+                  何をどう数えた結果かが分かります）。
                   文書の質問（手順・原因・規則）はナレッジベースを検索し、<b>[出典n]の番号つき</b>で
                   答えます。両方を組み合わせた質問（「一番停止が多い装置の対処方法は？」）もそのまま
                   聞けます。範囲の取り方で答えが変わる質問には、AIのほうから確認してきます。</td></tr>
@@ -25869,6 +25904,14 @@ window.CHAT_INIT = {
                   引数の木を再帰的にたどってSQLを収集（レポートの節やExcelのシートの中まで）→
                   実行 → 検算の自動割り込み。<b>ツール内の例外はすべて捕まえて</b>
                   エラーとして返します（1つの失敗でアプリを落とさない）。</td></tr>
+          <tr><td>SQLの日本語解説</td>
+              <td>SQLを組み立てるツール（24種）の宣言に <code>explanation</code> 引数を
+                  <b>ツール定義の組み立て時に一括で足して</b>います（1か所で配るので、
+                  ツールを増やしても自動で付きます）。AIはSQLと同じ呼び出しの中で解説も書くため、
+                  <b>追加のAI呼び出しは発生しません</b>。必須にはしていないので、解説が無くても
+                  SQLは実行されます（過去の会話も従来どおり表示されます）。
+                  ユーザー定義ツールのSQLは人が登録したものなので、AIの解説ではなく
+                  登録時の説明文を出します。</td></tr>
           <tr><td>2つの戻り値</td>
               <td>AI向け（トークン節約のため先頭40行と要約）と画面向け（全行）を作り分けます。
                   グラフはAI向けに行データを入れず「描画した」という事実と識別子だけを返します。</td></tr>
@@ -28547,6 +28590,11 @@ details.acc.is-target {
     background: var(--surface-2); font-size: 13px; font-weight: 500;
     color: var(--muted);
 }
+.toolblock__note {
+    padding: 9px 13px; border-top: 1px solid var(--border);
+    font-size: 12.5px; line-height: 1.75; color: var(--muted);
+}
+.toolblock__note b { color: var(--text); font-weight: 500; }
 .toolblock pre {
     margin: 0; padding: 11px 13px; overflow-x: auto;
     font-size: 12.2px; line-height: 1.55; background: var(--surface);
@@ -31754,7 +31802,13 @@ function addItem(item) {
             el('div', { class: 'toolblock__head' },
                 icon('table', 'icon--sm'), el('span', {}, item.label || item.tool),
                 item.purpose ? el('span', { class: 'muted small' }, `— ${item.purpose}`) : null),
-            el('pre', { class: 'mono' }, item.sql));
+            el('pre', { class: 'mono' }, item.sql),
+            // SQLを読めない人向けの解説。AIが書いたものなので、根拠はSQL本体で確かめられる
+            item.explanation
+                ? el('div', { class: 'toolblock__note' },
+                    el('b', {}, 'このSQLがしていること'),
+                    el('div', { style: 'white-space:pre-wrap;margin-top:3px' }, item.explanation))
+                : null);
         const links = catalogLinks(item.tables);
         if (item.question || links) {
             const foot = el('div', { class: 'toolblock__foot' });
