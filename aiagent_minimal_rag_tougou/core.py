@@ -10483,10 +10483,61 @@ def drop_table(db_path: Path, table: str) -> None:
         raise ImportError_("data/ の外は操作できません。")
     conn = sqlite3.connect(db_path)
     try:
+        # ビューと表で必要な文が違う。どちらか分からない場合に備えて両方試す
+        conn.execute(f"DROP VIEW IF EXISTS {_importer_qi(table)}")
         conn.execute(f"DROP TABLE IF EXISTS {_importer_qi(table)}")
         conn.commit()
     finally:
         conn.close()
+
+
+def create_view(db_path: Path, name: str, sql: str, replace: bool = False) -> None:
+    """ビュー（実体を持たない、名前を付けたSELECT）を作る。
+
+    SQLは SELECT専用ガードを通ったものだけを渡すこと（呼び出し側で検査する）。
+    replace=True なら同名のビューを作り直す（表は作り直さない＝取り違え防止）。
+    """
+    if db_path.parent.resolve() != config.DATA_DIR.resolve():
+        raise ImportError_("data/ の外は操作できません。")
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+        if row and row[0] != "view":
+            raise ImportError_(f"'{name}' は既にテーブルとして存在します。別の名前にしてください。")
+        if row and not replace:
+            raise ImportError_(f"ビュー '{name}' は既にあります。別の名前にしてください。")
+        if row:
+            conn.execute(f"DROP VIEW IF EXISTS {_importer_qi(name)}")
+        conn.execute(f"CREATE VIEW {_importer_qi(name)} AS {sql}")
+        conn.commit()
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise ImportError_(f"ビューを作れませんでした: {e}")
+    finally:
+        conn.close()
+
+
+def list_views(db_path: Path) -> list:
+    """DBにあるビューの名前と定義SQL。"""
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    try:
+        return [{"name": n, "sql": q} for n, q in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='view' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    finally:
+        conn.close()
+
+
+def view_body(db_path: Path, name: str) -> str:
+    """保存されている「CREATE VIEW ... AS」の後ろ（＝SELECT本体）を取り出す。"""
+    for v in list_views(db_path):
+        if v["name"] == name:
+            m = re.search(r"\bAS\b\s*(.+)$", v["sql"] or "", re.S | re.I)
+            return (m.group(1) if m else "").strip()
+    return ""
 
 
 # ==========================================================================
@@ -18833,6 +18884,63 @@ _TOOL_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設�
   グラフでないときは chart を省略する。"""
 
 
+_VIEW_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設定担当です。
+利用者が日本語で書いた「欲しい一覧」を、ビュー（名前を付けたSELECT）の定義に変換してください。
+
+出力形式（JSON以外の文字を含めないこと）:
+{
+  "name": "まとまり__名前 の形。まとまりは使う表の接頭辞に合わせる（例: 部品_在庫__発注一覧）",
+  "description": "この一覧が何かの説明。AIがこれを読んで使うかどうかを決める",
+  "sql": "SELECT ...（1文だけ。末尾のセミコロンは不要）"
+}
+
+守ること:
+- SQLは SELECT（または WITH ... SELECT）だけ。書き込み・DDLは書かない。
+- 列名・テーブル名は、与えられたカタログに実在するものだけを使う。推測で作らない。
+- カタログの「結合キー」に書かれた条件をそのまま使う。複合キー（※印つき）は
+  必ず全列を AND でつなぐ。片方の列だけで結ばない。
+- 列には日本語の別名を付けてよい（AS 部品名 など）。人が読む一覧になるように。
+- パラメータ（毎回変える値）は使えない。ビューは固定の一覧。
+- 名前は必ず「まとまり__名前」の形にする（__ は2つの下線）。
+"""
+
+
+def draft_view(db_path, purpose: str, previous: dict | None = None,
+               error: str | None = None) -> dict:
+    """日本語の「欲しい一覧」から、ビューの下書き（名前・説明・SQL）を起こす。"""
+    import db                       # 循環importを避けるため、使うときに読む
+
+    paths = [Path(db_path)] if db_path else db.list_db_files()
+    context = catalog.prompt_for_scope(
+        [{"path": str(p), "alias": db.alias_for(p), "tables": None} for p in paths])
+    ask = [f"欲しい一覧: {purpose}"]
+    if previous and error:
+        ask.append("\n前回の下書きは実際のデータで失敗しました。原因を直して書き直してください。")
+        ask.append(f"前回のSQL:\n{previous.get('sql', '')}")
+        ask.append(f"エラー: {error}")
+
+    resp = _create(
+        model=config.OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": _VIEW_SYSTEM},
+            {"role": "user", "content": f"{context}\n\n{chr(10).join(ask)}"},
+        ],
+        temperature=0,
+    )
+    content = resp.choices[0].message.content or ""
+    m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        raise ValueError(f"AIの応答をJSONとして解析できませんでした: {content[:200]}")
+    data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("AIの応答が想定した形式ではありません。")
+    return {
+        "name": str(data.get("name") or "").strip(),
+        "description": str(data.get("description") or purpose).strip(),
+        "sql": str(data.get("sql") or "").strip().rstrip(";"),
+    }
+
+
 def draft_tool(db_path, purpose: str, params_wanted: list[str] | None = None,
                render: str = "table", previous: dict | None = None,
                error: str | None = None) -> dict:
@@ -20750,6 +20858,7 @@ def catalog_index():
                          "codes": cm.get("values") or {}, "actual": actual})
         tables.append({
             "name": tname, "rows": t.get("row_count"),
+            "is_view": t.get("type") == "view",
             "description": tmeta.get("description", ""),
             "ai_draft": bool(tmeta.get("ai_draft")),
             "pk": pk_cols, "pk_src": pk_src,
@@ -20780,6 +20889,7 @@ def catalog_index():
         builtin_overrides=meta.get("builtin_tools") or {},
         intervals=list(jobs.INTERVALS.keys()),
         llm_ready=llm.is_configured(),
+        views=_views_payload(target),
     )
 
 
@@ -21106,6 +21216,182 @@ def _w_table_info():
         "sample_columns": t.get("sample_columns") or [],
         "sample_rows": jsonable((t.get("sample_rows") or [])[:5]),
     })
+
+
+# --- ビュー（実体を持たない、名前を付けたSELECT）--------------------------------
+#
+# 「よく使う結合や絞り込み」に名前を付けて置いておく口。表と同じ規約（まとまり__名前）
+# で作るので、登録するとテーブル一覧・ER図・チャットの表選択にそのまま出る。
+# 説明や用語も表と同じように付けられる（カタログ側は名前で引くので追加実装が要らない）。
+
+VIEW_PREVIEW_ROWS = 20
+
+
+def _view_check_sql(sql: str) -> str:
+    """ビューの定義として受け付けてよいSQLか。通らなければ ValueError。"""
+    sql = str(sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise ValueError("SQLが空です。")
+    db.validate_select(sql)          # SELECT専用ガード（書き込み・複数文を弾く）
+    return sql
+
+
+def _view_run(path, sql: str, limit: int = VIEW_PREVIEW_ROWS) -> dict:
+    """定義SQLを実データで動かして、列と先頭数行と件数を返す。"""
+    scope = [{"path": str(path), "alias": db.alias_for(path), "name": path.name}]
+    cols, rows, _tr = db.run_select(sql, scope, max_rows=limit)
+    total = None
+    try:
+        _c, crows, _t = db.run_select(
+            f"SELECT COUNT(*) FROM ({sql})", scope, max_rows=1)
+        total = crows[0][0] if crows else None
+    except Exception:
+        pass                          # 件数は付けられなくても本体は見せる
+    return {"columns": cols, "rows": jsonable(rows), "total": total}
+
+
+@bp_catalog.post("/api/catalog/view/preview")
+@admin_required
+def view_preview():
+    """定義SQLを実データで動かして確かめる（保存はしない）。"""
+    body = request.json or {}
+    try:
+        path = db.path_for(body.get("db") or "")
+        sql = _view_check_sql(body.get("sql"))
+        return jsonify({"ok": True, "sql": sql, **_view_run(path, sql)})
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@bp_catalog.post("/api/catalog/view/draft")
+@admin_required
+def view_draft():
+    """日本語の「欲しい一覧」から、AIにビューの下書きを起こさせる。
+
+    起こしたらその場で実データに当て、失敗したらエラーを添えて1回だけ書き直させる。
+    """
+    body = request.json or {}
+    purpose = str(body.get("purpose") or "").strip()
+    if not purpose:
+        return jsonify({"error": "どんな一覧が欲しいかを書いてください。"}), 400
+    if not llm.is_configured():
+        return jsonify({"error": "AIが未設定です。「モデル設定」画面で接続先とAPIキーを設定してください。"}), 400
+    try:
+        path = db.path_for(body.get("db") or "")
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+
+    draft, last_err = None, None
+    for _attempt in range(2):
+        try:
+            draft = llm.draft_view(path, purpose, previous=draft, error=last_err)
+        except Exception as e:
+            return jsonify({"error": f"AIの下書きに失敗しました: {e}"}), 400
+        try:
+            sql = _view_check_sql(draft.get("sql"))
+            preview = _view_run(path, sql)
+        except Exception as e:
+            last_err = str(e)
+            continue
+        return jsonify({"ok": True, **draft, "sql": sql, **preview})
+    return jsonify({"error": f"AIが書いたSQLが実データで通りませんでした: {last_err}",
+                    "sql": (draft or {}).get("sql", "")}), 400
+
+
+@bp_catalog.post("/api/catalog/view")
+@admin_required
+def view_save():
+    """ビューの新規作成・作り直し。説明もカタログに書く。"""
+    body = request.json or {}
+    try:
+        path = db.path_for(body.get("db") or "")
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+
+    name = importer.safe_name(str(body.get("name") or ""), table=True)
+    old = str(body.get("old_name") or "").strip()
+    if "__" not in name.strip("_"):
+        return jsonify({"error": "名前は「まとまり__名前」の形にしてください。"}), 400
+    try:
+        sql = _view_check_sql(body.get("sql"))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    profile = catalog.profile_db(path)
+    existing = profile.get("tables", {}).get(name)
+    if existing and existing.get("type") != "view" and name != old:
+        return jsonify({"error": f"'{name}' は既にテーブルとして存在します。"}), 400
+
+    try:
+        _view_run(path, sql, limit=1)     # 保存前に必ず動かす
+    except Exception as e:
+        return jsonify({"error": f"このSQLは実データで動きませんでした: {e}"}), 400
+
+    try:
+        importer.create_view(path, name, sql, replace=(name == old or bool(existing)))
+        if old and old != name:
+            importer.drop_table(path, old)   # 改名: 旧ビューを落とす
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    # 説明はカタログ（表と同じ置き場）に書く
+    meta = catalog.load_meta_for_edit(path)
+    tmeta = meta.setdefault("tables", {})
+    if old and old != name and old in tmeta:
+        tmeta[name] = tmeta.pop(old)         # 説明・列の説明を引き継ぐ
+    desc = str(body.get("description") or "").strip()
+    entry = tmeta.setdefault(name, {})
+    if desc:
+        entry["description"] = desc
+        entry.pop("ai_draft", None)
+    catalog.save_meta(path, meta)
+    catalog.forget(path)
+
+    print(f"[view] {path.name} のビュー {name} を保存しました（{g.user.username}）")
+    return jsonify({"ok": True, "name": name, "views": _views_payload(path)})
+
+
+@bp_catalog.post("/api/catalog/view/delete")
+@admin_required
+def view_delete():
+    """ビューを消して、カタログに残る参照も片づける（表の削除と同じ扱い）。"""
+    body = request.json or {}
+    try:
+        path = db.path_for(body.get("db") or "")
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "ビュー名がありません。"}), 400
+    if name not in {v["name"] for v in importer.list_views(path)}:
+        return jsonify({"error": f"ビュー '{name}' が見つかりません。"}), 404
+    importer.drop_table(path, name)
+    done = cleanup.clean_table(path, name, drop_jobs=False)
+    catalog.forget(path)
+    print(f"[view] {path.name} のビュー {name} を削除しました（{g.user.username}）")
+    return jsonify({"ok": True, "groups": cleanup.summarize(done),
+                    "views": _views_payload(path)})
+
+
+def _views_payload(path) -> list:
+    """画面に渡すビューの一覧（定義SQL・説明・列数・行数つき）。"""
+    profile = catalog.profile_db(path)
+    meta = catalog.load_meta(path)
+    tmeta = meta.get("tables") or {}
+    out = []
+    for v in importer.list_views(path):
+        t = (profile.get("tables") or {}).get(v["name"]) or {}
+        out.append({
+            "name": v["name"],
+            "sql": importer.view_body(path, v["name"]),
+            "description": (tmeta.get(v["name"]) or {}).get("description", ""),
+            "columns": [c["name"] for c in t.get("columns", [])],
+            "rows": t.get("row_count"),
+            "error": t.get("error") or "",
+        })
+    return out
 
 
 @bp_catalog.post("/api/catalog/layout")
@@ -23792,6 +24078,7 @@ TEMPLATES = {
     <button class="tab" data-pane="er">結合・ER図</button>
     <button class="tab" data-pane="glossary">用語集・例文</button>
     <button class="tab" data-pane="tools">ツール</button>
+    <button class="tab" data-pane="views">ビュー</button>
     <a class="tab" href="{{ url_for('imp.index') }}">取り込み</a>
 
     <div class="tabs__end">
@@ -23873,6 +24160,7 @@ TEMPLATES = {
     <details class="acc" data-table="{{ t.name }}">
       <summary>
         <strong>{{ t.name }}</strong>
+        {% if t.is_view %}<span class="badge" title="実体を持たないビュー。定義の変更は「ビュー」タブで行います">ビュー</span>{% endif %}
         <span class="muted small">{{ '{:,}'.format(t.rows) if t.rows is not none else '行数不明' }} / {{ t.columns|length }}列</span>
         {% if t.description %}<span class="badge badge--ok">説明あり</span>
         {% else %}<span class="badge badge--warn">説明なし</span>{% endif %}
@@ -23882,7 +24170,8 @@ TEMPLATES = {
            巻き添えの一覧を見せる確認が出るので、その場では消えない #}
         <button class="btn btn--sm btn--icon t-drop" data-table="{{ t.name }}"
                 data-rows="{{ t.rows or 0 }}"
-                title="{{ t.name }} を削除する" aria-label="{{ t.name }} を削除する"
+                title="{{ t.name }} を削除する{% if t.is_view %}（ビューの定義だけを消します。元のテーブルは残ります）{% endif %}"
+                aria-label="{{ t.name }} を削除する"
                 >{{ icon('trash', 'icon--sm') }}</button>
       </summary>
       <div class="acc__body">
@@ -24122,6 +24411,60 @@ TEMPLATES = {
       <div id="builtinList"></div>
     </div>
   </div>
+  <!-- ================= ビュー ================= -->
+  <div class="tabpane" id="pane-views">
+    <div class="card">
+      <div class="card__title">ビュー</div>
+      <div class="card__desc">
+        よく使う結合や絞り込みに名前を付けて保存します。<b>データは複製されず</b>、
+        開くたびに元のテーブルから最新が計算されます。<br>
+        登録するとテーブルと同じ扱いになり、テーブル一覧・ER図・チャットの表選択に出ます。
+        説明や列の説明、用語も<b>テーブルと同じように付けられます</b>（「テーブル」タブで編集）。
+      </div>
+      <div id="viewList"></div>
+      <div class="row mt">
+        <button class="btn btn--primary btn--sm" id="viewNew">＋ ビューを作る</button>
+      </div>
+    </div>
+
+    <div class="card hidden" id="viewEditor">
+      <div class="card__title" id="viewEditorTitle">ビューを作る</div>
+
+      <label class="field">1. どんな一覧が欲しいか、日本語で書く</label>
+      <input type="text" id="viewPurpose" placeholder="例: 発注に部品名と仕入先名を付けた一覧">
+      <div class="row mt mb">
+        <button class="btn btn--sm btn--primary" id="viewDraft">AIにSQLを組み立てさせる</button>
+        <span class="small muted">または</span>
+        <button class="btn btn--sm" id="viewManual">SQLを自分で書く</button>
+      </div>
+
+      <div id="viewSqlWrap" class="hidden">
+        <label class="field">2. SQL（SELECT文だけ。登録済みの結合はそのまま使えます）</label>
+        <textarea id="viewSql" rows="8" class="mono" style="width:100%"
+                  placeholder="SELECT ..."></textarea>
+        <div class="row mt mb">
+          <button class="btn btn--sm" id="viewRun">実データで動かして確かめる</button>
+        </div>
+        <div id="viewPreview"></div>
+
+        <label class="field mt">3. 名前と説明</label>
+        <div class="row mb">
+          <input type="text" id="viewName" class="mono" style="max-width:320px"
+                 placeholder="まとまり__名前">
+          <input type="text" id="viewDesc" class="grow"
+                 placeholder="この一覧が何かの説明（AIが読みます）">
+        </div>
+        <div class="small muted mb">
+          名前は「まとまり__名前」の形にしてください（まとまりは表と同じ接頭辞）。
+          説明はそのままAIに渡り、どんなときに使うかの判断材料になります。
+        </div>
+        <div class="row">
+          <button class="btn btn--primary btn--sm" id="viewSave">保存</button>
+          <button class="btn btn--ghost btn--sm" id="viewCancel">やめる</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
 
   {# 未保存の変更があるときだけ現れる。どこに何件あるかと、まとめて保存する口 #}
@@ -24150,6 +24493,7 @@ window.CAT = {
   builtin: {{ builtin|tojson }},
   builtinOverrides: {{ builtin_overrides|tojson }},
   checks: {{ checks|tojson }},
+  views: {{ views|tojson }},
   llmReady: {{ llm_ready|tojson }},
   // グラフ種別ごとの必須項目。種別によって要る欄が違うので、
   // サーバの定義をそのまま渡して画面側で入力欄を出し分ける
@@ -25652,6 +25996,37 @@ window.CHAT_INIT = {
   </div>
 
   <div class="card mt">
+    <div class="card__title">3-16b. ビュー</div>
+    <div class="tablewrap">
+      <table class="data">
+        <thead><tr><th style="width:210px">項目</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><td>実体</td>
+              <td>SQLiteの <code>CREATE VIEW</code>。保存されるのは<b>SELECT文だけ</b>で、データは複製されません
+                  （20万行の表にビューを作ってもファイルは1バイトも増えません）。開くたびに元の表から
+                  計算し直すので、常に最新です。書き込みはできません（読み取り専用）。</td></tr>
+          <tr><td>作り方</td>
+              <td>日本語で「欲しい一覧」を書くとAIがSQLを組み立て、その場で実データに当てて確かめます。
+                  通らなければエラーを添えて1回だけ書き直させます。SQLを自分で書くこともできます。
+                  保存前には必ず実行し、動かないSQLはカタログに入れません。</td></tr>
+          <tr><td>安全</td>
+              <td>定義SQLはSELECT専用ガードを通します（書き込み・DDL・複数文は登録できません）。
+                  ビューを読むときも通常の権限が効き、<b>元の表を選択から外している人はビューも読めません</b>
+                  （SQLiteのオーソライザが元の表への読み取りを止めるため）。</td></tr>
+          <tr><td>扱い</td>
+              <td>名前は表と同じ「まとまり__名前」の規約。登録するとテーブル一覧（「ビュー」の印つき）・
+                  ER図・チャットの表選択に出て、説明・列の説明・用語も表と同じように付けられます。
+                  削除すると定義だけが消え、元の表とデータは残ります。</td></tr>
+          <tr><td>注意</td>
+              <td>SQLiteには結果を保存しておく仕組み（マテリアライズドビュー）がありません。重い集計を
+                  毎回計算することになるので、そのぶん時間がかかります。元の表を削除・改名すると
+                  ビューは動かなくなり、一覧に「動きません」と出ます（作り直してください）。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card mt">
     <div class="card__title">3-17. 取り込みの内部処理</div>
     <div class="tablewrap">
       <table class="data">
@@ -26350,7 +26725,14 @@ window.CHAT_INIT = {
         <table class="data">
           <thead><tr><th style="width:210px">用語</th><th>説明</th></tr></thead>
           <tbody>
-            <tr><td>ER図（イーアールず）</td>
+            <tr><td>ビュー</td>
+              <td>よく使うSELECT文に名前を付けて保存したもので、「名前を付けた検索条件」です。
+                  データは複製されず、開くたびに元の表から計算し直されるので常に最新になります
+                  （Excelでいえば、値を貼り付けたシートではなく、数式のまま置いてあるシートに近い考え方です）。
+                  <b>このアプリでは</b>管理者がデータカタログの「ビュー」タブで作れます。作ったビューは
+                  テーブルと同じように扱われ、チャットからも使えます。正しい結合を1つ固定しておけるので、
+                  AIが毎回結合を組み立て直して間違える余地がなくなります（詳細は3-16bを参照）。</td></tr>
+          <tr><td>ER図（イーアールず）</td>
                 <td>表（エンティティ＝実体）と表同士の関係（リレーションシップ）を、箱と線で描いた「データの地図」です。
                     どの表とどの表をつなげて集計できるかが一目で分かります
                     （Excelのシート一覧だけでは、シート同士の対応関係までは分からないため）。
@@ -34052,6 +34434,185 @@ function wireMisc() {
     });
 }
 
+
+/* --- ビュー（実体を持たない、名前を付けたSELECT）-------------------------------
+   よく使う結合や絞り込みに名前を付けて置いておく。保存すると表と同じ扱いになる。
+   作り方は「日本語で書く → AIがSQLを組み立てる → 実データで動かして見せる → 登録」。 */
+
+let viewEditing = null;      // 編集中のビュー名（新規なら null）
+
+function renderViews() {
+    const box = $('#viewList');
+    if (!box) return;
+    const list = CAT.views || [];
+    if (!list.length) {
+        box.replaceChildren(el('div', { class: 'small muted' },
+            'まだありません。よく使う結合や絞り込みを登録しておくと、'
+            + 'AIが毎回SQLを組み立てずに済み、答えのぶれもなくなります。'));
+        return;
+    }
+    box.replaceChildren(...list.map(v => {
+        const out = el('div', { class: 'mt' });
+        return el('details', { class: 'acc' },
+            el('summary', {},
+                el('strong', {}, v.name),
+                el('span', { class: 'badge' }, 'ビュー'),
+                v.error ? el('span', { class: 'badge badge--warn' }, '動きません') : null,
+                el('span', { class: 'small muted', style: 'margin-left:8px' },
+                    v.description || '説明が未記入です')),
+            el('div', { class: 'acc__body' },
+                v.error ? el('div', { class: 'alert alert--err small mb' },
+                    `いまは動きません（元のテーブルが変わった可能性があります）: ${v.error}`) : null,
+                el('div', { class: 'small muted mb' },
+                    `${(v.columns || []).length}列`
+                    + (v.rows === null || v.rows === undefined ? '' : `・${Number(v.rows).toLocaleString()}行`)
+                    + '　列の説明や用語は「テーブル」タブから付けられます'),
+                el('div', { class: 'toolblock mb' },
+                    el('pre', { class: 'mono', style: 'white-space:pre-wrap' }, v.sql || '')),
+                el('div', { class: 'row' },
+                    el('button', { class: 'btn btn--sm', onclick: ev => previewView(v, out, ev.target) }, 'プレビュー'),
+                    el('button', { class: 'btn btn--sm', onclick: () => editView(v) }, '編集'),
+                    el('div', { class: 'spacer' }),
+                    el('button', { class: 'btn btn--sm btn--danger', onclick: () => deleteView(v) }, '削除')),
+                out));
+    }));
+}
+
+function viewPreviewBox(r) {
+    const cols = r.columns || [], rows = r.rows || [];
+    if (!cols.length) return el('div', { class: 'small muted' }, '列がありません。');
+    const head = el('tr', {}, ...cols.map(c => el('th', {}, c)));
+    const body = rows.slice(0, 10).map(row => el('tr', {}, ...row.map(x =>
+        el('td', {}, x === null || x === undefined ? '' : String(x)))));
+    return el('div', {},
+        el('div', { class: 'alert alert--ok small mb' },
+            r.total === null || r.total === undefined
+                ? `${rows.length}行 取得できました`
+                : `${Number(r.total).toLocaleString()}行 取得できました（先頭${Math.min(rows.length, 10)}行を表示）`),
+        el('div', { class: 'tablewrap' },
+            el('table', { class: 'data' }, el('thead', {}, head), el('tbody', {}, ...body))));
+}
+
+async function previewView(v, out, btn) {
+    btn.disabled = true;
+    try {
+        const r = await api('/api/catalog/view/preview', { db: CAT.db, sql: v.sql });
+        out.replaceChildren(viewPreviewBox(r));
+    } catch (e) {
+        out.replaceChildren(el('div', { class: 'alert alert--err small' }, e.message));
+    }
+    btn.disabled = false;
+}
+
+function openViewEditor(title) {
+    $('#viewEditor').classList.remove('hidden');
+    $('#viewEditorTitle').textContent = title;
+    $('#viewEditor').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function editView(v) {
+    viewEditing = v.name;
+    openViewEditor(`ビューを編集（${v.name}）`);
+    $('#viewPurpose').value = '';
+    $('#viewSqlWrap').classList.remove('hidden');
+    $('#viewSql').value = v.sql || '';
+    $('#viewName').value = v.name;
+    $('#viewDesc').value = v.description || '';
+    $('#viewPreview').replaceChildren();
+}
+
+async function deleteView(v) {
+    if (!confirm(`ビュー「${v.name}」を削除しますか？\n`
+        + '（元のテーブルとデータはそのまま残ります）')) return;
+    try {
+        const r = await api('/api/catalog/view/delete', { db: CAT.db, name: v.name });
+        CAT.views = r.views || [];
+        renderViews();
+        scrubTableFromPanes(v.name);
+        toast('ビューを削除しました。');
+    } catch (e) { toast(e.message, 'err', 9000); }
+}
+
+function wireViews() {
+    if (!$('#viewList')) return;
+    renderViews();
+
+    $('#viewNew').addEventListener('click', () => {
+        viewEditing = null;
+        openViewEditor('ビューを作る');
+        $('#viewPurpose').value = '';
+        $('#viewSql').value = '';
+        $('#viewName').value = '';
+        $('#viewDesc').value = '';
+        $('#viewPreview').replaceChildren();
+        $('#viewSqlWrap').classList.add('hidden');
+    });
+
+    $('#viewManual').addEventListener('click', () => {
+        $('#viewSqlWrap').classList.remove('hidden');
+        $('#viewSql').focus();
+    });
+
+    $('#viewDraft').addEventListener('click', async ev => {
+        const purpose = $('#viewPurpose').value.trim();
+        if (!purpose) { toast('どんな一覧が欲しいかを書いてください。', 'warn'); return; }
+        ev.target.disabled = true;
+        const old = ev.target.textContent;
+        ev.target.textContent = 'AIが考えています...';
+        try {
+            const r = await api('/api/catalog/view/draft', { db: CAT.db, purpose });
+            $('#viewSqlWrap').classList.remove('hidden');
+            $('#viewSql').value = r.sql || '';
+            if (!$('#viewName').value) $('#viewName').value = r.name || '';
+            if (!$('#viewDesc').value) $('#viewDesc').value = r.description || '';
+            $('#viewPreview').replaceChildren(viewPreviewBox(r));
+            toast('下書きができました。中身を確かめて保存してください。');
+        } catch (e) { toast(e.message, 'err', 12000); }
+        ev.target.disabled = false;
+        ev.target.textContent = old;
+    });
+
+    $('#viewRun').addEventListener('click', async ev => {
+        const sql = $('#viewSql').value.trim();
+        if (!sql) { toast('SQLを書いてください。', 'warn'); return; }
+        ev.target.disabled = true;
+        try {
+            const r = await api('/api/catalog/view/preview', { db: CAT.db, sql });
+            $('#viewPreview').replaceChildren(viewPreviewBox(r));
+        } catch (e) {
+            $('#viewPreview').replaceChildren(
+                el('div', { class: 'alert alert--err small' }, e.message));
+        }
+        ev.target.disabled = false;
+    });
+
+    $('#viewSave').addEventListener('click', async ev => {
+        const name = $('#viewName').value.trim();
+        const sql = $('#viewSql').value.trim();
+        if (!name) { toast('名前を入れてください。', 'warn'); return; }
+        if (!sql) { toast('SQLを書いてください。', 'warn'); return; }
+        ev.target.disabled = true;
+        try {
+            const r = await api('/api/catalog/view', {
+                db: CAT.db, name, sql,
+                description: $('#viewDesc').value.trim(),
+                old_name: viewEditing || '',
+            });
+            CAT.views = r.views || [];
+            renderViews();
+            $('#viewEditor').classList.add('hidden');
+            viewEditing = null;
+            toast('保存しました。テーブル一覧やチャットからも使えます。');
+        } catch (e) { toast(e.message, 'err', 12000); }
+        ev.target.disabled = false;
+    });
+
+    $('#viewCancel').addEventListener('click', () => {
+        $('#viewEditor').classList.add('hidden');
+        viewEditing = null;
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     wireTables();
     wireRowDelete();
@@ -34065,6 +34626,7 @@ document.addEventListener('DOMContentLoaded', () => {
     ER.init();
     wireTabs();          // ハッシュのタブ復元は ER.init の後（er タブ復元時に refit するため）
     wireTools();
+    wireViews();
     wireMisc();
     wireGroupMemo();
 
