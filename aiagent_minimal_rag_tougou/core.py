@@ -3130,7 +3130,7 @@ import config
 
 _history_lock = threading.Lock()
 # 追記のたびに全件を数え直さないよう、行数はプロセス内で覚えておく。
-# 別プロセス（refresh.py など）が書くとずれるが、間引きは後追いで効けばよい。
+# 別プロセス（cron の python core.py refresh など）が書くとずれるが、間引きは後追いで効けばよい。
 _count: int | None = None
 
 IMPORT_RECORD_KINDS = {"manual": "手動", "auto": "定期", "job": "定期（手動実行）",
@@ -6805,7 +6805,6 @@ import datetime as _dt  # noqa: F401  （シート値の型判定で使用）
 import io
 import re
 
-from exports import XLSX_MIME  # noqa: F401  （既存の参照互換のため再公開）
 
 from openpyxl import Workbook
 from openpyxl.chart import (AreaChart, BarChart, LineChart, PieChart, Reference,
@@ -9825,35 +9824,6 @@ def is_allowed(path: Path) -> bool:
     return any(real == d or d in real.parents for d in allowed_dirs())
 
 
-def list_source_files() -> list[Path]:
-    """取り込める候補ファイル（許可フォルダ配下を IMPORT_SCAN_DEPTH 階層まで探す）。
-
-    件数は IMPORT_MAX_FILES で打ち切る（そこに達したかは呼び出し側で
-    len() を見て判断する）。
-    """
-    seen: set = set()
-    found: list[Path] = []
-    for d in allowed_dirs():
-        try:
-            if not d.is_dir():
-                continue
-        except OSError:
-            continue
-        for p in _importer_walk(d, config.IMPORT_SCAN_DEPTH):
-            try:
-                real = p.resolve()
-            except OSError:
-                continue
-            # 同じファイルが複数の許可フォルダから見えることがあるので重複を除く
-            if real in seen or not is_allowed(real):
-                continue
-            seen.add(real)
-            found.append(real)
-            if len(found) >= config.IMPORT_MAX_FILES:
-                return sorted(found)
-    return sorted(found)
-
-
 def is_within_allowed(path: Path) -> bool:
     """許可フォルダの中にある実ファイルか（拡張子は問わない）。
 
@@ -9870,8 +9840,13 @@ def is_within_allowed(path: Path) -> bool:
     return any(real == d or d in real.parents for d in allowed_dirs())
 
 
-def list_all_files(depth: int = 0, limit: int | None = None) -> list[Path]:
-    """許可フォルダ配下のファイル（拡張子を問わない）。調査用。"""
+def list_all_files(depth: int | None = None, limit: int | None = None) -> list[Path]:
+    """許可フォルダ配下のファイル（拡張子を問わない）。調査用。
+
+    depth を渡さなければ config.IMPORT_SCAN_DEPTH（既定 0 = 無制限）に従う。
+    0 は「無制限」という意味のある値なので、未指定は None で区別する。
+    """
+    depth = config.IMPORT_SCAN_DEPTH if depth is None else depth
     cap = limit or config.IMPORT_MAX_FILES
     seen: set = set()
     found: list[Path] = []
@@ -10555,10 +10530,11 @@ def view_body(db_path: Path, name: str) -> str:
 # 1ジョブ = 「どのファイルを / どう読んで / どのテーブルへ / どの方式で / どの間隔で」。
 # 定義は data/import_jobs.yaml に置く（DBファイル自体が全ユーザー共通なのでジョブも共通）。
 #
-# 実行の入口は3つ。中身はすべて run_job() に集約してある。
+# 実行の入口は4つ。中身はすべて run_job() に集約してある。
 #   - 画面の「▶ 今すぐ更新」
-#   - 画面を開いたときの自動実行（config.IMPORT_AUTO_REFRESH が true のとき）
-#   - cron から refresh.py    ← 本番はこれが確実（誰も画面を開かなくても動く）
+#   - ジョブを登録した直後の初回取り込み（全件入れ替えのときだけ）
+#   - アプリ内スケジューラ（config.IMPORT_SCHEDULER・既定60秒ごと） ← 本番はこれ
+#   - cron から python core.py refresh（スケジューラを切って運用する場合）
 # ==========================================================================
 import threading
 import os
@@ -11112,14 +11088,13 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
 # アプリ内スケジューラ。cron や常駐サービスを別に用意せず、Pythonだけで定期実行する。
 #
 # アプリ起動時にデーモンスレッドを1本立て、一定間隔で「期限が来たジョブ」を実行する。
-# Streamlit のスクリプトは操作のたびに再実行されるが、スレッドはプロセスに1本だけ。
 # 画面を誰も開いていなくても、アプリのプロセスが生きていれば動く。
 #
-#   app.py ──start()──▶ [aiagent-import-scheduler スレッド]
-#                           └─ 60秒ごと: jobs.due_jobs() → jobs.run_job()
+#   create_app() ──start()──▶ [aiagent-import-scheduler スレッド]
+#                                 └─ 60秒ごと: jobs.due_jobs() → jobs.run_job()
 #
-# このスレッドから Streamlit の API（st.*）は呼ばない。
-# 画面の描画コンテキストが無いので、状態は _state に置いて画面側から読む。
+# このスレッドにはリクエストの文脈が無いので、Flask の g や request は使わない。
+# 状態は _state に置いて画面側から読む。
 # ==========================================================================
 import atexit
 import threading
@@ -18755,6 +18730,30 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
 
 # --- AI下書き（データカタログ用） ----------------------------------------------
 
+def _ask_json(system: str, user: str, what: str = "AIの応答") -> dict:
+    """AIに聞いて、応答からJSONオブジェクトを取り出す。
+
+    下書き系（表の説明・用語のSQL式・ビュー・ツール）が全部この形なので、
+    「温度0で聞く → 最初の { から最後の } までを取り出す → dict か確かめる」
+    をここ1本にまとめてある。``` で囲まれて返ってきても取り出せる。
+    what はエラー文に出す呼び名（どの下書きで失敗したかが分かるように）。
+    """
+    resp = _create(
+        model=config.OPENAI_MODEL,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0,
+    )
+    content = resp.choices[0].message.content or ""
+    m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        raise ValueError(f"{what}をJSONとして解析できませんでした: {content[:200]}")
+    data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise ValueError(f"{what}が想定した形式ではありません。")
+    return data
+
+
 _DRAFT_SYSTEM = """あなたはデータカタログ作成の専門家です。
 与えられたテーブルのプロファイル（列名・型・実値の分布・サンプル行）から、
 テーブルと各列の業務的な説明文を日本語で推測し、JSONだけを出力してください。
@@ -18824,21 +18823,7 @@ def draft_glossary_sql(db_path, table_name: str | None, terms: list[dict]) -> di
         context = catalog.db_text("db", Path(db_path), None, full=True)
     asked = "\n".join(f"- {t['term']}: {t.get('description') or ''}" for t in terms)
 
-    resp = _create(
-        model=config.OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": _GLOSSARY_SYSTEM},
-            {"role": "user", "content": f"{context}\n\n翻訳したい業務用語:\n{asked}"},
-        ],
-        temperature=0,
-    )
-    content = resp.choices[0].message.content or ""
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        raise ValueError(f"AIの応答をJSONとして解析できませんでした: {content[:200]}")
-    data = json.loads(m.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("AIの応答が想定した形式ではありません。")
+    data = _ask_json(_GLOSSARY_SYSTEM, f"{context}\n\n翻訳したい業務用語:\n{asked}", "用語のSQL式の下書き")
     wanted = {t["term"] for t in terms}
     out = {}
     for k, v in data.items():
@@ -18872,23 +18857,7 @@ def draft_table_meta(db_path, table_name: str) -> dict:
     profile = catalog.profile_db(Path(db_path))
     meta = catalog.load_meta(Path(db_path))
     text = catalog.table_text("db", table_name, profile, meta, full=True)
-    resp = _create(
-        model=config.OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": _DRAFT_SYSTEM},
-            {"role": "user", "content": f"ファイル名: {Path(db_path).name}\n\n{text}"},
-        ],
-        temperature=0,
-    )
-    content = resp.choices[0].message.content or ""
-    # ```json ... ``` フェンスを剥がしてから解析
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        raise ValueError(f"AI下書きの応答をJSONとして解析できませんでした: {content[:200]}")
-    data = json.loads(m.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("AI下書きの応答が想定した形式ではありません。")
-    return data
+    return _ask_json(_DRAFT_SYSTEM, f"ファイル名: {Path(db_path).name}\n\n{text}", "表の説明の下書き")
 
 
 # --- ユーザー定義ツールの下書き ---------------------------------------------------
@@ -19020,21 +18989,7 @@ def draft_view(db_path, purpose: str, previous: dict | None = None,
         ask.append(f"前回のSQL:\n{previous.get('sql', '')}")
         ask.append(f"エラー: {error}")
 
-    resp = _create(
-        model=config.OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": _VIEW_SYSTEM},
-            {"role": "user", "content": f"{context}\n\n{chr(10).join(ask)}"},
-        ],
-        temperature=0,
-    )
-    content = resp.choices[0].message.content or ""
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        raise ValueError(f"AIの応答をJSONとして解析できませんでした: {content[:200]}")
-    data = json.loads(m.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("AIの応答が想定した形式ではありません。")
+    data = _ask_json(_VIEW_SYSTEM, f"{context}\n\n{chr(10).join(ask)}", "ビューの下書き")
     # 「作らない方がよい」判断。SQLが無い応答も同じ扱いにする（無理に書かせない）
     sql = str(data.get("sql") or "").strip().rstrip(";")
     if data.get("ok") is False or not sql:
@@ -19084,21 +19039,7 @@ def draft_tool(db_path, purpose: str, params_wanted: list[str] | None = None,
         ask.append(f"前回のSQL:\n{previous.get('sql', '')}")
         ask.append(f"エラー: {error}")
 
-    resp = _create(
-        model=config.OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": _TOOL_SYSTEM},
-            {"role": "user", "content": f"{context}\n\n{chr(10).join(ask)}"},
-        ],
-        temperature=0,
-    )
-    content = resp.choices[0].message.content or ""
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        raise ValueError(f"AIの応答をJSONとして解析できませんでした: {content[:200]}")
-    data = json.loads(m.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("AIの応答が想定した形式ではありません。")
+    data = _ask_json(_TOOL_SYSTEM, f"{context}\n\n{chr(10).join(ask)}", "ツールの下書き")
 
     # 「作れない」判断。SQLが無い応答も同じ扱いにする（無理に書かせない）
     if data.get("ok") is False or not str(data.get("sql") or "").strip():
@@ -19983,9 +19924,6 @@ class _Guard:
     @staticmethod
     def key(call: dict) -> tuple:
         return (call["name"], (call.get("arguments") or "").strip())
-
-    def known_failure(self, call: dict) -> str | None:
-        return self.failed.get(self.key(call))
 
     def seen(self, call: dict) -> bool:
         """同じ引数で実行済みか（成功・失敗どちらも）。実行前の判定に使う。"""
@@ -24505,7 +24443,7 @@ TEMPLATES = {
     <div id="sec-ex" class="hidden">
       <div class="card">
         <div class="card__desc">
-          正しいと確認済みの質問とSQLの組。そのままAIのお手本になります（最大20件）。
+          正しいと確認済みの質問とSQLの組。そのままAIのお手本になります（最大{{ examples_max }}件）。
           <b>説明は任意です。</b>「なぜこの書き方なのか」「どこに気をつけるか」を書いておくと、
           AIは似た質問のときも同じ勘所を守ります。
           チャットで回答が正しかったときの「この質問とSQLを例文として保存」からも増えます。
@@ -24687,7 +24625,7 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
 {# データ一覧。DBという概念は見せない（このアプリのDBは常に1つで裏方の実装詳細）。
    テーブルを元DBグループで折りたたみ、「何があるか」を確かめられるようにする #}
 <details class="sidebar__section sbsec" id="secData">
-  <summary class="sbsec__head">
+  <summary>
     <span class="sidebar__label">SQLite3</span>
     <span class="badge" id="tblCount">{{ "%d / %d"|format(data.on_count, data.total) if data else 0 }}</span>
     {# summary の中のボタンは押しても開閉しない（common.js が止めている） #}
@@ -24750,7 +24688,7 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
 {# 社内文書の検索先。1件も登録が無ければ chat.js がこの節ごと隠す
    （使えないものを並べても、選びようがないため）。 #}
 <details class="sidebar__section sbsec" id="kbSection" style="display:none">
-  <summary class="sbsec__head">
+  <summary>
     <span class="sidebar__label">LightRAG</span>
     <span class="badge" id="kbCount"></span>
     {# summary の中のボタンは押しても開閉しない（common.js が止めている） #}
@@ -24773,7 +24711,7 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
 </details>
 
 <details class="sidebar__section sbsec" id="secHistory" open>
-  <summary class="sbsec__head">
+  <summary>
     <span class="sidebar__label">チャット履歴</span>
     <button class="btn btn--sm sbsec__act" id="newChat">＋ 新規</button>
   </summary>
@@ -25628,7 +25566,7 @@ window.CHAT_INIT = {
               <td><code>python core.py</code>。内部では waitress（1プロセス・マルチスレッドの
                   本番用サーバ・スレッド8）が待ち受けるため、<b>開発も本番も同じコマンド</b>で起動できます。
                   ホストは全アドレス（0.0.0.0）、ポートは <b>8000</b>、
-                  デバッグは常に無効（有効にするとブラウザからサーバ上のコードを実行できてしまうため）。
+                  デバッグは既定で無効（切り替えは core.py 末尾の DEBUG。有効にするとブラウザからサーバ上のコードを実行できてしまうため、本番では False のまま）。
                   <b>起動コード（core.py 末尾）は環境変数を読みません</b>（他のソフトが設定した PORT を拾う事故を避けるため）。</td></tr>
           <tr><td>本番向けの起動</td>
               <td>同じ <code>python core.py</code> のままで本番運用できます。コマンドから直接起動する
@@ -25977,7 +25915,7 @@ window.CHAT_INIT = {
   <div class="card mt">
     <div class="card__title">3-12. 整合性の警告（カタログ画面の⚠）</div>
     <div class="card__desc">
-      カタログに書いてある内容が、実際のデータとずれていないかを毎回照合します。検出するのは次の7種類です。
+      カタログに書いてある内容が、実際のデータとずれていないかを毎回照合します。検出するのは次の8種類です。
     </div>
     <div class="tablewrap">
       <table class="data">
@@ -26204,7 +26142,7 @@ window.CHAT_INIT = {
                   数値にできない値があればその列をTEXTに降格し、降格した列名を警告します。</td></tr>
           <tr><td>テーブル名の正規化</td>
               <td>全角を半角にし、記号と空白を <code>_</code> に。<b>日本語はそのまま残ります</b>。
-                  数字始まりは先頭に <code>_</code>、SQLiteの予約語89語は末尾に <code>_</code>、
+                  数字始まりは先頭に <code>_</code>、SQLiteの予約語67語は末尾に <code>_</code>、
                   <b>64文字</b>で切り詰め。まとまりの区切り <code>__</code> だけは保持します。</td></tr>
           <tr><td>更新のしかた</td>
               <td>全件入れ替え（毎回DROPして作り直し）と追記（既存列と照合し、
@@ -30667,7 +30605,7 @@ function renderSched(s) {
     if (!box) return;
     if (!s.enabled) {
         box.replaceChildren(el('div', { class: 'alert alert--warn' },
-            '自動実行は停止しています（.env の IMPORT_SCHEDULER=false）。手動更新はできます。'));
+            '自動実行は停止しています（env の IMPORT_SCHEDULER=false）。手動更新はできます。'));
     } else if (!s.running) {
         box.replaceChildren(el('div', { class: 'alert alert--err' },
             '自動実行のスレッドが動いていません。アプリを再起動してください。'));
@@ -31505,7 +31443,7 @@ function renderEmpty() {
 
     if (!window.CHAT_INIT.llmReady) {
         box.append(el('div', { class: 'alert alert--warn', style: 'display:inline-block;text-align:left' },
-            'LLMが未設定です。env の OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL を設定してください。'));
+            'LLMが未設定です。管理者に「モデル設定」画面で接続先URLとAPIキーの設定を依頼してください。'));
         return box;
     }
 
@@ -31898,7 +31836,7 @@ function addItem(item) {
 /** ユーザーの発言。マウスを乗せると編集アイコンが出る。 */
 function userTurn(item) {
     const wrap = el('div', { class: 'turn' });
-    const text = el('div', { class: 'turn__text' });
+    const text = el('div', {});
     if ((item.images || []).length) {
         text.append(el('div', { class: 'sentimgs' },
             item.images.map(im => el('a', { href: im.url, target: '_blank',
@@ -32143,7 +32081,7 @@ function mailCard(item) {
     } else {
         if (p.dry_run) {
             card.append(el('div', { class: 'alert alert--warn' },
-                'いまはテスト送信モードです（.env の SMTP_DRY_RUN=true）。'
+                'いまはテスト送信モードです（env の SMTP_DRY_RUN=true）。'
                 + '「送信」を押しても実際には送られず、内容の確認だけ行います。'));
         }
         const send = el('button', { class: 'btn btn--primary btn--sm' },
@@ -32520,7 +32458,6 @@ function activateTab(pane) {
     // DBを切り替えたときの持ち越しで来ても迷子にせず、その場所を開いて見せる。
     if (pane === 'info') {
         pane = 'tables';
-        $('#dbInfo')?.setAttribute('open', 'open');
     }
     const tab = $(`.tab[data-pane="${pane}"]`);
     if (!tab) return;
@@ -32751,8 +32688,6 @@ function wireManage() {
         await loadManage();
         renderTableManage(acc);
     }));
-    // DB情報を開いたときにサイズ・削除ボタンを出す
-    $('#dbInfo')?.addEventListener('toggle', ev => { if (ev.target.open) loadManage(); });
     // 定期取り込みの全体状態は開いてすぐ見えるようにする
     loadManage();
 }
@@ -34102,7 +34037,7 @@ function chartFields(box, kind, chart) {
             el('div', { style: 'width:180px' }, el('label', { class: 'field' }, 'グラフの種類'), sel),
             ...need.map(k => el('div', { class: 'grow' },
                 el('label', { class: 'field' }, `${k} にする列`),
-                el('input', { type: 'text', class: `ch-f ch-${k}`, 'data-key': k,
+                el('input', { type: 'text', class: 'ch-f', 'data-key': k,
                               value: Array.isArray(c[k]) ? c[k].join(', ') : (c[k] || '') }))),
             el('div', { class: 'grow' },
                 el('label', { class: 'field' }, 'グラフの表題（任意）'),
@@ -35146,7 +35081,7 @@ function renderChatList() {
                 el('div', { class: 'qa__clamp', title: c.title || '' }, c.title || '（無題）'),
                 el('div', { class: 'small muted' }, c.id,
                     ...(c.errors ? [' ', el('span', { class: 'badge badge--warn' }, `失敗${c.errors}`)] : []))),
-            el('td', { class: 'qa__q', title: x.text },
+            el('td', { title: x.text },
                 el('div', { class: 'qa__clamp' }, x.text)),
             el('td', { class: 'qa__a', title: answer },
                 el('div', { class: 'qa__clamp' }, answer || '（回答なし）')));

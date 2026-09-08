@@ -66,7 +66,7 @@ IMPORT_MAX_FILES = int(os.getenv("IMPORT_MAX_FILES", "2000") or 2000)
 
 # --- 定期取り込み -----------------------------------------------------------
 # 取り込み設定（ジョブ）の保存先。全ユーザー共通（DBファイル自体が共通のため）。
-# cron から refresh.py を動かすときは、アプリと同じ場所を指すこと。
+# cron から `python core.py refresh` を動かすときは、アプリと同じ場所を指すこと。
 IMPORT_JOBS_FILE = Path(os.getenv("IMPORT_JOBS_FILE",
                                   str(DATA_DIR / "import_jobs.yaml"))).expanduser()
 # アプリ内スケジューラ。アプリを起動している間、裏で定期取り込みを回す。
@@ -373,7 +373,5 @@ APP_TITLE = "DB分析アシスタント"
 # 画像を扱えるモデルのときは、貼り付け・ドロップの案内を chat.js が末尾に足す
 APP_INPUT_PLACEHOLDER = "データについて質問してください…"
 
-# 初期表示するサンプル質問ボタン（空リストにすると非表示）。
-# 同梱の sample_db.py で作れる5つのデモDB向け。DB横断の質問を含む。
 # 起動時にデータ用フォルダを用意
 DATA_DIR.mkdir(parents=True, exist_ok=True)
