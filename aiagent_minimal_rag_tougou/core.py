@@ -18887,12 +18887,42 @@ _TOOL_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設�
 _VIEW_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設定担当です。
 利用者が日本語で書いた「欲しい一覧」を、ビュー（名前を付けたSELECT）の定義に変換してください。
 
-出力形式（JSON以外の文字を含めないこと）:
+まず「そもそもビューを作るべきか」を判断し、作れる場合だけSQLを書いてください。
+
+【作れる場合】出力形式（JSON以外の文字を含めないこと）:
 {
+  "ok": true,
   "name": "まとまり__名前 の形。まとまりは使う表の接頭辞に合わせる（例: 部品_在庫__発注一覧）",
   "description": "この一覧が何かの説明。AIがこれを読んで使うかどうかを決める",
-  "sql": "SELECT ...（1文だけ。末尾のセミコロンは不要）"
+  "sql": "SELECT ...（1文だけ。末尾のセミコロンは不要）",
+  "explanation": "組み立てたSQLの日本語の解説（下記の書き方に従う）"
 }
+
+【作らない方がよい場合】理由だけを返す:
+{
+  "ok": false,
+  "reason": "なぜ作れない・作らない方がよいかの日本語の説明。代わりにどうすればよいかも書く"
+}
+
+ok: false にする場合（無理にSQLを書かないこと）:
+- 求められている内容が、既にある1つのテーブルそのものであるとき
+  → 「その内容は ○○ というテーブルがそのまま持っています。ビューを作らなくても
+     そのテーブルを使えます」のように、そのテーブル名を挙げて伝える。
+- カタログに、指示に合うテーブルや列が見当たらないとき
+  → 何を探したが見つからなかったかを具体的に書く。近そうなテーブルがあれば挙げる。
+- 指示があいまいで、どの表・どの列を使えばよいか決められないとき
+  → 何がはっきりしないか、どう書き足せばよいかを伝える。
+- 毎回変わる値（対象年・担当者など）を指定する必要があるとき
+  → ビューは固定の一覧なので作れない旨と、「ツール」なら毎回値を変えられることを伝える。
+- 集計や結合が要らず、単に1つの表を並べ替える・列を選ぶだけのとき
+  → チャットでそのつど聞けばよく、ビューにする必要は薄いことを伝える。
+
+explanation（解説）の書き方:
+- 日本語で3〜6行。SQLを読めない人にも分かる言葉で書く。
+- 「どの表を使うか」「どうつないだか（結合の条件と理由）」「どう絞ったか／集計したか」
+  「1行が何を表すか」の順に書く。
+- 複合キーで結合したときは、なぜ全列を条件にしたのかを一言添える。
+- SQLの構文用語（INNER JOIN など）をそのまま並べない。何をしているかを説明する。
 
 守ること:
 - SQLは SELECT（または WITH ... SELECT）だけ。書き込み・DDLは書かない。
@@ -18934,10 +18964,18 @@ def draft_view(db_path, purpose: str, previous: dict | None = None,
     data = json.loads(m.group(0))
     if not isinstance(data, dict):
         raise ValueError("AIの応答が想定した形式ではありません。")
+    # 「作らない方がよい」判断。SQLが無い応答も同じ扱いにする（無理に書かせない）
+    sql = str(data.get("sql") or "").strip().rstrip(";")
+    if data.get("ok") is False or not sql:
+        return {"ok": False,
+                "reason": str(data.get("reason")
+                              or "この指示ではビューを作れませんでした。").strip()}
     return {
+        "ok": True,
         "name": str(data.get("name") or "").strip(),
         "description": str(data.get("description") or purpose).strip(),
-        "sql": str(data.get("sql") or "").strip().rstrip(";"),
+        "sql": sql,
+        "explanation": str(data.get("explanation") or "").strip(),
     }
 
 
@@ -21289,13 +21327,16 @@ def view_draft():
             draft = llm.draft_view(path, purpose, previous=draft, error=last_err)
         except Exception as e:
             return jsonify({"error": f"AIの下書きに失敗しました: {e}"}), 400
+        # 「作らない方がよい」判断は、エラーではなく理由として画面へ返す
+        if draft.get("ok") is False:
+            return jsonify({"ok": False, "reason": draft.get("reason", "")})
         try:
             sql = _view_check_sql(draft.get("sql"))
             preview = _view_run(path, sql)
         except Exception as e:
             last_err = str(e)
             continue
-        return jsonify({"ok": True, **draft, "sql": sql, **preview})
+        return jsonify({**draft, "ok": True, "sql": sql, **preview})
     return jsonify({"error": f"AIが書いたSQLが実データで通りませんでした: {last_err}",
                     "sql": (draft or {}).get("sql", "")}), 400
 
@@ -24438,10 +24479,13 @@ TEMPLATES = {
         <button class="btn btn--sm" id="viewManual">SQLを自分で書く</button>
       </div>
 
+      <div id="viewNote"></div>
+
       <div id="viewSqlWrap" class="hidden">
         <label class="field">2. SQL（SELECT文だけ。登録済みの結合はそのまま使えます）</label>
         <textarea id="viewSql" rows="8" class="mono" style="width:100%"
                   placeholder="SELECT ..."></textarea>
+        <div id="viewExplain"></div>
         <div class="row mt mb">
           <button class="btn btn--sm" id="viewRun">実データで動かして確かめる</button>
         </div>
@@ -34504,6 +34548,16 @@ async function previewView(v, out, btn) {
     btn.disabled = false;
 }
 
+function renderViewExplain(text) {
+    const box = $('#viewExplain');
+    if (!box) return;
+    if (!text) { box.replaceChildren(); return; }
+    box.replaceChildren(el('div', { class: 'alert alert--info mt' },
+        el('div', { class: 'mb' }, el('b', {}, 'このSQLがしていること')),
+        el('div', { style: 'white-space:pre-wrap' }, text)));
+}
+
+
 function openViewEditor(title) {
     $('#viewEditor').classList.remove('hidden');
     $('#viewEditorTitle').textContent = title;
@@ -34513,6 +34567,8 @@ function openViewEditor(title) {
 function editView(v) {
     viewEditing = v.name;
     openViewEditor(`ビューを編集（${v.name}）`);
+    $('#viewNote').replaceChildren();
+    renderViewExplain('');
     $('#viewPurpose').value = '';
     $('#viewSqlWrap').classList.remove('hidden');
     $('#viewSql').value = v.sql || '';
@@ -34545,13 +34601,19 @@ function wireViews() {
         $('#viewName').value = '';
         $('#viewDesc').value = '';
         $('#viewPreview').replaceChildren();
+        $('#viewNote').replaceChildren();
+        renderViewExplain('');
         $('#viewSqlWrap').classList.add('hidden');
     });
 
     $('#viewManual').addEventListener('click', () => {
+        $('#viewNote').replaceChildren();
         $('#viewSqlWrap').classList.remove('hidden');
         $('#viewSql').focus();
     });
+
+    // 人がSQLを直したら、AIの解説は当てはまらなくなるので下ろす
+    $('#viewSql').addEventListener('input', () => renderViewExplain(''));
 
     $('#viewDraft').addEventListener('click', async ev => {
         const purpose = $('#viewPurpose').value.trim();
@@ -34559,12 +34621,30 @@ function wireViews() {
         ev.target.disabled = true;
         const old = ev.target.textContent;
         ev.target.textContent = 'AIが考えています...';
+        // 前回の理由・解説・結果は先に下ろす（考えている間、古い内容が残らないように）
+        $('#viewNote').replaceChildren();
+        renderViewExplain('');
+        $('#viewPreview').replaceChildren();
         try {
             const r = await api('/api/catalog/view/draft', { db: CAT.db, purpose });
+            if (r.ok === false) {
+                // 作らない方がよい、とAIが判断した。理由だけを出してSQLは書かない
+                $('#viewSqlWrap').classList.add('hidden');
+                $('#viewNote').replaceChildren(
+                    el('div', { class: 'alert alert--warn' },
+                        el('div', { class: 'mb' },
+                            el('b', {}, 'この指示ではビューを作りませんでした')),
+                        el('div', { style: 'white-space:pre-wrap' }, r.reason || ''),
+                        el('div', { class: 'small muted mt' },
+                            '書き方を変えてもう一度試すか、「SQLを自分で書く」で直接作れます。')));
+                return;
+            }
+            $('#viewNote').replaceChildren();
             $('#viewSqlWrap').classList.remove('hidden');
             $('#viewSql').value = r.sql || '';
             if (!$('#viewName').value) $('#viewName').value = r.name || '';
             if (!$('#viewDesc').value) $('#viewDesc').value = r.description || '';
+            renderViewExplain(r.explanation);
             $('#viewPreview').replaceChildren(viewPreviewBox(r));
             toast('下書きができました。中身を確かめて保存してください。');
         } catch (e) { toast(e.message, 'err', 12000); }
