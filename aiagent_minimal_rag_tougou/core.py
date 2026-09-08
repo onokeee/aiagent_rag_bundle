@@ -18773,8 +18773,13 @@ _GLOSSARY_SYSTEM = """あなたはSQLiteに詳しいデータカタログ作成�
 与えられたテーブル定義（列・型・実値の分布・サンプル行）をもとに、
 業務用語の「自然言語の説明」をSQLの式に翻訳してください。
 
-出力形式（JSON以外の文字を含めないこと）:
-{"用語": "SQL式", "用語2": "SQL式"}
+用語ごとに「式にできるか」を判断し、できる場合だけ式を書いてください。
+
+出力形式（JSON以外の文字を含めないこと。用語をキーにしたオブジェクト）:
+{
+  "用語": {"ok": true, "sql": "SQL式", "explanation": "その式が何をしているかの日本語の説明"},
+  "用語2": {"ok": false, "reason": "式にできない理由と、どう書き足せばよいか（日本語）"}
+}
 
 守ること:
 - WHERE にそのまま入る条件式（例: status != '9' AND amount >= 1000000）か、
@@ -18782,14 +18787,25 @@ _GLOSSARY_SYSTEM = """あなたはSQLiteに詳しいデータカタログ作成�
 - SELECT や FROM で始まる文全体は書かない。末尾にセミコロンを付けない。
 - 列名は与えられたテーブルに実在するものだけを使う。値は実値一覧にあるものを使う。
 - SQLiteに無い関数(STDDEV, MEDIAN, PERCENTILE_CONT, SQRT, POWER など)は使わない。
-- 説明があいまいで確信が持てない用語は、キーごと省略する（推測で書かない）。"""
+
+ok: false にする場合（推測で書かないこと。理由は具体的に）:
+- 必要な列がテーブルに無いとき → どんな列が要るのに無いのかを書く。
+- 説明があいまいで、しきい値や範囲が決まらないとき
+  → 何がはっきりしないか（「最近」が何日か、「大口」がいくら以上か等）を尋ねる。
+- SQLiteに無い関数が必要なとき → 何が必要で、代わりに何なら書けるかを書く。
+- 1つの式では表せない（複数の表の結合が要る等）とき → その旨と代わりの手段を書く。
+
+explanation（解説）の書き方:
+- 日本語で1〜3行。どの列をどう見て、何を満たす行（または何を計算した値）かを書く。
+- 列名はそのまま出してよいが、何を表す列かを添える。"""
 
 
 def draft_glossary_sql(db_path, table_name: str | None, terms: list[dict]) -> dict:
     """業務用語の説明文からSQL式の下書きを作る。
 
     terms: [{"term": 用語, "description": 自然言語の説明}, ...]
-    戻り値: {用語: SQL式}（翻訳できなかった用語は含まれない）
+    戻り値: {用語: {"ok": True, "sql": 式, "explanation": 解説}
+             または {"ok": False, "reason": 書けない理由}}
     """
     if not terms:
         return {}
@@ -18817,7 +18833,31 @@ def draft_glossary_sql(db_path, table_name: str | None, terms: list[dict]) -> di
     if not isinstance(data, dict):
         raise ValueError("AIの応答が想定した形式ではありません。")
     wanted = {t["term"] for t in terms}
-    return {k: str(v).strip() for k, v in data.items() if k in wanted and str(v).strip()}
+    out = {}
+    for k, v in data.items():
+        if k not in wanted:
+            continue
+        if isinstance(v, str):        # 旧形式（式だけ）の応答にも耐える
+            if v.strip():
+                out[k] = {"ok": True, "sql": v.strip(), "explanation": ""}
+            continue
+        if not isinstance(v, dict):
+            continue
+        sql = str(v.get("sql") or "").strip().rstrip(";")
+        if v.get("ok") is False or not sql:
+            out[k] = {"ok": False,
+                      "reason": str(v.get("reason")
+                                    or "この説明からはSQL式を決められませんでした。").strip()}
+        else:
+            out[k] = {"ok": True, "sql": sql,
+                      "explanation": str(v.get("explanation") or "").strip()}
+    # 応答に出てこなかった用語も「書けなかった」として理由を付ける
+    for t in terms:
+        out.setdefault(t["term"], {
+            "ok": False,
+            "reason": "この説明からはSQL式を決められませんでした。"
+                      "対象の列や、しきい値（いくつ以上か・何日以内か）を書き足してみてください。"})
+    return out
 
 
 def draft_table_meta(db_path, table_name: str) -> dict:
@@ -18853,8 +18893,11 @@ def draft_table_meta(db_path, table_name: str) -> dict:
 _TOOL_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設定担当です。
 利用者が日本語で書いた「やりたいこと」を、AIが呼び出せるツールの定義に変換してください。
 
-出力形式（JSON以外の文字を含めないこと）:
+まず「そもそもツールを作れるか」を判断し、作れる場合だけSQLを書いてください。
+
+【作れる場合】出力形式（JSON以外の文字を含めないこと）:
 {
+  "ok": true,
   "name": "英小文字と_のみの短い名前（例: monthly_sales）",
   "description": "このツールが何を返すかの説明。AIがこれを読んで使うかどうかを決める",
   "sql": "SELECT ...（1文だけ。末尾のセミコロンは不要）",
@@ -18862,8 +18905,29 @@ _TOOL_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの設�
     {"name": "year", "type": "string", "description": "対象年 YYYY",
      "required": true, "example": "2026"}
   ],
-  "chart": {"chart_type": "line", "x": "月", "y": "売上", "title": "月別売上"}
+  "chart": {"chart_type": "line", "x": "月", "y": "売上", "title": "月別売上"},
+  "explanation": "組み立てたSQLの日本語の解説（下記の書き方に従う）"
 }
+
+【作れない場合】理由だけを返す:
+{
+  "ok": false,
+  "reason": "なぜ作れないかの日本語の説明。代わりにどうすればよいかも書く"
+}
+
+ok: false にする場合（無理にSQLを書かないこと）:
+- カタログに、指示に合うテーブルや列が見当たらないとき
+  → 何を探したが見つからなかったかを具体的に書く。近そうなテーブルがあれば挙げる。
+- 指示があいまいで、どの表・どの列を使えばよいか決められないとき
+  → 何がはっきりしないか、どう書き足せばよいかを伝える。
+- 集計も絞り込みも要らず、1つの表をそのまま返すだけのとき
+  → その表をそのまま使えばよいこと（ツールにする必要が薄いこと）を伝える。
+
+explanation（解説）の書き方:
+- 日本語で3〜6行。SQLを読めない人にも分かる言葉で書く。
+- 「どの表を使うか」「どうつないだか（結合の条件と理由）」「どう絞ったか／集計したか」
+  「1行が何を表すか」「毎回変える値は何か」の順に書く。
+- SQLの構文用語（INNER JOIN など）をそのまま並べない。何をしているかを説明する。
 
 守ること:
 - SQLは SELECT（または WITH ... SELECT）だけ。書き込み・DDLは書かない。
@@ -19029,10 +19093,17 @@ def draft_tool(db_path, purpose: str, params_wanted: list[str] | None = None,
     if not isinstance(data, dict):
         raise ValueError("AIの応答が想定した形式ではありません。")
 
+    # 「作れない」判断。SQLが無い応答も同じ扱いにする（無理に書かせない）
+    if data.get("ok") is False or not str(data.get("sql") or "").strip():
+        return {"ok": False,
+                "reason": str(data.get("reason")
+                              or "この指示ではツールを作れませんでした。").strip()}
     out = {
+        "ok": True,
         "name": str(data.get("name") or "").strip(),
         "description": str(data.get("description") or purpose).strip(),
         "sql": str(data.get("sql") or "").strip().rstrip(";"),
+        "explanation": str(data.get("explanation") or "").strip(),
         "parameters": [],
         "render": render,
         "enabled": True,
@@ -21906,6 +21977,15 @@ def _w_draft_tool():
                                    previous=draft, error=last_err)
         except Exception as e:
             return jsonify({"error": f"下書きに失敗しました: {e}"}), 500
+        # 「作れない」判断は、エラーではなく理由として画面へ返す。
+        # ただし1回目だけ。実行に失敗したあとの ok:false は、作れない判断ではなく
+        # 技術的な失敗の言い換えなので、従来どおりの失敗として扱う
+        if draft.get("ok") is False:
+            if last_err is None:
+                return jsonify({"ok": False, "refused": True,
+                                "reason": draft.get("reason", "")})
+            tried.append(str(draft.get("reason") or "")[:200])
+            break
         draft["name"] = custom_tools.custom_tool_safe_name(draft.get("name") or purpose, taken)
         sql = draft.get("sql") or ""
         if not sql:
@@ -21914,8 +21994,15 @@ def _w_draft_tool():
             continue
         try:
             params = custom_tools.coerce_params(draft, _sample_params(draft))
-            scope = (_sql_scope(sql, path) if path
-                     else db.widen_scope(sql, []))
+            if path:
+                scope = _sql_scope(sql, path)
+            else:
+                # SQLがDB名を書いていれば、そのDBだけを繋ぐ。書いていなければ
+                # （DBが1つの環境では素の表名で書くのが自然）全DBを繋いで試す。
+                # 繋ぐDBが1つも決まらないと必ず「対象のDBがありません」で落ちるため。
+                scope = db.widen_scope(sql, []) or [
+                    {"path": str(p), "alias": db.alias_for(p), "name": p.name, "tables": None}
+                    for p in db.list_db_files()[:db.MAX_ATTACHED]]
             columns, rows, _ = db.run_select(sql, scope, max_rows=8, params=params)
         except Exception as e:
             last_err = str(e).splitlines()[0][:200]
@@ -21938,10 +22025,16 @@ def draft_glossary():
     terms = [{"term": r["term"], "description": r.get("description", "")}
              for r in (body.get("terms") or []) if r.get("term") and r.get("description")]
     try:
-        drafted = llm.draft_glossary_sql(path, body.get("table"), terms)
+        result = llm.draft_glossary_sql(path, body.get("table"), terms)
     except Exception as e:
         return jsonify({"error": f"下書きに失敗しました: {e}"}), 500
-    return jsonify({"ok": True, "drafted": drafted})
+    # drafted は従来どおり {用語: SQL式}。解説と理由は別に返す
+    return jsonify({
+        "ok": True,
+        "drafted": {k: v["sql"] for k, v in result.items() if v.get("ok")},
+        "explanations": {k: v.get("explanation", "") for k, v in result.items() if v.get("ok")},
+        "reasons": {k: v["reason"] for k, v in result.items() if not v.get("ok")},
+    })
 
 
 @bp_catalog.post("/api/catalog/draft-table")
@@ -33194,6 +33287,17 @@ function glAdd() {
     $('#glEditor .ed-term')?.focus();
 }
 
+/** AIの下書きの結果（式の解説／書けなかった理由）。人が式を直したら下ろす。 */
+function glDraftNote(it) {
+    const n = it.draftNote;
+    if (!n || !n.text) return null;
+    return el('div', { class: n.kind === 'ok' ? 'alert alert--info mt' : 'alert alert--warn mt' },
+        el('div', { class: 'mb' }, el('b', {},
+            n.kind === 'ok' ? 'この式がしていること' : 'SQL式にできませんでした')),
+        el('div', { style: 'white-space:pre-wrap' }, n.text));
+}
+
+
 function glRenderEditor() {
     const box = $('#glEditor');
     const it = glById(glSelId);
@@ -33237,8 +33341,9 @@ function glRenderEditor() {
     });
     sql.addEventListener('input', () => {
         if (it.sql === sql.value) return;
-        // 式が変わったら前の検証結果はあてにならないので消す
+        // 式が変わったら前の検証結果もAIの解説もあてにならないので消す
         it.sql = sql.value; it.verdict = null; it.detail = '';
+        if (it.draftNote) { it.draftNote = null; glRenderEditor(); return; }
         setStatus(status, it); markGlDirty(it); glRenderList();
     });
     scopeSel.addEventListener('change', () => {
@@ -33260,18 +33365,26 @@ function glRenderEditor() {
             draftBtn.disabled = true;
             draftBtn.innerHTML = '<span class="spinner"></span> 生成中';
             try {
+                const key = it.term.trim();
                 const r = await api('/api/catalog/glossary/draft',
                     { db: CAT.db, table: it.scope || null,
-                      terms: [{ term: it.term.trim(), description: it.description.trim() }] });
-                const drafted = (r.drafted || {})[it.term.trim()];
+                      terms: [{ term: key, description: it.description.trim() }] });
+                const drafted = (r.drafted || {})[key];
                 if (drafted) {
                     it.sql = drafted; it.verdict = null; it.detail = '';
+                    // AIの解説は、この式が何をしているかの説明。編集すると当てはまらなくなる
+                    it.draftNote = { kind: 'ok', text: (r.explanations || {})[key] || '' };
                     markGlDirty(it);
                     glRenderList(); glRenderEditor();
                     toast('SQL式を下書きしました。「検証」で確かめてから保存してください。');
                     return;        // エディタは作り直したので、このボタンはもう無い
                 }
-                toast('AIが判断できませんでした。説明をもう少し具体的に書いてみてください。', 'warn');
+                // 書けなかった理由をその場に出す（定型文で終わらせない）
+                it.draftNote = { kind: 'ng', text: (r.reasons || {})[key]
+                    || 'この説明からはSQL式を決められませんでした。' };
+                glRenderEditor();
+                toast('SQL式にできませんでした。理由を確かめてください。', 'warn', 8000);
+                return;            // エディタを作り直したので、このボタンはもう無い
             } catch (e) { toast(e.message, 'err'); }
             draftBtn.disabled = !CAT.llmReady;
             draftBtn.textContent = 'AIで下書き';
@@ -33308,6 +33421,7 @@ function glRenderEditor() {
                 el('div', { class: 'spacer' }), draftBtn, verifyBtn),
             sql,
             sqlNote(sql)),
+        glDraftNote(it),
         status,
         refPanel(it.scope, sql)));
 }
@@ -34161,9 +34275,20 @@ function openToolWizard(seed) {
             // db は送らない。全DBのカタログを見て、AIがどのDBを使うか決める
             const res = await api('/api/catalog/tool/draft', {
                 purpose: text, render: 'table' });
+            out.replaceChildren();
+            if (res.refused) {
+                // AIが「このツールは作れない・作らない方がよい」と判断した。
+                // SQLは書かせず、理由だけを見せる
+                out.append(el('div', { class: 'alert alert--warn small' },
+                    el('div', { class: 'mb' }, el('b', {}, 'この指示ではツールを作りませんでした')),
+                    el('div', { style: 'white-space:pre-wrap' }, res.reason || ''),
+                    el('div', { class: 'small muted mt' },
+                        'やりたいことを書き直してもう一度お試しください。')));
+                makeBtn.disabled = false;
+                return;
+            }
             drafted = res.tool;
             if (res.home_db) homeDb = res.home_db;
-            out.replaceChildren();
             if (!res.ok) {
                 out.append(el('div', { class: 'alert alert--err small' },
                     'うまく作れませんでした: ' + (res.error || '原因不明')
@@ -34171,6 +34296,11 @@ function openToolWizard(seed) {
             } else {
                 out.append(el('div', { class: 'alert alert--ok small' },
                     'できました。下の内容で作ります。'));
+                if (drafted && drafted.explanation) {
+                    out.append(el('div', { class: 'alert alert--info small mt' },
+                        el('div', { class: 'mb' }, el('b', {}, 'このSQLがしていること')),
+                        el('div', { style: 'white-space:pre-wrap' }, drafted.explanation)));
+                }
                 // 何ができたかを先に見せる。SQLを読めなくても、決まった内容と
                 // 実際に出た行を見れば「これでいい」と判断できる。
                 out.append(draftSummary(drafted));
