@@ -34647,9 +34647,13 @@ function wireViews() {
             renderViewExplain(r.explanation);
             $('#viewPreview').replaceChildren(viewPreviewBox(r));
             toast('下書きができました。中身を確かめて保存してください。');
-        } catch (e) { toast(e.message, 'err', 12000); }
-        ev.target.disabled = false;
-        ev.target.textContent = old;
+        } catch (e) {
+            toast(e.message, 'err', 12000);
+        } finally {
+            // 途中で return しても必ずボタンを戻す（「AIが考えています...」で固まらせない）
+            ev.target.disabled = false;
+            ev.target.textContent = old;
+        }
     });
 
     $('#viewRun').addEventListener('click', async ev => {
