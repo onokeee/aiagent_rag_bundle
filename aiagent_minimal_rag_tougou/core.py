@@ -29629,6 +29629,7 @@ const ER = (() => {
     /** サーバから返ってきた図を反映する。画面上の位置は動かさない
         （まだ保存していない配置を、関連を1本足しただけで捨てないため）。 */
     function applyEr(er) {
+        if (!er || !er.nodes) return;   // 図データを伴わない応答では触らない
         const positions = Object.fromEntries(data.nodes.map(n => [n.id, [n.x, n.y]]));
         data = er;
         data.nodes.forEach(n => { if (positions[n.id]) [n.x, n.y] = positions[n.id]; });
@@ -29652,7 +29653,9 @@ const ER = (() => {
     /* 関連API を1回叩いて図を反映する（履歴には積まない。undo/redo からも使う） */
     async function relApi(body) {
         const r = await api('/api/catalog/relationship', { db: CAT.db, ...body });
-        if (r.check) return r;                 // 実データ判定で止まった
+        // 保存せずに聞き返す応答（実データ判定で停止／複合キーの合流確認）には
+        // 図データが入らない。ここで返さないと図を空で置き換えて壊してしまう
+        if (r.check || r.ask) return r;
         applyEr(r.er); closePanel();
         return r;
     }
