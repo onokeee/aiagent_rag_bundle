@@ -359,6 +359,24 @@ CHAT_HISTORY_DAYS = int(os.getenv("CHAT_HISTORY_DAYS", "90") or 0)
 # 過去の会話を開いたときは「再ダウンロードできない」旨だけ表示する。
 CHAT_EMBED_FILE_MAX_BYTES = 2 * 1024 * 1024
 
+# LLMへ渡す会話履歴の上限。長い会話で文脈を食い潰さないための2つの目盛り。
+#   CHAT_KEEP_IMAGE_TURNS … 画像を残す「直近の質問の数」。
+#     画像はその質問のためのもので、base64は1枚で数MBになる。ここを超えた
+#     古い質問の画像は、短い注記に差し替えて履歴から外す（画面には残る）。
+#   CHAT_ANSWER_RESERVE_TOKENS … 回答とツール結果のために空けておく枠。
+#     モデルの文脈から、システムプロンプト・ツール定義・この枠を引いた
+#     残りが履歴に使える量になる。足りなくなったら古い質問から落とす。
+CHAT_KEEP_IMAGE_TURNS = int(os.getenv("CHAT_KEEP_IMAGE_TURNS", "2") or 2)
+CHAT_ANSWER_RESERVE_TOKENS = int(os.getenv("CHAT_ANSWER_RESERVE_TOKENS", "6000") or 6000)
+# 直近この数の質問は、上限を超えていても必ず残す（会話が成り立たなくなるため）
+CHAT_KEEP_TURNS_MIN = int(os.getenv("CHAT_KEEP_TURNS_MIN", "2") or 2)
+
+#: 同じ会話への送信が重なったとき、順番待ちする上限（秒）。
+#: 会話の保存は「読む → 足す → まるごと書き戻す」形なので、重なると
+#: 片方のやり取りが消える。ここで待たせて直列にする。
+#: 待ちきれないときは止めずに進む（鍵が返らなくなった会話を使えなくしないため）。
+CHAT_LOCK_WAIT_SEC = int(os.getenv("CHAT_LOCK_WAIT_SEC", "120") or 120)
+
 # --- ファイル出力 -----------------------------------------------------------
 # True にすると、ファイル作成後にボタンを押さなくてもブラウザの保存が始まる
 # （Excel / CSV / テキスト / ZIP 共通）。ブラウザ側の設定（自動ダウンロードの
