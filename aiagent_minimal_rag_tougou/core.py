@@ -1830,14 +1830,29 @@ def _out(df: pd.DataFrame):
 # --- クロス集計 -----------------------------------------------------------------
 
 def _sorted_by(pt: pd.DataFrame, rank_by: str) -> pd.DataFrame:
-    """大きい順に並べ替える。rank_by が列名ならその列、それ以外は行の合計で。"""
+    """大きい順に並べ替える。rank_by が列名ならその列、それ以外は行の合計で。
+
+    合計（margins）の行は必ずいちばん大きいので、そのまま並べると先頭に来て
+    「1位は合計」になってしまう。合計はどの分類でもないので、末尾に置く。
+    """
     target = None
     for c in pt.columns:
         if str(c) == str(rank_by):
             target = c
             break
     key = pt[target] if target is not None else pt.sum(axis=1, numeric_only=True)
-    return pt.loc[key.sort_values(ascending=False).index]
+    order = list(key.sort_values(ascending=False).index)
+    total = [i for i in order if _is_margin_row(i)]
+    if total:
+        order = [i for i in order if i not in total] + total
+    return pt.loc[order]
+
+
+def _is_margin_row(idx) -> bool:
+    """その行が合計（margins）の行か。多段の見出しにも効くようにする。"""
+    if isinstance(idx, tuple):
+        return any(str(x) == MARGIN_NAME for x in idx)
+    return str(idx) == MARGIN_NAME
 
 
 def _as_percent(pt: pd.DataFrame, mode: str) -> pd.DataFrame:
@@ -1911,7 +1926,15 @@ def pivot(columns: list, rows: list, index: list, cols: str | None, values: str,
 
     pt = pt.reset_index()
     if rank_by:
-        pt.insert(0, "順位", range(1, len(pt) + 1))
+        # 合計の行には順位を振らない（どの分類でもないので、1位にすると嘘になる）
+        marks, n = [], 0
+        for _i, row in pt.iterrows():
+            if any(str(v) == MARGIN_NAME for v in row.values):
+                marks.append("")
+            else:
+                n += 1
+                marks.append(n)
+        pt.insert(0, "順位", marks)
     # 列がMultiIndex（valuesとcolsの2段）になる場合があるので平坦化する
     flat = []
     for c in pt.columns:
@@ -2270,7 +2293,10 @@ def _names_in(text: str, name: str) -> bool:
     表名は日本語を含むので \w は Unicode のまま使う。英数字だけで境界を見ると
     「品質__x」が「高品質__x」の一部に当たる。
     """
-    return bool(re.search(r'(?<![\w."])"?' + re.escape(name) + r'"?(?![\w])', text))
+    # SQLの識別子は大小を区別しない。区別して探すと、定義に 品質__CLAIMS と
+    # 書かれたビューの元表が「読んでよい表」に入らず、読んだ瞬間に断られる
+    return bool(re.search(r'(?<![\w."])"?' + re.escape(name) + r'"?(?![\w])',
+                          text, re.IGNORECASE))
 
 
 def _view_closure(conn, aliases: list, allowed: set | None, sql: str = "") -> set:
@@ -2329,6 +2355,12 @@ def _make_authorizer(allowed: set | None, via_view: set | None = None):
     ビュー経由のときだけ通す（第5引数 trigger にビュー名が入るのが目印）。
     無条件に通すと、対象から外した表を直に名指しして読めてしまう。
     """
+    # SQLiteは「SQLに書かれたとおりの綴り」で名前を渡してくる。ビューの定義が
+    # 品質__CLAIMS と書いていれば、許可の一覧に 品質__claims があっても
+    # そのままでは一致しない。SQLが同じ表として扱うものは、ここでも同じとみなす
+    allow_ci = None if allowed is None else {str(x).lower() for x in allowed}
+    via_ci = {str(x).lower() for x in (via_view or ())}
+
     def _authorizer(action, arg1, arg2, db_name, trigger):
         if action not in _ALLOWED_ACTIONS:
             return sqlite3.SQLITE_DENY
@@ -2340,14 +2372,14 @@ def _make_authorizer(allowed: set | None, via_view: set | None = None):
             return sqlite3.SQLITE_DENY
         # SQLITE_READ は (テーブル名, 列名)。対象外の表なら止める
         if allowed is not None and action == sqlite3.SQLITE_READ and arg1:
-            name = str(arg1)
-            if name in allowed:
+            name = str(arg1).lower()
+            if name in allow_ci:
                 return sqlite3.SQLITE_OK
             # ビューの中身を読んでいる最中だけ、その定義が使う表を通す。
             # 列名が空の READ は「その表を参照する」ことの照会で、値は読まない
             # （COUNT(*) や入れ子のビューの解決で trigger 無しに飛んでくる）。
             # これも via_view に入っている名前に限って通す。
-            if via_view and name in via_view and (trigger or not arg2):
+            if via_ci and name in via_ci and (trigger or not arg2):
                 return sqlite3.SQLITE_OK
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
@@ -4649,6 +4681,12 @@ def drift_warnings(profile: dict, meta: dict) -> list[str]:
     for term, v in (meta.get("glossary") or {}).items():
         for t in _missing((v or {}).get("sql") if isinstance(v, dict) else ""):
             warns.append(f"用語「{term}」のSQL式が、存在しないテーブル '{t}' を使っています。")
+    # ユーザー定義ツールのSQLも見る。ここが抜けていたので、消した表を使うツールが
+    # そのまま残り、AIに配られ続けていた
+    for tool in (meta.get("tools") or []):
+        for t in _missing((tool or {}).get("sql")):
+            warns.append(f"ツール「{str((tool or {}).get('name') or '')[:30]}」が、"
+                         f"存在しないテーブル '{t}' を使っています。")
 
     # まとまりのメモ。改名すると本文だけ古い名前のまま残る（_rename_in_text は
     # 「まとまり__表名」という完全な表名しか置換しないので、裸のまとまり名は残る）。
@@ -5715,7 +5753,8 @@ def inline_limit() -> int:
         return config.PROMPT_INLINE_LIMIT_CHARS
 
 
-def prompt_for_scope(scope: list[dict], limit: int | None = None) -> str:
+def prompt_for_scope(scope: list[dict], limit: int | None = None,
+                     admin: bool = True) -> str:
     """選択スコープ全体のカタログテキスト。
 
     全文が上限（limit。省略時は管理者設定/env）以下なら詳細をインライン、
@@ -5724,7 +5763,15 @@ def prompt_for_scope(scope: list[dict], limit: int | None = None) -> str:
     （models.inline_limit_for 参照。固定値だと小さいモデルで溢れるため）。
     """
     if not scope:
-        return "（対象にできるDBがありません。「データ取り込み」でDBを作るよう案内してください。）"
+        # 一般利用者に「取り込み画面で作って」と言わせない。
+        # その画面は管理者専用で、メニューにも出ていない
+        return ("（対象にできるテーブルがありません。"
+                + ("「データ取り込み」でデータを入れるよう案内してください。"
+                   if admin else
+                   "サイドバーの一覧でチェックを入れるか、"
+                   "データが入っていないことを管理者に伝えるよう案内してください。"
+                   "取り込み画面は管理者専用なので、利用者には案内しないこと。")
+                + "）")
     full = "\n".join(db_text_cached(s["alias"], s["path"], s.get("tables"), full=True)
                      for s in scope)
     if len(full) <= (limit if limit is not None else inline_limit()):
@@ -5761,18 +5808,21 @@ def describe_table_text(scope: list[dict], db_alias: str, tname: str) -> str:
         entry = scope[0]              # DBは常に1つ。呼ぶ側が名前を知る必要はない
     else:
         entry = next((s for s in scope if s["alias"].lower() == str(db_alias).lower()), None)
-    if entry is not None and entry.get("tables") and tname not in entry["tables"]:
-        # 利用者が対象から外した表。説明も見せない（中身と扱いを揃える）
-        return (f"エラー: テーブル '{tname}' は、いまの対象に入っていません。"
-                "サイドバーの SQLite3 でチェックを入れると使えます。")
     if entry is None:
         aliases = ", ".join(s["alias"] for s in scope)
         return f"エラー: DBエイリアス '{db_alias}' は選択されていません。選択中: {aliases}"
     profile = profile_db(entry["path"])
     meta = load_meta(entry["path"])
+    # 「そもそも無い」を先に見る。順番が逆だと、存在しない表に対して
+    # 「対象に入っていません。チェックを入れてください」と案内してしまい、
+    # 入れようにも一覧に出てこないので堂々巡りになる
     if tname not in profile["tables"]:
         cand = ", ".join(profile["tables"].keys())
         return f"エラー: テーブル '{tname}' は {db_alias} にありません。存在するテーブル: {cand}"
+    if entry.get("tables") and tname not in entry["tables"]:
+        # 利用者が対象から外した表。説明も見せない（中身と扱いを揃える）
+        return (f"エラー: テーブル '{tname}' は実在しますが、いまの対象に入っていません。"
+                "サイドバーの一覧でチェックを入れると使えます。")
     return table_text(entry["alias"], tname, profile, meta, full=True)
 
 
@@ -10492,22 +10542,51 @@ def _cast(series: pd.Series, sqlite_type: str):
     return series.map(lambda v: None if v is None or pd.isna(v) else str(v))
 
 
-def prepare_frame(df: pd.DataFrame, columns: list[dict]):
-    """型を当てはめた DataFrame と、TEXTに落とした列名の一覧を返す。
+def _column_of(df: pd.DataFrame, name):
+    """元ファイルの列を取り出す。見出しが数値や日付のセルでも引けるようにする。
 
-    型は先頭数千行から推定するので、後ろの行に数値でない値が混ざることがある。
-    そのまま数値に変換すると黙ってNULLになって値が消えるため、
-    1件でも変換できない値があればその列は TEXT に落とす。
+    下見（plan_columns）は見出しを文字にして画面へ返すが、本番の読み込みでは
+    pandas の列名が数値の 2024 のままなので、"2024" では見つからず
+    KeyError で 500 になっていた（メッセージも「取り込みに失敗しました: '2024'」）。
+    """
+    if name in df.columns:
+        return df[name]
+    key = str(name)
+    for col in df.columns:
+        if str(col) == key:
+            return df[col]
+    raise ImportError_(
+        f"元のファイルに列 '{name}' がありません。"
+        "区切り文字・見出し行・シートの指定が変わっていないか確認してください。"
+        f"（いまの見出し: {'、'.join(str(c) for c in list(df.columns)[:10])}）")
+
+
+def prepare_frame(df: pd.DataFrame, columns: list[dict]):
+    """型を当てはめた DataFrame と、型を変えた列の説明の一覧を返す。
+
+    型は先頭数千行から推定するので、後ろの行に想定と違う値が混ざることがある。
+    そのまま当てはめると値が黙って変わるので、ここで型の方を広げて必ず知らせる。
+
+      ・数値にできない値がある      → TEXT にする（数値にすると NULL で消える）
+      ・整数のはずが小数が混ざる    → REAL にする（int() は 2.7 を 2 に切り捨てる）
     """
     out, degraded = {}, []
     for c in columns:
-        src = df[c["元の列名"]]
+        src = _column_of(df, c["元の列名"])
         if c["型"] in ("INTEGER", "REAL"):
             num = pd.to_numeric(src, errors="coerce")
             filled = src.notna() & (src.astype(str).str.strip() != "")
             if bool((filled & num.isna()).any()):
                 c["型"] = "TEXT"
-                degraded.append(c["列名"])
+                degraded.append(f'{c["列名"]}: 文字として保存（数値にできない値があった）')
+            elif c["型"] == "INTEGER":
+                # 小数を整数の列に入れると int() が切り捨てる。
+                # 集計だけがずれて、元ファイルと突き合わせるまで気づけない
+                frac = num.notna() & (num != num.round())
+                if bool(frac.any()):
+                    c["型"] = "REAL"
+                    degraded.append(
+                        f'{c["列名"]}: 小数として保存（整数の指定だったが小数が {int(frac.sum())} 件あった）')
         out[c["列名"]] = _cast(src, c["型"])
     return pd.DataFrame(out), degraded
 
@@ -11239,8 +11318,9 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None) -> d
         )
         message = f"{n:,}行を{'追記' if mode == 'append' else '全件入れ替え'}しました。"
         if degraded:
-            # 数値列に文字が混ざった。取り込み自体は通るが集計がずれるので、黙って通さない
-            message += (f" ⚠ 数値にできない値があったため文字として保存した列: {', '.join(degraded)}"
+            # 指定した型のままでは値が変わってしまう列。取り込み自体は通るが
+            # 集計がずれるので、黙って通さない
+            message += (f" ⚠ 型を変えて保存した列: {', '.join(degraded)}"
                         "（元ファイルの値を確認してください）")
 
         # 追記のときは、保存回数を超えた古い取り込み分を落とす
@@ -11588,7 +11668,7 @@ def _scrub_meta(meta: dict, own_alias: str, alias: str, table: str | None) -> di
       他所   … 関連とER図の置き場所だけ（例文は他DBのテーブルを引くこともある）
     """
     hit: dict = {"relationships": [], "glossary": [], "examples": [],
-                 "checks": [], "tables": [], "er_layout": []}
+                 "checks": [], "tables": [], "er_layout": [], "tools": []}
     mine = own_alias == alias
 
     rels = meta.get("relationships") or []
@@ -11646,6 +11726,18 @@ def _scrub_meta(meta: dict, own_alias: str, alias: str, table: str | None) -> di
         meta["examples"] = left
         if not left:
             meta.pop("examples", None)
+
+    # ユーザー定義ツールのSQL。ここを見ていなかったので、
+    # 消した表を使うツールがカタログに残り、AIに配られ続けていた
+    tls = meta.get("tools") or []
+    keep_tools = [x for x in tls
+                  if not uses_table(str((x or {}).get("sql") or ""), table, alias)]
+    if len(keep_tools) != len(tls):
+        hit["tools"] = [str((x or {}).get("name") or "")
+                        for x in tls if x not in keep_tools]
+        meta["tools"] = keep_tools
+        if not keep_tools:
+            meta.pop("tools", None)
 
     cks = verify.normalize(meta.get("checks"))
     def ck_hits(c):
@@ -11920,16 +12012,20 @@ def rename_table(path: Path, old: str, new: str) -> dict:
         # 旧まとまりが空になったらメモを引き継ぐか片づける（削除時と同じ考え方）。
         old_g = old.split("__", 1)[0] if "__" in old else None
         new_g = new.split("__", 1)[0]
-        moved_memo = None
+        moved_memo = kept_memo = None
         if old_g and old_g != new_g:
             rest = [t for t in prof["tables"] if t != old
                     and t.split("__", 1)[0] == old_g]
             groups = data.get("groups") or {}
             if not rest and old_g in groups:
-                entry = groups.pop(old_g)
                 if new_g not in groups:
-                    groups[new_g] = entry        # まとまりごと動いた＝メモも一緒に
+                    groups[new_g] = groups.pop(old_g)   # まとまりごと動いた＝メモも一緒に
                     moved_memo = old_g
+                else:
+                    # 移動先に既にメモがある。前は旧メモを黙って捨てていたが、
+                    # 書いた人にしか復元できないので残す。
+                    # 表の無いまとまりとして点検に出るので、そこで判断してもらう
+                    kept_memo = old_g
                 if groups:
                     data["groups"] = groups
                 else:
@@ -11978,7 +12074,7 @@ def rename_table(path: Path, old: str, new: str) -> dict:
 
     catalog.forget(path)
     return {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
-            "memo_moved": moved_memo}
+            "memo_moved": moved_memo, "memo_kept": kept_memo}
 
 
 def rename_group(path: Path, old_key: str, new_key: str) -> dict:
@@ -12018,6 +12114,7 @@ def rename_group(path: Path, old_key: str, new_key: str) -> dict:
 #: 画面に出すときの見出し。キーの順にそのまま並べる。
 LABELS = {
     "own_tables": "テーブルと中のデータ",
+    "tools": "AIに配るツール（SQLがこの表を使っているもの）",
     "tables": "テーブルの説明",
     "relationships": "関連（ER図の線）",
     "glossary": "業務用語",
@@ -18980,7 +19077,7 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
 - 「テーブルを見せて」「中身を全部見たい」のようにデータそのものを見たいと言われたら、SELECT * を打って先頭数行を貼るのではなく open_table を使う（全行を辿れる画面へのリンクが出る）。出したあとは何のテーブルかを1〜2文添えるだけでよい。
 
 # 選択中のデータカタログ
-{catalog.prompt_for_scope(scope, limit=inline_cap)}
+{catalog.prompt_for_scope(scope, limit=inline_cap, admin=admin)}
 
 現在時刻: {datetime.now().isoformat(timespec="seconds")}
 """
