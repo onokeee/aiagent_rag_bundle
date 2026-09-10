@@ -11437,6 +11437,11 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
                          "table": job.get("table"), "db_file": job.get("db_file"),
                          "message": msg})
             continue
+        if stamp == str(job.get("failed_stamp") or ""):
+            # この版はもう試して駄目だった。質問のたびに読み直しても結果は同じで、
+            # 大きなファイルだと1問ごとに数十秒待たせ、履歴も同じ失敗で埋まる。
+            # ファイルがさらに変わったら（stamp が違ったら）また試す
+            continue
         if stamp == str(job.get("source_stamp") or ""):
             # 変わっていない。ただし「ファイルが無い」で失敗扱いになった後、
             # 同じ内容のまま戻ってきた場合はここに来る。中身は前回取り込んだものと
@@ -11455,6 +11460,14 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
             continue                       # 変わっていない
         # 版の記録は run_job 側で行う（成功時のみ。失敗したら次の質問で再挑戦）
         res = run_job(job, kind="realtime")
+        saved = get_job(job.get("id", ""))
+        if saved is not None:
+            # 失敗した版を覚える／成功したら忘れる
+            if res.get("ok"):
+                saved.pop("failed_stamp", None)
+            else:
+                saved["failed_stamp"] = stamp
+            save_job(saved)
         done.append({"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
                      "table": job.get("table"), "db_file": job.get("db_file"),
                      "rows": res.get("rows"),
@@ -16345,12 +16358,31 @@ def _show_er_diagram(args: dict, scope: list[dict]) -> dict:
     }
 
 
+#: 画面のプレビューに載せる行数。画面が実際に出すのは先頭20行なので、
+#: これ以上を会話に残しても誰も使わないまま重くなるだけ
+#: （ファイルの中身は data に入っていて、そちらは全行ある）。
+PREVIEW_ROWS = 40
+
+
+def _preview_rows(columns, rows, name="", note=""):
+    """会話に残すプレビュー。全行ではなく先頭だけ持つ。"""
+    head = list(rows or [])[:PREVIEW_ROWS]
+    cut = len(rows or []) - len(head)
+    if cut > 0:
+        note = (note + f"（表示は先頭{len(head)}行。ファイルには全{len(rows):,}行）").strip()
+    out = {"name": name, "columns": columns, "rows": head,
+           "total_rows": len(rows or [])}
+    if note:
+        out["note"] = note
+    return out
+
+
 def _export_excel(args: dict, scope: list[dict]) -> dict:
     sheets_in = args.get("sheets") or []
     if not sheets_in:
         return _err("sheets が空です。少なくとも1つ SELECT を指定してください。")
 
-    built, summary = [], []
+    built, summary, preview = [], [], []
     for i, sh in enumerate(sheets_in, start=1):
         name = (sh or {}).get("name") or f"Sheet{i}"
         # ファイルには全行入れる（画面向けの2,000行とは別枠）。
@@ -16369,8 +16401,10 @@ def _export_excel(args: dict, scope: list[dict]) -> dict:
         charts = (sh or {}).get("charts") or (sh or {}).get("chart")
         if isinstance(charts, dict):
             charts = [charts]
+        # Excelの中身は全行（build_excel に渡す）。会話に残すのは先頭だけ
         built.append({"name": name, "columns": columns, "rows": rows, "note": note,
                       "charts": charts or []})
+        preview.append(_preview_rows(columns, rows, name, note))
         summary.append({"sheet": name, "columns": columns, "row_count": len(rows),
                         "truncated": truncated,
                         "charts": [c.get("type") for c in (charts or [])]})
@@ -16393,7 +16427,7 @@ def _export_excel(args: dict, scope: list[dict]) -> dict:
         }),
         "render": {
             "role": "assistant", "kind": "file", "filename": filename,
-            "mime": exports.XLSX_MIME, "data": data, "sheets": built,
+            "mime": exports.XLSX_MIME, "data": data, "sheets": preview,
             "note": f"{len(built)}シート",
         },
     }
@@ -16423,7 +16457,7 @@ def _export_csv(args: dict, scope: list[dict]) -> dict:
         made.append({"filename": exports.safe_filename(name, "csv"), "data": data})
         summary.append({"file": name, "columns": columns, "row_count": len(rows),
                         "truncated": truncated})
-        preview.append({"name": name, "columns": columns, "rows": rows})
+        preview.append(_preview_rows(columns, rows, name))
 
     if len(made) == 1:
         filename, data, mime = made[0]["filename"], made[0]["data"], exports.CSV_MIME
@@ -18279,6 +18313,8 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
         sheet = {"name": chart.get("title") or tool.get("name") or "Sheet1",
                  "columns": columns, "rows": rows,
                  "note": f"{cap:,}行で切り詰め" if truncated else ""}
+        # 会話に残すのは先頭だけ（ファイルの中身は data にある）
+        sheet_preview = _preview_rows(columns, rows, sheet["name"], sheet["note"])
         base = chart.get("filename") or tool.get("name")
         try:
             if kind == "excel":
@@ -18296,7 +18332,7 @@ def _run_custom(tool: dict, args: dict, scope: list[dict]) -> dict:
             "note": "ユーザーの画面に保存済み。",
         }), "render": {
             "role": "assistant", "kind": "file", "filename": filename,
-            "mime": mime, "data": data, "sheets": [sheet],
+            "mime": mime, "data": data, "sheets": [sheet_preview],
         }}
     if kind == "chart":
         missing = [c for c in (chart.get("x"), chart.get("y")) if c and c not in columns]
@@ -22327,7 +22363,10 @@ def view_delete():
     done = cleanup.clean_table(path, name, drop_jobs=False)
     catalog.forget(path)
     print(f"[view] {path.name} のビュー {name} を削除しました（{g.user.username}）")
+    # 掃除で用語集・例文・検算が変わっていることがある。新しい印を返さないと、
+    # 開いたままの画面からの次の保存が「別の場所で変わりました」で拒まれる
     return jsonify({"ok": True, "groups": cleanup.summarize(done),
+                    "stamps": _stamps_of(path),
                     "views": _views_payload(path)})
 
 
@@ -22452,6 +22491,14 @@ def _rows(body: dict, key: str):
     if not isinstance(v, list) or any(not isinstance(r, dict) for r in v):
         return None
     return v
+
+
+def _stamps_of(path) -> dict:
+    """いまの用語集・例文・検算の印。削除などで一覧が変わったとき、
+    開いたままの画面に渡し直すために使う（渡さないと次の保存が409になる）。"""
+    meta = catalog.load_meta(path)
+    return {k: catalog.section_stamp(meta, k)
+            for k in ("glossary", "examples", "checks")}
 
 
 def _stale(body: dict, meta: dict, kind: str, label: str):
@@ -23635,7 +23682,11 @@ def _w_drop_table():
     done = cleanup.clean_table(path, table,
                               drop_jobs=body.get("drop_jobs", True) is not False)
     print(f"[import] {path.name} の {table} を削除しました（{g.user.username}）")
-    return jsonify({"ok": True, "groups": cleanup.summarize(done)})
+    # 掃除で用語集・例文・検算が変わる。新しい印を返さないと、開いたままの
+    # 画面からの次の保存が「別の場所で変わりました」で拒まれ、
+    # 読み直しで書きかけが失われる
+    return jsonify({"ok": True, "groups": cleanup.summarize(done),
+                    "stamps": _stamps_of(path)})
 
 
 # =============================================================================
@@ -26790,8 +26841,14 @@ window.CHAT_INIT = {
               <td><code>messages</code>（AIに送る列）と <code>render_log</code>（画面に描く列）を別に持ちます。
                   システムプロンプトは保存せず、開くたびに最新のカタログで作り直します。</td></tr>
           <tr><td>APIに送る量</td>
-              <td><b>毎回その会話の全メッセージを送ります</b>。ターン数やトークン数による切り詰め・
-                  要約は実装していません（ツールの結果も残したまま）。長い会話ほど費用と時間が増えます。</td></tr>
+              <td>選んでいるモデルが一度に読める量に収まるよう、<b>古いやり取りから順に外して送ります</b>
+                  （直近のやり取りと、いちばん最初の指示は必ず残します）。要約はしません。
+                  外したぶんは「（以前のやり取りは省略しています）」と伝わるので、
+                  AIが勝手に忘れたふりをすることはありません。<br>
+                  質問に付けた画像は、直近の何回かを過ぎると本文から外します
+                  （画面の表示には残ります）。1枚で数MBあるものを毎回送り続けないためです。<br>
+                  ツールの結果は残したまま送ります。長い会話ほど費用と時間は増えますが、
+                  上限を超えて失敗することはありません。</td></tr>
           <tr><td>書き直して送信</td>
               <td>指定した「何回目の発言か」の直前で、AIに送る列と画面の列をそれぞれ切り詰めます。
                   本文を空で送ると巻き戻すだけ（元の文面を入力欄に戻す）。この経路は常に非ストリーミング。</td></tr>
@@ -29179,7 +29236,7 @@ def _fs_put(data, filename, mime, owner) -&gt; str:
       <tr><td>authenticate() — 3段の判定順と、その順序の理由</td><td><div class="mt"><code>auth.authenticate(username, password)</code> が画面から呼ばれる唯一の入口。処理は次の順で、途中で確定したらプロバイダには渡さない。</div><div class="mt">・<code>_try_builtin_admin(username, password)</code><br>・<code>admin_enabled()</code>（＝<code>ADMIN_USER</code> と <code>ADMIN_PASS</code> の両方が真）が偽なら即 None。<b><code>ADMIN_PASS</code> を空文字にするとこのアカウントごと無効</b>になる（空パスワードで入れてしまう事故を防ぐため）。<br>・ID は <code>strip().lower()</code> と <code>ADMIN_USER.lower()</code> の比較（大文字小文字を無視）。<br>・パスワードは <code>hmac.compare_digest(str(password).encode(&quot;utf-8&quot;), str(ADMIN_PASS).encode(&quot;utf-8&quot;))</code>。<b>bytes に落としてから比べているのは、<code>compare_digest</code> が非ASCIIの str を受け付けず TypeError になるため</b>（日本語パスワードを設定した瞬間に落ちる）。<br>・成功時は <code>User(username=ADMIN_USER, display_name=&quot;管理者&quot;, groups=[AUTH_ADMIN_GROUP], is_admin=True)</code>。<br>・常設管理者と同じIDだったが 1 で失敗した場合、<b>ここで None を返してプロバイダには渡さない</b>。LDAP側に同名の <code>admin</code> が居ても取り違えないため。<br>・<code>BUILTIN_USERS</code> のどれかとIDが一致したら <code>_try_builtin_user</code> の結果で確定（一致・不一致どちらでもプロバイダへは行かない）。<code>_try_builtin_user</code> は <b>IDとパスワードが同じ文字列</b>なら成功（<code>hmac.compare_digest</code> で比較）。返るのは <code>User(username=&lt;リストの綴り&gt;, display_name=&quot;&quot;, groups=[], is_admin=False)</code>。<br>・どれにも当たらなければ <code>get_provider().authenticate(username, password)</code>。</div><div class="mt">この「先に常設アカウントを見る」構造が、LDAPが落ちていても設定画面に入れる非常口になっている。逆に LDAP へ完全移行したら <code>BUILTIN_USERS = []</code> にし、<code>ADMIN_PASS</code> を強いものへ変えるのが前提。</div></td></tr>
       <tr><td>プロバイダ（local / http）</td><td><div class="mt"><code>AuthProvider</code>（ABC）の実装は2つで、<code>_PROVIDERS = {&quot;local&quot;: LocalAuthProvider, &quot;http&quot;: HttpApiAuthProvider}</code>。<code>get_provider(name)</code> は <code>AUTH_PROVIDER</code> を小文字化して引き、未知なら <code>AuthError</code> を投げる。</div><div class="mt"><b>LocalAuthProvider</b>（既定）</div><div class="mt">・<code>AUTH_USERS_FILE</code>（＝プロジェクト直下の <code>auth_users.yaml</code>）を毎回読む。キャッシュしない。<br>・ファイルが無い／<code>users</code> が空でも <code>AuthError</code> にはせず <b>None（＝普通の認証失敗）</b>を返す。常設 admin と BUILTIN_USERS だけで運用できるため。<br>・YAMLの読み込み自体が失敗したときだけ <code>AuthError</code>。<br>・ID照合は <code>lower()</code> 同士。パスワードは <code>verify_password</code>。<br>・<code>is_admin</code> は <code>AUTH_ADMIN_GROUP in groups</code> の完全一致（部分一致しない）。<br>・返す <code>username</code> は<b>YAMLに書かれた綴りそのもの</b>（入力の綴りではない）。これが保存先フォルダ名の安定に効いている。</div><div class="mt"><b>HttpApiAuthProvider</b></div><div class="mt">・<code>AUTH_API_URL</code> が空なら <code>AuthError</code>。<br>・<code>{AUTH_API_USER_FIELD: username, AUTH_API_PASS_FIELD: password}</code> を JSON で POST（<code>urllib.request</code>、タイムアウト <code>AUTH_API_TIMEOUT</code>＝10秒）。<br>・HTTPError の <b>400/401/403 は「認証失敗」で None</b>、それ以外は <code>AuthError</code>。接続不能も <code>AuthError</code>。<br>・応答が JSON でなければ <code>AuthError</code>。<br>・成功判定は <code>AUTH_API_SUCCESS_FIELD</code> が設定されていればその値の真偽、空なら <code>status == 200</code>。<br>・<code>_dig(data, &quot;user.displayName&quot;)</code> のドット区切りで入れ子から値を取る。<br>・<b><code>AUTH_API_GROUPS_FIELD</code> が空なら groups は必ず空 → 全員が一般ユーザー</b>。「応答に無いものを推測して管理者にするのは危険」という判断で、迷ったら一般に倒している。この構成では管理者は <code>ADMIN_PASS</code> で入る admin だけになる。</div><div class="mt"><code>AuthError</code> は「認証以前の失敗（設定不備・通信不可）」専用で、ログイン画面は None（＝ID/パスワード違い）とは違う文面を出す。</div></td></tr>
       <tr><td>パスワードのハッシュ（local プロバイダ用）</td><td><div class="mt"><code>hash_password(password)</code> は <code>secrets.token_bytes(16)</code> のソルトと <code>hashlib.pbkdf2_hmac(&quot;sha256&quot;, …, _ITER)</code>（<code>_ITER = 200_000</code>）で、<code>pbkdf2_sha256$&lt;反復数&gt;$&lt;salt hex&gt;$&lt;hash hex&gt;</code> の1行に詰める。</div><div class="mt"><code>verify_password(password, stored)</code> は <code>$</code> で4分割し、アルゴリズム名が違えば False、保存されている反復数で計算し直して <code>hmac.compare_digest(dk.hex(), hash_hex)</code> で比較。<code>ValueError</code> / <code>AttributeError</code> は握って False（形式が壊れた行で例外を出さない）。反復数を stored 側から読むので、<code>_ITER</code> を将来上げても既存ユーザーはそのままログインできる。</div><div class="mt"><code>save_users_file</code> は書いた後 <code>os.chmod(p, 0o600)</code> を試み、<code>OSError</code> は無視（Windowsでは事実上効かない）。</div></td></tr>
-      <tr><td>セッション（Cookie に入るもの・入らないもの）</td><td><div class="mt"><code>_USER_KEY = &quot;user&quot;</code>。</div><div class="mt">・<code>login_user(user)</code> … <code>session[&quot;user&quot;] = {&quot;username&quot;, &quot;display_name&quot;, &quot;groups&quot;(list), &quot;is_admin&quot;}</code> を書き、<code>session.permanent = False</code>。permanent=False なので <b>ブラウザを閉じるとログアウト</b>（<code>PERMANENT_SESSION_LIFETIME</code> は設定していない）。<br>・<code>load_user_into_context()</code> … <code>app.before_request</code> に登録。<code>session.get(&quot;user&quot;)</code> があれば <code>g.user = auth.User(<b>data)</code>、無ければ <code>g.user = None</code>。</b>ここで再検証は一切しない**（YAMLもLDAPも見に行かない）。<br>・<code>logout_user()</code> … <code>session.clear()</code>。<code>chat_id</code> も一緒に消える。</div><div class="mt">Cookie の設定は <code>create_app()</code> の <code>app.config.update</code> にある。</div><div class="tablewrap"><table class="data"><thead><tr><th>キー</th><th>値</th><th>備考</th></tr></thead><tbody><tr><td><code>SECRET_KEY</code></td><td><code>_secret_key()</code></td><td>下記</td></tr><tr><td><code>SESSION_COOKIE_HTTPONLY</code></td><td>True</td><td></td></tr><tr><td><code>SESSION_COOKIE_SAMESITE</code></td><td>&quot;Lax&quot;</td><td></td></tr><tr><td><code>SESSION_COOKIE_SECURE</code></td><td><b>未設定</b></td><td>社内HTTP前提</td></tr><tr><td><code>MAX_CONTENT_LENGTH</code></td><td>64MB</td><td></td></tr><tr><td><code>JSON_AS_ASCII</code></td><td>False</td><td></td></tr></tbody></table></div><div class="mt"><code>_secret_key()</code> の決まり方は <code>FLASK_SECRET_KEY</code>（環境変数）&gt; プロジェクト直下の <code>.flask_secret</code> の中身 &gt; 新規に <code>secrets.token_urlsafe(48)</code> を生成してそのファイルへ書き込み（<code>chmod 0o600</code> を試行）。<b>ファイルに残すのは「再起動でログアウトさせないため」</b>という明示の設計判断。逆に言えば、鍵を捨てる＝全員を強制ログアウトさせる唯一の手段になっている。</div><div class="mt">セッションに入るもう1つの値は <code>session[&quot;chat_id&quot;]</code>（いま開いている会話のID）だけ。会話の実体・モデル選択・RAG設定はすべてファイル側にある。</div></td></tr>
+      <tr><td>セッション（Cookie に入るもの・入らないもの）</td><td><div class="mt"><code>_USER_KEY = &quot;user&quot;</code>。</div><div class="mt">・<code>login_user(user)</code> … <code>session[&quot;user&quot;] = {&quot;username&quot;, &quot;display_name&quot;, &quot;groups&quot;(list), &quot;is_admin&quot;}</code> を書き、<code>session.permanent = False</code>。permanent=False なので <b>ブラウザを閉じるとログアウト</b>（<code>PERMANENT_SESSION_LIFETIME</code> は設定していない）。<br>・<code>load_user_into_context()</code> … <code>app.before_request</code> に登録。<code>session.get(&quot;user&quot;)</code> があれば <code>g.user = auth.User(**data)</code>、無ければ <code>g.user = None</code>。<b>ここで再検証は一切しない</b>（YAMLもLDAPも見に行かない）。<br>・<code>logout_user()</code> … <code>session.clear()</code>。<code>chat_id</code> も一緒に消える。</div><div class="mt">Cookie の設定は <code>create_app()</code> の <code>app.config.update</code> にある。</div><div class="tablewrap"><table class="data"><thead><tr><th>キー</th><th>値</th><th>備考</th></tr></thead><tbody><tr><td><code>SECRET_KEY</code></td><td><code>_secret_key()</code></td><td>下記</td></tr><tr><td><code>SESSION_COOKIE_HTTPONLY</code></td><td>True</td><td></td></tr><tr><td><code>SESSION_COOKIE_SAMESITE</code></td><td>&quot;Lax&quot;</td><td></td></tr><tr><td><code>SESSION_COOKIE_SECURE</code></td><td><b>未設定</b></td><td>社内HTTP前提</td></tr><tr><td><code>MAX_CONTENT_LENGTH</code></td><td>64MB</td><td></td></tr><tr><td><code>JSON_AS_ASCII</code></td><td>False</td><td></td></tr></tbody></table></div><div class="mt"><code>_secret_key()</code> の決まり方は <code>FLASK_SECRET_KEY</code>（環境変数）&gt; プロジェクト直下の <code>.flask_secret</code> の中身 &gt; 新規に <code>secrets.token_urlsafe(48)</code> を生成してそのファイルへ書き込み（<code>chmod 0o600</code> を試行）。<b>ファイルに残すのは「再起動でログアウトさせないため」</b>という明示の設計判断。逆に言えば、鍵を捨てる＝全員を強制ログアウトさせる唯一の手段になっている。</div><div class="mt">セッションに入るもう1つの値は <code>session[&quot;chat_id&quot;]</code>（いま開いている会話のID）だけ。会話の実体・モデル選択・RAG設定はすべてファイル側にある。</div></td></tr>
       <tr><td>ログイン画面（bp_auth）</td><td><div class="mt"><code>bp_auth = Blueprint(&quot;auth&quot;, __name__)</code>。ルートは <code>/login</code>（GET/POST）と <code>/logout</code>（POST）の2本で、<b>どちらにも権限デコレータは付かない</b>（アプリ全体で唯一の無防備ルートは他に <code>/vendor/plotly.min.js</code> のみ）。</div><div class="mt"><code>login()</code> の流れ:</div><div class="mt">・<code>g.get(&quot;user&quot;)</code> が既にあれば <code>chat.index</code> へリダイレクト。<br>・<code>auth.get_provider()</code>。ここで <code>AuthError</code> が出たら <code>login.html</code> に <code>fatal=&lt;文言&gt;</code> を渡してフォームごと出さない。<br>・<code>provider.name == &quot;local&quot;</code> かつ <code>not auth.admin_enabled()</code> かつ <code>auth_users.yaml</code> にユーザーが1人も居ない場合だけ <code>setup_needed = True</code>（画面に <code>python core.py users add &lt;名前&gt; --admin</code> を案内する）。<b><code>ADMIN_PASS</code> が設定されていればこの案内は出ない</b>（常設 admin で入れるため）。<br>・POST 時、ID か パスワードが空なら flash(warning)。<code>auth.authenticate</code> が <code>AuthError</code> なら flash(error)、None なら「ユーザー名またはパスワードが違います。」、成功なら <code>login_user(user)</code> して <code>next</code> へリダイレクト。<br>・<code>next</code> の検査は <code>nxt.startswith(&quot;/&quot;)</code> だけ。</div><div class="mt"><code>AuthProvider.hint</code>（<code>LocalAuthProvider</code> は「社内LDAP導入までの暫定アカウントです。」）は定義されているが、<code>login.html</code> は provider を受け取っておらず<b>どこにも表示されない</b>。</div></td></tr>
       <tr><td>login_required と admin_required</td><td><div class="mt">どちらも <code>functools.wraps</code> で包む素朴なデコレータで、判断材料は <code>g.get(&quot;user&quot;)</code> だけ。</div><pre class="mono small">login_required:
   user is None → path が &quot;/api/&quot; 始まり ? jsonify({&quot;error&quot;:&quot;ログインしてください。&quot;}),401
@@ -29323,6 +29380,9 @@ def safe_key(self) -&gt; str:
 
     <div id="previewArea"></div>
   </div>
+{# content--wide の閉じ。これが無いと、この画面だけ div が1つ開いたままになり、
+   DOMの入れ子が他の画面とずれる（実測: 描いた画面の深さが +1 だった） #}
+</div>
 
 {% endblock %}
 
@@ -32962,7 +33022,7 @@ async function confirmDelete(opts) {
  *  （別の画面へ行って戻ると消える、という分かりにくい挙動になっていた）。
  *  一覧・上部の数字・ER図・カタログの控えを、その場で揃える。
  */
-function dropTableFromView(name) {
+function dropTableFromView(name, stamps) {
     if (typeof CAT === 'undefined') return;      // カタログ画面以外では何もしない
     const acc = $(`#pane-tables details.acc[data-table="${CSS.escape(name)}"]:not(.t-manage)`);
     const group = acc?.closest('details.acc--group');
@@ -32996,6 +33056,10 @@ function dropTableFromView(name) {
         CAT.views = CAT.views.filter(v => v.name !== name);
         if (CAT.views.length !== before) MANAGE.refreshViews?.();
     }
+    // サーバ側の掃除で用語集・例文・検算が変わっているので、画面が持つ「印」も
+    // 差し替える。しないと次の保存が「別の場所で変わりました」で拒まれ、
+    // 読み直しで書きかけが失われる
+    if (stamps && typeof CAT !== 'undefined' && CAT.stamps) Object.assign(CAT.stamps, stamps);
     MANAGE.scrubTable?.(name);     // 例文・検算・用語の画面からも、この表のぶんを下ろす
     // 書きかけのまま消した場合の「未保存」も下ろす（保存する相手がもういない）。
     // まとまりごと消えたときは、そのメモの未保存も一緒に下ろす
@@ -33094,7 +33158,7 @@ function askDeleteTable(dbName, name, rows, isView) {
         body: { db: dbName, table: name },
         action: isView ? 'ビューを削除する' : 'テーブルを削除する',
         done: () => `${name} を削除し、カタログの記述も片づけました。`,
-        after: () => dropTableFromView(name),
+        after: (res) => dropTableFromView(name, res && res.stamps),
     });
 }
 
@@ -34756,6 +34820,22 @@ window.addEventListener('beforeunload', ev => {
 });
 function reloadClean() { leavingOnPurpose = true; window.location.reload(); }
 
+/** 読み直してよいか確かめる。書きかけがあれば聞く。
+
+    reloadClean は「わざと離れる」印を立てるので、離脱時の警告も出ない。
+    確かめずに読み直すと、他のタブに書きかけていた用語・例文・検算・説明が
+    警告なしに全部消える。 */
+function reloadCleanIfSaved() {
+    const left = dirtyLabel();
+    if (left && !confirm(`保存していない変更があります（${left}）。\n`
+                         + 'このまま画面を読み直すと、その内容は失われます。よろしいですか？')) {
+        toast('読み直しをやめました。先に保存してください。', 'err', 7000);
+        return false;
+    }
+    reloadClean();
+    return true;
+}
+
 /* --- 充実度（上部の数字） -------------------------------------------------------
    保存のたびに数え直す。ページを読み直さなくても数字が現実に追いつくように。 */
 
@@ -36155,9 +36235,14 @@ async function ckVerify(items, btn) {
 
 /** 検算ルールを保存する。 */
 async function saveChecks() {
+    // 「何か書かれているのに左右のSQLが揃っていない」行を止める。
+    // 名前と左右のSQLだけを見ていたので、左右の"名前"や内訳SQLだけ書いた
+    // 書きかけの行が素通りし、サーバで落とされて黙って消えていた
+    const written = it => (it.name || '').trim() || (it.left_sql || '').trim()
+        || (it.right_sql || '').trim() || (it.left_label || '').trim()
+        || (it.right_label || '').trim() || (it.drilldown || '').trim();
     const bad = ckItems.find(it =>
-        (it.name.trim() || it.left_sql.trim() || it.right_sql.trim())
-        && !(it.left_sql.trim() && it.right_sql.trim()));
+        written(it) && !((it.left_sql || '').trim() && (it.right_sql || '').trim()));
     if (bad) {
         toast(`「${bad.name || '（無題）'}」は左右の両方にSQLが必要です。`, 'err', 7000);
         ckSelect(bad.id);
@@ -36173,7 +36258,13 @@ async function saveChecks() {
     if (r.stamp) CAT.stamps.checks = r.stamp;
     // サーバの確定結果で作り直す（空のルールはここで消える）
     const results = new Map(ckItems.map(it => [it.name.trim(), it]));
+    const wasSel = ckItems.find(it => it.id === ckSelId)?.name?.trim();
     loadChecks();
+    // 作り直すと1件目が選ばれる。編集していたルールに戻す
+    if (wasSel) {
+        const back = ckItems.find(it => (it.name || '').trim() === wasSel);
+        if (back) ckSelId = back.id;
+    }
     ckItems.forEach(it => {
         const o = results.get(it.name);
         if (o) { it.verdict = o.verdict; it.detail = o.detail; }
@@ -36351,8 +36442,12 @@ function toolCard(tool) {
                     class: 'btn btn--sm btn--danger',
                     onclick: async () => {
                         if (!confirm(`${t.name} を削除しますか？`)) return;
-                        await api('/api/catalog/tool', { db: ownerFile, action: 'delete', name: t.name });
-                        toast('削除しました。'); reloadClean();
+                        // ここだけ try が無く、失敗しても何も出ないまま無反応だった
+                        try {
+                            await api('/api/catalog/tool',
+                                { db: ownerFile, action: 'delete', name: t.name });
+                        } catch (e) { toast(e.message, 'err', 9000); return; }
+                        toast('削除しました。'); reloadCleanIfSaved();
                     },
                 }, '削除') : null,
                 el('button', {
@@ -36362,7 +36457,7 @@ function toolCard(tool) {
                         try {
                             await api('/api/catalog/tool',
                                 { db: ownerFile, tool: payload, name: payload.name, original });
-                            toast('保存しました。'); reloadClean();
+                            toast('保存しました。'); reloadCleanIfSaved();
                         } catch (e) { toast(e.message, 'err'); }
                     },
                 }, '保存'))));
@@ -36456,7 +36551,7 @@ function openToolWizard(seed) {
             try {
                 await api('/api/catalog/tool',
                     { db: homeDb, tool: drafted, name: drafted.name, original: '' });
-                close(); toast('ツールを作りました。'); reloadClean();
+                close(); toast('ツールを作りました。'); reloadCleanIfSaved();
             } catch (e) { toast(e.message, 'err', 9000); }
         } }, 'この内容で作る');
 
@@ -36955,7 +37050,7 @@ async function deleteView(v) {
         // 「テーブル」タブとER図からも下ろす。ここを scrubTableFromPanes だけに
         // していたので、消したビューが一覧に残り、そこに説明を書いて保存すると
         // 存在しないビューの説明がカタログに戻っていた
-        dropTableFromView(v.name);
+        dropTableFromView(v.name, r.stamps);
         toast('ビューを削除しました。');
     } catch (e) { toast(e.message, 'err', 9000); }
 }
