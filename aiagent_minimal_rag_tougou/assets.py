@@ -14625,9 +14625,16 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
     const floorMin = Number(x.minIntervalHours || 0) * 60;
     const sch = r.schedule || {};
     const curKind = sch.kind || 'manual';
+    // いまの最低間隔でも選べる「時間ごと」の値。1時間ごとが短いからといって
+    // 6時間ごとまで塞いではいけないので、しかたの可否もこの中の最短で判定する。
+    const okHours = v.hours.filter(h => !(floorMin > 0 && h * 60 < floorMin));
+    // 保存済みの値は、いま短くなっていてもそのまま見せる（何が設定されているか分かるように）
+    const savedHours = Number(sch.hours || 0);
+    const pickHours = (curKind === 'hours' && v.hours.indexOf(savedHours) >= 0)
+        ? savedHours : (okHours.length ? okHours[0] : (v.hours[0] || 1));
     // しかた（手動のみ／時間ごと／毎日／毎週／毎月／毎月第N曜日）
     const kindSel = el('select', { style: 'max-width:210px' }, ...Object.entries(v.kinds).map(([k, label]) => {
-        const gap = scheduleGap(k, sch.hours || v.hours[0]);
+        const gap = scheduleGap(k, pickHours);
         const tooShort = gap > 0 && floorMin > 0 && gap < floorMin && k !== curKind;
         return el('option', { value: k, ...(curKind === k ? { selected: 'selected' } : {}),
                               ...(tooShort ? { disabled: 'disabled' } : {}) },
@@ -14635,7 +14642,7 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
     }));
     const hoursSel = el('select', { style: 'max-width:130px' }, ...v.hours.map(h => {
         const tooShort = floorMin > 0 && h * 60 < floorMin && !(curKind === 'hours' && Number(sch.hours) === h);
-        return el('option', { value: String(h), ...(Number(sch.hours || 1) === h ? { selected: 'selected' } : {}),
+        return el('option', { value: String(h), ...(pickHours === h ? { selected: 'selected' } : {}),
                               ...(tooShort ? { disabled: 'disabled' } : {}) }, `${h}時間ごと`);
     }));
     const timeIn = el('input', { type: 'time', value: sch.time || '08:00', style: 'width:110px' });
@@ -14714,7 +14721,7 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
     const reset = () => {
         const s2 = r.schedule || {};
         kindSel.value = s2.kind || 'manual';
-        hoursSel.value = String(s2.hours || 1);
+        hoursSel.value = String(pickHours);
         timeIn.value = s2.time || '08:00';
         wdaySel.value = String(s2.weekday || 0);
         daySel.value = String(s2.day || 1);
