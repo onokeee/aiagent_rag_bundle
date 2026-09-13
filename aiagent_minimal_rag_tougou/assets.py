@@ -190,10 +190,10 @@ TEMPLATES = {
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
+    {# 一般利用者のメニュー。管理者の分は上の囲いにある（同じものを2回出さない）。
+       ヘルプは管理者メニューのタブに移したので、ここには置かない #}
+    {% if not user.is_admin %}
     <div class="sidebar__section">
-      {# 上の「マイエージェント」は管理者限定の囲みの中にある。一般利用者は
-         ヘルプやテーブル画面を開くと、戻る道が無くなってしまうのでここにも置く #}
-      {% if not user.is_admin %}
       <a class="navlink {{ 'is-active' if nav.startswith('chat.') }}" href="{{ url_for('chat.index') }}"
          data-desc="データについて日本語で質問すると、AIがSQLを書いて答えます。">
         {{ icon('chat') }} マイエージェント</a>
@@ -205,13 +205,8 @@ TEMPLATES = {
          data-desc="AIがあなたについて覚えていること（前提・好み・期間）。会話から自動で書き足され、ここで直せます。本人だけのものです。">
         {{ icon('user') }} 覚え書き</a>
       {% endif %}
-      {% endif %}
-      {% if not user.is_admin %}
-      <a class="navlink {{ 'is-active' if nav.startswith('help.') }}" href="{{ url_for('help.index') }}"
-         data-desc="全機能の説明書。">
-        {{ icon('help') }} ヘルプ</a>
-      {% endif %}
     </div>
+    {% endif %}
 
     {% block sidebar %}{% endblock %}
 
@@ -1321,7 +1316,7 @@ window.CHAT_INIT = {
         <thead><tr><th style="width:210px">項目</th><th>説明</th></tr></thead>
         <tbody>
           <tr><td>権限</td>
-              <td>一般利用者＝マイエージェント・マイロボット・ヘルプ。管理者＝全画面（カタログ・取り込み・各設定）。
+              <td>一般利用者＝マイエージェント・マイロボット・覚え書き。管理者＝全画面（管理者メニューの各タブ。ヘルプもここ）。
                   管理者だけに渡るAIツールは、一般利用者のAIには渡りません。</td></tr>
           <tr><td>アカウント管理</td>
               <td>サーバ上のコマンドで行います:
