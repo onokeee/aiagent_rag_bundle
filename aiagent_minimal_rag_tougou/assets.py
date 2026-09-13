@@ -185,8 +185,8 @@ TEMPLATES = {
       {% endif %}
       {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
          データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・利用状況 #}
-      <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.')) }}" href="{{ url_for('catalog.index') }}"
-         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+      <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.', 'help.')) }}" href="{{ url_for('catalog.index') }}"
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・ER図・用語集・例文・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
@@ -961,13 +961,31 @@ window.CHAT_INIT = {
                   文書の質問（手順・原因・規則）はナレッジベースを検索し、<b>[出典n]の番号つき</b>で
                   答えます。両方を組み合わせた質問（「一番停止が多い装置の対処方法は？」）もそのまま
                   聞けます。範囲の取り方で答えが変わる質問には、AIのほうから確認してきます。</td></tr>
-          <tr><td>「自分」で聞く</td>
-              <td>「<b>自分が</b>担当したトラブルを出して」「<b>自分宛てに</b>メールして」のように聞けます。
-                  AIはまず「ログイン中の利用者」の道具であなたのログインIDを調べ、つぎにデータカタログの中から
-                  社員名簿にあたる表を探して、そのIDと一致する行をあなたとして扱います。
-                  <b>どの表・どの列を使うかは、カタログに書かれた説明から判断します</b>（表の名前は決め打ちにしていません）。
-                  名簿が見つからない・1人に絞れないときは、推測せずに聞き返します。うまく当たらないときは、
-                  管理者が社員名簿の表と、ログインIDが入っている列（統一IDなど）に説明を書くと精度が上がります。</td></tr>
+          <tr><td>この答えはどうだったか</td>
+              <td>答えの下に<b>3つのボタン</b>が出ます。「これでいい」「数字が違う」
+                  「知りたいことと違う」です。1つ押すだけで終わりで、理由は書かなくてかまいません。
+                  真ん中の文言は、その答えが何を使ったかで変わります。表から数えたなら「数字が違う」、
+                  社内文書から答えたなら「書いてあることと違う」、どちらも使っていなければ「内容が違う」。
+                  <b>「数字が違う」を押したときだけ</b>、正しい値を1行きく欄が開きます（任意・飛ばせます）。
+                  ここに値が入ると、管理者がSQLをその値と突き合わせて、どの列や結合が悪いのかを特定できます。
+                  押したものは管理者の「利用状況」に集まり、データや文書を足す判断に使われます。</td></tr>
+          <tr><td>この取り方は合っている？</td>
+              <td>SQLの枠の下にも「合っている」「合っていない」が出ます。すぐ上に
+                  <b>「このSQLがしていること」</b>の日本語の解説があるので、読んで判断できる人はここで答えられます。
+                  「合っている」は<b>そのまま例文にしてよい</b>という評価と同じものなので、
+                  隣の「この質問と答え方を例文にする」と並べてあります。押せる人を絞ってはいません。</td></tr>
+          <tr><td>社内文書の出典の見え方</td>
+              <td>1回の検索で15件ほど返ることがあります。全部を抜粋つきで並べると、
+                  答えより根拠のほうが長くなって読めません。そこで
+                  <b>AIが実際に根拠にした出典だけを開いて見せ</b>、残りは
+                  「引用されなかった N 件も見る」に畳んでいます。<b>消してはいない</b>ので、押せば全部見られます。
+                  抜粋は文書の先頭200字だけです（その先はこの画面には来ていないので、
+                  原本を読みたいときはファイル名から当たってください）。</td></tr>
+          <tr><td>このデータがほしい、と伝える</td>
+              <td>AIが「いまのデータでは答えられない」と判断したときだけ、黄色いカードが出ます。
+                  何が足りなかったかをAIが一文で書くので、<b>伝える／伝えない</b>を選ぶだけです。
+                  伝えたものは管理者の「利用状況 → 要望」に、同じ趣旨のものと束ねて多い順に並びます。
+                  社内文書の検索が1件も見つからずに終わったときは、押さなくても記録されます。</td></tr>
           <tr><td>「自分」で聞く</td>
               <td>「<b>自分が</b>担当したトラブルを出して」「<b>自分宛てに</b>メールして」のように聞けます。
                   AIはまず「ログイン中の利用者」の道具であなたのログインIDを調べ、つぎにデータカタログの中から
@@ -983,10 +1001,6 @@ window.CHAT_INIT = {
                   メニューの「<b>パーソナライズ</b>」（マイロボットの下）で本文をそのまま読んで直せます。「覚えない」にすると止まり、
                   いまの本文もAIに渡しません。会話で「忘れて」と言えば、その回答のあとに消えます（消えていなければ本文から消してください）。
                   他の利用者には見えませんが、<b>管理者は管理者メニューで内容を見られます</b>（利用状況の質問履歴と同じ扱い）。</td></tr>
-          <tr><td>メールの決まり</td>
-              <td>このアプリから出るメールは、差出人がアプリ名（{{ app_title }}）と管理者が決めたアドレスになり、
-                  本文の冒頭に<b>自動で作られたメールであることの断り書き</b>と<b>送信者（あなたのログインID）</b>が入ります。
-                  文面は管理者が「メール設定」で決めています。送れる宛先も管理者が登録したものだけです。</td></tr>
           <tr><td>メールの決まり</td>
               <td>このアプリから出るメールは、差出人がアプリ名（{{ app_title }}）と管理者が決めたアドレスになり、
                   本文の冒頭に<b>自動で作られたメールであることの断り書き</b>と<b>送信者（あなたのログインID）</b>が入ります。
@@ -1077,12 +1091,6 @@ window.CHAT_INIT = {
           <tr><td>詳細を見る</td>
               <td>マイロボットの画面の各カードの「詳細」を開くと、手順ごとの中身（SQLや引数）・穴・使う表・フォルダ出力・定期実行・
                   メール・作成日時・前回の実行結果が全部見られます。</td></tr>
-          <tr><td>社内文書の検索を含める</td>
-              <td>ナレッジベース（社内文書）の検索も手順に入れられます。実行するたびに<b>そのときの文書を検索し直す</b>ので、
-                  手順書が更新されていれば新しい内容が出ます。見つけた文章は表（出典・ナレッジベース・文書・抜粋）としても
-                  受け取れるので、そのまま Excel／CSV に出したり、メールに添付したりできます。
-                  ただし<b>AIが書いた回答の文章そのものは再現しません</b>（AIを使わない実行なので）。
-                  毎回ちがう文章が必要なときは、マイエージェントで聞いてください。</td></tr>
           <tr><td>社内文書の検索を含める</td>
               <td>ナレッジベース（社内文書）の検索も手順に入れられます。実行するたびに<b>そのときの文書を検索し直す</b>ので、
                   手順書が更新されていれば新しい内容が出ます。見つけた文章は表（出典・ナレッジベース・文書・抜粋）としても
@@ -1301,8 +1309,18 @@ window.CHAT_INIT = {
               <td>利用者のパーソナライズ（AIが会話から覚える前提・好み・期間。1人1つの本文）の決めごと: <b>機能を使うか</b>（外すとメニューから消え、AIにも渡さない）、
                   <b>書き直しに使うモデル</b>（回答のたびに1回呼ぶので、安いモデルにできる）、<b>本文の上限（文字）</b>。
                   その下に<b>全利用者の本文</b>がそのまま並びます（閲覧のみ。直せるのは本人だけ）。</td></tr>
-          <tr><td>利用状況</td>
-              <td>このアプリの使われ方の集計（質問数・利用者・推移・道具・失敗の内訳）と、質問と回答の履歴。
+          <tr><td>利用状況（要望・前提の地図・レポート）</td>
+              <td><b>要望</b>: 「知りたいことと違う」と押されたもの、AIが答えきれないと申告したもの、
+                  社内文書の検索が0件で終わったものを、多い順に束ねて並べます。
+                  カタログのどの言葉にも当たらなかった語も出ます。<br>
+                  <b>前提の地図</b>: 全員のパーソナライズを行ごとに並べます。2人以上が同じことを
+                  覚えていれば、それは個人の好みではなく組織の常識なので、用語集か表の説明に
+                  1度書けば全員に効きます。同じ言葉について食い違う前提は、定義が揺れている候補です。<br>
+                  <b>レポート</b>: 押したときだけAIを1回呼び、読み物を1本作ります。
+                  数字はこのアプリが数えたもので、AIには言葉だけを書かせています。</td></tr>
+          <tr><td>利用状況（健康診断の側）</td>
+              <td>タブは<b>全体像／利用者／推移／使われた機能／使われたデータ／失敗／質問・履歴</b>。
+                  どれだけ使われたか、どの表が使われたか、どこで転んだか。
                   期間と利用者で絞り、Excel に出せます。他の利用者の質問がそのまま見えるので取り扱いに注意。</td></tr>
         </tbody>
       </table>
@@ -1874,7 +1892,7 @@ window.CHAT_INIT = {
         <tbody>
           <tr><td>構成</td>
               <td>Python + Flask の1プロセス。画面（Jinja2テンプレート）とAPIを同じサーバが返します。
-                  機能ごとに11個のブループリント（マイエージェント／カタログ／取り込み／メール／モデル／
+                  機能ごとに12個のブループリント（マイエージェント／カタログ／取り込み／メール／モデル／
                   ナレッジ／表示／ヘルプ／認証ほか）に分かれています。</td></tr>
           <tr><td>起動</td>
               <td><code>python core.py</code>。内部では waitress（1プロセス・マルチスレッドの
@@ -2243,7 +2261,7 @@ window.CHAT_INIT = {
   <div class="card mt">
     <div class="card__title">3-12. 整合性の警告（カタログ画面の⚠）</div>
     <div class="card__desc">
-      カタログに書いてある内容が、実際のデータとずれていないかを毎回照合します。検出するのは次の8種類です。
+      カタログに書いてある内容が、実際のデータとずれていないかを毎回照合します。検出するのは次の12種類です。
     </div>
     <div class="tablewrap">
       <table class="data">
@@ -2255,6 +2273,11 @@ window.CHAT_INIT = {
           <tr><td>関連の列が無い／表が無い</td><td>関連の端点が実在しない（他データベースを指すものは対象外）</td></tr>
           <tr><td>例文が存在しない表を使用</td><td>例文のSQLに、実在しない「まとまり__表名」が出てくる</td></tr>
           <tr><td>検算が存在しない表を使用</td><td>左右のSQLとドリルダウンを合わせて判定</td></tr>
+          <tr><td>関連の列数が合っていない</td><td>複合キーの関連で、左右の列の数が違う。</td></tr>
+          <tr><td>ツールが存在しない表を使用</td><td>ユーザー定義ツールのSQLに、実在しない表が出てくる。</td></tr>
+          <tr><td>まとまりのメモだけが残っている</td><td>メモはあるのに、そのまとまりの表が1つも無い。</td></tr>
+          <tr><td>まとまりのメモの表名が実在しない</td><td>メモの中で案内している表が、いまは無い。</td></tr>
+          <tr><td>まとまりのメモの案内先が無い</td><td>メモが、存在しないまとまりへ案内している。</td></tr>
           <tr><td>用語のSQL式が存在しない表を使用</td><td>SQL式を持つ用語のみ対象</td></tr>
         </tbody>
       </table>
@@ -2900,6 +2923,71 @@ window.CHAT_INIT = {
     </div>
   </div>
   {% endif %}
+
+
+    <h3>この答えはどうだったか（評価の記録）</h3>
+    <div class="mt">置き場は <code>data/feedback.jsonl</code>（1行1件の追記専用）。
+      <b>会話ファイルとは別</b>にしてある。利用者が会話を消しても、要望が残っていないと意味がないため。</div>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th style="width:210px">入口</th><th>中身</th></tr></thead>
+      <tbody>
+        <tr><td>利用者が押したもの</td><td><code>POST /api/feedback</code>。
+            種類は ok / wrong / off_target / sql_ok / sql_ng と、AIの申告への返事 gap_confirm / gap_dismiss。
+            <b>質問文・何で答えたか・使った表は、画面から来た値ではなくサーバが会話ファイルから取り直す</b>
+            （画面の値を信じると、押した人が書き換えられる値の上に要望の一覧を作ることになる）。
+            同じ人が同じ質問に同じ種類を2回押しても、1件しか残らない。</td></tr>
+        <tr><td>AIの申告</td><td>道具 <code>report_gap(kind, what)</code>。
+            kind は data / doc / feature / explain。答えきれないと自覚したときに1回だけ呼ばせる。
+            追加のAI呼び出しは要らない（答えを書く流れの中で手順が1つ増えるだけ）。</td></tr>
+        <tr><td>0件で終わった文書検索</td><td>誰も押さなくても自動で1行。
+            「予算に入らなくて渡せなかった」と「本当に無かった」を区別していて、後者だけを残す。</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>引用率（社内文書の当たり具合）</h3>
+    <div class="mt">AIは根拠にした箇所に <code>[出典1]</code> のように番号を添える決まりになっている。
+      つまり<b>返した出典と、実際に引いた出典の両方が会話の記録に残っている</b>。その比が引用率で、
+      <b>誰も押さなくても取れる</b>うえ、<b>過去の会話からもさかのぼって数えられる</b>。
+      出典番号は質問ごとに1から振り直されるので、質問の区切りごとに突き合わせる
+      （まとめて数えると、前の質問の番号を今の回答が引いたことになる）。</div>
+    <div class="mt">引用率が低いときは、取ってくる件数が多すぎるか、文書の切り方が粗いか、
+      そのナレッジベースがその質問に向いていないかのどれか。「使われた機能」タブにナレッジベース別で出る。</div>
+
+    <h3>デバッガは開かせない</h3>
+    <div class="mt">デバッガが開いていると、例外が出たときに<b>ブラウザからサーバの Python を実行できる</b>。
+      PIN で守られているように見えるが、PIN はユーザー名・MACアドレス・マシンIDから作る固定値で、
+      同じ機械なら毎回同じものが出る。守りにならない。</div>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th style="width:260px">断るもの</th><th>どこで止めるか</th></tr></thead>
+      <tbody>
+        <tr><td><code>flask run --debug</code></td><td>環境変数 <code>FLASK_DEBUG</code> に落ちてから
+            アプリが読み込まれるので、<code>create_app</code> の入口で見る。</td></tr>
+        <tr><td>環境変数 <code>FLASK_DEBUG=1</code></td><td>同上。コマンドに書かなくても同じ扱い。</td></tr>
+        <tr><td><code>flask run --debugger</code></td><td>こちらは環境変数を通らない別の引数なので、
+            起動時の引数も見る。</td></tr>
+        <tr><td><code>DEBUG = True</code> のまま外に出す</td><td><code>HOST</code> が
+            自分のPCからしか届かないアドレスでなければ、起動そのものを止める。</td></tr>
+      </tbody>
+    </table></div>
+    <h3>利用状況の新しい口</h3>
+    <div class="tablewrap"><table class="data">
+      <thead><tr><th style="width:280px">ルート</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/feedback</code></td><td>この答えはどうだったか。ログインしていれば誰でも。
+            自分の会話でなければ 404。同じ質問に同じ種類は1件しか残らない。</td></tr>
+        <tr><td><code>GET /api/usage/report?method=requests</code></td><td>要望の集計（管理者のみ）。</td></tr>
+        <tr><td><code>GET /api/usage/report?method=premises</code></td><td>前提の地図（管理者のみ）。</td></tr>
+        <tr><td><code>GET /api/usage/reports</code></td><td>保存したレポートの一覧と1本の中身（管理者のみ）。</td></tr>
+        <tr><td><code>POST /api/usage/report-build</code></td><td>レポートを1本作る。<b>ここだけAIを1回呼ぶ</b>
+            （管理者のみ）。押したときにしか動かない。</td></tr>
+      </tbody>
+    </table></div>
+    <div class="mt">レポートは集計ではなく読み物なので、<code>/api/usage/report?method=report</code> では取れない（400）。
+      Excel出力の対象にもならない。</div>
+
+    <div class="mt">通常の起動は <code>python core.py</code>（waitress）。
+      <code>flask run</code> は Werkzeug の開発サーバで、接続ごとにスレッドを無制限に作り、
+      遅いクライアントも切らない。本番の待ち受けには向かない。</div>
 
   <!-- ==================================================================== -->
   <!-- 第4部 用語解説 -->
@@ -4013,7 +4101,7 @@ return picked[:MAX_ATTACHED] if picked else scope</pre><div class="mt">「選択
     <div class="card__title" id="impl-tools">5-5. ツール基盤</div>
     <div class="card__desc">AIに渡す「関数の宣言（JSON Schema）」と「実処理（ハンドラ）」を別々に持ち、両者を名前で突き合わせて実行する層。宣言は BUILTIN_TOOLS（静的リテラル37個＋グラフ6個の機械生成＋ナレッジ1個、引退1個を除いて計43個）に集約し、build_tools が権限・無効化・説明上書き・動的なナレッジ宣言・ユーザー定義ツールを毎ステップ合成して LLM に渡す。実行は dispatch が引数JSONの解析から検算の割り込みまで一本道で通し、戻り値は必ず {ok, llm_content, render} の3キー（検算が引っかかったときだけ verify_alerts が生える）。ツールが取った表は results の置き場に預けて result_id を返し、後続のツールが同じSQLを書き直さずに使い回せるようにしている。</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:210px">項目</th><th>内容</th></tr></thead><tbody>
-      <tr><td>全体像 — 4つの表と1つの入口</td><td><div class="mt">ツール基盤は「名前をキーにした4つの表」だけでできている。ツールを1つ足すときに触るのはこの4つ。</div><div class="tablewrap"><table class="data"><thead><tr><th>表</th><th>中身</th><th>誰が作るか</th></tr></thead><tbody><tr><td><code>BUILTIN_TOOLS</code></td><td>宣言（JSON Schema）のリスト</td><td>元 <code>tools/schemas.py</code> のリテラル ＋ <code>_chart_tools()</code> ＋ <code>KNOWLEDGE_TOOLS</code></td></tr><tr><td><code>_HANDLERS</code></td><td>ツール名 → 実処理の関数</td><td>各モジュールの <code>HANDLERS_*</code> を <code>_MODULES</code> 順に合成</td></tr><tr><td><code>SQL_TOOLS</code></td><td>SQLを引数で受け取るツール名の集合</td><td>各モジュールの <code>SQL_TOOLS_*</code> の和</td></tr><tr><td><code>ADMIN_TOOLS</code></td><td>管理者にだけ渡すツール名の集合</td><td>各モジュールの <code>ADMIN_TOOLS_*</code> の和</td></tr></tbody></table></div><div class="mt">合成の元になるのが <code>_MODULES</code>。<code>(HANDLERS_*, SQL_TOOLS_*, ADMIN_TOOLS_*)</code> の3つ組を、統合前のファイル順（query → stats → reports → mail → business → files → usage → knowledge）で並べたタプルで、コメントに「名前が重なったときにどちらが残るかを変えないため、順序は動かさないこと」と明記されている（辞書内包なので<b>後勝ち</b>）。</div><pre class="mono small">_HANDLERS   = {name: fn for m in _MODULES for name, fn in m[0].items()}
+      <tr><td>全体像 — 4つの表と1つの入口</td><td><div class="mt">ツール基盤は「名前をキーにした4つの表」だけでできている。ツールを1つ足すときに触るのはこの4つ。</div><div class="tablewrap"><table class="data"><thead><tr><th>表</th><th>中身</th><th>誰が作るか</th></tr></thead><tbody><tr><td><code>BUILTIN_TOOLS</code></td><td>宣言（JSON Schema）のリスト</td><td>元 <code>tools/schemas.py</code> のリテラル ＋ <code>_chart_tools()</code> ＋ <code>KNOWLEDGE_TOOLS</code> ＋ <code>WHOAMI_TOOL</code> ＋ <code>REPORT_GAP_TOOL</code></td></tr><tr><td><code>_HANDLERS</code></td><td>ツール名 → 実処理の関数</td><td>各モジュールの <code>HANDLERS_*</code> を <code>_MODULES</code> 順に合成</td></tr><tr><td><code>SQL_TOOLS</code></td><td>SQLを引数で受け取るツール名の集合</td><td>各モジュールの <code>SQL_TOOLS_*</code> の和</td></tr><tr><td><code>ADMIN_TOOLS</code></td><td>管理者にだけ渡すツール名の集合</td><td>各モジュールの <code>ADMIN_TOOLS_*</code> の和</td></tr></tbody></table></div><div class="mt">合成の元になるのが <code>_MODULES</code>。<code>(HANDLERS_*, SQL_TOOLS_*, ADMIN_TOOLS_*)</code> の3つ組を、統合前のファイル順（query → stats → reports → mail → business → files → usage → knowledge）で並べたタプルで、コメントに「名前が重なったときにどちらが残るかを変えないため、順序は動かさないこと」と明記されている（辞書内包なので<b>後勝ち</b>）。</div><pre class="mono small">_HANDLERS   = {name: fn for m in _MODULES for name, fn in m[0].items()}
 SQL_TOOLS   = {name for m in _MODULES for name in m[1]}
 ADMIN_TOOLS = {name for m in _MODULES for name in m[2]}</pre><div class="mt">実測値:</div><div class="mt">・<code>_HANDLERS</code> は44個（query 19 / stats 10 / reports 3 / mail 2 / business 7 / files 1 / usage 1 / knowledge 1）。<br>・<code>BUILTIN_TOOLS</code> は43個。差の1個は引退した <code>plot_chart</code>（宣言だけ消して実処理は残してある）。<br>・<code>SQL_TOOLS</code> は25個（query 11 = 固定5 ＋ <code>_CHART_TOOLS</code> 6、stats 8、business 6）。うち宣言があるのは24個。<br>・<code>ADMIN_TOOLS</code> は <code>{&quot;explore_import_files&quot;, &quot;analyze_usage&quot;}</code> の2個だけ。</div><div class="mt"><code>SQL_TOOLS</code> に入れない判断にも理由がある。<code>data_quality</code> は引数でSQLを受け取らず自分でDBを見に行くので対象外。<code>scenario_analysis</code> と <code>monte_carlo_simulation</code> はSQLが任意なので外してある。<code>analyze_usage</code> と <code>search_knowledge_base</code> は材料がDBではない（履歴ファイル／ナレッジベース）。</div></td></tr>
       <tr><td>BUILTIN_TOOLS の組み立て — import時に3段階で書き換わる</td><td><div class="mt"><code>BUILTIN_TOOLS</code> という名前は import 中に3回意味が変わる。読む順序を間違えると何が入っているか分からなくなる。</div><div class="mt"><b>第1段: リテラルの構築</b>元 <code>tools/schemas.py</code> の巨大なリスト。静的に書かれたツールが37個、その途中に <code>*_chart_tools()</code> が展開されて用途別グラフ6個（<code>plot_comparison</code> / <code>plot_trend</code> / <code>plot_composition</code> / <code>plot_distribution</code> / <code>plot_relationship</code> / <code>plot_kpi</code>）が入る。グラフツールの宣言は <code>_CHART_TOOLS</code>（名前 → 分類・説明・使う指定・必須）と <code>_CHART_ARGS</code>（引数名 → スキーマ断片）から機械生成される。同じ引数の説明を6回書かないため。</div><div class="mt"><b>第2段: <code>_allow_result_id(BUILTIN_TOOLS)</code></b>宣言の木を再帰で全走査し、<code>properties</code> に <code>&quot;sql&quot;</code> があって <code>&quot;result_id&quot;</code> が無いノードすべてに次を足す。</div><div class="mt">・<code>result_id</code>（<code>_RESULT_ID</code>）… 前のツールが取ったデータを指す<br>・<code>rows</code>（<code>_INLINE_ROWS</code>）… 表そのものを直接渡す（DBを介さないデータ）<br>・<code>columns</code>（<code>_INLINE_COLUMNS</code>）… ただし <b><code>columns</code> が既にあるノードは上書きしない</b></div><div class="mt">さらに、そのノードの <code>required</code> から <code>&quot;sql&quot;</code> を取り除く。SQLの代わりに result_id や rows で来てもよくなるため。</div><div class="mt">再帰なので、トップレベルだけでなく <code>export_excel</code> の <code>sheets.items</code>（<code>properties</code> に <code>sql</code> がある）や、レポートの節のような入れ子にも同じ処理が効く。docstring に「1つずつ手で書き足すと必ず抜けるので、木をたどって機械的に付ける」とある。</div><div class="mt"><code>columns</code> を上書きしない理由はコメントに書かれている。<code>pivot_table</code> の <code>columns</code> は「列に展開する1列名」で<b>文字列</b>であり、ここで配列宣言に置き換えると後段の <code>_coerce_lists</code> が文字列を要素1つの配列に直してしまい、pandas 側で <code>unhashable type: &#x27;list&#x27;</code> になる。</div><div class="mt"><b>第3段: 引退フィルタ</b></div><pre class="mono small">_RETIRED = {&quot;plot_chart&quot;}
@@ -4047,7 +4135,7 @@ return _attach_verification(_run_custom(tool, args, scope), sqls, scope)</pre><d
 }</pre><div class="mt"><code>_execute</code> での扱いが対称になっている。</div><div class="mt">・<code>llm_content</code> → <code>chat[&quot;messages&quot;].append({&quot;role&quot;: &quot;tool&quot;, &quot;tool_call_id&quot;: c[&quot;id&quot;], &quot;content&quot;: content})</code><br>・<code>render</code> → 真なら <code>chat[&quot;render_log&quot;].append(dict(res[&quot;render&quot;]))</code></div><div class="mt"><b>作り分けの原則</b>は「AI向けは要約、画面向けは全行」。</div><div class="tablewrap"><table class="data"><thead><tr><th>ツール</th><th>llm_content</th><th>render</th></tr></thead><tbody><tr><td><code>run_sql_query</code></td><td><code>columns</code> / <code>row_count</code> / <b>先頭 <code>SAMPLE_ROWS_FOR_LLM</code>=40行</b> / <code>result_id</code> / <code>note</code> / <code>source_note</code> / <code>example_registered</code></td><td><code>kind: table</code> に<b>全行</b>（最大2,000行）</td></tr><tr><td><code>plot_chart</code> 系</td><td><code>status: &quot;chart_rendered&quot;</code> / <code>chart_type</code> / <code>columns</code> / <code>row_count</code> / <code>result_id</code> — <b>行データを入れない</b></td><td><code>kind: chart</code> に全行</td></tr><tr><td>分析系（<code>_report_result</code>）</td><td><code>notes</code> 全文 ＋ 各表の先頭40行 ＋ <code>meta</code>。表ごとに <code>result_id</code></td><td><code>kind: report</code> に表を丸ごと</td></tr><tr><td>ファイル出力</td><td><code>status: &quot;file_ready&quot;</code> / <code>filename</code> / <code>columns</code> / <code>row_count</code>。<b>バイト列は渡さない</b></td><td><code>kind: file</code> に <code>data</code>（bytes）と <code>sheets</code></td></tr><tr><td><code>describe_table</code></td><td><b>JSONではなく素のテキスト</b>（<code>catalog.describe_table_text</code> の戻り）</td><td><code>None</code></td></tr><tr><td>エラー（<code>_err</code>）</td><td><code>{&quot;error&quot;: message}</code></td><td><code>kind: error</code> の1枚カード</td></tr></tbody></table></div><div class="mt">グラフの行データをAI側に入れないのは、AIには「描いた」という事実と <code>result_id</code> があれば足りるため。逆に <code>notes</code>（所見）は AI に読ませたいので全文渡す。</div><div class="mt"><b>画面への最後の変換</b>は <code>render_item_for_web</code>。<code>data</code> と <code>sheets</code> を除いた全キーを <code>jsonable()</code>（NaN/inf を <code>None</code> に潰す）で通し、</div><div class="mt">・<code>chart</code> / <code>chart_dual</code> → plotly の figure JSON にして <code>kind</code> を <code>&quot;chart&quot;</code> に統一。描画に失敗したら <code>kind: &quot;error&quot;</code> に差し替える<br>・<code>report_doc</code> → 節ごとの <code>chart</code> を figure に変換<br>・<code>file</code> → <code>sheets</code> を先頭20行＋総数だけのプレビューに縮める</div><div class="mt">さらに <code>_web_log</code> が、<code>item[&quot;data&quot;]</code> を持つアイテムを <code>_fs_put</code> でサーバに預けて <code>w[&quot;url&quot;] = &quot;/api/file/&lt;token&gt;&quot;</code> に差し替え、<code>kind == &quot;sql&quot;</code> のアイテムに <code>TOOL_LABELS</code> から日本語ラベル（<code>run_sql_query</code> → 「SQL実行 (SELECT)」など）を付ける。</div><div class="mt"><b>切り詰めの表示</b>は llm_content と render の両方に入れる。<code>source_note()</code> が AI向け（<code>source_row_count</code> / <code>source_truncated</code> / <code>source_total_rows</code> / <code>warning</code>）、<code>render_source_note()</code> が画面向け（<code>truncated</code> / <code>source_total_rows</code>）。docstring に、長らく <code>llm_content</code> にしか入っておらず、2,000行を超える明細から作った散布図やピボットが断り書きなしに一部だけを描いていた、と経緯が書かれている。</div></td></tr>
       <tr><td>ユーザー定義ツールの合流と _run_custom</td><td><div class="mt">ユーザー定義ツールは「名前 + 説明 + パラメータ定義 + SQLテンプレート + 出力形式」だけで表す。Pythonコードは書かせない。SQLは <code>db.run_select</code> の SELECT専用ガードを通し、パラメータは SQLite のバインド変数として渡すのでSQLインジェクションは起こらない。保存先は各DBの <code>.meta.yaml</code> の <code>tools:</code>。</div><div class="mt"><b>収集</b> — <code>collect_everywhere(selected=None)</code>:</div><div class="mt">・<code>db.list_db_files()</code> 順に全DBの <code>.meta.yaml</code> を読む。<b>置き場のDBを選んでいなくても拾う</b>（ツールは作るときにDBを意識させないため、組み込みと同じ扱いにする）。<br>・<code>enabled is False</code> は除外。<b>名前の重複は先に見つかった方が勝つ</b>（<code>seen</code> セット）。<br>・<code>selected</code> を渡すと、そのSQLが名指ししている DB が1つも選ばれていないツールを外す。どのDBも名指ししていないSQL（<code>dbs_named_in</code> が空）は置き場のDBのものとして扱う。<br>・各ツールに <code>owner</code>（alias）と <code>owner_file</code>（ファイル名）を足して返す。編集画面が保存先を知るため。</div><div class="mt"><b>検証</b> — <code>validate_custom_tool(tool, existing_names)</code> は問題点のリストを返す（<b>空なら妥当</b>）。<code>build_tools</code> は <code>if not validate_custom_tool(tool, set())</code> で判定するので、二重否定に注意。<code>existing_names</code> に <code>set()</code> を渡しているのは、重複が <code>collect_everywhere</code> の <code>seen</code> で既に落ちているため。検査項目:</div><div class="mt">・名前: <code>^[A-Za-z][A-Za-z0-9_]{0,47}$</code>、<code>builtin_names()</code> と重複しない、<code>existing_names</code> と重複しない<br>・説明・SQL: 必須<br>・パラメータ: 名前が <code>^[A-Za-z_][A-Za-z0-9_]*$</code>、重複なし、型が <code>(&quot;string&quot;,&quot;integer&quot;,&quot;number&quot;,&quot;boolean&quot;)</code> のいずれか<br>・<b>SQL中の <code>:名前</code> とパラメータ定義の対応を双方向で</b>（<code>bind_names()</code> は <code>(?&lt;!:):([A-Za-z_][A-Za-z0-9_]*)</code> で拾う。<code>::</code> は型キャストなので除外）<br>・出力形式が <code>(&quot;table&quot;,&quot;chart&quot;,&quot;chart_dual&quot;,&quot;excel&quot;,&quot;csv&quot;,&quot;none&quot;)</code> のいずれか、<code>chart</code> なら種別ごとの必須項目、<code>chart_dual</code> なら <code>x</code> / <code>bar_y</code> / <code>line_y</code></div><div class="mt"><code>builtin_names()</code> は <code>from tools import BUILTIN_TOOLS</code> を<b>遅延 import</b> して名前集合を作る。以前は4つだけ列挙していて、漏れた名前（<code>forecast</code> など）でツールを作れてしまい、AIに同じ名前の関数が2つ渡って実行されるのは組み込み側だけ、という不整合が起きていた、とコメントにある。</div><div class="mt"><b>実行</b> — <code>_run_custom(tool, args, scope)</code>:</div><div class="mt">・<code>render_sql(tool)</code> = <code>tool[&quot;sql&quot;].strip()</code>。<b><code>:name</code> は置換しない</b>（実行時にバインドするため）。<br>・<code>coerce_params(tool, args)</code> で定義された型に寄せる。<code>None</code> はそのまま <code>None</code>（＝NULLバインド）。変換できなければ <code>ValueError</code> → <code>_err</code>。<br>・<code>db.widen_scope(sql, scope)</code> で SQL が名指ししているDBを繋ぐ。<b>以降の預け先もこの広げた scope</b>。<br>・行数上限: <code>render</code> が <code>excel</code> / <code>csv</code> なら <code>min(config.EXPORT_MAX_ROWS, 1_048_575)</code>（Excelのシート上限）、それ以外は <code>None</code>（＝<code>db.run_select</code> の既定 = <code>MAX_RESULT_ROWS</code> 2,000）。<br>・<code>rows[:MAX_RESULT_ROWS]</code> を <code>_results.put(..., label=f&quot;{name}（ユーザー定義ツール）&quot;)</code> して <code>result_id</code> を返す。コメントに経緯がある — 組み込みツールは前から返しているのにユーザー定義だけ返しておらず、「このツールの結果をグラフにして」と言われてもAIには渡す手段が無かった（SQLはAIに見せていないので取り直せない）。<br>・<code>render</code> の値で分岐: <code>none</code> → <code>render: None</code> / <code>excel</code>・<code>csv</code> → ファイル生成して <code>kind: file</code> / <code>chart</code> → <code>chart.x</code> と <code>chart.y</code> が結果の列にあるか確かめてから <code>kind: chart</code> / <code>chart_dual</code> → <code>x</code> + <code>bar_y</code> + <code>line_y</code> を確かめて <code>kind: chart_dual</code> / それ以外 → <code>kind: table</code>。</div><div class="mt"><b>組み込みの上書き</b> — <code>builtin_overrides(entries)</code> は <code>.meta.yaml</code> の <code>builtin_tools:</code> を合成する。<code>{&quot;ツール名&quot;: {&quot;enabled&quot;: False}}</code> と <code>{&quot;ツール名&quot;: {&quot;description&quot;: &quot;...&quot;}}</code> の2種類だけ。無効化は OR（どれか1つで無効なら無効）、説明は最初に見つかったもの。</div></td></tr>
       <tr><td>主なデータ構造</td><td>・ツール宣言 t = {&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: str, &quot;description&quot;: str, &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {引数名: スキーマ}, &quot;required&quot;: [引数名]}}}<br>・dispatch の戻り値 = {&quot;ok&quot;: bool, &quot;llm_content&quot;: str, &quot;render&quot;: dict|None} ＋ 検算が引っかかったときだけ &quot;verify_alerts&quot;: [alert]<br>・render アイテム = {&quot;role&quot;: &quot;assistant&quot;, &quot;kind&quot;: &quot;table&quot;|&quot;chart&quot;|&quot;chart_dual&quot;|&quot;report&quot;|&quot;report_doc&quot;|&quot;file&quot;|&quot;error&quot;|&quot;sources&quot;|&quot;sql&quot;|&quot;text&quot;|&quot;glossary_term&quot;|&quot;mail_draft&quot;, ...kind ごとの追加キー}<br>・scope = [{&quot;path&quot;: str, &quot;alias&quot;: str, &quot;name&quot;: str（DBファイル名）, &quot;tables&quot;: [表名], &quot;meta&quot;: .meta.yaml の中身}]（build_scope が作る。dispatch には entries としても同じものが渡る）<br>・_MODULES = ((HANDLERS_query, SQL_TOOLS_query, ()), (HANDLERS_stats, ...), ... (HANDLERS_knowledge, SQL_TOOLS_knowledge, ADMIN_TOOLS_knowledge)) — (実処理dict, SQLを受け取る名前set, 管理者専用名前set) の3つ組<br>・_REQUIRED = {ツール名: (required の引数名, ...)}（import時に BUILTIN_TOOLS から凍結。_allow_result_id が sql を抜いた後の姿）<br>・_LIST_PARAMS = {ツール名: {&quot;文字列の配列&quot;型の引数名, ...}}（トップレベル properties のみ）<br>・results の1エントリ = {&quot;scope&quot;: str, &quot;columns&quot;: [str], &quot;rows&quot;: [tuple], &quot;truncated&quot;: bool, &quot;sql&quot;: str|None, &quot;norm_sql&quot;: str, &quot;turn&quot;: str, &quot;label&quot;: str|None}。result_id は &quot;r_&quot; + uuid4().hex[:8]、turn は &quot;t_&quot; + uuid4().hex[:8]<br>・fetch の戻り値 = (columns, rows, truncated, result_id, total_rows)。total_rows は切り詰めが起きたときだけ非 None<br>・ユーザー定義ツール = {&quot;name&quot;, &quot;description&quot;, &quot;parameters&quot;: [{&quot;name&quot;, &quot;type&quot;, &quot;description&quot;, &quot;required&quot;}], &quot;sql&quot;, &quot;render&quot;: table|chart|chart_dual|excel|csv|none, &quot;chart&quot;: {...}, &quot;enabled&quot;, &quot;owner&quot;: alias, &quot;owner_file&quot;: ファイル名}<br>・builtin_overrides の戻り値 = {ツール名: {&quot;enabled&quot;: False?, &quot;description&quot;: str?}}（enabled は False のときだけ入る）<br>・_Guard の状態 = {failed: {(name, arguments文字列): 理由}, done: {(name, arguments文字列)}, repeats: int}</td></tr>
-      <tr><td>定数・しきい値</td><td>・MAX_ENTRIES = 40 — results に覚えておく結果の数（元 tools/results.py）<br>・MAX_CELLS = 400_000 — results の総セル数（行×列）の上限。超えたら古い順に捨てるが len(_store) &gt; 1 の条件があるため最低1件は残る<br>・config.MAX_RESULT_ROWS = 2000 — 1クエリで取得・表示する最大行数。results に預けるのもこの行数まで<br>・config.SAMPLE_ROWS_FOR_LLM = 40 — llm_content に入れるサンプル行数（トークン節約）<br>・config.EXPORT_MAX_ROWS = 1000000（env で変更可）— ファイル出力の行数上限。_run_custom では min(EXPORT_MAX_ROWS, 1_048_575) でExcelのシート上限に丸める<br>・config.MAX_AGENT_STEPS = 10（env で変更可）— _advance / _stream_advance のループ回数<br>・_HAS_DEFAULT = {&quot;title&quot;, &quot;filename&quot;, &quot;chart_type&quot;, &quot;purpose&quot;} — スキーマ上は必須でも実処理が既定値を持つので _missing_required が見逃す引数<br>・_RETIRED = {&quot;plot_chart&quot;} — 宣言だけ BUILTIN_TOOLS から落とすツール。実処理は _HANDLERS に残る<br>・_DYNAMIC_TOOLS = {&quot;search_knowledge_base&quot;} — build_tools が固定宣言を捨てて組み立て直すツール<br>・ADMIN_TOOLS = {&quot;explore_import_files&quot;, &quot;analyze_usage&quot;} — ADMIN_TOOLS_files ∪ ADMIN_TOOLS_usage<br>・_Guard.LIMIT = 2 — 同じ (ツール名, 引数文字列) が何回来たら質問を打ち切るか<br>・BUILTIN_TOOLS = 43個（静的リテラル37 ＋ _chart_tools() 6 − plot_chart 1 ＋ KNOWLEDGE_TOOLS 1）。_HANDLERS = 44個<br>・SQL_TOOLS = 25個（query 11 / stats 8 / business 6）。うち宣言があり explanation が付くのは24個 — help.html の「24種」と一致<br>・custom_tools._NAME_RE = ^[A-Za-z][A-Za-z0-9_]{0,47}$ — OpenAI の function 名の制約に合わせた48文字以内<br>・custom_tools.RENDER_KINDS = (&quot;table&quot;, &quot;chart&quot;, &quot;chart_dual&quot;, &quot;excel&quot;, &quot;csv&quot;, &quot;none&quot;) / PARAM_TYPES = (&quot;string&quot;, &quot;integer&quot;, &quot;number&quot;, &quot;boolean&quot;)<br>・search_knowledge_base の chunk_top_k 上限 = max(1, min(AIの指定, 利用者設定の2倍, 100))</td></tr>
+      <tr><td>定数・しきい値</td><td>・MAX_ENTRIES = 40 — results に覚えておく結果の数（元 tools/results.py）<br>・MAX_CELLS = 400_000 — results の総セル数（行×列）の上限。超えたら古い順に捨てるが len(_store) &gt; 1 の条件があるため最低1件は残る<br>・config.MAX_RESULT_ROWS = 2000 — 1クエリで取得・表示する最大行数。results に預けるのもこの行数まで<br>・config.SAMPLE_ROWS_FOR_LLM = 40 — llm_content に入れるサンプル行数（トークン節約）<br>・config.EXPORT_MAX_ROWS = 1000000（env で変更可）— ファイル出力の行数上限。_run_custom では min(EXPORT_MAX_ROWS, 1_048_575) でExcelのシート上限に丸める<br>・config.MAX_AGENT_STEPS = 10（env で変更可）— _advance / _stream_advance のループ回数<br>・_HAS_DEFAULT = {&quot;title&quot;, &quot;filename&quot;, &quot;chart_type&quot;, &quot;purpose&quot;} — スキーマ上は必須でも実処理が既定値を持つので _missing_required が見逃す引数<br>・_RETIRED = {&quot;plot_chart&quot;} — 宣言だけ BUILTIN_TOOLS から落とすツール。実処理は _HANDLERS に残る<br>・_DYNAMIC_TOOLS = {&quot;search_knowledge_base&quot;} — build_tools が固定宣言を捨てて組み立て直すツール<br>・ADMIN_TOOLS = {&quot;explore_import_files&quot;, &quot;analyze_usage&quot;} — ADMIN_TOOLS_files ∪ ADMIN_TOOLS_usage<br>・_Guard.LIMIT = 2 — 同じ (ツール名, 引数文字列) が何回来たら質問を打ち切るか<br>・BUILTIN_TOOLS = 45個（静的リテラル37 ＋ _chart_tools() 6 − plot_chart 1 ＋ KNOWLEDGE_TOOLS 1 ＋ who_am_i ＋ report_gap）。_HANDLERS = 46個<br>・SQL_TOOLS = 25個（query 11 / stats 8 / business 6）。うち宣言があり explanation が付くのは24個 — help.html の「24種」と一致<br>・custom_tools._NAME_RE = ^[A-Za-z][A-Za-z0-9_]{0,47}$ — OpenAI の function 名の制約に合わせた48文字以内<br>・custom_tools.RENDER_KINDS = (&quot;table&quot;, &quot;chart&quot;, &quot;chart_dual&quot;, &quot;excel&quot;, &quot;csv&quot;, &quot;none&quot;) / PARAM_TYPES = (&quot;string&quot;, &quot;integer&quot;, &quot;number&quot;, &quot;boolean&quot;)<br>・search_knowledge_base の chunk_top_k 上限 = max(1, min(AIの指定, 利用者設定の2倍, 100))</td></tr>
     </tbody></table></div>
     <div class="card__title mt">落とし穴（18件）</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:60px">#</th><th>内容</th></tr></thead><tbody>
@@ -5647,6 +5735,21 @@ window.TABLE_INIT = {
     <div id="uBody"></div>
   </div>
 
+  {# レポート。集計ではなく読み物なので、表の枠とは別に描く #}
+  <div class="tabpane" id="pane-doc">
+    <div class="row mb" style="align-items:center;gap:8px;flex-wrap:wrap">
+      <input type="text" id="uRepName" style="max-width:140px" placeholder="2026-09">
+      <button class="btn btn--sm btn--primary" id="uRepBuild"
+              title="いまの条件で集計し、AIに1回だけ読み物を書かせます">レポートを作る</button>
+      <select id="uRepPick" style="max-width:200px"><option value="">保存したレポート…</option></select>
+      <span class="small muted" id="uRepNote"></span>
+    </div>
+    <div class="alert alert--warn small mb">
+      作るときだけAIを1回呼びます（費用がかかります）。数字はこのアプリが数えたもので、
+      AIには言葉だけを書かせています。集計の中身は左のタブで確かめてください。</div>
+    <div id="uRepBody"></div>
+  </div>
+
   {# 会話の履歴。左に一覧、右に中身 #}
   <div class="tabpane" id="pane-chats">
     <div id="uQNotes"></div>
@@ -6337,7 +6440,7 @@ details.acc.is-target {
     background: var(--surface); margin-bottom: 10px; overflow: hidden;
 }
 .toolblock__head {
-    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px; flex-wrap: wrap;
     background: var(--surface-2); font-size: 13px; font-weight: 500;
     color: var(--muted);
 }
@@ -6368,7 +6471,7 @@ details.acc.is-target {
 .src__where { font-size: 12.5px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
 .src__no { color: var(--accent); font-weight: 600; }
 .src__text {
-    /* 抜粋は先頭200字しか来ないので、切らずにそのまま出す。
+    /* 抜粋は先頭200字しか来ないので、切らずにそのまま出す。押す場所でもない。
        件数が多くて埋まる問題は「引用された出典だけ開く」の方で解いてある。 */
     /* 改行はそのままにしない。文書の抜粋には改行が多く、そのまま出すと
        1件で画面が埋まる。続けて流して、折り返しだけ任せる。 */
@@ -6384,8 +6487,8 @@ details.acc.is-target {
 .srcs__more:hover { color: var(--accent); }
 
 /* 集計の切り口の帯に入れる区切り。左がニーズ、右が健康診断 */
-.tabs__sep { width: 1px; height: 18px; align-self: center; margin: 0 10px;
-             background: var(--border-2); flex: none; }
+.tabs--sub .tabs__sep { height: 18px; align-self: center; margin: 0 10px;
+                        background: var(--border-2); flex: none; }
 
 .filecard {
     display: flex; align-items: center; gap: 12px; padding: 13px 15px;
@@ -6602,6 +6705,33 @@ details.acc.is-target {
 .tblpick, .grppick { flex: none; margin: 0; cursor: pointer; }
 .dbpick__table:has(.tblpick:not(:checked)) .dbpick__tname { opacity: .45; }
 /* 一覧はチェックの分だけ左を詰める（インデントが二重にならないように） */
+/* --- この答えはどうだったか（回答の下の3つのボタン） --------------------------------
+   「役に立ったか」と「合っているか」は別の軸だが、ボタンを4つ並べると
+   非IT部門の人は読み分けられない。1行1問にして、選択肢を3つにする。 */
+.fbrow {
+    display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+    font-size: 12px; color: var(--muted); margin: 2px 0 10px 2px;
+}
+.fbrow__b {
+    border: 1px solid var(--border-2); background: var(--surface); color: var(--text);
+    border-radius: 999px; padding: 2px 11px; font-size: 12px; cursor: pointer;
+}
+.fbrow__b:hover { border-color: var(--accent); color: var(--accent); }
+.fbrow__done { color: var(--ok); }
+.fbask {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 9px 11px; margin: 0 0 10px 2px; font-size: 12px; max-width: 640px;
+}
+.fbask input[type=text] { max-width: 260px; }
+.fbask .row { gap: 7px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+
+/* 答えきれなかったことの申告。AIが自分で書いた1行を、そのまま管理者に渡す */
+.gapcard {
+    background: var(--warn-weak); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 10px 12px; margin-bottom: 10px; font-size: 12.5px; max-width: 640px;
+}
+.gapcard__what { color: var(--muted); margin: 5px 0 9px; }
+
 /* --- パーソナライズ（専用の画面。本文は1つのテキスト） ------------------------ */
 .memedit textarea { width: 100%; min-height: 340px; margin-top: 10px; font-size: 14px; line-height: 1.75;
                     font-family: inherit; resize: vertical; }
@@ -9523,7 +9653,11 @@ function renderHistory(items) {
         const stamp = (c.updated_at || '').slice(5, 16).replace('T', ' ');
         box.append(el('div', {
             class: 'histitem' + (c.id === currentChatId ? ' is-active' : ''),
-            onclick: ev => { if (!ev.target.closest('.histitem__del')) openChat(c.id); },
+            onclick: ev => {
+                if (ev.target.closest('.histitem__del')) return;
+                // 別のタブで消された会話を押すと api() が投げる。黙って止まらないよう受ける
+                openChat(c.id).catch(e => { toast(e.message, 'warn'); refreshHistory(); });
+            },
         },
             el('div', { class: 'histitem__title', title: `${c.title}（${stamp}）` }, c.title || '（無題）'),
             el('span', { class: 'small muted' }, stamp),
@@ -9751,6 +9885,7 @@ function showEmpty() {
 function clearLog() {
     viewToken++;                 // 進行中の送信からの描き込みを、ここで無効にする
     turnCount = 0;
+    fbTurn = null;               // 前の会話の「この答えはどうだったか」を持ち越さない
     $('#logInner').replaceChildren(renderEmpty());
 }
 
@@ -9947,11 +10082,150 @@ function exampleCard(item) {
    ファイル名・本文の抜粋を並べる。AIの回答を人が検証できることが目的なので、
    折りたたんで隠さず、行の抜粋だけを畳んでおく（クリックで全文）。 */
 
+/* --- この答えはどうだったか ------------------------------------------------------
+   応えられなかった質問は、失敗としてはどこにも残らない。無い表について聞かれると
+   AIは「そのデータはありません」と答えて正常に終わるので、記録の上では
+   「成功した1問で終わった会話」になり、満足した人と見分けがつかない。
+   だからここで1回だけ聞く。
+
+   聞くのは「どうだったか」の1問だけ。選択肢は3つで、そのまま3つの直し方に対応する。
+     これでいい           → 例文の候補
+     数字が違う/書いてある… → カタログか文書を直す
+     知りたいことと違う    → データか文書を足す
+   ボタンを4つ並べて2つの軸を混ぜない（非IT部門の人は読み分けられない）。 */
+let fbTurn = null;
+
+function fbStart(turn) {
+    fbTurn = { turn, chatId: currentChatId, usedSql: false, usedDoc: false,
+               node: null, ask: null, sent: false, busy: false };
+}
+
+/** 真ん中のボタンの文言は、その回答が何で答えたかで変える。
+ *  表なら「数字が違う」、社内文書なら「書いてあることと違う」、両方なら「内容が違う」。 */
+function fbMidLabel(st) {
+    if (st.usedSql && st.usedDoc) return '内容が違う';
+    if (st.usedDoc) return '書いてあることと違う';
+    if (st.usedSql) return '数字が違う';
+    return '内容が違う';          // 表も文書も使わずに答えた回（「データがありません」など）
+}
+
+/** 「数字が違う」のあとに1行だけ聞く。任意。
+ *  値が入ると、苦情が検算のもとに変わる（管理者がSQLを既知の値と突き合わせられる）。 */
+function fbFollowLabel(st) {
+    if (st.usedDoc && !st.usedSql) return '正しくはどの文書に書いてありますか（任意）';
+    if (st.usedSql) return '正しい値が分かれば教えてください（任意）';
+    return 'どこが違いましたか（任意）';
+}
+
+/** 評価を送る。**押した行の turn** を送る（いまの turn ではない）。
+ *  ここを取り違えると、前の質問の行を押したときに別の質問の評価として残る。
+ *  会話IDも、その行を作ったときのものを使う（途中で会話を切り替えても正しく残る）。 */
+async function fbSend(st, kind, detail) {
+    if (!st || st.turn === undefined || st.turn === null) return false;
+    if (st.busy) return false;                 // 連打で同じものを2回送らない
+    st.busy = true;
+    try {
+        await api('/api/feedback', { chat_id: st.chatId || currentChatId, turn: st.turn,
+                                     kind, detail: detail || '' });
+        return true;
+    } catch (e) {
+        toast(e.message, 'warn');
+        return false;
+    } finally {
+        st.busy = false;
+    }
+}
+
+/** 回答の下に1行だけ置く。答えが増えるたびに末尾へ動かす（turn の最後に居させる）。 */
+function feedbackRow() {
+    if (!fbTurn || fbTurn.turn === undefined || fbTurn.turn === null) return;
+    if (fbTurn.sent) return;                  // もう押された turn には出し直さない
+    if (fbTurn.node) fbTurn.node.remove();
+    const st = fbTurn;
+    const row = el('div', { class: 'fbrow' }, el('span', {}, 'この答えは'));
+    const done = (msg) => {
+        st.sent = true;
+        row.replaceChildren(el('span', { class: 'fbrow__done' }, msg));
+        if (st.ask) st.ask.remove();
+    };
+    const ask = (kind) => {
+        if (st.ask) st.ask.remove();          // 2回押しても欄は1つにする
+        const inp = el('input', { type: 'text', placeholder: '' });
+        const send = async (b, value) => {
+            b.disabled = true;                // 応答を待つあいだの連打を止める
+            if (await fbSend(st, kind, value)) done('ありがとうございます。管理者に伝わりました。');
+            else b.disabled = false;
+        };
+        const box = el('div', { class: 'fbask' },
+            el('b', {}, fbFollowLabel(st)),
+            el('div', { class: 'row' }, inp,
+                el('button', { class: 'btn btn--sm btn--primary',
+                    onclick: ev => send(ev.currentTarget, inp.value) }, '送る'),
+                el('button', { class: 'btn btn--sm',
+                    onclick: ev => send(ev.currentTarget, '') }, '分からない')));
+        st.ask = box;
+        row.after(box);
+        inp.focus();
+    };
+    const btn = (label, fn) => el('button', { class: 'fbrow__b', onclick: fn }, label);
+    const one = (kind, msg) => async (ev) => {
+        ev.currentTarget.disabled = true;     // 応答を待つあいだの連打を止める
+        if (await fbSend(st, kind, '')) done(msg);
+        else ev.currentTarget.disabled = false;
+    };
+    row.append(
+        btn('これでいい', one('ok', 'ありがとうございます。例文の候補にします。')),
+        btn(fbMidLabel(st), () => ask('wrong')),
+        btn('知りたいことと違う', one('off_target', 'ありがとうございます。管理者に伝わりました。')));
+    st.node = row;
+    // その質問の最後の吹き出しの中に入れる。#logInner に直に足すと、
+    // このあと道具の結果が来たときに、行がその上へ取り残される
+    (slot('assistant') || $('#logInner')).append(row);
+}
+
+/** AIが「答えきれなかった」と申告したとき。記録はサーバ側で済んでいるので、
+ *  ここは本人に見せて、要らなければ取り消せるようにするだけ。 */
+/** 種別ごとの聞き方。語尾を機械的に落とすと「この説明が足りないを」のような文になるので、
+ *  そのまま文になる言い方を種別ごとに持つ。 */
+const GAP_ASK = {
+    data: 'このデータがほしい、と管理者に伝えますか？',
+    doc: 'この文書がほしい、と管理者に伝えますか？',
+    feature: 'この機能がほしい、と管理者に伝えますか？',
+    explain: 'この説明が足りない、と管理者に伝えますか？',
+};
+
+function gapCard(item) {
+    const st = fbTurn;                        // この回の turn を掴んでおく
+    const box = el('div', { class: 'gapcard' });
+    box.append(el('b', {}, GAP_ASK[item.gap_kind] || '足りないものを、管理者に伝えますか？'),
+               el('div', { class: 'gapcard__what' }, item.what || ''));
+    const foot = el('div', { class: 'row', style: 'gap:7px' });
+    const close = (msg) => box.replaceChildren(el('span', { class: 'small muted' }, msg));
+    const pick = (kind, msg) => async (ev) => {
+        ev.currentTarget.disabled = true;     // 応答を待つあいだの連打を止める
+        if (await fbSend(st, kind, item.what || '')) close(msg);
+        else ev.currentTarget.disabled = false;
+    };
+    foot.append(
+        el('button', { class: 'btn btn--sm btn--primary',
+                       onclick: pick('gap_confirm', '管理者に伝えました。') }, '伝える'),
+        el('button', { class: 'btn btn--sm',
+                       onclick: pick('gap_dismiss', '伝えませんでした。') }, '伝えない'));
+    box.append(foot);
+    return box;
+}
+
+
 /** 回答の本文に出てきた出典番号。半角・全角どちらの括弧でも拾う。
  *  括弧無しの「出典15」まで拾うと、「出典が15件」のような文まで数えてしまうので取らない。 */
 function citedNumbers(text) {
     const out = new Set();
-    String(text || '').replace(/[\[［]\s*出典\s*(\d+)/g, (_, n) => { out.add(String(Number(n))); return ''; });
+    // [出典1、3] のように1つの括弧に複数入ることがあるので、括弧の中の数字を全部拾う。
+    // 括弧の無い「出典15」は拾わない（「出典が15件」のような文まで数えてしまうため）
+    String(text || '').replace(/[\[［]\s*出典[^\]］]*/g, (block) => {
+        String(block).replace(/\d+/g, (n) => { out.add(String(Number(n))); return ''; });
+        return '';
+    });
     return out;
 }
 
@@ -10020,8 +10294,10 @@ function sourcesCard(item) {
                 r.hidden = !on;
                 if (!on) hidden++;
             });
-            list.hidden = (hidden === rows.length);   // 1件も出ないなら枠ごと消す
+            // hidden 属性は .srcs の display:flex に負けるので、クラスで消す
+            list.classList.toggle('hidden', hidden === rows.length);
             more.hidden = !all && !hidden;
+            foot.classList.toggle('hidden', more.hidden);   // 空の帯だけ残さない
             more.textContent = all ? '引用されなかった分を畳む'
                 : (list.dataset.fold === 'pending' ? `見つかった ${hidden} 件を見る`
                                                    : `引用されなかった ${hidden} 件も見る`);
@@ -10030,9 +10306,10 @@ function sourcesCard(item) {
             list.dataset.open = list.dataset.open === '1' ? '' : '1';
             sync();
         });
+        const foot = el('div', { class: 'toolblock__foot' }, more);
         list.syncFold = sync;
         sync();
-        block.append(list, el('div', { class: 'toolblock__foot' }, more));
+        block.append(list, foot);
     }
 
     // 一部のナレッジベースだけ落ちた場合。黙って減らすと「無かった」と誤解される
@@ -10049,11 +10326,13 @@ function addItem(item) {
     const body = slot(item.role === 'user' ? 'user' : 'assistant');
     if (item.kind === 'text' && item.role === 'user' && item.turn !== undefined) {
         turnCount = item.turn + 1;           // 次に送る発言の番号
+        fbStart(item.turn);                  // この質問ぶんの「どうだったか」を始める
         body.append(userTurn(item));
     } else if (item.kind === 'text') {
         body.append(el('div', { html: `<p>${mdToHtml(item.content)}</p>` },
                       catalogLinks(item.tables)));
         revealCitedSources(item.content);     // この本文が根拠にした出典だけを開く
+        feedbackRow();                        // 「この答えはどうだったか」を末尾に置き直す
     } else if (item.kind === 'sql') {
         const block = el('div', { class: 'toolblock' },
             el('div', { class: 'toolblock__head' },
@@ -10066,9 +10345,30 @@ function addItem(item) {
                     el('b', {}, 'このSQLがしていること'),
                     el('div', { style: 'white-space:pre-wrap;margin-top:3px' }, item.explanation))
                 : null);
+        if (fbTurn) fbTurn.usedSql = true;
         const links = catalogLinks(item.tables);
-        if (item.question || links) {
+        {
             const foot = el('div', { class: 'toolblock__foot' });
+            // 取り方が合っているかは、解説を読んだ人にしか判断できない。
+            // 押せる人を絞るのではなく、解説のすぐ下に置いて目に入るようにする。
+            // 「合っている」は、そのまま例文にしてよいという評価と同じもの。
+            const judge = el('div', { class: 'row', style: 'gap:6px;align-items:center' },
+                el('span', { class: 'small muted' }, 'この取り方は'));
+            const sqlSt = fbTurn;             // このSQLが出た回の turn を掴んでおく
+            const pick = (kind, msg) => async (ev) => {
+                ev.currentTarget.disabled = true;   // 応答を待つあいだの連打を止める
+                if (await fbSend(sqlSt, kind, item.sql || '')) {
+                    judge.replaceChildren(el('span', { class: 'small fbrow__done' }, msg));
+                } else {
+                    ev.currentTarget.disabled = false;
+                }
+            };
+            judge.append(
+                el('button', { class: 'fbrow__b',
+                    onclick: pick('sql_ok', 'ありがとうございます。例文の候補にします。') }, '合っている'),
+                el('button', { class: 'fbrow__b',
+                    onclick: pick('sql_ng', 'ありがとうございます。管理者に伝わりました。') }, '合っていない'));
+            foot.append(judge);
             if (item.question) {
                 // 直接保存ではなくAIに頼む。AIが内容の日本語説明と実データ付きの
                 // 登録カードを出し、そこで確定する（何が登録されるか見えるように）
@@ -10150,7 +10450,10 @@ function addItem(item) {
     } else if (item.kind === 'example_proposal') {
         body.append(exampleCard(item));
     } else if (item.kind === 'sources') {
+        if (fbTurn) fbTurn.usedDoc = true;
         body.append(sourcesCard(item));
+    } else if (item.kind === 'gap') {
+        body.append(gapCard(item));
     } else if (item.kind === 'table_link') {
         body.append(tableCardLink(item));
     } else if (item.kind === 'er') {
@@ -10634,7 +10937,12 @@ async function sendStreaming(text, imageTokens) {
     const closeText = () => {
         if (node && !buf.trim()) node.remove();   // 中身が無ければ跡を残さない
         else if (node) node.classList.add('is-done');   // 点滅カーソルを消す
-        revealCitedSources(buf);                  // 書き終えてから答え合わせをする
+        // 本文が空のまま答え合わせをしない。closeText は道具の結果が来るたびに呼ばれるので、
+        // 空で通すと「まだ引用されていない出典カード」を引用ゼロで確定させてしまう
+        if (buf.trim()) {
+            revealCitedSources(buf);
+            feedbackRow();                        // 答えが出そろってから1行置く
+        }
         node = null; buf = '';
     };
 
@@ -13533,6 +13841,9 @@ const who = () => $('#uUser').value || '';
 
 /** その表をグラフにするなら何が向くか。向かなければ null。 */
 function chartSpec(table) {
+    // 集計側が「この表はグラフにしない」と言っているなら描かない。
+    // 1列目が長い文の表は、棒を並べても軸が読めないため
+    if (table.chart === false) return null;
     const cols = table.columns || [], rows = table.rows || [];
     if (rows.length < 2 || cols.length < 2) return null;
     // 数値の列を探す（先頭列は見出しとして使う）
@@ -13744,7 +14055,15 @@ function renderChatList() {
                 el('div', { class: 'small muted' }, c.id,
                     ...(c.errors ? [' ', el('span', { class: 'badge badge--warn' }, `失敗${c.errors}`)] : []))),
             el('td', { title: x.text },
-                el('div', { class: 'qa__clamp' }, x.text)),
+                el('div', { class: 'qa__clamp' }, x.text),
+                // 押された評価。どの質問で何が押されたかが、そのまま改善の入口になる
+                ...((x.fb || []).length
+                    ? [el('div', { class: 'small' },
+                         ...(x.fb || []).map(f => el('span', {
+                             class: 'badge' + (f === 'これでいい' ? '' : ' badge--warn'),
+                             style: 'margin-right:4px',
+                         }, f)))]
+                    : [])),
             el('td', { class: 'qa__a', title: answer },
                 el('div', { class: 'qa__clamp' }, answer || '（回答なし）')));
     }));
@@ -13780,14 +14099,101 @@ async function loadChats() {
     renderChatList();
 }
 
+/* --- レポート（AIに1回だけ書かせる読み物） --------------------------------------
+   数字はコードが出し、AIには言葉だけを書かせている。だからここでは
+   返ってきた文をそのまま並べるだけで、計算も整形もしない。
+   作るのはボタンを押したときだけ（画面を開いただけでは呼ばない）。 */
+const REP_SECTIONS = [
+    ['used', 'よく使われている用途'],
+    ['teams', '部署ごとの様子'],
+    ['want_data', 'ほしいと言われたデータ'],
+    ['want_func', 'ほしいと言われた機能'],
+    ['actions', '次の1か月で打つ手'],
+    ['unknown', 'この記録からは分からないこと'],
+];
+
+function renderReport(rec) {
+    const body = $('#uRepBody');
+    if (!rec) {
+        body.replaceChildren(el('div', { class: 'empty' },
+            'まだレポートがありません。上の「レポートを作る」を押してください。'));
+        return;
+    }
+    const card = el('div', { class: 'card' },
+        el('div', { class: 'card__title' }, `${rec.name} のレポート`),
+        el('div', { class: 'small muted' },
+           `作成: ${String(rec.at || '').slice(0, 16).replace('T', ' ')}`
+           + (rec.by ? `（${rec.by}）` : '')));
+    const b = rec.body || {};
+    let any = false;
+    REP_SECTIONS.forEach(([key, label]) => {
+        const items = b[key] || [];
+        if (!items.length) return;
+        any = true;
+        card.append(el('div', { class: 'card__title', style: 'margin-top:14px;font-size:13px' }, label),
+                    el('ul', { style: 'margin:4px 0 0 0;padding-left:20px' },
+                       ...items.map(x => el('li', { style: 'margin-bottom:3px' }, String(x)))));
+    });
+    if (!any) card.append(el('div', { class: 'small muted mt' }, '書ける内容がありませんでした。'));
+    body.replaceChildren(card);
+}
+
+async function loadReportList(pick) {
+    let r;
+    try { r = await api('/api/usage/reports', undefined, 'GET'); } catch (e) { return; }
+    const sel = $('#uRepPick');
+    sel.replaceChildren(el('option', { value: '' }, '保存したレポート…'),
+        ...(r.reports || []).map(x => el('option', { value: x.name }, x.name)));
+    if (pick) sel.value = pick;
+    $('#uRepNote').textContent = (r.reports || []).length
+        ? `保存済み ${r.reports.length} 本` : '';
+}
+
+async function openReport(name) {
+    if (!name) { renderReport(null); return; }
+    try {
+        renderReport(await api(`/api/usage/reports?name=${encodeURIComponent(name)}`,
+                               undefined, 'GET'));
+    } catch (e) {
+        toast(e.message, 'warn');
+    }
+}
+
+async function buildReport() {
+    const btn = $('#uRepBuild');
+    const name = ($('#uRepName').value || '').trim();
+    if (!confirm('AIを1回呼んでレポートを作ります。よろしいですか？')) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = '作成中…';
+    try {
+        const rec = await api('/api/usage/report-build', { days: days(), user: who(), name });
+        renderReport(rec);
+        await loadReportList(rec.name);
+        toast(`レポート「${rec.name}」を作りました。`, 'ok');
+    } catch (e) {
+        toast(e.message, 'warn');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+}
+
+
 /* --- タブ・条件・Excel ------------------------------------------------------- */
 
 function showTab(key) {
     $$('.tab[data-view]').forEach(t => t.classList.toggle('is-active', t.dataset.view === key));
     const isChats = key === 'chats';
-    $('#pane-report').classList.toggle('is-active', !isChats);
+    const isDoc = key === 'report';       // レポートは集計ではなく読み物
+    $('#pane-report').classList.toggle('is-active', !isChats && !isDoc);
     $('#pane-chats').classList.toggle('is-active', isChats);
-    if (isChats) { loadChats(); } else { view = key; loadReport(); }
+    $('#pane-doc').classList.toggle('is-active', isDoc);
+    // Excel出力は集計のためのもの。読み物のタブでは押せないようにする
+    $('#uExport').disabled = isDoc;
+    if (isChats) loadChats();
+    else if (isDoc) { loadReportList(); renderReport(null); }
+    else { view = key; loadReport(); }
 }
 
 async function exportExcel() {
@@ -13812,14 +14218,21 @@ async function exportExcel() {
 
 document.addEventListener('DOMContentLoaded', () => {
     $$('.tab[data-view]').forEach(t => t.addEventListener('click', () => showTab(t.dataset.view)));
-    $('#uRange').addEventListener('change', () =>
-        $('#pane-chats').classList.contains('is-active') ? loadChats() : loadReport());
-    $('#uUser').addEventListener('change', () =>
-        $('#pane-chats').classList.contains('is-active') ? loadChats() : loadReport());
+    const reload = () => {
+        if ($('#pane-doc').classList.contains('is-active')) return;   // 読み物は作り直さない
+        if ($('#pane-chats').classList.contains('is-active')) loadChats();
+        else loadReport();
+    };
+    $('#uRange').addEventListener('change', reload);
+    $('#uUser').addEventListener('change', reload);
     $('#uChatFilter').addEventListener('input', renderChatList);
     wireQaHeader();
     $('#uExport').addEventListener('click', exportExcel);
-    loadReport();
+    $('#uRepBuild').addEventListener('click', buildReport);
+    $('#uRepPick').addEventListener('change', ev => openReport(ev.target.value));
+    // 最初に選ばれているタブは、サーバが決める（USAGE_VIEWS の先頭）。
+    // ここで 'summary' を決め打ちすると、下線の付いたタブと中身が食い違う
+    showTab($('.tab[data-view].is-active')?.dataset.view || view);
 });
 })();
 
@@ -14752,7 +15165,11 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
         ? el('div', { class: 'alert alert--warn small mt' },
              'いまアプリの定期実行（スケジューラ）が止まっています。設定は保存できますが、時刻になっても動きません。管理者に確認してください。')
         : null;
-    const choosable = [...kindSel.options].some(o => !o.disabled && o.value !== 'manual');
+    // いま保存されている設定は、短すぎても選択肢に残してある（何が設定されているかを
+    // 見せるため）。数に入れると「選び直してください」と言いながら選べるのは今の設定だけ、
+    // という案内になるので、ここでは除く
+    const choosable = [...kindSel.options].some(
+        o => !o.disabled && o.value !== 'manual' && o.value !== curKind);
     const blocked = (sch.floor_blocked)
         ? el('div', { class: 'alert alert--warn small mt' },
              choosable ? '管理者が決めた最低間隔より短いので、いまは動きません。間隔を選び直してください。'
@@ -14782,7 +15199,7 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
     const reset = () => {
         const s2 = r.schedule || {};
         kindSel.value = s2.kind || 'manual';
-        hoursSel.value = String(pickHours);
+        hoursSel.value = String(v.hours.indexOf(Number(s2.hours)) >= 0 ? s2.hours : pickHours);
         timeIn.value = s2.time || '08:00';
         wdaySel.value = String(s2.weekday || 0);
         daySel.value = String(s2.day || 1);

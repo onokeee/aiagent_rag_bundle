@@ -94,6 +94,14 @@ ROBOT_MAX_STEPS = int(os.getenv("ROBOT_MAX_STEPS", "20") or 20)                 
 ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
                                      str(DATA_DIR / "robot_settings.yaml"))).expanduser()
 
+# --- 要望と評価の記録 ---------------------------------------------------------------
+# 「応えられなかった」「この答えは違う」を1行ずつ溜める場所。
+# 会話ファイルとは別にするのは、利用者が会話を消しても要望を残すため。
+FEEDBACK_FILE = Path(os.getenv("FEEDBACK_FILE",
+                               str(DATA_DIR / "feedback.jsonl"))).expanduser()
+# 読み込む上限（行）。古いものから捨てずに全部残すが、読むのはここまで。
+FEEDBACK_MAX_READ = int(os.getenv("FEEDBACK_MAX_READ", "20000") or 20000)
+
 # --- パーソナライズ（利用者について、会話から自動で覚える） ---------------------------
 # 回答のあとにもう1回AIを呼び、「次回以降の質問でも使える前提・好み・期間」を本文（1つのテキスト）に
 # 書き足して data/users/<利用者>/memory.yaml に残す。次の質問からシステムプロンプトに載る。

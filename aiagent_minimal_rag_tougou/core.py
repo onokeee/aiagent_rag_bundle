@@ -4045,12 +4045,19 @@ def _walk_sql(node, acc: list) -> None:
             _walk_sql(v, acc)
 
 
-def collect_sqls() -> tuple:
+def collect_sqls(days: int | None = None, user: str | None = None) -> tuple:
     """全ユーザーのチャット履歴から実行SQLを集める。
 
     同じSQLが画面用の写しとツール呼び出しの両方に残っているので、
     会話単位で重複を除く。戻り値: (SQLのリスト, 会話数)
+
+    days / user を指定すると、その範囲の会話だけを見る。利用状況の
+    「使われたデータ」はこれで絞る（絞らないと、画面の期間を変えても
+    数字が動かず、同じ画面に別の母数が同居することになる）。
+    ER図に重ねる分は全期間で見たいので、既定は絞らない。
     """
+    from datetime import datetime as _dtm, timedelta as _tdl
+    limit = _dtm.now() - _tdl(days=days) if days else None
     sqls: list[str] = []
     users = Path(config.USER_META_DIR)
     chats = 0
@@ -4059,10 +4066,16 @@ def collect_sqls() -> tuple:
     for f in users.glob("*/chats/*.json"):
         if f.name == "index.json":
             continue
+        if user and f.parent.parent.name.lower() != str(user).lower():
+            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
+        if limit:
+            created = str(data.get("created_at") or "")
+            if created and created[:19] < limit.strftime("%Y-%m-%dT%H:%M:%S"):
+                continue
         chats += 1
         seen: set = set()
         for item in data.get("render_log") or []:
@@ -7518,6 +7531,7 @@ TOOL_LABELS = {
     "analyze_usage": "利用状況の分析",
     "propose_glossary_term": "用語登録の提案",
     "propose_example": "例文登録の提案",
+    "report_gap": "足りないものの報告",
 }
 
 
@@ -10271,6 +10285,93 @@ def robots_delete():
                     "robots": _robot_rows(g.user)})
 
 
+# --- この答えはどうだったか（利用者が押したものを受け取る） ------------------------
+# 押されるのは1つの質問につき多くて1回。書くのは追記1行だけなので、
+# 会話の保存とは別系統にしてある（会話を消しても要望は残す）。
+
+#: 画面から受け取ってよい種類。種類の一覧は usage 側に1つだけ置いてある
+#: （2か所に書くと、片方に足したときにもう片方で弾かれる）。
+#: gap はAIの申告と自動の記録だけが書くので、画面からは受け取らない。
+#: 代わりに、その申告に対する本人の返事を2つ受け取る。
+_FB_FROM_UI = (set(usage.FEEDBACK_KINDS) - {"gap"}) | {"gap_confirm", "gap_dismiss"}
+
+
+def _fb_turn_facts(chat: dict, turn: int) -> dict:
+    """その質問の「質問文・何で答えたか・使った表」を会話ファイルから取り直す。
+
+    画面から送られた値は信じない。信じると、あとで集計の根拠にできない
+    （押した人が書き換えられる値の上に、要望の一覧を作ることになる）。
+    """
+    log = (chat or {}).get("render_log") or []
+    # その質問から、次の質問の手前まで
+    start, end = None, len(log)
+    seen = -1
+    for i, x in enumerate(log):
+        if x.get("role") == "user" and x.get("kind") == "text":
+            seen += 1
+            if seen == turn:
+                start = i
+            elif start is not None:
+                end = i
+                break
+    if start is None:
+        return {"question": "", "basis": "", "tables": []}
+    span = log[start:end]
+    tables, used_sql, used_doc = [], False, False
+    for x in span:
+        if x.get("kind") == "sql":
+            used_sql = True
+            for t in (x.get("tables") or []):
+                name = t.get("table") if isinstance(t, dict) else str(t)
+                if name and name not in tables:
+                    tables.append(str(name))
+        elif x.get("kind") == "sources":
+            used_doc = True
+    return {"question": str(span[0].get("content") or "")[:300],
+            "basis": ("both" if used_sql and used_doc else
+                      "doc" if used_doc else "sql" if used_sql else ""),
+            "tables": tables[:20]}
+
+
+@bp_chat.post("/api/feedback")
+@login_required
+def feedback_post():
+    body = _body()
+    kind = str(body.get("kind") or "").strip()
+    if kind not in _FB_FROM_UI:
+        return jsonify({"error": "その評価は受け取れません。"}), 400
+    try:
+        turn = int(body.get("turn"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "どの質問についてかが分かりません。"}), 400
+    if turn < 0:
+        return jsonify({"error": "どの質問についてかが分かりません。"}), 400
+    chat_id = str(body.get("chat_id") or "").strip()[:64]
+    chat = chats.load_chat(g.user, chat_id) if chat_id else None
+    if chat_id and chat is None:
+        # 自分の会話しか読めない作りなので、読めない＝自分のものではない。
+        # そのまま記録すると、他人の会話の行に印が付いてしまう
+        return jsonify({"error": "その会話は見つかりません。"}), 404
+    facts = _fb_turn_facts(chat or {}, turn)
+    rec = {"at": datetime.now().isoformat(timespec="seconds"),
+           "user": g.user.username, "chat_id": chat_id, "turn": turn,
+           "detail": str(body.get("detail") or "")[:300], **facts}
+    if kind in ("gap_confirm", "gap_dismiss"):
+        # AIの申告はもう1行書かれている。ここはその申告に対する本人の返事。
+        # 種別を引き継がないと、同じ文が別の束に分かれて二重に数えられる
+        rec.update({"kind": "gap", "auto": False,
+                    "gap_kind": str(body.get("gap_kind") or "").strip(),
+                    "confirmed": kind == "gap_confirm"})
+    else:
+        rec["kind"] = kind
+    # 同じ質問に同じ評価を何度も押せると、件数をいくらでも作れてしまう。
+    # 「いちばん多い要望」はレポートの文面にも乗るので、ここで断つ。
+    # 押し直し（気が変わった）は受けたいので、種類が違えば通す
+    if usage.feedback_seen(g.user.username, chat_id, turn, kind):
+        return jsonify({"ok": True, "already": True})
+    usage.feedback_add(rec)
+    return jsonify({"ok": True})
+
 # --- パーソナライズ（メニューの「マイロボット」の下。本文は1つのテキスト） -------
 
 @bp_chat.get("/memory", endpoint="memory")
@@ -11336,10 +11437,14 @@ _PREMISE_MIN = 4
 _PREMISE_MAX = 60
 
 
+#: 箇条書きの印。行をそろえるときと、元の行を出すときの両方で使う。
+_PREMISE_BULLET = re.compile(r"^[-*・･●○◆■□\s]+")
+
+
 def _premise_norm(line: str) -> str:
     """行をそろえる。箇条書きの印・全半角・空白の違いで別物にしないため。"""
     s = unicodedata.normalize("NFKC", str(line or "")).strip()
-    s = re.sub(r"^[-*・･●○◆■□\s]+", "", s)
+    s = _PREMISE_BULLET.sub("", s)
     s = re.sub(r"[。\.]+$", "", s)
     return re.sub(r"\s+", "", s).lower()
 
@@ -11352,7 +11457,7 @@ def _premise_lines() -> list[tuple]:
             key = _premise_norm(raw)
             if len(key) < _PREMISE_MIN:
                 continue
-            out.append((row["user"], re.sub(r"^[-*・･●○◆■□\s]+", "", raw.strip()), key))
+            out.append((row["user"], _PREMISE_BULLET.sub("", raw.strip()), key))
     return out
 
 
@@ -11360,8 +11465,11 @@ def _premise_vocab() -> list[str]:
     """カタログの言葉（表名・列名・用語）。長い順に返す（最長一致で当てるため）。"""
     words = set()
     for f in db.list_db_files():
-        prof = catalog.profile_db(f)
-        meta = catalog.load_meta(f)
+        try:
+            prof = catalog.profile_db(f)
+            meta = catalog.load_meta(f)
+        except Exception:
+            continue        # 1つ読めないだけでタブ全体を落とさない
         for t, info in (prof.get("tables") or {}).items():
             words.add(t)
             words.update(str(c.get("name") or "") for c in (info.get("columns") or []))
@@ -11371,24 +11479,44 @@ def _premise_vocab() -> list[str]:
 
 
 def _premise_hits(key: str, vocab: list) -> list:
-    """その行に出てくるカタログの言葉。長い順に当てて、重なった短い語は取らない。"""
-    hits, used = [], ""
+    """その行に出てくるカタログの言葉。長い順に当てて、重なった短い語は取らない。
+
+    「当たった文字列をつなげて含まれるか」で見てはいけない。
+    「部署は営業、部署コードは4桁」のような行で、長い方に含まれるだけの
+    短い語が、別の場所に独立して出ていても落ちてしまう。当たった区間で見る。
+    """
+    hits: list = []
+    taken: list = []                 # 既に当たった区間 [(開始, 終了), ...]
     for w in vocab:
         low = str(w).lower()
-        if low and low in key and low not in used:
-            hits.append(str(w))
-            used += low
+        if not low:
+            continue
+        pos = 0
+        while True:
+            i = key.find(low, pos)
+            if i < 0:
+                break
+            if not any(i < e and a < i + len(low) for a, e in taken):
+                hits.append(str(w))
+                taken.append((i, i + len(low)))
+                break
+            pos = i + 1
     return hits
 
 
 def _premise_kind(key: str, hits: list) -> str:
-    """その行が何の話かを、いちばん手が打ちやすい向き先で1つに決める。"""
-    if hits:
-        return "表・用語の意味"
+    """その行が何の話かを、いちばん手が打ちやすい向き先で1つに決める。
+
+    出力と期間を先に見る。カタログの語彙には「金額」「日付」のような
+    どの環境にもある列名が入るので、表・用語を先に見ると
+    「売上はExcelで出して」まで表の話に吸われ、既定の分布が空になる。
+    """
     if any(w in key for w in _PREMISE_OUTPUT):
         return "出力の既定"
     if any(w in key for w in _PREMISE_PERIOD):
         return "期間の既定"
+    if hits:
+        return "表・用語の意味"
     return "その他"
 
 
@@ -11417,10 +11545,16 @@ def _premise_groups(lines: list) -> list[dict]:
     return sorted(merged, key=lambda g: (-len(g["users"]), g["text"]))
 
 
-def premises_report() -> dict:
-    """前提の地図。戻り値の形は usage.analyze と同じ（画面とExcelが同じ入れ物で受ける）。"""
-    everyone = usage_users()
-    lines = _premise_lines()
+def premises_report(user: str | None = None) -> dict:
+    """前提の地図。戻り値の形は usage.analyze と同じ（画面とExcelが同じ入れ物で受ける）。
+
+    user を指定すると、その人のぶんだけ。パーソナライズには「いつ書いたか」しか
+    無いので、期間では絞らない。
+    """
+    everyone = [u for u in usage_users()
+                if not user or u.lower() == str(user).lower()]
+    lines = [x for x in _premise_lines()
+             if not user or x[0].lower() == str(user).lower()]
     if not lines:
         return {"title": "前提の地図", "tables": [],
                 "notes": ["パーソナライズにまだ何も書かれていません。"
@@ -11457,8 +11591,6 @@ def premises_report() -> dict:
     dist_rows = []
     for kind, words in (("出力の既定", _PREMISE_OUTPUT), ("期間の既定", _PREMISE_PERIOD)):
         for g in groups:
-            if _premise_hits(g["key"], vocab):
-                continue                      # 表・用語の話はこちらでは数えない
             if any(x in g["key"] for x in words):
                 dist_rows.append((kind, g["text"][:60], len(g["users"])))
     dist_rows.sort(key=lambda r: (r[0], -r[2]))
@@ -11467,14 +11599,15 @@ def premises_report() -> dict:
     if shared_rows:
         tables.append({"name": "みんなが覚えていること（2人以上）",
                        "columns": ["覚えている内容", "人数", "ログインID", "向き先"],
-                       "rows": shared_rows})
+                       "rows": shared_rows, "chart": False})
     if clash_rows:
         tables.append({"name": "同じ言葉について食い違っている前提",
                        "columns": ["言葉", "ログインID", "覚えている内容"],
-                       "rows": clash_rows[:_PREMISE_MAX]})
+                       "rows": clash_rows[:_PREMISE_MAX], "chart": False})
     if dist_rows:
         tables.append({"name": "出力と期間の既定",
-                       "columns": ["区分", "内容", "人数"], "rows": dist_rows[:_PREMISE_MAX]})
+                       "columns": ["区分", "内容", "人数"], "rows": dist_rows[:_PREMISE_MAX],
+                       "chart": False})
     tables.append({"name": "利用者ごとの行数", "columns": ["ログインID", "前提の行"],
                    "rows": sorted(((u, sum(1 for x, _, _ in lines if x == u)) for u in writers),
                                   key=lambda r: -r[1])})
@@ -11511,14 +11644,20 @@ def premises_report() -> dict:
 _SETTLED_STATUS = {"ok": "成功", "error": "失敗", "running": "実行中", "": "まだ動いていない"}
 
 
-def _settled_robots() -> list[tuple]:
-    """全利用者のマイロボットを1行ずつ。持ち主はログインID（あとで部署に引き直すため）。"""
+def _settled_robots(user: str = "") -> list[tuple]:
+    """マイロボットを1行ずつ。持ち主はログインID（あとで部署に引き直すため）。
+
+    user を指定すると、その人のぶんだけ。ロボットには「いつ作ったか」しか
+    無いので、期間では絞らない（絞ると定着しているものほど消えてしまう）。
+    """
     rows = []
     try:
         dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
     except OSError:
         return rows
     for d in sorted(dirs):
+        if user and d.name.lower() != str(user).lower():
+            continue
         p = d / "robots.json"
         if not p.exists():
             continue
@@ -11539,15 +11678,15 @@ def _settled_robots() -> list[tuple]:
     return rows
 
 
-def _settled_tables() -> tuple:
+def _settled_tables(user: str = "") -> tuple:
     """(表のリスト, 所見のリスト)。使われた機能タブの下に足す。"""
     tables, notes = [], []
 
-    rows = _settled_robots()
+    rows = _settled_robots(user)
     if rows:
         tables.append({"name": "マイロボット（全利用者）",
                        "columns": ["名前", "持ち主（ログインID）", "手順", "定期実行", "直近"],
-                       "rows": [r[:5] for r in rows]})
+                       "rows": [r[:5] for r in rows], "chart": False})
 
     # 数えもの。組み込みで書けなかったものが、どれだけ足されたか
     try:
@@ -11578,12 +11717,338 @@ def _settled_tables() -> tuple:
     return tables, notes
 
 
-def _usage_add_settled(res: dict) -> dict:
+def _usage_add_settled(res: dict, user: str = "") -> dict:
     """「使われた機能」の結果に、定着したものを足す（中身が core 側にあるため）。"""
-    tables, notes = _settled_tables()
+    tables, notes = _settled_tables(user)
     return {**res, "tables": list(res.get("tables") or []) + tables,
             "notes": list(res.get("notes") or []) + notes}
 
+
+# =============================================================================
+# ===== 要望（利用状況のタブ）
+# 「応えられなかった」「この答えは違う」を、多い順に並べて読む場所。
+#
+# 材料は data/feedback.jsonl の3つの入口:
+#   利用者が押したもの / AIの申告（report_gap） / 0件で終わった文書検索（自動）
+#
+# 同じ趣旨のものは束ねて数える。1件ずつ並べても読まれないし、
+# 「何人が何回言ったか」が分からないと、どれから手を付けるか決められない。
+# =============================================================================
+
+#: 要望の見出し。gap_kind をそのまま使う。
+_REQ_LABELS = {"data": "データがほしい", "doc": "文書がほしい",
+               "feature": "機能がほしい", "explain": "説明が足りない",
+               "": "（種別なし）"}
+#: 対応のボタンの代わりに、どこへ行けばよいかを1語で出す。
+_REQ_NEXT = {"data": "取り込みを作る", "doc": "ナレッジベースに足す",
+             "feature": "例文・ツールを足す", "explain": "用語集・表の説明に書く",
+             "": "内容を読んで判断する"}
+#: 質問文から言葉を切り出す。日本語は助詞がひらがななので、
+#: 漢字・カタカナ・英数字の続きを拾うと、名詞の候補がだいたい取れる。
+#: 形態素解析を入れるほどの精度は要らない（当たりを付けるための一覧なので）。
+_WORD_RE = re.compile(r"[一-龯]{2,}|[ァ-ヶー]{2,}|[A-Za-z][A-Za-z0-9_]{1,}")
+#: どの会社でも出る言葉。並べても手掛かりにならないので落とす。
+_WORD_STOP = frozenset((
+    "一覧", "件数", "合計", "平均", "最大", "最小", "教", "表示", "確認", "今月", "先月",
+    "今年", "昨年", "今日", "昨日", "今週", "先週", "全部", "全体", "以上", "以下",
+    "場合", "内容", "状況", "結果", "対象", "可能", "必要", "情報", "データ", "ファイル",
+    "エクセル", "Excel", "CSV", "グラフ", "リスト", "ランキング", "トップ", "Top"))
+
+
+def _req_words(questions: list, vocab: list) -> list[tuple]:
+    """カタログのどの言葉にも当たらなかった語。(語, 回数, 人数, 代表質問) で返す。
+
+    当たり判定は「カタログの語を含むか／カタログの語に含まれるか」の両方向で見る。
+    片方向だけだと「受入検査結果」と「受入検査」がすれ違う。
+    """
+    low = [str(w).lower() for w in vocab]
+    hits: dict = {}
+    for who, q in questions:
+        for w in set(_WORD_RE.findall(str(q or ""))):
+            if w in _WORD_STOP or len(w) < 2:
+                continue
+            wl = w.lower()
+            if any(wl in v or v in wl for v in low):
+                continue
+            h = hits.setdefault(w, {"n": 0, "users": set(), "q": q})
+            h["n"] += 1
+            if who:                      # 名前の無い記録は人数に数えない
+                h["users"].add(who)
+    return sorted(((w, h["n"], len(h["users"]), str(h["q"])[:60]) for w, h in hits.items()),
+                  key=lambda r: (-r[2], -r[1], r[0]))
+
+
+def _req_group(recs: list) -> list[dict]:
+    """同じ趣旨のものを束ねる。前提の地図と同じ寄せ方（そろえて一致、次に包含）。"""
+    by: dict = {}
+    for r in recs:
+        text = str(r.get("detail") or r.get("question") or "").strip()
+        if not text:
+            continue
+        key = _premise_norm(text)
+        if not key:
+            continue
+        g = by.setdefault((r.get("gap_kind") or "", key),
+                          {"kind": r.get("gap_kind") or "", "key": key, "text": text,
+                           "n": 0, "users": [], "last": "", "q": "", "confirmed": 0,
+                           "kb": ""})
+        g["n"] += 1
+        u = str(r.get("user") or "")
+        if u and u not in g["users"]:
+            g["users"].append(u)
+        at = str(r.get("at") or "")
+        if at > g["last"]:
+            g["last"] = at
+        if not g["q"]:
+            g["q"] = str(r.get("question") or "")
+        if not g["kb"]:
+            g["kb"] = str(r.get("kb") or "")     # 0件で終わったナレッジベース名
+        if r.get("confirmed"):
+            g["confirmed"] += 1
+    groups = sorted(by.values(), key=lambda g: -len(g["key"]))
+    merged: list = []
+    for g in groups:
+        host = next((m for m in merged
+                     if m["kind"] == g["kind"] and g["key"] in m["key"]), None)
+        if host is None:
+            merged.append(g)
+            continue
+        host["n"] += g["n"]
+        host["confirmed"] += g["confirmed"]
+        host["last"] = max(host["last"], g["last"])
+        host["kb"] = host["kb"] or g["kb"]
+        for u in g["users"]:
+            if u not in host["users"]:
+                host["users"].append(u)
+    return sorted(merged, key=lambda g: (-len(g["users"]), -g["n"]))
+
+
+def requests_report(days: int | None = None, user: str | None = None) -> dict:
+    """要望。戻り値の形は usage.analyze と同じ。"""
+    recs = usage.feedback_read(days=days, user=user)
+    # 本人が「伝えない」と言ったものは、AIの申告ごと外す。
+    # 外さないと、画面では「伝えませんでした」と出るのに、要望には残り続ける
+    dropped = {_premise_norm(str(r.get("detail") or ""))
+               for r in recs if r.get("confirmed") is False}
+    gaps = [r for r in recs
+            if r.get("kind") == "gap" and r.get("confirmed") is not False
+            and _premise_norm(str(r.get("detail") or "")) not in dropped]
+    off = [r for r in recs if r.get("kind") == "off_target"]
+    if not recs:
+        return {"title": "要望", "tables": [],
+                "notes": ["まだ記録がありません。"
+                          "マイエージェントで「知りたいことと違う」が押されたとき、"
+                          "AIが答えきれなかったとき、社内文書の検索が0件で終わったときに溜まります。"],
+                "meta": {"records": 0}}
+
+    tables, notes = [], []
+    groups = _req_group(gaps + off)
+    if groups:
+        tables.append({"name": "言われたこと（多い順）", "chart": False,
+                       "columns": ["種別", "内容", "件数", "本人が要ると言った",
+                                   "言った人（ログインID）", "最終", "代表質問", "向き先"],
+                       "rows": [(_REQ_LABELS.get(g["kind"], g["kind"]), g["text"][:80], g["n"],
+                                 g["confirmed"],
+                                 "、".join(g["users"][:6])
+                                 + (" ほか" if len(g["users"]) > 6 else ""),
+                                 g["last"][5:16].replace("T", " "),
+                                 (g["q"][:50] + (f"／{g['kb']} を探して0件" if g["kb"] else "")),
+                                 _REQ_NEXT.get(g["kind"], ""))
+                                for g in groups[:MAX_REQ]]})
+    # 種別ごとの数。どこから手を付けるかの目安
+    kinds: dict = {}
+    for g in groups:
+        k = kinds.setdefault(g["kind"], {"groups": 0, "n": 0, "users": set()})
+        k["groups"] += 1
+        k["n"] += g["n"]
+        k["users"] |= set(g["users"])
+    if kinds:
+        tables.append({"name": "種別ごと",
+                       "columns": ["種別", "内容の数", "延べ件数", "人数", "向き先"],
+                       "rows": [(_REQ_LABELS.get(k, k), v["groups"], v["n"], len(v["users"]),
+                                 _REQ_NEXT.get(k, ""))
+                                for k, v in sorted(kinds.items(),
+                                                   key=lambda kv: -kv[1]["n"])]})
+
+    # カタログに無い言葉。AIは要らない（カタログの語彙に当てるだけ）
+    # 語彙を当てる母数は、上の表と同じ「要望として数えたもの」に揃える。
+    # 全件から作ると、満足した質問の言葉まで「無い言葉」に並ぶ
+    qs = [(str(r.get("user") or ""), str(r.get("question") or r.get("detail") or ""))
+          for r in gaps + off]
+    words = _req_words(qs, _premise_vocab())
+    if words:
+        tables.append({"name": "カタログに無い言葉", "chart": False,
+                       "columns": ["言葉", "回数", "人数", "代表質問"],
+                       "rows": words[:MAX_REQ]})
+
+    auto = sum(1 for r in gaps if r.get("auto"))
+    notes.append(f"記録は {len(recs)} 件。うち要望として数えたのは {len(gaps) + len(off)} 件"
+                 f"（AIの申告と0件の検索が {auto} 件、利用者が押したものが "
+                 f"{len(gaps) + len(off) - auto} 件）。"
+                 + (f"本人が「伝えない」と言ったものを {len(dropped)} 種はずしています。"
+                    if dropped else ""))
+    if groups:
+        top = groups[0]
+        notes.append(f"いちばん多いのは「{top['text'][:40]}」で、"
+                     f"{len(top['users'])} 人が計 {top['n']} 回。"
+                     f"手当ては「{_REQ_NEXT.get(top['kind'], '')}」です。")
+    if words:
+        notes.append(f"カタログのどの言葉にも当たらない語が {len(words)} 種あります。"
+                     "表を足すか、用語集に足すかの入口になります。"
+                     "助詞で切っているだけなので、語の切れ目が変なものは読み飛ばしてください。")
+    return {"title": "要望", "tables": tables, "notes": notes,
+            "meta": {"records": len(recs), "groups": len(groups)}}
+
+
+def _silent_failures(days: int | None, user: str | None) -> tuple:
+    """黙った失敗。最後まで動いたのに答えが違ったもの。
+
+    いまの失敗タブが拾うのは例外で止まったものだけ。動いて違っていた方は
+    どこにも残っていなかった。役に立って、しかも間違っている答えが、
+    このアプリでいちばん怖いものなので、件数ではなく「直す場所」でまとめる。
+    """
+    recs = [r for r in usage.feedback_read(days=days, user=user)
+            if r.get("kind") in ("wrong", "sql_ng")]
+    if not recs:
+        return [], []
+    where: dict = {}
+    for r in recs:
+        names = [str(t) for t in (r.get("tables") or [])] or ["（表が分からない）"]
+        for t in names:
+            w = where.setdefault(t, {"n": 0, "users": set(), "detail": ""})
+            w["n"] += 1
+            if str(r.get("user") or ""):     # 名前の無い記録は人数に数えない
+                w["users"].add(str(r["user"]))
+            if not w["detail"] and r.get("detail"):
+                w["detail"] = str(r["detail"])[:60]
+    rows = [(t, v["n"], len(v["users"]), v["detail"])
+            for t, v in sorted(where.items(), key=lambda kv: -kv[1]["n"])]
+    detail = [(str(r.get("at") or "")[5:16].replace("T", " "), str(r.get("user") or ""),
+               str(r.get("question") or "")[:40], str(r.get("detail") or "")[:60])
+              for r in recs[-MAX_REQ:]]
+    tables = [{"name": "黙った失敗（動いたのに答えが違った）", "chart": False,
+               "columns": ["直す場所（表）", "件数", "人数", "言われた内容"], "rows": rows},
+              {"name": f"黙った失敗の明細（最大{MAX_REQ}件）", "chart": False,
+               "columns": ["日時", "利用者", "質問", "内容"], "rows": detail}]
+    notes = [f"黙った失敗が {len(recs)} 件あります。例外で止まったものとは別で、"
+             "最後まで動いたのに答えが違ったものです。"
+             "件数ではなく、直す場所（表）でまとめています。"
+             "同じ表に集まっていれば、その表の列の意味か結合を直せば止まります。"]
+    return tables, notes
+
+
+def _usage_add_silent(res: dict, days, user) -> dict:
+    tables, notes = _silent_failures(days, user)
+    if not tables:
+        return res
+    return {**res, "tables": list(res.get("tables") or []) + tables,
+            "notes": list(res.get("notes") or []) + notes}
+
+
+
+# =============================================================================
+# ===== 利用状況レポート（AIに1回だけ書かせる）
+# 数字はコードが出し、AIには言葉だけ書かせる。新しい数字は作らせない。
+#
+# 材料のうち、パーソナライズ（1人2,000字が上限）とマイロボット（1人5件が既定）は
+# 丸ごと渡せる。会話ログだけは量に上限が無いので、集計した数字だけを渡す。
+#
+# 押したときだけ呼ぶ。画面を開いただけでは呼ばない（費用が読めなくなるため）。
+# =============================================================================
+
+REPORT_DIR_NAME = "usage_reports"
+#: 材料に載せる各集計の行数の上限。多すぎると1回の呼び出しに入らない。
+_REPORT_ROWS = 25
+#: 材料ぜんぶの文字数の上限。表の数・利用者の数で際限なく伸びるので、
+#: ここで頭を止める。超えたら後ろの集計から落として、その旨を材料に書く。
+_REPORT_CHARS = 60000
+
+
+def _report_dir() -> Path:
+    d = Path(config.DATA_DIR) / REPORT_DIR_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _report_material(days: int | None, who: str) -> str:
+    """AIに渡す材料。画面に出ているものと同じ数字だけを並べる。"""
+    parts = []
+    for method in ("summary", "users", "tools", "databases", "errors", "requests", "premises"):
+        try:
+            res = _usage_result(method, days or 0, who)
+        except Exception as e:
+            parts.append(f"## {method}\n（集計できませんでした: {e}）")
+            continue
+        lines = [f"## {res.get('title') or method}"]
+        lines += [f"- {n}" for n in (res.get("notes") or [])]
+        for t in (res.get("tables") or []):
+            lines.append(f"### {t.get('title') or ''}")
+            lines.append(" | ".join(str(c) for c in (t.get("columns") or [])))
+            for row in (t.get("rows") or [])[:_REPORT_ROWS]:
+                lines.append(" | ".join("" if v is None else str(v) for v in row))
+        parts.append("\n".join(lines))
+    out, used = [], 0
+    for p in parts:
+        if used + len(p) > _REPORT_CHARS:
+            out.append("（材料が多いため、ここから先の集計は省きました）")
+            break
+        out.append(p)
+        used += len(p) + 2
+    return "\n\n".join(out)
+
+
+#: Windows がデバイスとして扱う名前。ファイルにできない（CON.json も同じ扱い）。
+_WIN_DEVICES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+
+
+def _report_path(name: str) -> Path:
+    """名前からファイル名を作る。使えない字を落とすので、別の名前が同じ
+    ファイルに落ちることがある（「9月分」と「9月分（営業）」）。
+    そのままだと前のレポートが黙って消えるので、中身の名前が違えば別名にする。
+    """
+    safe = "".join(c for c in str(name) if c.isalnum() or c in "-_")[:32] or "report"
+    if safe.upper() in _WIN_DEVICES:
+        safe = "_" + safe
+    d = _report_dir()
+    p = d / f"{safe}.json"
+    for i in range(2, 100):
+        cur = _read_json(p) if p.exists() else None
+        if not isinstance(cur, dict) or str(cur.get("name") or "") == str(name):
+            return p                      # 空いている、または同じ名前のレポート
+        p = d / f"{safe}-{i}.json"
+    return p
+
+
+def report_list() -> list[dict]:
+    """保存してあるレポートの一覧（作った日時の新しい順）。
+
+    ファイル名の順ではない。「9月分」のような名前を付けた時点で、
+    名前の順は作った順と関係がなくなるため。
+    """
+    out = []
+    for p in sorted(_report_dir().glob("*.json")):
+        data = _read_json(p)
+        if isinstance(data, dict) and data.get("name"):
+            out.append({"name": data["name"], "at": data.get("at") or "",
+                        "by": data.get("by") or "", "days": data.get("days")})
+    return sorted(out, key=lambda r: r["at"], reverse=True)
+
+
+def report_load(name: str) -> dict | None:
+    p = _report_path(name)
+    if not p.exists():          # 無い名前を聞かれるのは普通のこと。ログに出さない
+        return None
+    data = _read_json(p)
+    return data if isinstance(data, dict) and data.get("name") else None
+
+
+def report_save(name: str, body: dict, days, who: str, by: str) -> dict:
+    rec = {"name": name, "at": datetime.now().isoformat(timespec="seconds"),
+           "by": by, "days": days, "user": who, "body": body}
+    _write_json(_report_path(name), rec)
+    return rec
 
 # --- パーソナライズ（管理者メニューのタブ） -----------------------------------------
 
@@ -13523,12 +13988,17 @@ import db
 bp_usage = Blueprint("usage", __name__)
 
 #: 画面のタブ。キーは usage.METHODS のもの＋imports。
-#: 集計の中身が core 側にあるもの（パーソナライズなど）。usage.analyze には渡さない。
-USAGE_CORE_VIEWS = {"premises"}
+#: レポートは集計ではなく読み物なので、画面も専用の枠で描く。
+USAGE_DOC_VIEWS = {"report"}
+
+#: 要望の一覧に並べる上限。多すぎると読まれない。
+MAX_REQ = 60
 
 #: 左は「ニーズを読む」、右は「健康診断」。sep で帯に区切りを入れる。
 USAGE_VIEWS = [
+    {"key": "requests",  "label": "要望"},
     {"key": "premises",  "label": "前提の地図"},
+    {"key": "report",    "label": "レポート", "doc": True},
     {"key": "summary",   "label": "全体像", "sep": True},
     {"key": "users",     "label": "利用者"},
     {"key": "trend",     "label": "推移"},
@@ -13541,6 +14011,19 @@ USAGE_VIEWS = [
     # 集計としては残す（Excel出力もこのキーで作る）が、単独のタブは出さない。
     {"key": "questions", "label": "質問・履歴", "merged": True},
 ]
+
+#: 期間の指定の上限（日）。これより大きい値は「全期間」と同じ扱いにする。
+#: 上限を入れないと、datetime の引き算があふれて 500 になる。
+USAGE_MAX_DAYS = 3650
+
+
+def _usage_days(value) -> int:
+    """画面から来た日数を、0〜上限に収める。負の数は「全期間」と同じ0にする。"""
+    try:
+        return max(0, min(int(value or 0), USAGE_MAX_DAYS))
+    except (TypeError, ValueError):
+        return 0
+
 
 #: 期間の選択肢。None は全期間。
 USAGE_RANGES = [{"days": 7, "label": "直近7日"}, {"days": 30, "label": "直近30日"},
@@ -13560,18 +14043,27 @@ def _usage_result(method: str, days, user):
     """集計を1つ実行して、画面が使う形に整える。"""
     # パーソナライズは core 側にあるので、こちらで作る。
     # 戻り値の形は usage.analyze と同じなので、表示もExcel出力もこの先は共通。
-    res = (premises_report() if method in USAGE_CORE_VIEWS
-           else usage.analyze(method, days=days or None, user=user or None))
+    if method == "premises":
+        res = premises_report(user=user or None)
+    elif method == "requests":
+        res = requests_report(days=days or None, user=user or None)
+    else:
+        res = usage.analyze(method, days=days or None, user=user or None)
+    # 失敗タブは「止まった失敗」だけを拾う。動いたのに違っていた方を足す
+    if method == "errors":
+        res = _usage_add_silent(res, days or None, user or None)
     # 「使われた機能」には、定着したもの（ロボット・ツール・ビュー・例文）を足す。
     # 中身が core 側にあるので、集計側（usage）では作れない
     if method == "tools":
-        res = _usage_add_settled(res)
+        res = _usage_add_settled(res, user or "")
     return {"title": res.get("title") or "", "notes": res.get("notes") or [],
             # 表の名前は集計側が name で返す。画面は title を見るので、ここで揃える
             # （揃えないと「推移」のように表が3つ並ぶタブで、どれが何か分からない）
             "tables": [{"title": t.get("title") or t.get("name") or "",
                         "columns": list(t.get("columns") or []),
-                        "rows": [list(r) for r in (t.get("rows") or [])]}
+                        "rows": [list(r) for r in (t.get("rows") or [])],
+                        # 1列目が長い文の表はグラフにしても読めない。表ごとに切れるようにする
+                        "chart": t.get("chart", True)}
                        for t in (res.get("tables") or [])]}
 
 
@@ -13586,14 +14078,11 @@ def usage_index():
 @admin_required
 def usage_report():
     method = (request.args.get("method") or "summary").strip()
-    if method not in {v["key"] for v in USAGE_VIEWS}:
+    if method in USAGE_DOC_VIEWS or method not in {v["key"] for v in USAGE_VIEWS}:
         return jsonify({"error": "その集計はありません。"}), 400
+    days = _usage_days(request.args.get("days"))
     try:
-        days = int(request.args.get("days") or 0)
-    except ValueError:
-        days = 0
-    try:
-        return jsonify(_usage_result(method, days, (request.args.get("user") or "").strip()))
+        return jsonify(_usage_result(method, days, str(request.args.get("user") or "").strip()))
     except Exception as e:
         return jsonify({"error": f"集計に失敗しました: {e}"}), 500
 
@@ -13632,27 +14121,53 @@ def _qa_pairs(log: list, created: str) -> list[dict]:
 @admin_required
 def usage_chats():
     """全利用者の会話一覧（質問と回答つき）。"""
+    days = _usage_days(request.args.get("days"))
     try:
-        days = int(request.args.get("days") or 0)
-    except ValueError:
-        days = 0
-    out = _chat_rows(days, (request.args.get("user") or "").strip())
+        out = _chat_rows(days, str(request.args.get("user") or "").strip())
+    except Exception as e:      # 画面はJSONを待っている。500のHTMLを返すと画面ごと壊れる
+        return jsonify({"error": f"会話の一覧を作れませんでした: {e}"}), 500
     return jsonify({"chats": out[:500], "total": len(out)})
 
 
-_QA_COLUMNS = ["日時", "利用者", "会話ID", "会話", "質問", "回答"]
+_QA_COLUMNS = ["日時", "利用者", "会話ID", "会話", "質問", "回答", "押された評価"]
+
+
+#: Excelに出す「質問と回答」の明細の上限。会話が増えるといくらでも伸びるため。
+QA_MAX_ROWS = 5000
 
 
 def _qa_rows(days: int, who: str) -> list[list]:
     """「質問と回答」1行ぶんの配列（_QA_COLUMNS と同じ並び）。Excelの2箇所で使う。"""
     return [[q["at"], c["user"], c["id"], c["title"] or "（無題）", q["text"],
-             (" ".join(q["marks"]) + " " + q["answer"]).strip()]
+             (" ".join(q["marks"]) + " " + q["answer"]).strip(),
+             "、".join(q.get("fb") or [])]
             for c in _chat_rows(days, who)
-            for q in c["questions"]]
+            for q in c["questions"]][:QA_MAX_ROWS]
+
+
+#: 押された評価の印。質問・履歴の行に出す（言い方は usage 側と1つに揃える）。
+_FB_MARKS = usage.FEEDBACK_KINDS
+
+
+def _fb_by_turn(days: int, who: str) -> dict:
+    """(会話ID, 質問番号) -> 押された評価の並び。質問・履歴の行に印を出すため。"""
+    out: dict = {}
+    for r in usage.feedback_read(days=days or None, user=who or None):
+        cid, turn = str(r.get("chat_id") or ""), r.get("turn")
+        if not cid or not isinstance(turn, int):
+            continue
+        label = _FB_MARKS.get(str(r.get("kind") or ""))
+        if not label:
+            continue
+        got = out.setdefault((cid, turn), [])
+        if label not in got:
+            got.append(label)
+    return out
 
 
 def _chat_rows(days: int, who: str) -> list[dict]:
     """会話1本を1レコードに畳む（質問と回答の対つき）。画面とExcelで共用。"""
+    fb = _fb_by_turn(days, who)
     limit = datetime.now() - timedelta(days=days) if days else None
     out = []
     root = Path(config.USER_META_DIR)
@@ -13660,7 +14175,9 @@ def _chat_rows(days: int, who: str) -> list[dict]:
         if f.name == "index.json":
             continue
         owner = f.parent.parent.name
-        if who and owner != who:
+        # 他の集計（collect / feedback_read）は大小を区別しない。ここだけ区別すると、
+        # 同じ条件のExcelの中で集計シートと明細シートの母数が食い違う
+        if who and owner.lower() != str(who).lower():
             continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
@@ -13679,9 +14196,44 @@ def _chat_rows(days: int, who: str) -> list[dict]:
             "errors": sum(1 for x in log if x.get("kind") == "error"),
             "last_at": str((log[-1].get("at") if log else "") or "")[:16].replace("T", " "),
             # 質問と、その質問に対する回答の対。画面はこれを1行として表に出す。
-            "questions": _qa_pairs(log, created)[:50],
+            # 押された評価があれば印を添える（どの質問で何が押されたかが、改善の入口になる）
+            "questions": [{**q, "fb": fb.get((str(data.get("id") or f.stem), i), [])}
+                          for i, q in enumerate(_qa_pairs(log, created)[:50])],
         })
     return out
+
+
+@bp_usage.get("/api/usage/reports")
+@admin_required
+def usage_reports():
+    """保存してあるレポートの一覧と、指定した1本の中身。"""
+    name = (request.args.get("name") or "").strip()
+    if name:
+        rec = report_load(name)
+        if rec is None:
+            return jsonify({"error": "そのレポートはありません。"}), 404
+        return jsonify(rec)
+    return jsonify({"reports": report_list()})
+
+
+@bp_usage.post("/api/usage/report-build")
+@admin_required
+def usage_report_build():
+    """レポートを1本作る。**AIを1回だけ呼ぶ**ので、押したときにしか動かない。"""
+    body = _body()
+    days = _usage_days(body.get("days"))
+    who = str(body.get("user") or "").strip()
+    name = str(body.get("name") or "").strip()[:60] or datetime.now().strftime("%Y-%m")
+    if not llm.is_configured():
+        return jsonify({"error": "AIの設定が済んでいません。「モデル設定」を確認してください。"}), 400
+    material = _report_material(days, who)
+    try:
+        out = brain.build_usage_report(material)
+    except Exception as e:
+        return jsonify({"error": f"レポートを作れませんでした: {e}"}), 502
+    rec = report_save(name, out, days, who, g.user.username)
+    print(f"[usage] レポート「{name}」を作りました（{g.user.username}）")
+    return jsonify(rec)
 
 
 @bp_usage.post("/api/usage/export")
@@ -13689,15 +14241,15 @@ def _chat_rows(days: int, who: str) -> list[dict]:
 def usage_export():
     """いま見ている条件のまま Excel にする。1つの集計＝1シート。"""
     body = _body()
-    methods = [m for m in (body.get("methods") or [])
-               if m in {v["key"] for v in USAGE_VIEWS}]
+    # 同じ集計を何度も並べられると、そのぶん全会話を読み直す。重複は落として数も切る
+    methods = list(dict.fromkeys(
+        m for m in (body.get("methods") or [])
+        if m in {v["key"] for v in USAGE_VIEWS} and m not in USAGE_DOC_VIEWS
+    ))[:len(USAGE_VIEWS)]
     if not methods:
         return jsonify({"error": "出力する集計が選ばれていません。"}), 400
-    try:
-        days = int(body.get("days") or 0)
-    except (TypeError, ValueError):
-        days = 0
-    who = (body.get("user") or "").strip()
+    days = _usage_days(body.get("days"))
+    who = str(body.get("user") or "").strip()
     labels = {v["key"]: v["label"] for v in USAGE_VIEWS}
 
     sheets = []
@@ -13738,8 +14290,6 @@ def usage_export():
                    "rows": conv_rows,
                    "note": "1行 = 1つの会話。集計はこの明細から数えています。"})
 
-    if not sheets:
-        return jsonify({"error": "出せる表がありませんでした。"}), 400
 
     cond = [labels[m] for m in methods]
     span = next((r["label"] for r in USAGE_RANGES if r["days"] == days), "全期間")
@@ -14163,7 +14713,67 @@ def _warn_if_no_admin() -> None:
           "誰も開けません（マイエージェントは使えます）。")
 
 
+# --- デバッガは開かせない -----------------------------------------------------------
+# デバッガが開いていると、例外が出たときにブラウザからこのサーバの Python を
+# 実行できる。PINで守られているように見えるが、PINはユーザー名・MACアドレス・
+# マシンIDから作る固定値で、同じ機械なら毎回同じものが出る。秘密にはならない。
+#
+# flask run は --debug も FLASK_DEBUG=1 も、アプリを読み込む前に
+# os.environ["FLASK_DEBUG"] に落とす（Flask本体がそう書いている）。
+# だから create_app の入口で見れば、コマンドの書き方に関係なく両方を断てる。
+
+_TRUE = ("1", "true", "yes", "on", "t", "y")
+
+_NO_DEBUG_MSG = (
+    "\n[app] デバッグモードでは起動しません。\n"
+    "  理由: デバッガが開くと、例外が出たときにブラウザからこのサーバの Python を\n"
+    "        実行できます。PIN はユーザー名・MACアドレス・マシンIDから作る固定値で、\n"
+    "        同じ機械なら毎回同じものが出るため、守りになりません。\n"
+    "  断ったもの: flask run の --debug / --debugger と、環境変数 FLASK_DEBUG=1。\n"
+    "  通常の起動: python core.py\n"
+    "  詳しいエラーを見たいとき: core.py の DEBUG を True にして python core.py\n"
+    "        （そのときは HOST も 127.0.0.1 にしてください）\n"
+)
+
+_NO_DEBUG_REMOTE = (
+    "\n[app] DEBUG = True のまま、外から届くアドレスでは起動しません。\n"
+    f"  いまの設定: HOST = {{host}}\n"
+    "  デバッガが開くと、ブラウザからこのサーバの Python を実行できます。\n"
+    "  手元で見るなら HOST = \"127.0.0.1\"、社内に出すなら DEBUG = False にしてください。\n"
+)
+
+
+def _is_loopback(host) -> bool:
+    """自分のPCからしか届かないアドレスか。
+
+    空文字を入れてはいけない。`app.run(host="")` は 0.0.0.0 と同じで、
+    全てのネットワークから届く（loopback ではない）。
+    """
+    return str(host or "").strip().lower() in ("127.0.0.1", "localhost", "::1")
+
+
+#: flask run がデバッガを開く口。--debug は環境変数に落ちるが、
+#: --debugger は別の引数で、環境変数を通らない（Flask本体の作り）。
+_DEBUG_ARGS = ("--debugger", "--debug")
+
+
+def _refuse_debugger() -> None:
+    """flask run の --debug / --debugger / FLASK_DEBUG=1 を断つ。
+
+    --debug は環境変数 FLASK_DEBUG に落ちてからアプリが読み込まれるので、
+    環境変数を見れば足りる。ところが --debugger は別の引数で、
+    環境変数を通らずに use_debugger=True になる。だから引数も見る。
+    """
+    if str(os.environ.get("FLASK_DEBUG") or "").strip().lower() in _TRUE:
+        raise SystemExit(_NO_DEBUG_MSG)
+    if any(a in _DEBUG_ARGS for a in sys.argv[1:]):
+        raise SystemExit(_NO_DEBUG_MSG)
+
+
 def create_app() -> Flask:
+    # デバッガは開かせない（flask run の --debug / FLASK_DEBUG=1 を断つ）。
+    # どちらも同じ環境変数に落ちるので、ここ1か所で両方止まる
+    _refuse_debugger()
     # 画面ファイル（HTML/CSS/JS）はファイルではなく本ファイル末尾の
     # TEMPLATES / STATIC_FILES から配る
     app = Flask(__name__, static_folder=None)
@@ -14520,6 +15130,10 @@ if __name__ == "__main__":
             sys.exit(_sql_guard_selftest())
         sys.exit(f"不明なコマンド: {_cmd}（users / refresh / selftest のどれか。"
                  "サーバ起動は引数なしの python core.py）")
+
+    # DEBUG のまま社内に出すと、flask run --debug と同じ危険になる
+    if DEBUG and not _is_loopback(HOST):
+        raise SystemExit(_NO_DEBUG_REMOTE.format(host=HOST))
 
     app = create_app()
     if DEBUG:

@@ -2541,9 +2541,11 @@ def save_admin(data: dict, user: str | None = None) -> dict:
 # 時系列は発言ごとの時刻（表示物の at）で数える。この仕組みを入れる前の
 # 古い会話には at が無いので、会話の開始時刻で代用し、その旨を所見に明示する。
 # ==========================================================================
+import io
 import json
 import re
-from collections import Counter
+import threading
+from collections import Counter, deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -2552,6 +2554,10 @@ import history
 
 #: 質問文・エラー文をそのまま並べるときの上限。多すぎると読まれない。
 MAX_LIST = 40
+
+#: 割合（％）を出してよい最低の会話数。これを下回るときは実数だけにする。
+#: 3件中1件を「33%」と書くと、読む側が過剰に反応してしまうため。
+_MIN_FOR_PCT = 10
 
 METHODS = {
     "summary": "全体像（期間・利用者・会話数・失敗率）",
@@ -2590,6 +2596,103 @@ _ERROR_KINDS = (
 _WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
 
 
+# ==========================================================================
+# 要望と評価の記録（data/feedback.jsonl）
+#
+# 応えられなかった質問は、失敗としてはどこにも残らない。無い表について聞かれると
+# AIは「そのデータはありません」と答えて正常に終わるので、記録の上では
+# 「成功した1問で終わった会話」になり、満足した人と見分けがつかない。
+# ここに1行ずつ残して、初めて要望として数えられる。
+#
+# 会話ファイルとは別の追記専用ファイルにする。利用者が会話を消しても
+# 要望が消えないため（消えると、いちばん不満だった人の声から先に失われる）。
+# ==========================================================================
+_FB_LOCK = threading.Lock()
+
+#: 記録の種類と、画面に出す言い方。core 側の「質問・履歴」の印と、
+#: 画面から受け取ってよい種類の検査（_FB_FROM_UI）は、ここを元にする。
+FEEDBACK_KINDS = {
+    "ok":         "これでいい",
+    "wrong":      "内容が違う",
+    "off_target": "知りたいことと違う",
+    "sql_ok":     "取り方が合っている",
+    "sql_ng":     "取り方が合っていない",
+    "gap":        "答えきれなかった",
+}
+#: AIの申告と自動の記録で使う、足りなかったものの種類。
+GAP_KINDS = {
+    "data":    "データがほしい",
+    "doc":     "文書がほしい",
+    "feature": "機能がほしい",
+    "explain": "説明が足りない",
+}
+
+
+def feedback_add(record: dict) -> bool:
+    """1行足す。書けなくても呼び出し元は止めない（記録のために回答を止めない）。"""
+    try:
+        path = Path(config.FEEDBACK_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        with _FB_LOCK:
+            with io.open(str(path), "a", encoding="utf-8", newline="\n") as f:
+                f.write(line + "\n")
+        return True
+    except Exception as e:                      # 書けない理由は環境側。黙らせない
+        print(f"[feedback] 記録できませんでした: {e}")
+        return False
+
+
+def feedback_seen(user: str, chat_id: str, turn, kind: str) -> bool:
+    """同じ人が、同じ質問に、同じ評価を既に付けているか。
+
+    付いているのに何度も受けると、件数をいくらでも作れてしまう
+    （その件数はレポートの文面にも乗る）。押し直しは種類が違うので通る。
+    """
+    if not chat_id:
+        return False
+    for r in feedback_read():
+        if (str(r.get("user") or "") == str(user)
+                and str(r.get("chat_id") or "") == str(chat_id)
+                and r.get("turn") == turn and str(r.get("kind") or "") == str(kind)):
+            return True
+    return False
+
+
+def feedback_read(days: int | None = None, user: str | None = None) -> list[dict]:
+    """記録を読む。壊れた行は飛ばす（1行のために全部を止めない）。"""
+    path = Path(config.FEEDBACK_FILE)
+    if not path.exists():
+        return []
+    limit = datetime.now() - timedelta(days=days) if days else None
+    out: list[dict] = []
+    try:
+        # deque なら、ファイルが大きくても使うメモリは上限ぶんで済む。
+        # readlines()[-n:] は 0 を渡すと [-0:] ＝ 全行になり、上限のつもりが逆に外れる
+        with io.open(str(path), encoding="utf-8") as f:
+            lines = list(_deque(f, maxlen=max(1, int(config.FEEDBACK_MAX_READ))))
+    except OSError:
+        return []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if user and str(rec.get("user") or "").lower() != str(user).lower():
+            continue
+        if limit:
+            at = _usage_dt(rec.get("at"))
+            if at and at < limit:
+                continue
+        out.append(rec)
+    return out
+
+
 def _usage_dt(value) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value))
@@ -2597,8 +2700,11 @@ def _usage_dt(value) -> datetime | None:
         return None
 
 
-def _usage_table(name: str, columns: list, rows: list) -> dict:
-    return {"name": name, "columns": columns, "rows": [tuple(r) for r in rows]}
+def _usage_table(name: str, columns: list, rows: list, chart: bool = True) -> dict:
+    # chart=False は「この表はグラフにしても読めない」という指定
+    # （1列目が長い文の表。棒を並べても軸が読めず、高さだけが増える）
+    return {"name": name, "columns": columns, "rows": [tuple(r) for r in rows],
+            "chart": chart}
 
 
 def _usage_out(title: str, tables: list, notes: list, meta: dict | None = None) -> dict:
@@ -2789,29 +2895,37 @@ def summary(records: list[dict], days: int | None = None) -> dict:
     chats_with_err = sum(1 for r in records if r["errors"])
     active_days = {r["created"].date() for r in records if r["created"]}
 
+    # 何も出さずに1問で終わった会話。表もグラフもファイルも作っていない。
+    # 「一発で満足した人」と「諦めた人」を分けるための手がかりで、
+    # 質問文を読めば、どちらだったかが分かる
+    empty = [r for r in records
+             if len(r["questions"]) <= 1 and not (r["tables"] or r["charts"]
+                                                  or r["files"] or r["reports"])]
+    # 母数が小さいと割合は意味を持たない（1件の失敗が100%になる）。
+    # そのときは実数だけ出す
+    def _pct(n):
+        return f"{n} 件（{n / n_chats * 100:.0f}%）" if n_chats >= _MIN_FOR_PCT else f"{n} 件"
+
     rows = [
         ("会話", f"{n_chats:,} 件"),
         ("質問", f"{n_turns:,} 回"),
         ("利用者", f"{len(users)} 人"),
         ("使われた日", f"{len(active_days)} 日"),
         ("1会話あたりの質問", f"{n_turns / n_chats:.1f} 回"),
-        ("失敗を含む会話", f"{chats_with_err} 件（{chats_with_err / n_chats * 100:.0f}%）"),
+        ("失敗を含む会話", _pct(chats_with_err)),
+        ("何も出さずに1問で終わった会話", _pct(len(empty))),
         ("作った表・グラフ", f"表 {sum(r['tables'] for r in records):,} / "
                             f"グラフ {sum(r['charts'] for r in records):,}"),
         ("出したファイル", f"{sum(r['files'] for r in records):,} 件"),
     ]
 
     notes = [_period_note(records)]
-    # 1回で終わった会話が多いなら、続けて聞ける場になっていない可能性がある
-    one_shot = sum(1 for r in records if len(r["questions"]) <= 1)
-    if n_chats >= 5:
+    if n_chats >= 5 and empty:
         notes.append(
-            f"1問だけで終わった会話が {one_shot}/{n_chats} 件"
-            f"（{one_shot / n_chats * 100:.0f}%）。"
-            + ("会話を続けて掘り下げる使い方が根づいています。"
-               if one_shot / n_chats < 0.5 else
-               "多くが単発です。最初の答えで満足したか、続きを諦めたかのどちらかなので、"
-               "失敗の内訳（errors）も合わせて見てください。"))
+            f"何も出さずに1問で終わった会話が {len(empty)}/{n_chats} 件あります。"
+            "表もグラフもファイルも作っていない会話です。"
+            "一発で満足したのか、聞きたいことに届かずに諦めたのかは、"
+            "下の一覧で質問文を読むと分かります。")
     if errs:
         kinds = Counter(classify_error(e)[0] for e in errs)
         top, n = kinds.most_common(1)[0]
@@ -2826,9 +2940,18 @@ def summary(records: list[dict], days: int | None = None) -> dict:
         notes.append(f"最も使っているのは {who}（{cnt} 件 / 全体の "
                      f"{cnt / n_chats * 100:.0f}%）。")
 
-    return _usage_out("利用状況の全体像", [_usage_table("全体", ["項目", "値"], rows)], notes,
+    tables = [_usage_table("全体", ["項目", "値"], rows)]
+    if empty:
+        tables.append(_usage_table(
+            f"何も出さずに1問で終わった会話（最大{MAX_LIST}件）",
+            ["日付", "利用者", "質問"],
+            [((f"{r['created']:%m-%d %H:%M}" if r["created"] else "—"), r["user"],
+              (r["questions"][0] if r["questions"] else "")[:60])
+             for r in empty[-MAX_LIST:]], chart=False))
+    return _usage_out("利用状況の全体像", tables, notes,
                 {"chats": n_chats, "turns": n_turns, "users": len(users),
-                 "errors": len(errs), "active_days": len(active_days)})
+                 "errors": len(errs), "active_days": len(active_days),
+                 "empty": len(empty)})
 
 
 def by_user(records: list[dict]) -> dict:
@@ -2995,7 +3118,8 @@ def by_tool(records: list[dict]) -> dict:
                  "rag_returned": rag_all["returned"], "rag_cited": rag_all["cited"]})
 
 
-def by_database(records: list[dict]) -> dict:
+def by_database(records: list[dict], days: int | None = None,
+                user: str | None = None) -> dict:
     """どのテーブルが使われたか。
 
     かつては「どのDBを使ったか」を数えていたが、このアプリのDBは常に1つで、
@@ -3007,10 +3131,15 @@ def by_database(records: list[dict]) -> dict:
         return _empty(None)
 
     # 実行されたSQLからテーブル名を拾う（ER図の利用状況と同じ数え方）。
-    sqls, _ = sqlusage.collect_sqls()
+    # 画面で選んだ期間・利用者に合わせる。合わせないと、同じ画面の中で
+    # 「表ごとの回数」だけが全期間・全員になり、母数が食い違う
+    sqls, _ = sqlusage.collect_sqls(days=days, user=user)
     known = set()
     for f in db.list_db_files():
-        known |= set(catalog.profile_db(f)["tables"])
+        try:
+            known |= set(catalog.profile_db(f)["tables"])
+        except Exception:
+            continue        # 1つ読めないだけでタブ全体を落とさない
     per_table: Counter = Counter()
     for sql in sqls:
         low = str(sql).lower()
@@ -3044,7 +3173,8 @@ def by_database(records: list[dict]) -> dict:
                                str(sql).lower()) for t in known))
     notes = [_period_note(records),
              "実行されたSQLに出てきたテーブルを数えています"
-             "（1つのSQLに複数のテーブルが出れば、それぞれ1回ずつ）。"]
+             "（1つのSQLに複数のテーブルが出れば、それぞれ1回ずつ）。"
+             + ("この表も、上で選んだ期間と利用者で絞っています。" if (days or user) else "")]
     if sqls and hit < len(sqls):
         notes.append(
             f"記録に残るSQL {len(sqls)} 本のうち、いまあるテーブルを使っているのは "
@@ -3119,9 +3249,10 @@ def errors(records: list[dict]) -> dict:
     if outside:
         notes.append(f"{outside} 件はモデル・API側の問題で、カタログを直しても減りません。")
     return _usage_out("失敗の内訳",
-                [_usage_table("分類", ["分類", "件数", "割合", "打ち手"], kind_rows),
+                [_usage_table("分類", ["分類", "件数", "割合", "打ち手"], kind_rows,
+                               chart=False),
                  _usage_table(f"直近の失敗（最大{MAX_LIST}件）",
-                        ["日付", "利用者", "質問", "内容"], detail_rows)],
+                        ["日付", "利用者", "質問", "内容"], detail_rows, chart=False)],
                 notes, {"errors": len(items), "catalog_fixable": catalog_side})
 
 
@@ -3153,7 +3284,7 @@ def questions(records: list[dict]) -> dict:
                      "この質問文がそのまま、カタログに足りない語彙の一覧になります。")
     return _usage_out("聞かれた質問",
                 [_usage_table(f"直近の質問（最大{MAX_LIST}件）",
-                        ["日付", "利用者", "質問", "失敗"], rows)],
+                        ["日付", "利用者", "質問", "失敗"], rows, chart=False)],
                 notes, {"questions": len(asked)})
 
 
@@ -3215,7 +3346,14 @@ def analyze(method: str = "summary", days: int | None = None,
         raise ValueError(f"method は {'、'.join([*METHODS, 'imports'])} "
                          f"のいずれかです（受け取った値: {method}）")
     records = collect(days=days, user=user)
-    res = fn(records, days) if fn is summary else fn(records)
+    if fn is summary:
+        res = fn(records, days)
+    elif fn is by_database:
+        # 「使われたデータ」は会話の外（実行されたSQL）も見るので、
+        # 絞り込みをそちらにも渡す。渡さないと画面の中で母数が食い違う
+        res = fn(records, days=days, user=user)
+    else:
+        res = fn(records)
     if user:
         res["notes"] = [f"対象: {user} のみ", *res.get("notes", [])]
     return res
@@ -12092,6 +12230,17 @@ def _search_knowledge_base(args: dict, scope: list[dict]) -> dict:
         results, char_budget=int(settings["max_context_chars"]), start_index=start)
     _rag_used_sources(len(sources))
 
+    if not sources and not dropped:
+        # 本当に1件も無かった＝「この文書がほしい」という要望そのもの。
+        # 誰もボタンを押さなくても残す（押されるのを待つと、いちばん多い
+        # 「黙って去った人」の分が丸ごと落ちる）。
+        feedback_add({
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "user": getattr(_current_user(), "username", "") or "",
+            "kind": "gap", "gap_kind": "doc", "auto": True,
+            "detail": query[:200], "question": query[:200],
+            "kb": "、".join(str(r["name"]) for r in results if not r.get("error"))[:200],
+        })
     if not sources:
         # 「予算に入らなくて渡せなかった」と「本当に無かった」は別のこと。
         # 一緒にすると、当たっているのに「ありません」と答えてしまう
@@ -12165,8 +12314,62 @@ def _who_am_i(args: dict, scope: list[dict]) -> dict:
     }), "render": None}
 
 
+# 答えきれなかったことを、AI自身に1行で申告させる道具。
+# 応えられなかった質問は失敗としてどこにも残らないので、これが無いと
+# 「ほしいデータ」「ほしい機能」は見えないままになる。
+# パーソナライズのような別建ての呼び出しは要らない（答えを書く流れで手順が1つ増えるだけ）。
+REPORT_GAP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "report_gap",
+        "description": (
+            "質問に十分に答えられなかったときに、足りなかったものを1行で報告する。"
+            "データが無い・社内文書が無い・いまの機能ではできない・カタログの説明が足りない、"
+            "のいずれかに当てはまるなら、答えを書く前に1回だけ呼ぶ。"
+            "呼んでも利用者への答えは変わらない（管理者に伝わるだけ）。"
+            "答えられたときは呼ばない。1つの質問で何度も呼ばない。"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["data", "doc", "feature", "explain"],
+                         "description": ("data=表のデータが無い / doc=社内文書が無い / "
+                                         "feature=いまの機能ではできない / "
+                                         "explain=カタログの説明が足りず判断できない")},
+                "what": {"type": "string",
+                         "description": ("何が足りなかったかを、管理者が読んで動ける一文で書く。"
+                                         "例: 協力会社ごとの受入検査の結果（合否・数量・日付）")},
+            },
+            "required": ["kind", "what"],
+        },
+    },
+}
+
+
+def _report_gap(args: dict, scope: list[dict]) -> dict:
+    kind = str(args.get("kind") or "").strip()
+    what = str(args.get("what") or "").strip()
+    if kind not in GAP_KINDS:
+        return _err(f"kind は {'、'.join(GAP_KINDS)} のいずれかです。")
+    if not what:
+        return _err("何が足りなかったか（what）を1文で書いてください。")
+    feedback_add({
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "user": getattr(_current_user(), "username", "") or "",
+        # auto=True は「人が押していない」という意味。AIが自分で申告したものなので、
+        # 利用者が押したものと同じ列には数えない
+        "kind": "gap", "gap_kind": kind, "auto": True, "detail": what[:300],
+    })
+    return {"ok": True, "llm_content": _json({
+        "tool": "report_gap", "recorded": True,
+        "note": "管理者に伝えた。回答の中でこのことを長く説明しなくてよい。"
+                "いまあるデータで答えられる範囲を、そのまま答えること。"}),
+        "render": {"role": "assistant", "kind": "gap", "gap_kind": kind,
+                   "label": GAP_KINDS[kind], "what": what[:300]}}
+
+
 HANDLERS_knowledge = {"search_knowledge_base": _search_knowledge_base,
-                      "who_am_i": _who_am_i}
+                      "who_am_i": _who_am_i,
+                      "report_gap": _report_gap}
 
 # SQLは受け取らない（材料はDBではなくナレッジベース）
 SQL_TOOLS_knowledge: set = set()
@@ -12324,7 +12527,7 @@ import verify
 # ナレッジ検索の宣言もここで合流させる。こうしておくと _missing_required と
 # _coerce_lists（どちらも BUILTIN_TOOLS から表を作る）がそのまま効く。
 # ただしAIへ実際に渡す宣言は build_tools が組み立て直す（_DYNAMIC_TOOLS を参照）。
-BUILTIN_TOOLS = BUILTIN_TOOLS + KNOWLEDGE_TOOLS + [WHOAMI_TOOL]
+BUILTIN_TOOLS = BUILTIN_TOOLS + KNOWLEDGE_TOOLS + [WHOAMI_TOOL, REPORT_GAP_TOOL]
 
 #: 宣言を実行時に組み立て直すツール。BUILTIN_TOOLS の固定の宣言は使わない。
 #: ナレッジベースは運用中に増減するので、選択肢（名前と説明）を起動時には決められない。
@@ -13117,6 +13320,9 @@ search_knowledge_base で調べる。数値の集計は表（run_sql_query）、
 
 守ること:
 - 取得した本文(context)に書かれていることだけを根拠にする。書かれていないことは推測しない。
+- 十分に答えられなかったときは report_gap を1回呼ぶ（データが無い・文書が無い・
+  いまの機能ではできない・カタログの説明が足りない）。呼んでも答えは変わらない。
+  管理者が「何が足りないか」を数えるための記録で、これが無いと要望は誰にも見えない。
 - 根拠にした箇所には [出典1] のように出典番号を必ず添える。番号は検索結果のものをそのまま使う。
 - 文書を使って答えたときは、回答の最後に「根拠」としてその出典を並べる
   （出典番号・ナレッジベース名・ファイル名）。人が原本に当たれるようにするため。
@@ -14041,6 +14247,39 @@ _MEMORY_SYSTEM = """あなたは、社内データ分析アプリの利用者に
 {"text": "書き直した本文（変える必要が無ければ null）"}
 迷ったら null（変えない）。"""
 
+
+_USAGE_REPORT_SYSTEM = """あなたは社内の分析基盤の運用担当です。
+渡された「集計結果」だけを根拠に、管理者が読む月次レポートを日本語で書いてください。
+
+守ること:
+- **数字を新しく作らない。** 渡された数字だけを使い、足し算・割り算もしない。
+  渡されていない数字が必要なら「記録がありません」と書く。
+- 利用者はログインIDで書かれている。社員名簿のような表がカタログにあれば、
+  そこから部署や役職を読み取って「部署ごとの様子」を書いてよい。
+  引けないときは、その節を書かずに「名簿と突き合わせられませんでした」と書く。
+- 読むのは非IT部門の管理者。ファイル名・関数名・列名の羅列は書かない。
+- 材料が薄いときは、無理に結論を書かず「まだ判断できる記録がありません」と書く。
+
+出力はJSONだけ。次の形にすること:
+{
+  "used":     ["よく使われている用途を1件1文で。最大5件"],
+  "teams":    ["部署ごとの様子を1件1文で。引けないときは空の配列"],
+  "want_data":["ほしいと言われたデータを1件1文で"],
+  "want_func":["ほしいと言われた機能を1件1文で"],
+  "actions":  ["次の1か月で打つ手を、効く順に最大3件。それぞれ理由を1文で添える"],
+  "unknown":  ["この記録からは分からなかったことを1件1文で"]
+}
+"""
+
+
+def build_usage_report(material: str, model: str | None = None) -> dict:
+    """集計済みの材料から、読み物の形のレポートを1回の呼び出しで作らせる。"""
+    data = _ask_json(_USAGE_REPORT_SYSTEM, material, "利用状況レポート", model=model or None)
+    out = {}
+    for key in ("used", "teams", "want_data", "want_func", "actions", "unknown"):
+        v = data.get(key)
+        out[key] = [str(x).strip() for x in v if str(x).strip()][:8] if isinstance(v, list) else []
+    return out
 
 def extract_memory(existing_text: str, question: str, answer: str,
                    model: str | None = None):
