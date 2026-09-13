@@ -2617,6 +2617,65 @@ def classify_error(message: str) -> tuple[str, str]:
 # 材料集め
 # =============================================================================
 
+#: 回答が根拠にした出典番号を拾う正規表現。画面のJSと同じ決まりで拾う
+#: （括弧の無い「出典15」は取らない。「出典が15件」のような文まで数えてしまうため）。
+_CITE_RE = re.compile(r"[\[［]\s*出典\s*(\d+)")
+
+
+def _cited_numbers(text: str) -> set:
+    return {int(m) for m in _CITE_RE.findall(str(text or ""))}
+
+
+def _rag_stats(log: list) -> dict:
+    """社内文書の検索の当たり具合を、1つの会話から数える。
+
+    出典番号は質問ごとに1から振り直される。だから質問の区切りごとに
+    「返した出典」と「回答が引いた出典」を突き合わせないと、
+    前の質問の番号を今の回答が引いたことになってしまう。
+    """
+    out = {"searches": 0, "zero": 0, "returned": 0, "cited": 0, "by_kb": {}}
+    seg_src: dict = {}                 # 出典番号 -> ナレッジベース名（いまの質問ぶん）
+    seg_cited: set = set()
+
+    def kb(name):
+        return out["by_kb"].setdefault(str(name), {"returned": 0, "cited": 0,
+                                                   "searches": 0, "zero": 0})
+
+    def flush():
+        for idx, name in seg_src.items():
+            k = kb(name)
+            k["returned"] += 1
+            out["returned"] += 1
+            if idx in seg_cited:
+                k["cited"] += 1
+                out["cited"] += 1
+        seg_src.clear()
+        seg_cited.clear()
+
+    for item in log:
+        if item.get("role") == "user" and item.get("kind") == "text":
+            flush()
+            continue
+        if item.get("kind") == "sources":
+            out["searches"] += 1
+            srcs = item.get("sources") or []
+            for name in (item.get("searched") or []):
+                kb(name)["searches"] += 1
+            if not srcs:
+                out["zero"] += 1
+                for name in (item.get("searched") or []):
+                    kb(name)["zero"] += 1
+            for s in srcs:
+                try:
+                    seg_src[int(s.get("index"))] = str(s.get("knowledge_base") or "")
+                except (TypeError, ValueError):
+                    continue
+        elif item.get("kind") == "text" and item.get("role") != "user":
+            seg_cited |= _cited_numbers(item.get("content"))
+    flush()
+    return out
+
+
 def _asked(log: list, fallback: datetime | None) -> list[dict]:
     """1発言ぶんの記録。質問の時刻と、答え終わった時刻を組にする。
 
@@ -2695,6 +2754,7 @@ def collect(days: int | None = None, user: str | None = None) -> list[dict]:
             "tables": kinds.get("table", 0),
             "files": kinds.get("file", 0),
             "reports": kinds.get("report", 0),
+            "rag": _rag_stats(log),
         })
     out.sort(key=lambda r: r["created"] or datetime.min)
     return out
@@ -2880,6 +2940,45 @@ def by_tool(records: list[dict]) -> dict:
         top = calls.most_common(3)
         notes.append("よく使われるのは " +
                      "、".join(f"{n}（{c}回）" for n, c in top) + "。")
+    tables = [_usage_table("ツール別", ["ツール", "回数", "割合"], rows)]
+
+    # --- 社内文書の当たり具合。誰にも押してもらわずに取れる2つの数字 ---
+    # 引用率 = 返した出典のうち、回答が [出典N] で実際に引いた割合。
+    # 低ければ、取ってくる件数が多すぎるか、文書の切り方が粗いか、
+    # そのナレッジベースがその質問に向いていないかのどれか。
+    rag_all = {"searches": 0, "zero": 0, "returned": 0, "cited": 0}
+    per_kb: dict = {}
+    for r in records:
+        st = r.get("rag") or {}
+        for k in rag_all:
+            rag_all[k] += int(st.get(k) or 0)
+        for name, v in (st.get("by_kb") or {}).items():
+            cur = per_kb.setdefault(name, {"returned": 0, "cited": 0, "searches": 0, "zero": 0})
+            for k in cur:
+                cur[k] += int(v.get(k) or 0)
+    if rag_all["searches"]:
+        kb_rows = [(name, v["searches"], v["returned"], v["cited"],
+                    (f"{v['cited'] / v['returned'] * 100:.0f}%" if v["returned"] else "—"),
+                    v["zero"])
+                   for name, v in sorted(per_kb.items(),
+                                         key=lambda kv: -(kv[1]["cited"] / kv[1]["returned"]
+                                                          if kv[1]["returned"] else 0))]
+        tables.append(_usage_table(
+            "社内文書の当たり具合（ナレッジベース別）",
+            ["ナレッジベース", "検索", "返した出典", "引用された", "引用率", "0件"], kb_rows))
+        rate = (rag_all["cited"] / rag_all["returned"] * 100) if rag_all["returned"] else 0
+        notes.append(f"社内文書の検索は {rag_all['searches']} 回。返した出典 "
+                     f"{rag_all['returned']} 件のうち、回答が根拠にしたのは "
+                     f"{rag_all['cited']} 件（引用率 {rate:.0f}%）。"
+                     "残りは読まれずに捨てられています。")
+        if rag_all["returned"] and rate < 30:
+            notes.append("引用率が低いときは、取ってくる件数が多すぎるか、文書の切り方が粗いか、"
+                         "そのナレッジベースがその質問に向いていないかのどれかです。"
+                         "件数はサイドバーの検索設定で変えられます。")
+        if rag_all["zero"]:
+            notes.append(f"1件も見つからずに終わった検索が {rag_all['zero']} 回あります。"
+                         "文書そのものが足りていない可能性があります。")
+
     try:
         import tools as _tools
         unused = sorted(set(_tools._HANDLERS) - set(calls))
@@ -2891,8 +2990,9 @@ def by_tool(records: list[dict]) -> dict:
                          "呼び分けが安定します。使ってほしいなら説明文を具体的に書き直します。")
     except Exception:
         pass
-    return _usage_out("呼ばれた機能", [_usage_table("ツール別", ["ツール", "回数", "割合"], rows)],
-                notes, {"total_calls": total, "kinds": len(calls)})
+    return _usage_out("呼ばれた機能", tables, notes,
+                {"total_calls": total, "kinds": len(calls),
+                 "rag_returned": rag_all["returned"], "rag_cited": rag_all["cited"]})
 
 
 def by_database(records: list[dict]) -> dict:

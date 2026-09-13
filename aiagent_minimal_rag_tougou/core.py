@@ -11502,6 +11502,89 @@ def premises_report() -> dict:
                      "writers": len(writers)}}
 
 
+# --- 定着したもの（「使われた機能」タブの下に足す） --------------------------------
+# マイロボット・ユーザー定義ツール・ビュー・例文は、どれも
+# 「これは私の定型業務だ」という宣言。用途を語る材料としては質問文より強い。
+# 読むのに新しい記録もAIも要らない（登録されたものを数えるだけ）。
+
+#: 直近の結果の言い方。カードの文言と合わせる。
+_SETTLED_STATUS = {"ok": "成功", "error": "失敗", "running": "実行中", "": "まだ動いていない"}
+
+
+def _settled_robots() -> list[tuple]:
+    """全利用者のマイロボットを1行ずつ。持ち主はログインID（あとで部署に引き直すため）。"""
+    rows = []
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return rows
+    for d in sorted(dirs):
+        p = d / "robots.json"
+        if not p.exists():
+            continue
+        data = _read_json(p)
+        for r in ((data.get("robots") if isinstance(data, dict) else None) or []):
+            if not (isinstance(r, dict) and r.get("id")):
+                continue
+            kinds = []
+            for s in (r.get("steps") or []):
+                label = TOOL_LABELS.get(s.get("name")) or str(s.get("name") or "")
+                if label and label not in kinds:
+                    kinds.append(label)
+            sch = _robot_schedule_norm(r)
+            rows.append((r.get("name") or "（無題）", d.name, "、".join(kinds),
+                         _robot_schedule_label(sch),
+                         _SETTLED_STATUS.get(str(r.get("last_status") or ""), "—"),
+                         sch["interval_minutes"]))
+    return rows
+
+
+def _settled_tables() -> tuple:
+    """(表のリスト, 所見のリスト)。使われた機能タブの下に足す。"""
+    tables, notes = [], []
+
+    rows = _settled_robots()
+    if rows:
+        tables.append({"name": "マイロボット（全利用者）",
+                       "columns": ["名前", "持ち主（ログインID）", "手順", "定期実行", "直近"],
+                       "rows": [r[:5] for r in rows]})
+
+    # 数えもの。組み込みで書けなかったものが、どれだけ足されたか
+    try:
+        customs = custom_tools.collect_everywhere()
+    except Exception:
+        customs = []
+    views = []
+    for f in db.list_db_files():
+        try:
+            views.extend(list_views(f))
+        except Exception:
+            continue
+    ex = 0
+    for f in db.list_db_files():
+        ex += len(catalog.load_meta(f).get("examples") or [])
+    scheduled = sum(1 for r in rows if r[5] > 0)
+    counts = [("マイロボット", len(rows)), ("うち定期実行", scheduled),
+              ("ユーザー定義ツール", len(customs)), ("ビュー", len(views)), ("例文", ex)]
+    tables.append({"name": "定着したもの", "columns": ["種類", "件数"], "rows": counts})
+
+    if rows:
+        notes.append(f"マイロボットが {len(rows)} 件（うち定期実行 {scheduled} 件）。"
+                     "登録された定型業務そのものなので、質問文より強く用途を語ります。")
+    if customs or views:
+        notes.append(f"ユーザー定義ツール {len(customs)} 件・ビュー {len(views)} 件。"
+                     "組み込みの機能では書けなかった集計が、ここに溜まります。"
+                     "似たものが増えていれば、組み込みに足す価値があります。")
+    return tables, notes
+
+
+def _usage_add_settled(res: dict) -> dict:
+    """「使われた機能」の結果に、定着したものを足す（中身が core 側にあるため）。"""
+    tables, notes = _settled_tables()
+    return {**res, "tables": list(res.get("tables") or []) + tables,
+            "notes": list(res.get("notes") or []) + notes}
+
+
 # --- パーソナライズ（管理者メニューのタブ） -----------------------------------------
 
 def _memory_overview() -> list[dict]:
@@ -13479,6 +13562,10 @@ def _usage_result(method: str, days, user):
     # 戻り値の形は usage.analyze と同じなので、表示もExcel出力もこの先は共通。
     res = (premises_report() if method in USAGE_CORE_VIEWS
            else usage.analyze(method, days=days or None, user=user or None))
+    # 「使われた機能」には、定着したもの（ロボット・ツール・ビュー・例文）を足す。
+    # 中身が core 側にあるので、集計側（usage）では作れない
+    if method == "tools":
+        res = _usage_add_settled(res)
     return {"title": res.get("title") or "", "notes": res.get("notes") or [],
             # 表の名前は集計側が name で返す。画面は title を見るので、ここで揃える
             # （揃えないと「推移」のように表が3つ並ぶタブで、どれが何か分からない）
