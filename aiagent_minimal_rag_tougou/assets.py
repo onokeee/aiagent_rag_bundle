@@ -5619,6 +5619,7 @@ window.TABLE_INIT = {
      （上の管理者メニューの帯とは別。JSは data-view のあるタブだけを見る） #}
   <div class="tabs tabs--bar tabs--sub">
     {% for v in views if not v.merged %}
+    {% if v.sep %}<span class="tabs__sep"></span>{% endif %}
     <button class="tab {{ 'is-active' if loop.first }}" data-view="{{ v.key }}">{{ v.label }}</button>
     {% endfor %}
     <button class="tab" data-view="chats">質問・履歴</button>
@@ -6363,16 +6364,17 @@ details.acc.is-target {
    行を押すと全文が出る（長い抜粋が並ぶと、回答本文が埋もれるため）。 */
 
 .srcs { padding: 8px 11px; display: flex; flex-direction: column; gap: 8px; }
-.src { cursor: pointer; border-left: 2px solid var(--border); padding-left: 9px; }
-.src:hover { border-left-color: var(--accent); }
+.src { border-left: 2px solid var(--border); padding-left: 9px; }
 .src__where { font-size: 12.5px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
 .src__no { color: var(--accent); font-weight: 600; }
 .src__text {
+    /* 抜粋は先頭200字しか来ないので、切らずにそのまま出す。
+       件数が多くて埋まる問題は「引用された出典だけ開く」の方で解いてある。 */
+    /* 改行はそのままにしない。文書の抜粋には改行が多く、そのまま出すと
+       1件で画面が埋まる。続けて流して、折り返しだけ任せる。 */
     color: var(--muted); font-size: 12.5px; line-height: 1.7; margin-top: 2px;
-    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
-    overflow: hidden;
+    word-break: break-word;
 }
-.src.is-open .src__text { -webkit-line-clamp: unset; overflow: visible; }
 /* 引用されなかった出典を開く・畳む。件数を出すので、押す前に量が分かる */
 .srcs__more {
     background: none; border: 0; padding: 0; font: inherit; font-size: 12px;
@@ -6380,6 +6382,10 @@ details.acc.is-target {
     text-decoration: underline; text-underline-offset: 3px;
 }
 .srcs__more:hover { color: var(--accent); }
+
+/* 集計の切り口の帯に入れる区切り。左がニーズ、右が健康診断 */
+.tabs__sep { width: 1px; height: 18px; align-self: center; margin: 0 10px;
+             background: var(--border-2); flex: none; }
 
 .filecard {
     display: flex; align-items: center; gap: 12px; padding: 13px 15px;
@@ -9985,13 +9991,11 @@ function sourcesCard(item) {
         const rows = sources.map(s => {
             // サーバが送ってくるのは先頭だけ（全文ではない）。
             // 「全文」と書くと、ここに無い＝文書に無い、と読まれてしまう
+            // 押しても何も起きないので、押す場所にはしない。
+            // 抜粋の続き（200字の先）はそもそも画面に来ていないため、
+            // どう押しても出せない。原本はファイル名から当たってもらう。
             const cut = s.excerpt_cut;
-            const row = el('div', {
-                class: 'src',
-                title: cut ? `クリックで抜粋（先頭${s.excerpt_chars || 200}字）の全体を表示します`
-                           : 'クリックで抜粋の全体を表示します',
-                onclick: () => row.classList.toggle('is-open'),
-            },
+            const row = el('div', { class: 'src' },
                 el('div', { class: 'src__where' },
                     el('span', { class: 'src__no' }, `[出典${s.index}]`),
                     el('span', {}, s.knowledge_base),

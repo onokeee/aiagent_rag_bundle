@@ -11306,6 +11306,202 @@ def robot_admin_stop_route():
     return jsonify({"ok": True, "name": robot.get("name")})
 
 
+# =============================================================================
+# ===== 前提の地図（利用状況のタブ）
+# パーソナライズを、利用者ごとではなく「行ごと」に横へ並べる。
+#
+# パーソナライズに溜まるのは「利用者が毎回言わないとAIに通じなかったこと」で、
+# 個人単位では本人の設定にすぎない。横に並べると話が変わる。
+# 2人以上が同じことを覚えていれば、それは個人の好みではなく組織の常識で、
+# 用語集か表の説明に1度書けば全員に効く（＝カタログの穴の一覧になる）。
+#
+# 同じ言葉について別々のことを覚えている人がいれば、定義が揺れている。
+# 放置すると、同じ名前の数字が会議で食い違う。
+#
+# 新しい記録は要らない。集計そのものは data/users/*/memory.yaml を読むだけ。
+# =============================================================================
+import re
+import unicodedata
+
+#: 「出力の好み」と読める語。アプリ自身が持つ出力の種類だけを見る
+#: （業務の言葉は環境ごとに違うので入れない）。
+_PREMISE_OUTPUT = ("excel", "エクセル", "csv", "グラフ", "図", "pdf", "word", "ワード",
+                   "powerpoint", "パワポ", "スライド", "表で", "一覧で")
+#: 「期間の既定」と読める語。
+_PREMISE_PERIOD = ("先月", "今月", "前月", "昨年", "去年", "前年", "年度", "直近",
+                   "今期", "前期", "四半期", "月次", "週次", "日次", "累計", "期間")
+#: 並べても意味の無い行（空・見出しだけ）を落とすための最短の長さ。
+_PREMISE_MIN = 4
+#: 1つの表に並べる上限。多すぎると読まれない（usage.MAX_LIST と同じ考え方）。
+_PREMISE_MAX = 60
+
+
+def _premise_norm(line: str) -> str:
+    """行をそろえる。箇条書きの印・全半角・空白の違いで別物にしないため。"""
+    s = unicodedata.normalize("NFKC", str(line or "")).strip()
+    s = re.sub(r"^[-*・･●○◆■□\s]+", "", s)
+    s = re.sub(r"[。\.]+$", "", s)
+    return re.sub(r"\s+", "", s).lower()
+
+
+def _premise_lines() -> list[tuple]:
+    """全利用者のパーソナライズを (ログインID, 元の行, そろえた行) に開く。"""
+    out = []
+    for row in _memory_overview():
+        for raw in str(row.get("text") or "").splitlines():
+            key = _premise_norm(raw)
+            if len(key) < _PREMISE_MIN:
+                continue
+            out.append((row["user"], re.sub(r"^[-*・･●○◆■□\s]+", "", raw.strip()), key))
+    return out
+
+
+def _premise_vocab() -> list[str]:
+    """カタログの言葉（表名・列名・用語）。長い順に返す（最長一致で当てるため）。"""
+    words = set()
+    for f in db.list_db_files():
+        prof = catalog.profile_db(f)
+        meta = catalog.load_meta(f)
+        for t, info in (prof.get("tables") or {}).items():
+            words.add(t)
+            words.update(str(c.get("name") or "") for c in (info.get("columns") or []))
+            words.update(catalog.table_glossary(meta, t))
+        words.update(catalog.db_glossary(meta))
+    return sorted((w for w in words if len(str(w)) >= 2), key=lambda w: -len(w))
+
+
+def _premise_hits(key: str, vocab: list) -> list:
+    """その行に出てくるカタログの言葉。長い順に当てて、重なった短い語は取らない。"""
+    hits, used = [], ""
+    for w in vocab:
+        low = str(w).lower()
+        if low and low in key and low not in used:
+            hits.append(str(w))
+            used += low
+    return hits
+
+
+def _premise_kind(key: str, hits: list) -> str:
+    """その行が何の話かを、いちばん手が打ちやすい向き先で1つに決める。"""
+    if hits:
+        return "表・用語の意味"
+    if any(w in key for w in _PREMISE_OUTPUT):
+        return "出力の既定"
+    if any(w in key for w in _PREMISE_PERIOD):
+        return "期間の既定"
+    return "その他"
+
+
+def _premise_groups(lines: list) -> list[dict]:
+    """同じことを言っている行をまとめる。
+
+    そろえた文字列が一致するものを1つにし、そのあと
+    「片方がもう片方を丸ごと含む」ものを吸収する（「部署は関西工場」と
+    「うちの部署は関西工場」を別々に数えないため）。
+    """
+    by_key: dict = {}
+    for user, raw, key in lines:
+        g = by_key.setdefault(key, {"key": key, "text": raw, "users": []})
+        if user not in g["users"]:
+            g["users"].append(user)
+    groups = sorted(by_key.values(), key=lambda g: -len(g["key"]))
+    merged: list = []
+    for g in groups:
+        host = next((m for m in merged if g["key"] in m["key"]), None)
+        if host is None:
+            merged.append(g)
+            continue
+        for u in g["users"]:
+            if u not in host["users"]:
+                host["users"].append(u)
+    return sorted(merged, key=lambda g: (-len(g["users"]), g["text"]))
+
+
+def premises_report() -> dict:
+    """前提の地図。戻り値の形は usage.analyze と同じ（画面とExcelが同じ入れ物で受ける）。"""
+    everyone = usage_users()
+    lines = _premise_lines()
+    if not lines:
+        return {"title": "前提の地図", "tables": [],
+                "notes": ["パーソナライズにまだ何も書かれていません。"
+                          "マイエージェントで質問して答えが返ると、AIがここに書き足します。"],
+                "meta": {"lines": 0}}
+
+    vocab = _premise_vocab()
+    groups = _premise_groups(lines)
+    writers = sorted({u for u, _, _ in lines})
+
+    # (1) 2人以上が同じことを覚えている＝組織の常識。カタログに書けば全員に効く
+    shared = [g for g in groups if len(g["users"]) >= 2]
+    shared_rows = [(g["text"][:80], len(g["users"]), "、".join(g["users"]),
+                    _premise_kind(g["key"], _premise_hits(g["key"], vocab)))
+                   for g in shared[:_PREMISE_MAX]]
+
+    # (2) 同じ言葉について、別々のことを覚えている＝定義が揺れている候補
+    by_word: dict = {}
+    for g in groups:
+        for w in _premise_hits(g["key"], vocab):
+            by_word.setdefault(w, []).append(g)
+    clash_rows = []
+    for w in sorted(by_word):
+        gs = by_word[w]
+        if len(gs) < 2:
+            continue
+        # 同じ人だけが書いている言葉は揺れではない（本人の中では一貫している）
+        if len({u for g in gs for u in g["users"]}) < 2:
+            continue
+        for g in gs[:4]:
+            clash_rows.append((w, "、".join(g["users"]), g["text"][:80]))
+
+    # (3) 出力と期間の既定。多数派が分かれば、アプリの初期値を変える判断ができる
+    dist_rows = []
+    for kind, words in (("出力の既定", _PREMISE_OUTPUT), ("期間の既定", _PREMISE_PERIOD)):
+        for g in groups:
+            if _premise_hits(g["key"], vocab):
+                continue                      # 表・用語の話はこちらでは数えない
+            if any(x in g["key"] for x in words):
+                dist_rows.append((kind, g["text"][:60], len(g["users"])))
+    dist_rows.sort(key=lambda r: (r[0], -r[2]))
+
+    tables = []
+    if shared_rows:
+        tables.append({"name": "みんなが覚えていること（2人以上）",
+                       "columns": ["覚えている内容", "人数", "ログインID", "向き先"],
+                       "rows": shared_rows})
+    if clash_rows:
+        tables.append({"name": "同じ言葉について食い違っている前提",
+                       "columns": ["言葉", "ログインID", "覚えている内容"],
+                       "rows": clash_rows[:_PREMISE_MAX]})
+    if dist_rows:
+        tables.append({"name": "出力と期間の既定",
+                       "columns": ["区分", "内容", "人数"], "rows": dist_rows[:_PREMISE_MAX]})
+    tables.append({"name": "利用者ごとの行数", "columns": ["ログインID", "前提の行"],
+                   "rows": sorted(((u, sum(1 for x, _, _ in lines if x == u)) for u in writers),
+                                  key=lambda r: -r[1])})
+
+    quiet = [u for u in everyone if u not in writers]
+    notes = [f"前提の行は {len(lines)} 件（{len(groups)} 種類）。"
+             f"書いている人は {len(writers)} 人です。"]
+    if shared:
+        notes.append(f"2人以上が同じことを覚えている行が {len(shared)} 件あります。"
+                     "これは個人の好みではなく組織の常識なので、用語集か表の説明に1度書けば"
+                     "全員に効きます（新しく入った人にも最初から効きます）。")
+    else:
+        notes.append("2人以上が同じことを覚えている行はまだありません。")
+    if clash_rows:
+        notes.append(f"同じ言葉について別々のことを覚えている組が "
+                     f"{len({r[0] for r in clash_rows})} 語ぶんあります。"
+                     "定義が揺れている候補です。用語集で決めると、数字の食い違いが止まります。")
+    if quiet:
+        notes.append(f"パーソナライズが空のままの人が {len(quiet)} 人います"
+                     f"（{'、'.join(quiet[:5])}{' ほか' if len(quiet) > 5 else ''}）。"
+                     "一度使って離れた可能性があります。「利用者」タブの最終利用と"
+                     "合わせて見てください。")
+    return {"title": "前提の地図", "tables": tables, "notes": notes,
+            "meta": {"lines": len(lines), "groups": len(groups), "shared": len(shared),
+                     "writers": len(writers)}}
+
+
 # --- パーソナライズ（管理者メニューのタブ） -----------------------------------------
 
 def _memory_overview() -> list[dict]:
@@ -13244,8 +13440,13 @@ import db
 bp_usage = Blueprint("usage", __name__)
 
 #: 画面のタブ。キーは usage.METHODS のもの＋imports。
+#: 集計の中身が core 側にあるもの（パーソナライズなど）。usage.analyze には渡さない。
+USAGE_CORE_VIEWS = {"premises"}
+
+#: 左は「ニーズを読む」、右は「健康診断」。sep で帯に区切りを入れる。
 USAGE_VIEWS = [
-    {"key": "summary",   "label": "全体像"},
+    {"key": "premises",  "label": "前提の地図"},
+    {"key": "summary",   "label": "全体像", "sep": True},
     {"key": "users",     "label": "利用者"},
     {"key": "trend",     "label": "推移"},
     {"key": "tools",     "label": "使われた機能"},
@@ -13274,9 +13475,14 @@ def usage_users() -> list[str]:
 
 def _usage_result(method: str, days, user):
     """集計を1つ実行して、画面が使う形に整える。"""
-    res = usage.analyze(method, days=days or None, user=user or None)
+    # パーソナライズは core 側にあるので、こちらで作る。
+    # 戻り値の形は usage.analyze と同じなので、表示もExcel出力もこの先は共通。
+    res = (premises_report() if method in USAGE_CORE_VIEWS
+           else usage.analyze(method, days=days or None, user=user or None))
     return {"title": res.get("title") or "", "notes": res.get("notes") or [],
-            "tables": [{"title": t.get("title") or "",
+            # 表の名前は集計側が name で返す。画面は title を見るので、ここで揃える
+            # （揃えないと「推移」のように表が3つ並ぶタブで、どれが何か分からない）
+            "tables": [{"title": t.get("title") or t.get("name") or "",
                         "columns": list(t.get("columns") or []),
                         "rows": [list(r) for r in (t.get("rows") or [])]}
                        for t in (res.get("tables") or [])]}
