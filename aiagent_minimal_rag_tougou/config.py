@@ -166,7 +166,19 @@ SMTP_SECURITY = (os.getenv("SMTP_SECURITY", "none").strip().lower() or "none")
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_SENDER = os.getenv("SMTP_SENDER", "").strip()
-SMTP_SENDER_NAME = os.getenv("SMTP_SENDER_NAME", "DB分析アシスタント").strip()
+# 本文の冒頭に必ず入れる断り書き（管理者メニュー → メール設定 で変えられる。ここは初期値）。
+# {app} はアプリ名に置き換わる。空にすると付けない。
+MAIL_BODY_HEADER = os.getenv("MAIL_BODY_HEADER", "").strip() or (
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "このメールは {app} が自動で作成・送信しています。\n"
+    "内容にはAIが生成した文章が含まれます。数字や結論は、必ず元のデータでお確かめください。\n"
+    "このメールに返信しても、送信者には届かないことがあります。\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+# 本文に「送信者（ログインID）」の行を入れるか
+MAIL_SHOW_SENDER = (os.getenv("MAIL_SHOW_SENDER", "true").strip().lower()
+                    in ("1", "true", "yes", "on"))
+# 差出人の表示名。空ならアプリ名（APP_TITLE）を使う＝受け取る人に出所が分かる形にする
+SMTP_SENDER_NAME = os.getenv("SMTP_SENDER_NAME", "").strip()
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20") or 20)
 # 「メール設定」画面で宛先として登録してよいドメインの【初期値】（env では設定しない）。
 # 管理者が「メール設定」画面の「登録してよいドメイン」で変更でき、画面で保存した値が

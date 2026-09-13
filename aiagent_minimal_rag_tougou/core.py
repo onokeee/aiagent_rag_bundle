@@ -7475,6 +7475,7 @@ bp_chat = Blueprint("chat", __name__)
 TOOL_LABELS = {
     "run_sql_query": "SQL実行 (SELECT)",
     "search_knowledge_base": "社内文書の検索",
+    "who_am_i": "ログイン中の利用者",
     "plot_chart": "グラフ描画",
     "plot_dual_axis": "2軸グラフ描画 (棒+折れ線)",
     "plot_comparison": "グラフ描画（比較）",
@@ -7591,7 +7592,7 @@ def chat_index():
         history=chats.list_chats(g.user),
         folder_out=importer.output_dir_status()["ok"],
         memory=memory_payload(g.user),
-        robot_intervals=INTERVALS,
+        robot_sched_vocab=_robot_sched_vocab(),
         robot_min_hours=robot_settings()["min_interval_hours"],
         scheduler_on=scheduler.is_running(),
         starters=scope_starters(build_scope({f.name: [] for f in db.list_db_files()})),
@@ -8666,6 +8667,8 @@ def mail_send():
     files, missing = _attachments_for(chat, draft.get("attach_filenames"))
     if missing:
         return jsonify({"error": f"添付ファイルが見つかりません: {', '.join(missing)}"}), 400
+    # 本文に入れる送信者は、画面の値ではなく「押した本人」で確定させる
+    draft["from_user"], draft["from_user_name"] = g.user.username, g.user.display_name
     try:
         record = mailer.send(draft, files, user=g.user.username)
     except mailer.MailError as e:
@@ -9423,55 +9426,194 @@ def _robot_folder_defaults(steps: list[dict]) -> dict:
             "folder_overwrite": bool((first or {}).get("folder_overwrite"))}
 
 
-_SCHEDULE_KEYS = ("interval_minutes", "start_at", "enabled", "values", "last_run", "last_status", "last_message")
+_SCHEDULE_KEYS = ("kind", "hours", "time", "weekday", "day", "nth",
+                  "start_at", "enabled", "values", "last_run", "last_status", "last_message")
+#: 定期実行の型。画面のプルダウンはこの順で出す
+ROBOT_SCHEDULE_KINDS = {
+    "manual": "手動のみ",
+    "hours": "時間ごと",
+    "daily": "毎日",
+    "weekly": "毎週",
+    "monthly_day": "毎月（日を指定）",
+    "monthly_nth": "毎月（第○曜日）",
+}
+ROBOT_HOURS = (1, 3, 6, 12)                      # 「時間ごと」で選べる間隔
+ROBOT_WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
+ROBOT_NTH = {1: "第1", 2: "第2", 3: "第3", 4: "第4", 5: "最終"}
+#: それぞれの型の「最短でどれだけ空くか」（分）。管理者の最低間隔と比べるのに使う
+_KIND_GAP = {"manual": 0, "daily": 1440, "weekly": 10080, "monthly_day": 40320, "monthly_nth": 40320}
+
+
+def _robot_sched_vocab() -> dict:
+    """画面のプルダウンに出す語彙（定期実行のしかた）。"""
+    return {"kinds": ROBOT_SCHEDULE_KINDS, "hours": list(ROBOT_HOURS),
+            "weekdays": list(ROBOT_WEEKDAYS), "nth": {str(k): v for k, v in ROBOT_NTH.items()}}
+
+
+def _robot_hhmm(text, default="08:00") -> str:
+    """'8:0' や '08:00' を 'HH:MM' に整える。おかしければ既定。"""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*", str(text or ""))
+    if not m:
+        return default
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return default
+    return f"{h:02d}:{mi:02d}"
+
+
+def _robot_schedule_gap(sch: dict) -> int:
+    """この設定で、実行と実行のあいだが最短で何分空くか（管理者の最低間隔と比べる用）。"""
+    if sch.get("kind") == "hours":
+        return int(sch.get("hours") or 1) * 60
+    return _KIND_GAP.get(sch.get("kind"), 0)
 #: create_app が入れる Flask アプリ。定期実行のスレッドは要求の外なので、これで要求の文脈を作って動かす
 _flask_app = None
 
 
 def _robot_schedule_norm(robot: dict) -> dict:
-    """保存されている定期実行の設定を、欠けを埋めた形で返す（無ければ「手動のみ」）。"""
+    """保存されている定期実行の設定を、欠けを埋めた形で返す（無ければ「手動のみ」）。
+
+    この機能の最初の形（interval_minutes だけ）で保存されたものも読めるようにしてある。
+    """
     sch = robot.get("schedule") if isinstance(robot.get("schedule"), dict) else {}
+    kind = str(sch.get("kind") or "")
+    if kind not in ROBOT_SCHEDULE_KINDS:
+        kind = _robot_kind_from_minutes(sch)          # 古い保存からの読み替え
+    try:
+        hours = int(sch.get("hours") or 0)
+    except (TypeError, ValueError):
+        hours = 0
+    if hours not in ROBOT_HOURS:
+        hours = 1
+    try:
+        weekday = int(sch.get("weekday"))
+    except (TypeError, ValueError):
+        weekday = 0
+    weekday = weekday if 0 <= weekday <= 6 else 0
+    try:
+        day = int(sch.get("day") or 1)
+    except (TypeError, ValueError):
+        day = 1
+    day = max(1, min(day, 31))
+    try:
+        nth = int(sch.get("nth") or 1)
+    except (TypeError, ValueError):
+        nth = 1
+    nth = nth if nth in ROBOT_NTH else 1
+    values = sch.get("values") if isinstance(sch.get("values"), dict) else {}
+    out = {"kind": kind, "hours": hours, "time": _robot_hhmm(sch.get("time")),
+           "weekday": weekday, "day": day, "nth": nth,
+           "start_at": str(sch.get("start_at") or ""),
+           "enabled": sch.get("enabled") is not False,
+           "values": {str(k): str(v) for k, v in values.items()},
+           "last_run": str(sch.get("last_run") or ""),
+           "last_status": str(sch.get("last_status") or ""),
+           "last_message": str(sch.get("last_message") or "")}
+    out["interval_minutes"] = _robot_schedule_gap(out)     # 昔の画面・最低間隔の判定と比べるため
+    out["interval_label"] = _robot_schedule_label(out)
+    return out
+
+
+def _robot_kind_from_minutes(sch: dict) -> str:
+    """古い保存（interval_minutes）を新しい型に読み替える。"""
     try:
         minutes = int(sch.get("interval_minutes") or 0)
     except (TypeError, ValueError):
-        minutes = 0
-    if minutes not in INTERVALS.values():
-        minutes = 0
-    values = sch.get("values") if isinstance(sch.get("values"), dict) else {}
-    return {"interval_minutes": minutes,
-            "interval_label": next((k for k, v in INTERVALS.items() if v == minutes), "手動のみ"),
-            "start_at": str(sch.get("start_at") or ""),
-            "enabled": sch.get("enabled") is not False,
-            "values": {str(k): str(v) for k, v in values.items()},
-            "last_run": str(sch.get("last_run") or ""),
-            "last_status": str(sch.get("last_status") or ""),
-            "last_message": str(sch.get("last_message") or "")}
+        return "manual"
+    if minutes <= 0:
+        return "manual"
+    if minutes >= 10080:
+        return "weekly"
+    if minutes >= 1440:
+        return "daily"
+    return "hours"
+
+
+def _robot_schedule_label(sch: dict) -> str:
+    """設定を一言で（画面とメールに出す）。"""
+    kind = sch["kind"]
+    if kind == "manual":
+        return "手動のみ"
+    if kind == "hours":
+        return f"{sch['hours']}時間ごと"
+    if kind == "daily":
+        return f"毎日 {sch['time']}"
+    if kind == "weekly":
+        return f"毎週{ROBOT_WEEKDAYS[sch['weekday']]}曜日 {sch['time']}"
+    if kind == "monthly_day":
+        return f"毎月{sch['day']}日 {sch['time']}"
+    return f"毎月{ROBOT_NTH[sch['nth']]}{ROBOT_WEEKDAYS[sch['weekday']]}曜日 {sch['time']}"
+
+
+def _robot_nth_weekday(year: int, month: int, weekday: int, nth: int):
+    """その月の第N○曜日（nth=5 は最終）。無ければ None。"""
+    import calendar
+    days = [d for d in range(1, calendar.monthrange(year, month)[1] + 1)
+            if datetime(year, month, d).weekday() == weekday]
+    if not days:
+        return None
+    if nth >= 5:
+        return days[-1]
+    return days[nth - 1] if len(days) >= nth else None
+
+
+def _robot_next_occurrence(sch: dict, after: datetime, start: datetime):
+    """この設定で「after より後」の最初の実行時刻。開始日時より前には動かさない。"""
+    import calendar
+    from datetime import timedelta
+    kind = sch["kind"]
+    if after < start:                      # 開始前は、開始日時から数える
+        after = start - timedelta(microseconds=1)
+    if kind == "hours":
+        step = timedelta(hours=int(sch["hours"]))
+        if after < start:
+            return start
+        return start + step * (int((after - start) / step) + 1)
+    hh, mm = (int(x) for x in sch["time"].split(":"))
+    if kind == "daily":
+        cand = after.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return cand if cand > after else cand + timedelta(days=1)
+    if kind == "weekly":
+        cand = after.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        cand += timedelta(days=(int(sch["weekday"]) - cand.weekday()) % 7)
+        return cand if cand > after else cand + timedelta(days=7)
+    # 毎月（日を指定／第N曜日）。その月に無い日（2月30日など）は、その月の最終日に寄せる
+    y, m = after.year, after.month
+    for _ in range(14):
+        last_day = calendar.monthrange(y, m)[1]
+        if kind == "monthly_day":
+            d = min(int(sch["day"]), last_day)
+        else:
+            d = _robot_nth_weekday(y, m, int(sch["weekday"]), int(sch["nth"]))
+        if d:
+            cand = datetime(y, m, d, hh, mm)
+            if cand > after:
+                return cand
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return None
 
 
 def robot_next_scheduled(robot: dict, now: datetime | None = None):
     """定期実行の次の時刻（datetime）。手動のみ・止めているなら None。
 
-    開始日時を起点に、間隔の刻みで進む（前回の実行時刻からではなく、決めた時刻の並びを守る。
-    毎日 8:00 なら手動で 10:00 に動かしても次は翌日 8:00）。
-    まだ一度も動いていなければ、いまより後の最初の刻み（開始日時が未来ならその時刻）。
-    サーバが止まっていて刻みを何回か過ぎていたら、次の周回で1回だけ動く。
+    決めた時刻の並び（毎日8:00、毎週火曜9:00…）を守る。手動で動かしても並びはずれない。
+    まだ一度も動いていなければ、いまより後の最初の時刻（開始日時が未来ならその時刻）。
+    サーバが止まっていて何回か過ぎていたら、次の周回で1回だけ動く。
     """
-    from datetime import timedelta
     sch = _robot_schedule_norm(robot)
-    minutes = sch["interval_minutes"]
-    if minutes <= 0 or not sch["enabled"]:
+    if sch["kind"] == "manual" or not sch["enabled"]:
         return None
+    from datetime import timedelta
     now = now or datetime.now()
     start = parse_dt(sch["start_at"]) or parse_dt(robot.get("created_at")) or now
-    step = timedelta(minutes=minutes)
     last = parse_dt(sch["last_run"])
-    if last is None:
-        if start >= now:
-            return start
-        return start + step * (int((now - start) / step) + 1)
-    if last < start:
-        return start
-    return start + step * (int((last - start) / step) + 1)
+    if last is None or last < start:
+        # まだ動いていない（または開始日時を後ろにずらした）。開始日時ちょうどの回から数える
+        nxt = _robot_next_occurrence(sch, start - timedelta(microseconds=1), start)
+        if last is not None:
+            return nxt                     # 開始前に動いていた → 開始日時ちょうどの回を待つ
+        return nxt if (nxt and nxt > now) else _robot_next_occurrence(sch, now, start)
+    return _robot_next_occurrence(sch, last, start)
 
 
 def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
@@ -9484,15 +9626,47 @@ def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("定期実行の設定の形が正しくありません。")
     cur = _robot_schedule_norm(robot)
+    kind = str(raw.get("kind") or "")
+    if not kind and "interval_minutes" in raw:
+        # この機能の最初の形（分の間隔）。知っている値だけ読み替える
+        legacy = {0: ("manual", 1), 60: ("hours", 1), 180: ("hours", 3), 360: ("hours", 6),
+                  720: ("hours", 12), 1440: ("daily", 1), 10080: ("weekly", 1)}
+        try:
+            minutes = int(raw.get("interval_minutes") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("定期実行の間隔が正しくありません。")
+        if minutes not in legacy:
+            raise ValueError("定期実行のしかたは一覧から選んでください。")
+        kind, raw = legacy[minutes][0], {**raw, "hours": legacy[minutes][1]}
+    kind = kind or cur["kind"]
+    if kind not in ROBOT_SCHEDULE_KINDS:
+        raise ValueError("定期実行のしかたは一覧から選んでください。")
+    want = {"kind": kind,
+            "hours": raw.get("hours", cur["hours"]),
+            "time": _robot_hhmm(raw.get("time", cur["time"])),
+            "weekday": raw.get("weekday", cur["weekday"]),
+            "day": raw.get("day", cur["day"]),
+            "nth": raw.get("nth", cur["nth"])}
     try:
-        minutes = int(raw.get("interval_minutes", cur["interval_minutes"]) or 0)
+        want["hours"] = int(want["hours"] or 1)
+        want["weekday"] = int(want["weekday"] or 0)
+        want["day"] = int(want["day"] or 1)
+        want["nth"] = int(want["nth"] or 1)
     except (TypeError, ValueError):
-        raise ValueError("定期実行の間隔が正しくありません。")
-    if minutes not in INTERVALS.values():
-        raise ValueError("定期実行の間隔は一覧から選んでください。")
+        raise ValueError("定期実行の設定に数でない値が入っています。")
+    if kind == "hours" and want["hours"] not in ROBOT_HOURS:
+        raise ValueError(f"「時間ごと」で選べるのは {'、'.join(str(h) + '時間' for h in ROBOT_HOURS)} です。")
+    if kind in ("weekly", "monthly_nth") and not (0 <= want["weekday"] <= 6):
+        raise ValueError("曜日の指定が正しくありません。")
+    if kind == "monthly_day" and not (1 <= want["day"] <= 31):
+        raise ValueError("日にちは 1〜31 で指定してください（無い月は月末に寄せます）。")
+    if kind == "monthly_nth" and want["nth"] not in ROBOT_NTH:
+        raise ValueError("第○曜日の指定が正しくありません。")
+    gap = _robot_schedule_gap(want)
     floor_min = float(settings.get("min_interval_hours") or 0) * 60
-    # 最低間隔は「間隔を変えるとき」だけ見る。止める・穴の値を直すだけなら、いまの間隔のまま通す
-    if minutes != cur["interval_minutes"] and minutes > 0 and floor_min > 0 and minutes < floor_min:
+    # 最低間隔は「しかたを変えるとき」だけ見る。止める・穴の値を直すだけなら、いまのまま通す
+    changed_kind = (kind != cur["kind"] or want["hours"] != cur["hours"])
+    if changed_kind and gap > 0 and floor_min > 0 and gap < floor_min:
         raise ValueError("定期実行の間隔は、管理者が決めた最低間隔"
                          f"（{_hours_label(settings['min_interval_hours'])}）より短くはできません。")
     # 空で送られてきても、いまの開始日時は消さない（欄を消しただけで刻みが動かないように）。
@@ -9516,10 +9690,11 @@ def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
                 raise ValueError(f"穴「{h.get('label')}」は数値で入力してください（入力: {v}）。")
         vals[h["key"]] = v
     enabled = raw.get("enabled", cur["enabled"])
-    out = {"interval_minutes": minutes, "start_at": start_at,
+    out = {**want, "start_at": start_at,
            "enabled": True if enabled is None else bool(enabled), "values": vals}
-    if minutes != cur["interval_minutes"] or start_at != cur["start_at"]:
-        out.update({"last_run": "", "last_status": "", "last_message": ""})
+    same = all(out[k] == cur[k] for k in ("kind", "hours", "time", "weekday", "day", "nth"))
+    if not same or start_at != cur["start_at"]:
+        out.update({"last_run": "", "last_status": "", "last_message": ""})   # 並びを数え直す
     else:
         out.update({k: cur[k] for k in ("last_run", "last_status", "last_message")})
     return out
@@ -9544,6 +9719,7 @@ def _robot_send_mails(chat: dict, user) -> tuple[int, str]:
         if missing:
             notes.append(f"添付が見つからないので送りません: {', '.join(missing)}")
             continue
+        draft["from_user"], draft["from_user_name"] = user.username, getattr(user, "display_name", "")
         try:
             record = mailer.send(draft, files, user=user.username)
         except mailer.MailError as e:
@@ -9572,14 +9748,80 @@ def _robot_send_mails(chat: dict, user) -> tuple[int, str]:
     return sent, " ".join(words).strip()
 
 
+ROBOT_HISTORY_MAX = 20            # 1つのロボットに残す実行履歴の件数
+
+
+def _robot_notify_check(addresses) -> list[str]:
+    """失敗を知らせる宛先。メール設定で許可されたアドレスだけ通す。ValueError は画面に出す。"""
+    out = []
+    if isinstance(addresses, str):
+        addresses = [a for a in re.split(r"[,;\s]+", addresses) if a]
+    for a in (addresses or [])[:10]:
+        addr = str(a or "").strip()
+        if not addr:
+            continue
+        if not mailer.EMAIL_RE.match(addr):
+            raise ValueError(f"メールアドレスの形が正しくありません: {addr}")
+        if not mailer.settings().allows(addr):
+            raise ValueError(f"{addr} は送信が許可されていません。"
+                             "管理者が「メール設定」で許可したアドレス・ドメインだけを指定できます。")
+        if addr not in out:
+            out.append(addr)
+    return out
+
+
+def _robot_notify_failure(user, robot: dict, message: str) -> str:
+    """定期実行が失敗したことを、本人が決めた宛先に知らせる。戻り値は結果の一言（空なら何もしていない）。"""
+    to = list(robot.get("notify_to") or [])
+    if not to:
+        return ""
+    name = robot.get("name") or "（無題）"
+    body = (f"マイロボット「{name}」の定期実行が失敗しました。\n\n"
+            f"日時: {chats.now().replace('T', ' ')}\n"
+            f"利用者: {getattr(user, 'display_name', '') or user.username}\n"
+            f"内容: {message}\n\n"
+            "マイロボットの画面を開き、そのロボットの「実行履歴」で前後の記録を確認してください。"
+            "表の名前が変わった・元のデータが取れないなど、直せる原因が書かれていることがあります。")
+    draft = {"to": to, "subject": f"[{config.APP_TITLE}] マイロボット「{name}」の定期実行が失敗しました",
+             "body": body, "from_user": user.username,
+             "from_user_name": getattr(user, "display_name", "")}
+    try:
+        record = mailer.send(draft, [], user=user.username)
+    except mailer.MailError as e:
+        return f"失敗の通知メールを送れませんでした: {e}"
+    except Exception as e:
+        return f"失敗の通知メールの送信でエラー: {e}"
+    return ("失敗の通知メールを送りました。" if not record.get("dry_run")
+            else "失敗の通知メールは、テスト送信モードのため送っていません。")
+
+
+def _robot_failed(user, robot: dict, message: str, source: str) -> str:
+    """定期実行が動かせなかった／落ちたときの後始末。知らせを送り、結果を書き戻す。"""
+    if source == "schedule":
+        note = _robot_notify_failure(user, robot, message)
+        if note:
+            message = f"{message} {note}"
+    _robot_write_back(user, robot["id"], False, message, source)
+    return message
+
+
 def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> None:
-    """実行結果をロボットに書き戻す。定期実行なら定期実行の欄にも（次の刻みの起点になる）。"""
+    """実行結果をロボットに書き戻す。定期実行なら定期実行の欄にも（次の刻みの起点になる）。
+
+    実行履歴（いつ・手動か定期か・成否・一言・結果の会話）も、ここで1件足す。
+    不具合が起きたとき、まずここを見れば「いつから・何が起きているか」が分かる。
+    """
     with _robots_lock:
         saved = robot_get(user, rid)
         if saved is None:                     # 実行中に別のタブで削除された。書くと消したはずのものが戻る
             return
         now = chats.now()
         saved.update({"last_run": now, "last_status": "ok" if ok else "error", "last_message": message})
+        hist = [h for h in (saved.get("history") or []) if isinstance(h, dict)]
+        hist.append({"at": now, "source": source, "ok": bool(ok), "message": str(message)[:400],
+                     "chat_id": str(saved.get("_last_chat_id") or "")})
+        saved["history"] = hist[-ROBOT_HISTORY_MAX:]
+        saved.pop("_last_chat_id", None)
         if source == "schedule":
             sch = _robot_schedule_norm(saved)
             sch.update({"last_status": "ok" if ok else "error", "last_message": message})
@@ -9632,6 +9874,18 @@ def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
             _sent, mail_msg = _robot_send_mails(chat, user)
             if mail_msg:
                 message = f"{message} {mail_msg}"
+        if not ok and source == "schedule":
+            note = _robot_notify_failure(user, robot, message)
+            if note:
+                message = f"{message} {note}"
+        with _robots_lock:                    # 履歴に「結果の会話」を残すため、書き戻しの直前に渡す
+            saved = robot_get(user, robot["id"])
+            if saved is not None:
+                saved["_last_chat_id"] = chat.get("id") or ""
+                try:
+                    robot_save(user, saved, check_dup=False)
+                except ValueError:
+                    pass
         _robot_write_back(user, robot["id"], ok, message, source)
         return chat, ok, message
     finally:
@@ -9712,8 +9966,9 @@ def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
                 g.user = user
                 missing = _robot_missing_tables(robot)
                 if missing:
-                    message = f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。"
-                    _robot_write_back(user, robot["id"], False, message, "schedule")
+                    message = _robot_failed(
+                        user, robot, f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。",
+                        "schedule")
                 else:
                     chat, ok, message = _robot_execute(user, robot, values, source="schedule")
                     if chat is None:      # 手で実行中だった。押さえた印のままにせず理由を残す
@@ -9721,7 +9976,7 @@ def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
         except Exception as e:
             message = f"定期実行でエラー: {e}"
             try:
-                _robot_write_back(user, robot["id"], False, message, "schedule")
+                message = _robot_failed(user, robot, message, "schedule")
             except Exception:
                 pass
         ran.append({"user": user.username, "name": robot.get("name") or "（無題）", "ok": ok,
@@ -9762,6 +10017,8 @@ def _robot_row(r: dict, settings: dict | None = None) -> dict:
                          # 管理者の最低間隔より短い設定。動かない（間隔を直すまで）
                          "floor_blocked": floor_blocked},
             "mail_auto": bool(r.get("mail_auto")),
+            "notify_to": list(r.get("notify_to") or []),
+            "history": [h for h in (r.get("history") or []) if isinstance(h, dict)][-ROBOT_HISTORY_MAX:],
             "has_mail_steps": any(s.get("name") == "compose_email" for s in steps),
             "steps_detail": _robot_steps_detail(steps),
             "owner": str((r.get("owner") or {}).get("username") or ""),
@@ -9894,7 +10151,13 @@ def robots_save():
              # 定期実行で名乗る本人（権限は登録時のもの）
              "owner": _owner_snapshot(g.user),
              # 実行のたびに、作ったメールの下書きをそのまま送る（下書きを作る手順があるときだけ）
-             "mail_auto": bool(body.get("mail_auto")) and any(s["name"] == "compose_email" for s in kept)}
+             "mail_auto": bool(body.get("mail_auto")) and any(s["name"] == "compose_email" for s in kept),
+             "notify_to": []}
+    if "notify_to" in body:
+        try:
+            robot["notify_to"] = _robot_notify_check(body.get("notify_to"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
     if isinstance(body.get("schedule"), dict):
         try:
             robot["schedule"] = _robot_schedule_from_body(body, robot, robot_settings())
@@ -9980,6 +10243,12 @@ def robots_update():
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         changed = True
+    if "notify_to" in body:
+        try:
+            robot["notify_to"] = _robot_notify_check(body.get("notify_to"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        changed = True
     if changed:
         robot["owner"] = _owner_snapshot(g.user)   # いまの権限の写しにする（定期実行で名乗るため）
     if not changed:
@@ -10055,7 +10324,9 @@ bp_robots = Blueprint("robots", __name__)
 def robots_page():
     settings = robot_settings()
     return render_template("robots.html", robots=_robot_rows(g.user), settings=settings,
-                           intervals=INTERVALS, scheduler_on=scheduler.is_running(),
+                           sched_vocab=_robot_sched_vocab(), scheduler_on=scheduler.is_running(),
+                           mail_ready=not mailer.settings().problems(),
+                           allowed_domains=mailer.allowed_domains_label(),
                            interval_label=(_hours_label(settings["min_interval_hours"])
                                            if settings["min_interval_hours"] > 0 else ""))
 

@@ -6088,6 +6088,9 @@ class SmtpSettings:
     password: str = ""
     sender: str = ""
     sender_name: str = ""
+    # 全メール共通の文面（管理者メニュー → メール設定）
+    body_header: str = ""            # 本文の冒頭に必ず入れる断り書き（{app} はアプリ名）
+    show_sender: bool = True         # 「送信者（ログインID）」の行を入れるか
     timeout: int = 20
     allow_addresses: list = field(default_factory=list)
     senders: list = field(default_factory=list)      # 画面で選べる差出人の候補
@@ -6151,7 +6154,7 @@ SERVER_KEYS = ("host", "port", "timeout")
 EDITABLE_KEYS = SERVER_KEYS + ("sender", "sender_name", "senders",
                                "allow_addresses", "max_recipients", "dry_run",
                                "alert_to", "alert_enabled", "alert_kinds",
-                               "ok_domains")
+                               "ok_domains", "body_header", "show_sender")
 
 
 def _read_overrides() -> dict:
@@ -6197,6 +6200,10 @@ def settings() -> SmtpSettings:
         senders=senders,
         max_recipients=int(ov.get("max_recipients", config.SMTP_MAX_RECIPIENTS) or 20),
         dry_run=bool(ov["dry_run"]) if "dry_run" in ov else config.SMTP_DRY_RUN,
+        # 全メール共通の文面（画面で保存した値 > env の初期値）
+        body_header=str(ov.get("body_header", config.MAIL_BODY_HEADER) or ""),
+        show_sender=(bool(ov["show_sender"]) if "show_sender" in ov
+                     else config.MAIL_SHOW_SENDER),
         alert_to=[str(a).strip() for a in (ov.get("alert_to") or []) if str(a).strip()],
         # 既定はON。以前の設定ファイルにキーが無い場合、今までどおり通知する
         alert_enabled=bool(ov["alert_enabled"]) if "alert_enabled" in ov else True,
@@ -6343,7 +6350,8 @@ def _with_current(data: dict) -> dict:
               "senders": s.senders, "allow_addresses": s.allow_addresses,
               "max_recipients": s.max_recipients, "dry_run": s.dry_run,
               "alert_to": s.alert_to, "alert_enabled": s.alert_enabled,
-              "alert_kinds": s.alert_kinds, "ok_domains": send_ok_domains()}
+              "alert_kinds": s.alert_kinds, "ok_domains": send_ok_domains(),
+              "body_header": s.body_header, "show_sender": s.show_sender}
     # None は「指定なし」。空文字や空リストは「消したい」なので通す。
     merged.update({k: v for k, v in (data or {}).items()
                    if k in merged and v is not None})
@@ -6373,6 +6381,8 @@ def save_settings(data: dict, user: str | None = None) -> SmtpSettings:
         "alert_enabled": bool(merged.get("alert_enabled", True)),
         "alert_kinds": [k for k in (merged.get("alert_kinds") or []) if k in ALERT_KINDS],
         "ok_domains": _parse_domains(merged.get("ok_domains")),
+        "body_header": str(merged.get("body_header") or "").strip()[:2000],
+        "show_sender": bool(merged.get("show_sender", True)),
     })
     _write_overrides(keep)
     print(f"[mailer] 設定を更新しました（{user or '不明'}）: "
@@ -6389,6 +6399,10 @@ def mail_status() -> dict:
     return {"configured": s.configured, "host": s.host, "port": s.port,
             "sender": s.sender,
             "sender_name": s.sender_name, "dry_run": s.dry_run,
+            "body_header": s.body_header, "show_sender": s.show_sender,
+            "app_title": config.APP_TITLE,
+            "sample_body": compose_body({"body": "（ここに本文が入ります）",
+                                         "from_user": "（ログインID）"}),
             "senders": s.senders,
             "allow_addresses": s.allow_addresses,
             "alert_to": s.alert_to,
@@ -6618,12 +6632,37 @@ def validate_draft(draft: dict, *, system: bool = False) -> list[str]:
     return errors
 
 
+def sender_label() -> str:
+    """From に出す表示名。決めていなければアプリ名を使う（受け取る人に出所が分かるように）。"""
+    return settings().sender_name or config.APP_TITLE
+
+
+def compose_body(draft: dict) -> str:
+    """実際に送る本文。冒頭の断り書き → 送信者（ログインID） → 下書きの本文。
+
+    画面の確認カードもこれを使うので、「見たものと送られるもの」がずれない。
+    """
+    s = settings()
+    body = str(draft.get("body") or "")
+    parts = []
+    if s.body_header:
+        parts.append(s.body_header.replace("{app}", config.APP_TITLE))
+    if s.show_sender:
+        who = str(draft.get("from_user") or "").strip()
+        name = str(draft.get("from_user_name") or "").strip()
+        if who or name:
+            parts.append(f"送信者: {name}（ログインID: {who}）" if name and name != who
+                         else f"送信者: {who or name}")
+    parts.append(body)
+    return "\n\n".join(p for p in parts if p)
+
+
 def build_message(draft: dict, attachments: list[dict] | None = None) -> EmailMessage:
     """EmailMessage を組み立てる（送信せずに中身を確認するのにも使う）。"""
     s = settings()
     msg = EmailMessage()
-    msg["From"] = formataddr((str(Header(s.sender_name, "utf-8")), s.sender)) \
-        if s.sender_name else s.sender
+    name = sender_label()
+    msg["From"] = formataddr((str(Header(name, "utf-8")), s.sender)) if name else s.sender
     msg["To"] = ", ".join(_norm_addresses(draft.get("to")))
     if _norm_addresses(draft.get("cc")):
         msg["Cc"] = ", ".join(_norm_addresses(draft.get("cc")))
@@ -6632,7 +6671,7 @@ def build_message(draft: dict, attachments: list[dict] | None = None) -> EmailMe
     msg["Subject"] = str(draft.get("subject") or "")
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
-    msg.set_content(str(draft.get("body") or ""))
+    msg.set_content(compose_body(draft))
 
     for a in (attachments or []):
         data, name = a.get("data"), a.get("filename") or "attachment"
@@ -6651,9 +6690,9 @@ def preview(draft: dict, attachments: list[dict] | None = None) -> dict:
     to = _norm_addresses(draft.get("to"))
     cc = _norm_addresses(draft.get("cc"))
     bcc = _norm_addresses(draft.get("bcc"))
-    body = str(draft.get("body") or "")
+    body = compose_body(draft)          # 送られるのと同じ文面を見せる
     return {
-        "from": (f"{s.sender_name} <{s.sender}>" if s.sender_name else s.sender),
+        "from": (f"{sender_label()} <{s.sender}>" if sender_label() else s.sender),
         "to": to, "cc": cc, "bcc": bcc,
         "subject": str(draft.get("subject") or ""),
         "body": body,
@@ -9753,9 +9792,13 @@ def _compose_email(args: dict, scope: list[dict]) -> dict:
             return _err(f"「{args['to_query']}」に一致する宛先が見つかりませんでした。"
                         "find_mail_recipients で候補を確認してください。")
     to = list(dict.fromkeys(a for a in to if a))
+    me = _current_user()
     draft = {"to": to, "cc": args.get("cc") or [], "bcc": args.get("bcc") or [],
              "subject": args.get("subject") or "", "body": args.get("body") or "",
              "reply_to": args.get("reply_to") or "",
+             # 送信者は本文の決まり（メール設定）で本文に入る。下書きの時点で持たせておく
+             "from_user": getattr(me, "username", "") if me else "",
+             "from_user_name": getattr(me, "display_name", "") if me else "",
              "attach_filenames": list(args.get("attach_filenames") or [])}
     view = mailer.preview(draft)
     # 添付は会話ログから web 側が解決する。ここでは名前だけ持たせる。
@@ -11973,24 +12016,57 @@ def _search_knowledge_base(args: dict, scope: list[dict]) -> dict:
                        "sources": [], "failures": failures, "dropped": dropped,
                        "searched": [r["name"] for r in results if not r.get("error")]}}
 
+    # 見つけた文章は表としても預ける。こうしておくと、そのまま Excel／CSV に出せる
+    # （AIが書いた回答の文章とは別に、根拠そのものを残したいことが多いため）。
+    rid = put(scope, ["出典", "ナレッジベース", "文書", "抜粋"],
+              [[s["index"], s["knowledge_base"], s["file_path"] or "",
+                s["excerpt"] + ("…" if s.get("excerpt_cut") else "")] for s in sources],
+              label=f"文書検索: {query[:40]}")
     return {"ok": True, "llm_content": _json({
         "tool": "search_knowledge_base",
         "query": query,
         "searched": [r["name"] for r in results if not r.get("error")],
         "found": len(sources),
+        "result_id": rid,
         "context": context,
         "sources": [{k: v for k, v in s.items() if k != "excerpt"} for s in sources],
         "failures": failures,
         "note": "回答は context に書かれていることだけを根拠にすること。"
                 "根拠にした箇所には [出典1] のように出典番号を必ず添える。"
                 "context に無いことは推測せず、分からないと述べること。"
-                "複数のナレッジベースで内容が食い違う場合は、両方を出典付きで併記する。",
+                "複数のナレッジベースで内容が食い違う場合は、両方を出典付きで併記する。"
+                "見つけた文章そのものを Excel／CSV にしたいと言われたら、この result_id を"
+                "出力の道具に渡せばよい（出典・ナレッジベース・文書・抜粋の表になる）。",
     }), "render": {"role": "assistant", "kind": "sources", "query": query,
                    "sources": sources, "failures": failures,
                    "searched": [r["name"] for r in results if not r.get("error")]}}
 
 
-HANDLERS_knowledge = {"search_knowledge_base": _search_knowledge_base}
+def _who_am_i(args: dict, scope: list[dict]) -> dict:
+    """いま質問している人のログイン情報（ログインIDと表示名）を返す。
+
+    「自分の」「私が担当した」と言われたときの出発点。ここから先（社員名簿の
+    どの表・どの列と突き合わせるか）は、カタログの説明を読んだAIが決める。
+    この道具は表を知らないので、どんなデータの入れ方でも使える。
+    """
+    user = _current_user()
+    if user is None:
+        return _err("ログイン情報が取れませんでした。画面を開き直してもう一度お試しください。")
+    return {"ok": True, "llm_content": _json({
+        "tool": "who_am_i",
+        "login_id": getattr(user, "username", ""),
+        "display_name": getattr(user, "display_name", "") or getattr(user, "username", ""),
+        "is_admin": bool(getattr(user, "is_admin", False)),
+        "note": ("これがいま質問している本人。「自分」「私」「担当した」はこの人を指す。"
+                 "社員番号や氏名で絞り込みたいときは、カタログから社員名簿にあたる表を探し、"
+                 "このログインIDと同じ値が入っている列（統一ID・社員ID・アカウントなど）で1行に特定すること。"
+                 "表や列の名前は決め打ちにせず、カタログの説明から判断する。"
+                 "見つからないときは、推測で別の人の行を使わず、利用者に確認すること。"),
+    }), "render": None}
+
+
+HANDLERS_knowledge = {"search_knowledge_base": _search_knowledge_base,
+                      "who_am_i": _who_am_i}
 
 # SQLは受け取らない（材料はDBではなくナレッジベース）
 SQL_TOOLS_knowledge: set = set()
@@ -12002,6 +12078,19 @@ ADMIN_TOOLS_knowledge: set = set()
 #: 配列引数の直し（_coerce_lists）がそのまま効く。
 #: 実際にAIへ渡すときは build_tools が、登録中のナレッジベースの名前と説明を
 #: 差し込んだものに置き換える（登録は運用中に増えるため）。
+#: 「自分」を分かるための道具。表に依存しないので、どの環境でも渡す
+WHOAMI_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "who_am_i",
+        "description": ("いま質問している人のログインID・表示名を返す。"
+                        "「自分の」「私が担当した」「自分宛てに」のように本人を指す言い方が出てきたら、"
+                        "まずこれを呼ぶこと。ここで得たログインIDを、カタログにある社員名簿のような表の"
+                        "IDの列と突き合わせて1行に特定する（どの表・どの列かはカタログの説明から判断する）。"),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 KNOWLEDGE_TOOLS = [{
     "type": "function",
     "function": {
@@ -12135,7 +12224,7 @@ import verify
 # ナレッジ検索の宣言もここで合流させる。こうしておくと _missing_required と
 # _coerce_lists（どちらも BUILTIN_TOOLS から表を作る）がそのまま効く。
 # ただしAIへ実際に渡す宣言は build_tools が組み立て直す（_DYNAMIC_TOOLS を参照）。
-BUILTIN_TOOLS = BUILTIN_TOOLS + KNOWLEDGE_TOOLS
+BUILTIN_TOOLS = BUILTIN_TOOLS + KNOWLEDGE_TOOLS + [WHOAMI_TOOL]
 
 #: 宣言を実行時に組み立て直すツール。BUILTIN_TOOLS の固定の宣言は使わない。
 #: ナレッジベースは運用中に増減するので、選択肢（名前と説明）を起動時には決められない。
@@ -13053,6 +13142,15 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
     rows: [{{"項目": "◯◯の基準値", "内容": "△△"}}, ...]
     rows: [["分類A", 47], ["分類B", 18]] と columns: ["分類", "値"]
   「データが無いので出力できません」と答えてはいけない。rows を使うこと。
+
+# 「自分」と言われたとき
+- 「自分の」「私が担当した」「自分宛てに」のように本人を指す言い方が出てきたら、まず who_am_i を呼ぶ。
+  返ってくるのはログインIDと表示名だけ。そこから先は、カタログにある社員名簿のような表を自分で探し、
+  ログインIDと同じ値が入っている列（統一ID・社員ID・アカウント名など）で1行に特定する。
+  どの表・どの列かは決め打ちにせず、カタログの説明と列の説明から判断すること。
+- 特定できたら、その人の社員番号・氏名・所属・メールアドレスを、以降の絞り込みや宛先に使う。
+- 名簿が見つからない・1行に絞れないときは、推測で別の人の行を使わない。何が分からなかったかを述べて、
+  利用者に聞き返すこと（「社員番号を教えてください」など）。
 
 # マイロボット（画面の機能。あなたが登録・実行するものではない）
 - 利用者が気に入った処理の流れ（あなたが使った道具の列）に名前を付けて保存し、あとでAIなしで

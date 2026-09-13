@@ -142,7 +142,7 @@ TEMPLATES = {
                           ('knowledge', 'knowledge.index', 'ナレッジベース'), ('models', 'models.index', 'モデル設定'),
                           ('mail', 'mail.index', 'メール設定'), ('robots', 'catalog.robot_settings', 'マイロボット'),
                           ('memory', 'catalog.memory_admin', '覚え書き'),
-                          ('usage', 'usage.index', '利用状況')] -%}
+                          ('usage', 'usage.index', '利用状況'), ('help', 'help.index', 'ヘルプ')] -%}
 {% if key == 'sep' %}<span class="tabs__sep" aria-hidden="true"></span>
 {% elif key == active %}<button class="tab is-active">{{ label }}</button>
 {% else %}<a class="tab" href="{{ url_for(ep) }}">{{ label }}</a>
@@ -186,7 +186,7 @@ TEMPLATES = {
       {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
          データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・利用状況 #}
       <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.')) }}" href="{{ url_for('catalog.index') }}"
-         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、覚え書き、利用状況を、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、覚え書き、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
@@ -206,9 +206,11 @@ TEMPLATES = {
         {{ icon('user') }} 覚え書き</a>
       {% endif %}
       {% endif %}
+      {% if not user.is_admin %}
       <a class="navlink {{ 'is-active' if nav.startswith('help.') }}" href="{{ url_for('help.index') }}"
-         data-desc="全機能の説明書と、システム構成の説明。">
+         data-desc="全機能の説明書。">
         {{ icon('help') }} ヘルプ</a>
+      {% endif %}
     </div>
 
     {% block sidebar %}{% endblock %}
@@ -904,7 +906,7 @@ window.CHAT_INIT = {
   folderOut: {{ folder_out|default(false)|tojson }},
   knowledge: {{ knowledge|tojson }},
   memory: {{ memory|tojson }},
-  robotIntervals: {{ robot_intervals|tojson }},
+  robotSchedVocab: {{ robot_sched_vocab|tojson }},
   robotMinIntervalHours: {{ robot_min_hours|tojson }},
   schedulerOn: {{ scheduler_on|tojson }},
   starters: {{ starters|tojson }}
@@ -915,9 +917,11 @@ window.CHAT_INIT = {
 
 # --- help.html ---
 "help.html": r"""{% extends "base.html" %}
+{% from "_admintabs.html" import admintabs %}
 {% block title %}ヘルプ — {{ app_title }}{% endblock %}
 
 {% block body %}
+{% if user.is_admin %}<div class="content"><div class="tabs tabs--bar">{{ admintabs('help') }}</div></div>{% endif %}
 {# help クラスは「表のセルを折り返す」ための目印。table.data は本来
    1行1件のデータ格子用（white-space: nowrap で1行に収める）で、
    長い説明文を入れるヘルプでは1行目の途中で切れてしまう #}
@@ -962,6 +966,20 @@ window.CHAT_INIT = {
                   文書の質問（手順・原因・規則）はナレッジベースを検索し、<b>[出典n]の番号つき</b>で
                   答えます。両方を組み合わせた質問（「一番停止が多い装置の対処方法は？」）もそのまま
                   聞けます。範囲の取り方で答えが変わる質問には、AIのほうから確認してきます。</td></tr>
+          <tr><td>「自分」で聞く</td>
+              <td>「<b>自分が</b>担当したトラブルを出して」「<b>自分宛てに</b>メールして」のように聞けます。
+                  AIはまず「ログイン中の利用者」の道具であなたのログインIDを調べ、つぎにデータカタログの中から
+                  社員名簿にあたる表を探して、そのIDと一致する行をあなたとして扱います。
+                  <b>どの表・どの列を使うかは、カタログに書かれた説明から判断します</b>（表の名前は決め打ちにしていません）。
+                  名簿が見つからない・1人に絞れないときは、推測せずに聞き返します。うまく当たらないときは、
+                  管理者が社員名簿の表と、ログインIDが入っている列（統一IDなど）に説明を書くと精度が上がります。</td></tr>
+          <tr><td>「自分」で聞く</td>
+              <td>「<b>自分が</b>担当したトラブルを出して」「<b>自分宛てに</b>メールして」のように聞けます。
+                  AIはまず「ログイン中の利用者」の道具であなたのログインIDを調べ、つぎにデータカタログの中から
+                  社員名簿にあたる表を探して、そのIDと一致する行をあなたとして扱います。
+                  <b>どの表・どの列を使うかは、カタログに書かれた説明から判断します</b>（表の名前は決め打ちにしていません）。
+                  名簿が見つからない・1人に絞れないときは、推測せずに聞き返します。うまく当たらないときは、
+                  管理者が社員名簿の表と、ログインIDが入っている列（統一IDなど）に説明を書くと精度が上がります。</td></tr>
           <tr><td>覚え書き</td>
               <td>ChatGPT のメモリと同じ発想。回答のあとにAIがもう一度だけ働き、やり取りの中から
                   <b>次回以降の質問でも使える前提・好み・期間</b>（「うちの部署は関西工場」「Excel で欲しい」
@@ -970,6 +988,14 @@ window.CHAT_INIT = {
                   メニューの「<b>覚え書き</b>」（マイロボットの下）で本文をそのまま読んで直せます。「覚えない」にすると止まり、
                   いまの本文もAIに渡しません。会話で「忘れて」と言えば、その回答のあとに消えます（消えていなければ本文から消してください）。
                   他の利用者には見えませんが、<b>管理者は管理者メニューで内容を見られます</b>（利用状況の質問履歴と同じ扱い）。</td></tr>
+          <tr><td>メールの決まり</td>
+              <td>このアプリから出るメールは、差出人がアプリ名（{{ app_title }}）と管理者が決めたアドレスになり、
+                  本文の冒頭に<b>自動で作られたメールであることの断り書き</b>と<b>送信者（あなたのログインID）</b>が入ります。
+                  文面は管理者が「メール設定」で決めています。送れる宛先も管理者が登録したものだけです。</td></tr>
+          <tr><td>メールの決まり</td>
+              <td>このアプリから出るメールは、差出人がアプリ名（{{ app_title }}）と管理者が決めたアドレスになり、
+                  本文の冒頭に<b>自動で作られたメールであることの断り書き</b>と<b>送信者（あなたのログインID）</b>が入ります。
+                  文面は管理者が「メール設定」で決めています。送れる宛先も管理者が登録したものだけです。</td></tr>
           <tr><td>モデルの選択</td>
               <td>サイドバー上部のプルダウン。候補は管理者が「モデル設定」で決めた一覧で、選択は
                   利用者ごとに保存されます。「画像OK」の表示があるモデルでは、貼り付け（Ctrl+V）や
@@ -1039,8 +1065,10 @@ window.CHAT_INIT = {
                   表が改名・削除されていると実行前に止まります。管理者だけの道具を含む手順は、
                   一般利用者が実行するとその手順で止まります（権限は実行する本人のもの）。</td></tr>
           <tr><td>定期実行（RPAのように動かす）</td>
-              <td>登録するとき、またはマイロボットの画面のカード「定期実行」で、<b>間隔</b>（15分ごと〜1週間ごと。定期取り込みと同じ一覧）と
-                  <b>開始日時</b>を決めると、その時刻から間隔ごとにサーバが自動で動かします。画面を閉じていても・自分のPCを消していても、
+              <td>登録するとき、またはマイロボットの画面のカード「定期実行」で、<b>しかた</b>
+                  （1・3・6・12時間ごと／毎日◯時／毎週◯曜日◯時／毎月◯日◯時／毎月第◯◯曜日◯時）と
+                  <b>開始日時</b>（この日時より前には動かさない）を決めると、サーバが自動で動かします。
+                  毎月31日のように無い月がある指定は、その月の最終日に寄せます。画面を閉じていても・自分のPCを消していても、
                   アプリのサーバが動いていれば動きます（サーバが止まっていた分は、次に動いたときに1回だけ実行）。
                   結果はマイエージェントの新しい会話に残り、フォルダ出力を選んでいればファイルも置かれます。穴がある場合は
                   カードの「定期実行」で「定期実行のたびに使う値」を決めます（空なら登録時の値）。
@@ -1054,6 +1082,23 @@ window.CHAT_INIT = {
           <tr><td>詳細を見る</td>
               <td>マイロボットの画面の各カードの「詳細」を開くと、手順ごとの中身（SQLや引数）・穴・使う表・フォルダ出力・定期実行・
                   メール・作成日時・前回の実行結果が全部見られます。</td></tr>
+          <tr><td>社内文書の検索を含める</td>
+              <td>ナレッジベース（社内文書）の検索も手順に入れられます。実行するたびに<b>そのときの文書を検索し直す</b>ので、
+                  手順書が更新されていれば新しい内容が出ます。見つけた文章は表（出典・ナレッジベース・文書・抜粋）としても
+                  受け取れるので、そのまま Excel／CSV に出したり、メールに添付したりできます。
+                  ただし<b>AIが書いた回答の文章そのものは再現しません</b>（AIを使わない実行なので）。
+                  毎回ちがう文章が必要なときは、マイエージェントで聞いてください。</td></tr>
+          <tr><td>社内文書の検索を含める</td>
+              <td>ナレッジベース（社内文書）の検索も手順に入れられます。実行するたびに<b>そのときの文書を検索し直す</b>ので、
+                  手順書が更新されていれば新しい内容が出ます。見つけた文章は表（出典・ナレッジベース・文書・抜粋）としても
+                  受け取れるので、そのまま Excel／CSV に出したり、メールに添付したりできます。
+                  ただし<b>AIが書いた回答の文章そのものは再現しません</b>（AIを使わない実行なので）。
+                  毎回ちがう文章が必要なときは、マイエージェントで聞いてください。</td></tr>
+          <tr><td>実行履歴・失敗したときの知らせ</td>
+              <td>「詳細」の下の「<b>実行履歴</b>」に、直近20回の実行（日時・手動か定期か・成否・内容）が残ります。
+                  <b>定期実行がうまくいかないときは、まずここを見てください</b>（「表が見つかりません」なら表の名前が変わっています）。
+                  「定期実行」の中の「<b>失敗したときに知らせるメール</b>」に宛先を入れておくと、定期実行が失敗したときにメールが届きます。
+                  宛先は、管理者が「メール設定」で許可したアドレス・ドメインだけ指定できます。</td></tr>
           <tr><td>上限と間隔</td>
               <td>1人あたりの登録数・同じロボットの実行の最低間隔・1つのロボットの手順数の上限は、管理者が
                   「管理者メニュー → マイロボット」で決めます（既定 5 件・12 時間・20 手順）。間隔は前回うまくいった実行から数えます
@@ -1143,7 +1188,7 @@ window.CHAT_INIT = {
     <div class="card__title">2. 管理者メニュー — データカタログ（テーブル・結合・用語集・ツール・ビュー・取り込み・出力）</div>
     <div class="card__desc">
       管理者の画面はサイドバーの「<b>管理者メニュー</b>」1つにまとまっていて、上のタブで切り替えます
-      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・覚え書き・利用状況）。
+      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・覚え書き・利用状況・ヘルプ）。
       ここに書いた内容が<b>そのままAIの理解</b>になります。回答の質はカタログの質で決まります。
       未保存の変更は下部の「まとめて保存 (Ctrl+S)」でまとめて確定できます。
     </div>
@@ -1246,7 +1291,10 @@ window.CHAT_INIT = {
                   モデルを取り直せます。候補から外しても、誰かが使用中のモデルは選択肢に残ります。</td></tr>
           <tr><td>メール設定</td>
               <td>送信サーバ（SMTP）・差出人・送ってよい宛先ドメイン・宛先件数の上限を決めます。
-                  既定は試送モード（実際には送らない）。接続確認ボタンで疎通を確かめられます。</td></tr>
+                  既定は試送モード（実際には送らない）。接続確認ボタンで疎通を確かめられます。
+                  <b>文面の決まり</b>もここで決めます: 本文の冒頭に必ず入れる断り書き（<code>{app}</code> はアプリ名に置き換え）と、
+                  「送信者（ログインID）」の行を入れるか。差出人の表示名が空のときは From にアプリ名が出ます。
+                  マイエージェントの下書きも、マイロボットの自動送信も、同じ形で送られます。</td></tr>
           <tr><td>マイロボット</td>
               <td>利用者のマイロボットの決めごと: <b>1人あたりの登録上限数</b>（既定 5 件）、<b>同じロボットの実行の最低間隔</b>
                   （既定 12 時間。前回うまくいった実行から数え、0 で制限なし）、<b>1つのロボットの手順数の上限</b>（既定 20）。
@@ -4726,7 +4774,9 @@ window.IMP = {
 <script>
 window.ROBOTS_INIT = {
   robots: {{ robots|tojson }},
-  intervals: {{ intervals|tojson }},
+  schedVocab: {{ sched_vocab|tojson }},
+  mailReady: {{ mail_ready|tojson }},
+  allowedDomains: {{ allowed_domains|tojson }},
   minIntervalHours: {{ settings.min_interval_hours|tojson }},
   schedulerOn: {{ scheduler_on|tojson }},
   agentUrl: {{ url_for('chat.index')|tojson }}
@@ -4942,6 +4992,26 @@ window.KB_INIT = {
              placeholder="例: bi-report@example.co.jp">
       <button class="btn btn--sm" id="addSender">＋ 追加</button>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card__title">文面の決まり（このアプリから出す全部のメール）</div>
+    <div class="card__desc">
+      マイエージェントの下書きも、マイロボットの自動送信も、ここで決めた形で送られます。
+      差出人の表示名は「差出人」の欄が空ならアプリ名（{{ app_title }}）になります。
+    </div>
+    <label class="field">本文の冒頭に必ず入れる断り書き</label>
+    <textarea id="bodyHeader" rows="5" style="width:100%"
+              placeholder="例: このメールは {app} が自動で作成・送信しています。"></textarea>
+    <div class="small muted mt">
+      <code>{app}</code> と書くとアプリ名（{{ app_title }}）に置き換わります。空にすると付けません。
+    </div>
+    <label class="mt" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="showSender">
+      <span class="small">本文に「送信者（ログインID）」の行を入れる（誰が出したメールか受け取る人に分かるようにする）</span>
+    </label>
+    <div class="small muted mt">実際に送られる形:</div>
+    <pre class="mono" id="bodySample" style="white-space:pre-wrap;background:var(--surface-2);padding:8px;border-radius:var(--radius-sm);font-size:12.5px"></pre>
   </div>
 
   <div class="card">
@@ -5414,7 +5484,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
           <summary>
             <strong>{{ r.name }}</strong>
             <span class="small muted" style="margin-left:8px">{{ r.n_steps }}手順・{{ r.tools|join(' → ') }}</span>
-            {% if r.schedule.interval_minutes %}<span class="badge" style="margin-left:6px">{{ r.schedule.interval_label }}{% if r.schedule.enabled is sameas false %}（止めています）{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at[5:16]|replace('T', ' ') }}{% endif %}</span>{% endif %}
+            {% if r.schedule.kind != 'manual' %}<span class="badge" style="margin-left:6px">{{ r.schedule.interval_label }}{% if r.schedule.enabled is sameas false %}（止めています）{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at[5:16]|replace('T', ' ') }}{% endif %}</span>{% endif %}
             {% if r.mail_auto %}<span class="badge" style="margin-left:4px">メール自動送信</span>{% endif %}
             {% if r.last_status == 'error' %}<span class="badge badge--warn" style="margin-left:4px">前回失敗</span>{% endif %}
             {% if (r.schedule.interval_minutes and r.schedule.enabled is not sameas false) or r.mail_auto %}
@@ -5430,8 +5500,12 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
               <dt>穴</dt><dd>{% if r.holes %}{% for h in r.holes %}{{ h.label }}（登録時の値: {{ h.sample }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}</dd>
               <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
               <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
-              <dt>定期実行</dt><dd>{% if r.schedule.interval_minutes %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
-              <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}</dd>
+              <dt>定期実行</dt><dd>{% if r.schedule.kind != 'manual' %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
+              <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}{% if r.notify_to %}／失敗したら {{ r.notify_to|join('、') }} に知らせる{% endif %}</dd>
+              <dt>実行履歴</dt>
+              <dd>{% if r.history %}<div class="tablewrap" style="max-height:220px"><table class="data"><thead><tr><th style="width:120px">日時</th><th style="width:60px">種類</th><th style="width:56px">結果</th><th>内容</th></tr></thead><tbody>
+                {% for h in r.history|reverse %}<tr><td>{{ h.at[:16]|replace('T', ' ') }}</td><td>{{ '定期' if h.source == 'schedule' else '手動' }}</td><td>{{ '成功' if h.ok else '失敗' }}</td><td>{{ h.message }}</td></tr>{% endfor %}
+              </tbody></table></div>{% else %}まだ実行していません{% endif %}</dd>
               <dt>作成・更新・前回の実行</dt><dd>{{ r.created_at|replace('T', ' ') }} ／ {{ r.updated_at|replace('T', ' ') }} ／ {% if r.last_run %}{{ r.last_run|replace('T', ' ') }}（{{ '成功' if r.last_status == 'ok' else ('実行中' if r.last_status == 'running' else '失敗') }}）{{ r.last_message }}{% else %}まだ実行していません{% endif %}</dd>
             </dl>
           </div>
@@ -9553,7 +9627,7 @@ async function registerRobot(upto) {
     // フォルダ出力の決めごと（ファイルを作る手順があるときだけ）。共通部品で作る
     const folder = r.has_file_steps ? window.ROBOT.folderOptions(r) : null;
     // 定期実行（時刻になったらサーバが動かす）と、メールの自動送信（下書きを作る手順があるときだけ）
-    const sched = window.ROBOT.scheduleOptions({ schedule: {}, holes: [] }, window.CHAT_INIT.robotIntervals || {}, null, false,
+    const sched = window.ROBOT.scheduleOptions({ schedule: {}, holes: [] }, window.CHAT_INIT.robotSchedVocab, null, false,
         { minIntervalHours: window.CHAT_INIT.robotMinIntervalHours, schedulerOn: window.CHAT_INIT.schedulerOn });
     const mailCb = el('input', { type: 'checkbox' });
     const body = el('div', {},
@@ -14544,25 +14618,58 @@ function folderOptions(r, onChange) {
 /** 定期実行の欄。{node, value()} を返す。onChange を渡すと変更のたびに呼ぶ。
  *  intervals は {表示名: 分}（定期取り込みと同じ一覧）。r.schedule と r.holes を見る。
  *  withValues=true なら、穴の値（定期実行のたびに使う値）と「止める」も出す（カード用）。 */
-function scheduleOptions(r, intervals, onChange, withValues, extra) {
+/** その設定で、実行と実行のあいだが最短で何分空くか（管理者の最低間隔と比べる用。サーバと同じ計算）。 */
+function scheduleGap(kind, hours) {
+    if (kind === 'hours') return Number(hours || 1) * 60;
+    return { manual: 0, daily: 1440, weekly: 10080, monthly_day: 40320, monthly_nth: 40320 }[kind] || 0;
+}
+
+function scheduleOptions(r, vocab, onChange, withValues, extra) {
     const x = extra || {};
+    const v = vocab || { kinds: {}, hours: [], weekdays: [], nth: {} };
     const floorMin = Number(x.minIntervalHours || 0) * 60;
     const sch = r.schedule || {};
-    const cur = Number(sch.interval_minutes || 0);
-    const sel = el('select', {}, ...Object.entries(intervals || {}).map(([label, minutes]) => {
-        const m = Number(minutes);
-        const tooShort = m > 0 && floorMin > 0 && m < floorMin && m !== cur;
-        return el('option', { value: String(m), ...(cur === m ? { selected: 'selected' } : {}),
+    const curKind = sch.kind || 'manual';
+    // しかた（手動のみ／時間ごと／毎日／毎週／毎月／毎月第N曜日）
+    const kindSel = el('select', { style: 'max-width:210px' }, ...Object.entries(v.kinds).map(([k, label]) => {
+        const gap = scheduleGap(k, sch.hours || v.hours[0]);
+        const tooShort = gap > 0 && floorMin > 0 && gap < floorMin && k !== curKind;
+        return el('option', { value: k, ...(curKind === k ? { selected: 'selected' } : {}),
                               ...(tooShort ? { disabled: 'disabled' } : {}) },
                   label + (tooShort ? '（管理者の最低間隔より短い）' : ''));
     }));
-    const start = el('input', { type: 'datetime-local', value: (sch.start_at || '').slice(0, 16) });
+    const hoursSel = el('select', { style: 'max-width:130px' }, ...v.hours.map(h => {
+        const tooShort = floorMin > 0 && h * 60 < floorMin && !(curKind === 'hours' && Number(sch.hours) === h);
+        return el('option', { value: String(h), ...(Number(sch.hours || 1) === h ? { selected: 'selected' } : {}),
+                              ...(tooShort ? { disabled: 'disabled' } : {}) }, `${h}時間ごと`);
+    }));
+    const timeIn = el('input', { type: 'time', value: sch.time || '08:00', style: 'width:110px' });
+    const wdaySel = el('select', { style: 'max-width:110px' }, ...v.weekdays.map((w, i) =>
+        el('option', { value: String(i), ...(Number(sch.weekday || 0) === i ? { selected: 'selected' } : {}) }, w + '曜日')));
+    const daySel = el('select', { style: 'max-width:100px' }, ...Array.from({ length: 31 }, (_, i) => i + 1).map(d =>
+        el('option', { value: String(d), ...(Number(sch.day || 1) === d ? { selected: 'selected' } : {}) }, `${d}日`)));
+    const nthSel = el('select', { style: 'max-width:100px' }, ...Object.entries(v.nth).map(([k, label]) =>
+        el('option', { value: k, ...(String(sch.nth || 1) === k ? { selected: 'selected' } : {}) }, label)));
+    const start = el('input', { type: 'datetime-local', value: (sch.start_at || '').slice(0, 16), style: 'max-width:210px' });
     const on = el('input', { type: 'checkbox', ...(sch.enabled === false ? {} : { checked: 'checked' }) });
     const holeInputs = {};
+    // しかたに応じて出す欄
+    const detail = el('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap;align-items:center' },
+        hoursSel, nthSel, wdaySel, daySel, timeIn);
+    const syncDetail = () => {
+        const k = kindSel.value;
+        hoursSel.classList.toggle('hidden', k !== 'hours');
+        nthSel.classList.toggle('hidden', k !== 'monthly_nth');
+        wdaySel.classList.toggle('hidden', k !== 'weekly' && k !== 'monthly_nth');
+        daySel.classList.toggle('hidden', k !== 'monthly_day');
+        timeIn.classList.toggle('hidden', k === 'manual' || k === 'hours');
+        detail.classList.toggle('hidden', k === 'manual');
+    };
     const rows = [
-        el('span', { class: 'small' }, '間隔'), el('div', {}, sel),
+        el('span', { class: 'small' }, 'しかた'), el('div', {}, kindSel),
+        el('span', { class: 'small' }, 'いつ'), detail,
         el('span', { class: 'small' }, '開始日時'), el('div', {}, start,
-            el('span', { class: 'small muted', style: 'margin-left:6px' }, 'この時刻から、間隔ごとに動きます（空なら登録した時刻から）')),
+            el('span', { class: 'small muted', style: 'margin-left:6px' }, 'この日時より前には動きません（空なら登録した時刻から）')),
     ];
     if (withValues) {
         rows.push(el('span', { class: 'small' }, '動かす'), el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' },
@@ -14582,7 +14689,7 @@ function scheduleOptions(r, intervals, onChange, withValues, extra) {
         ? el('div', { class: 'alert alert--warn small mt' },
              'いまアプリの定期実行（スケジューラ）が止まっています。設定は保存できますが、時刻になっても動きません。管理者に確認してください。')
         : null;
-    const choosable = [...sel.options].some(o => !o.disabled && o.value !== '0');
+    const choosable = [...kindSel.options].some(o => !o.disabled && o.value !== 'manual');
     const blocked = (sch.floor_blocked)
         ? el('div', { class: 'alert alert--warn small mt' },
              choosable ? '管理者が決めた最低間隔より短いので、いまは動きません。間隔を選び直してください。'
@@ -14592,22 +14699,33 @@ function scheduleOptions(r, intervals, onChange, withValues, extra) {
             ? el('div', { class: 'alert alert--warn small mt' },
                  `いまの最低間隔（${x.minIntervalHours} 時間）では、選べる間隔がありません（手動のみになります）。`)
             : null);
-    const sync = () => { if (onChange) onChange(); };
-    [sel, start, on, ...Object.values(holeInputs)].forEach(i => i.addEventListener('change', sync));
+    const sync = () => { syncDetail(); if (onChange) onChange(); };
+    [kindSel, hoursSel, timeIn, wdaySel, daySel, nthSel, start, on,
+     ...Object.values(holeInputs)].forEach(i => i.addEventListener('change', sync));
+    syncDetail();
     const node = el('div', {}, grid, note, warn, blocked);
     const value = () => {
-        const v = { interval_minutes: Number(sel.value || 0), start_at: start.value || '' };
+        const out = { kind: kindSel.value, hours: Number(hoursSel.value || 1),
+                      time: timeIn.value || '08:00', weekday: Number(wdaySel.value || 0),
+                      day: Number(daySel.value || 1), nth: Number(nthSel.value || 1),
+                      start_at: start.value || '' };
         if (withValues) {
-            v.enabled = on.checked;
-            v.values = Object.fromEntries(Object.entries(holeInputs).map(([k, i]) => [k, i.value]));
+            out.enabled = on.checked;
+            out.values = Object.fromEntries(Object.entries(holeInputs).map(([k, i]) => [k, i.value]));
         }
-        return v;
+        return out;
     };
     // 保存を断られたとき、いま保存されている値に戻す（断られた値が残ったままだと、次の変更も同じ理由で断られる）
     const reset = () => {
         const s2 = r.schedule || {};
-        sel.value = String(Number(s2.interval_minutes || 0));
+        kindSel.value = s2.kind || 'manual';
+        hoursSel.value = String(s2.hours || 1);
+        timeIn.value = s2.time || '08:00';
+        wdaySel.value = String(s2.weekday || 0);
+        daySel.value = String(s2.day || 1);
+        nthSel.value = String(s2.nth || 1);
         start.value = (s2.start_at || '').slice(0, 16);
+        syncDetail();
         on.checked = s2.enabled !== false;
         const sample = Object.fromEntries((r.holes || []).map(h => [h.key, h.sample ?? '']));
         Object.entries(holeInputs).forEach(([k, i]) => { i.value = (s2.values || {})[k] ?? sample[k] ?? ''; });
@@ -14618,7 +14736,7 @@ function scheduleOptions(r, intervals, onChange, withValues, extra) {
 /** 定期実行を一言で（カードの表示用）。 */
 function scheduleLabel(r) {
     const sch = r.schedule || {};
-    if (!Number(sch.interval_minutes || 0)) return '定期実行: 手動のみ';
+    if ((sch.kind || 'manual') === 'manual') return '定期実行: 手動のみ';
     if (sch.enabled === false) return `定期実行: ${sch.interval_label}（止めています）`;
     return `定期実行: ${sch.interval_label}` + (sch.next_at ? `・次回 ${sch.next_at.slice(5, 16).replace('T', ' ')}` : '');
 }
@@ -14663,7 +14781,7 @@ function cardMeta(r) {
         + ((r.holes || []).length ? `・穴 ${r.holes.map(h => h.label).join('、')}` : '')
         + (r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')}` : '・まだ実行していません')
         + (wait ? `・次に実行できるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
-        + (Number((r.schedule || {}).interval_minutes || 0) ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
+        + (((r.schedule || {}).kind || 'manual') !== 'manual' ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
         + (r.mail_auto ? '・メール自動送信' : '')
         + (r.from_title ? `・元の会話「${r.from_title}」` : '');
 }
@@ -14693,6 +14811,7 @@ function card(r) {
         scheduleRow(r),
         r.has_mail_steps ? mailRow(r) : null,
         detailRow(r),
+        historyRow(r),
         r.last_status === 'error'
             ? el('div', { class: 'alert alert--err small mt' }, `前回の実行: ${r.last_message}`) : null);
 }
@@ -14700,7 +14819,7 @@ function card(r) {
 /** 定期実行の設定（間隔・開始・止める・穴の値）。変えるとその場で保存。 */
 function scheduleRow(r) {
     const summary = el('span', { class: 'small muted' }, window.ROBOT.scheduleLabel(r));
-    const opts = window.ROBOT.scheduleOptions(r, window.ROBOTS_INIT.intervals || {}, async () => {
+    const opts = window.ROBOT.scheduleOptions(r, window.ROBOTS_INIT.schedVocab, async () => {
         try {
             const res = await api('/api/robots/update', { id: r.id, schedule: opts.value() });
             const fresh = res.robots.find(x => x.id === r.id);
@@ -14715,9 +14834,29 @@ function scheduleRow(r) {
         } catch (e) { opts.reset(); toast(e.message, 'err', 9000); }
     }, true, { minIntervalHours: window.ROBOTS_INIT.minIntervalHours, schedulerOn: window.ROBOTS_INIT.schedulerOn });
     const sch = r.schedule || {};
+    // 失敗したときの知らせ先。管理者が許可したアドレスだけ（サーバも同じ判断で断る）
+    const notify = el('input', { type: 'text', value: (r.notify_to || []).join(', '),
+                                 style: 'max-width:340px',
+                                 placeholder: '例: yamada@example.co.jp（カンマ区切りで複数可）' });
+    const saveNotify = async () => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, notify_to: notify.value });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) { Object.assign(r, fresh); notify.value = (r.notify_to || []).join(', '); }
+            toast((r.notify_to || []).length ? '失敗したときの知らせ先を保存しました。' : '知らせ先を空にしました。');
+        } catch (e) { notify.value = (r.notify_to || []).join(', '); toast(e.message, 'err', 9000); }
+    };
+    notify.addEventListener('change', saveNotify);
+    const notifyBox = el('div', { class: 'mt' },
+        el('label', { class: 'field' }, '定期実行が失敗したときに知らせるメール（任意）'),
+        notify,
+        el('div', { class: 'small muted mt' },
+           window.ROBOTS_INIT.mailReady
+               ? `${window.ROBOTS_INIT.allowedDomains} のうち、管理者が「メール設定」で許可したアドレスだけ指定できます。`
+               : 'いまメールを送れる設定になっていません（管理者がメール設定を終えると使えます）。'));
     return el('details', { class: 'acc', style: 'margin-top:8px' },
         el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
-        el('div', { class: 'acc__body' }, opts.node,
+        el('div', { class: 'acc__body' }, opts.node, notifyBox,
             sch.last_run ? el('div', { class: `small mt ${sch.last_status === 'error' ? 'alert alert--err' : 'muted'}` },
                 `前回の定期実行: ${sch.last_run.slice(5, 16).replace('T', ' ')} ${sch.last_message || ''}`) : null));
 }
@@ -14742,6 +14881,34 @@ function mailRow(r) {
            el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')));
 }
 
+/** 実行履歴。いつ・手動か定期か・成否・一言。不具合はまずここを見る。 */
+function historyRow(r) {
+    const rows = [...(r.history || [])].reverse();
+    const label = rows.length
+        ? `実行履歴（${rows.length}件・失敗 ${rows.filter(h => !h.ok).length}件）`
+        : '実行履歴（まだありません）';
+    const body = rows.length
+        ? el('div', { class: 'tablewrap', style: 'max-height:320px' },
+            el('table', { class: 'data' },
+                el('thead', {}, el('tr', {}, el('th', { style: 'width:120px' }, '日時'),
+                                   el('th', { style: 'width:70px' }, '種類'),
+                                   el('th', { style: 'width:60px' }, '結果'),
+                                   el('th', {}, '内容'))),
+                el('tbody', {}, ...rows.map(h => el('tr', {},
+                    el('td', { class: 'small' }, (h.at || '').slice(0, 16).replace('T', ' ')),
+                    el('td', { class: 'small' }, h.source === 'schedule' ? '定期' : '手動'),
+                    el('td', { class: 'small' }, h.ok ? '成功' : el('b', { style: 'color:var(--err)' }, '失敗')),
+                    el('td', { class: 'small', style: 'white-space:pre-wrap' }, h.message || ''))))))
+        : el('div', { class: 'small muted' }, 'まだ実行していません。');
+    return el('details', { class: 'acc', style: 'margin-top:8px' },
+        el('summary', { class: 'small', style: 'cursor:pointer' },
+           el('span', { class: r.history && r.history.some(h => !h.ok) ? '' : 'muted' }, label)),
+        el('div', { class: 'acc__body' }, body,
+            el('div', { class: 'small muted mt' },
+               '定期実行の失敗はここに残ります。原因が「表が見つかりません」なら、'
+               + '表の名前が変わったか消えています。作り直すと直ります。')));
+}
+
 /** 登録内容の詳細（手順の中身・穴・表・決めごと）。 */
 function detailRow(r) {
     const sch = r.schedule || {};
@@ -14756,7 +14923,7 @@ function detailRow(r) {
         el('dt', {}, '使う表'), el('dd', {}, (r.tables || []).join('、') || 'なし'),
         el('dt', {}, 'フォルダ出力'), el('dd', {}, r.has_file_steps ? window.ROBOT.folderLabel(r).replace('フォルダ: ', '') : 'ファイルを作る手順はありません'),
         el('dt', {}, '定期実行'), el('dd', {}, window.ROBOT.scheduleLabel(r).replace('定期実行: ', '')
-            + (Number(sch.interval_minutes || 0) && sch.start_at ? `（開始 ${sch.start_at.replace('T', ' ')}）` : '')),
+            + ((sch.kind || 'manual') !== 'manual' && sch.start_at ? `（開始 ${sch.start_at.replace('T', ' ')}）` : '')),
         el('dt', {}, 'メール'), el('dd', {}, r.has_mail_steps ? (r.mail_auto ? '実行のたびに自動で送る' : '下書きを出すだけ（送らない）') : 'メールの手順はありません'),
         el('dt', {}, '元の会話'), el('dd', {}, r.from_title || '—'),
         el('dt', {}, '作成・更新'), el('dd', {}, `${(r.created_at || '').replace('T', ' ')} ／ ${(r.updated_at || '').replace('T', ' ')}`),
@@ -15262,6 +15429,11 @@ function render() {
     $('#maxRecipients').value = s.max_recipients ?? 20;
     $('#dryRun').checked = !!s.dry_run;
     ['#maxRecipients', '#dryRun'].forEach(x => { $(x).disabled = !editable(); });
+    // 文面の決まり（打っている最中は上書きしない）
+    if (document.activeElement !== $('#bodyHeader')) $('#bodyHeader').value = s.body_header || '';
+    $('#showSender').checked = s.show_sender !== false;
+    ['#bodyHeader', '#showSender'].forEach(x => { $(x).disabled = !editable(); });
+    $('#bodySample').textContent = s.sample_body || '';
     $('#dryNote').replaceChildren(s.dry_run
         ? el('div', { class: 'alert alert--info' },
             'テスト送信モードです。マイエージェントの「送信」を押しても外にはメールが出ず、'
@@ -15345,6 +15517,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     $('#sender').addEventListener('change', ev => { state.sender = ev.target.value; });
     $('#senderName').addEventListener('input', ev => { state.sender_name = ev.target.value; });
+    $('#bodyHeader').addEventListener('input', ev => { state.body_header = ev.target.value; });
+    $('#showSender').addEventListener('change', ev => { state.show_sender = ev.target.checked; });
     $('#maxRecipients').addEventListener('input',
         ev => { state.max_recipients = parseInt(ev.target.value || '20', 10); });
     $('#dryRun').addEventListener('change', ev => {
@@ -15391,6 +15565,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 max_recipients: state.max_recipients,
                 dry_run: state.dry_run,
                 ok_domains: $('#okDomains').value,
+                body_header: $('#bodyHeader').value,
+                show_sender: $('#showSender').checked,
             });
             state = { ...state, ...r };
             toast('保存しました。', 'ok');
