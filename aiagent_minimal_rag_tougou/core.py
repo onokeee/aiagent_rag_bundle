@@ -142,8 +142,12 @@ def _ro_uri(path) -> str:
 
 
 def connect_ro(path) -> sqlite3.Connection:
-    """単一DBへの読み取り専用接続（プロファイリング用）。"""
-    return sqlite3.connect(_ro_uri(path), uri=True)
+    """単一DBへの読み取り専用接続（プロファイリング用）。
+
+    timeout は取り込み側（書き込み接続）と同じ 30 秒。既定の 5 秒だと、
+    大きな表の全件入れ替えのコミット中に当たった読み取りが database is locked で落ちる。
+    """
+    return sqlite3.connect(_ro_uri(path), uri=True, timeout=30)
 
 
 # SQLiteが同時にATTACHできる数の上限（既定10）。main を1つ使うので実質これだけ。
@@ -1060,8 +1064,20 @@ def _read_json(p: Path):
 
 
 def _write_json(p: Path, data) -> None:
+    """一時ファイルに書いてから差し替える。
+
+    直接上書きすると、書いている途中で落ちた（停電・強制終了・ディスク満杯）とき
+    ファイルが途中まででしか残らず、次に読んだ側が「空」と見なして上書きしてしまう。
+    """
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+#: 会話一覧（index.json）の「読む → 足す → 書き戻す」を直列にする。会話ごとの鍵では
+#: 別々の会話（質問の途中でロボットを実行、など）の同時保存を防げず、後勝ちで一覧から消える
+_index_lock = threading.RLock()
 
 
 #: 会話1つにつき1本の鍵。「読む → 足す → まるごと書き戻す」を直列にするため。
@@ -1181,18 +1197,19 @@ def _save_index(user, items: list[dict]) -> None:
 
 
 def _upsert_index(user, summary: dict) -> list[dict]:
-    items = [c for c in list_chats(user) if c.get("id") != summary["id"]]
-    items.insert(0, summary)
-    items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
+    with _index_lock:
+        items = [c for c in list_chats(user) if c.get("id") != summary["id"]]
+        items.insert(0, summary)
+        items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
 
-    # 上限を超えた古い会話は実体ごと削除
-    for old in items[config.CHAT_HISTORY_LIMIT:]:
-        f = _chat_file(user, old.get("id", ""))
-        if f.exists():
-            f.unlink()
-    items = items[:config.CHAT_HISTORY_LIMIT]
-    _save_index(user, items)
-    return items
+        # 上限を超えた古い会話は実体ごと削除
+        for old in items[config.CHAT_HISTORY_LIMIT:]:
+            f = _chat_file(user, old.get("id", ""))
+            if f.exists():
+                f.unlink()
+        items = items[:config.CHAT_HISTORY_LIMIT]
+        _save_index(user, items)
+        return items
 
 
 # --- 作成ファイル(bytes)の出し入れ ------------------------------------------------
@@ -1349,7 +1366,8 @@ def delete_chat(user, chat_id: str) -> bool:
     mark_deleted(user, chat_id)
     if existed:
         p.unlink()
-    _save_index(user, [c for c in list_chats(user) if c.get("id") != chat_id])
+    with _index_lock:
+        _save_index(user, [c for c in list_chats(user) if c.get("id") != chat_id])
     return existed
 
 
@@ -1605,7 +1623,8 @@ _prefs_lock = threading.Lock()
 # rag_settings … 検索の効き方（rag/settings.py の RAG_SPECS）
 # tables_off   … 分析の対象から外したテーブル名（外したものを持つ理由は
 #                 rag_off と同じ。新しく取り込んだ表は既定で対象に入る）
-KEYS = ("model", "rag_off", "rag_settings", "tables_off")
+# memory_off   … 覚え書き（会話から自動で覚える）を止めているか
+KEYS = ("model", "rag_off", "rag_settings", "tables_off", "memory_off")
 
 
 def _key(user) -> str:
@@ -1647,6 +1666,310 @@ def set_value(user, key: str, value) -> None:
     data = load(user)
     data[key] = value
     _save(user, data)
+
+
+# ==========================================================================
+# ===== 覚え書き（利用者について、会話から自動で覚える）
+#
+#   data/users/<ユーザー>/memory.yaml
+#     text:       本文（1つのテキスト。箇条書きの行の集まり）
+#     updated_at: 最後に変わった時刻（画面が「変わったか」を見るための印）
+#
+# ChatGPT のメモリと同じ発想。回答のあとにもう1回AIを呼び、直近のやり取りを踏まえて
+# 本文を書き直させる（足す・直す・消す）。次の質問からシステムプロンプトの「この利用者について」に載る。
+# 本人は「覚え書き」の画面（サイドバーのマイロボットの下）で本文をそのまま編集できる。
+# データの中身や1回きりの指示は覚えない（brain.extract_memory の決まり）。本人だけのもの。
+# ==========================================================================
+_memory_lock = threading.RLock()
+MEMORY_SETTING_RANGES = {"max_chars": (100, 20000)}
+
+
+def _memory_setting_defaults() -> dict:
+    return {"enabled": bool(config.MEMORY_ENABLED), "model": str(config.MEMORY_MODEL or ""),
+            "max_chars": int(config.MEMORY_MAX_CHARS)}
+
+
+def memory_settings() -> dict:
+    """覚え書きの決めごと。管理者が画面で保存した値 > env（config）。範囲の外は寄せる。"""
+    out = _memory_setting_defaults()
+    p = config.MEMORY_SETTINGS_FILE
+    if p.exists():
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[memory] 決めごとの設定を読めませんでした: {p} ({e})")
+            data = {}
+        if isinstance(data, dict):
+            if "enabled" in data:
+                out["enabled"] = bool(data["enabled"])
+            if "model" in data:
+                out["model"] = str(data.get("model") or "").strip()
+            if "max_chars" in data:
+                try:
+                    out["max_chars"] = int(data["max_chars"])
+                except (TypeError, ValueError):
+                    pass
+    lo, hi = MEMORY_SETTING_RANGES["max_chars"]
+    out["max_chars"] = max(lo, min(int(out["max_chars"]), hi))
+    return out
+
+
+def memory_settings_note() -> dict:
+    p = config.MEMORY_SETTINGS_FILE
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return ({"updated_by": str(data.get("updated_by") or ""), "updated_at": str(data.get("updated_at") or "")}
+            if isinstance(data, dict) else {})
+
+
+def save_memory_settings(values: dict, user: str | None = None) -> dict:
+    """管理者が決めた値を保存する。範囲の外・知らないモデルは ValueError（保存しない）。"""
+    cur = memory_settings()
+    if "enabled" in values:
+        if not isinstance(values["enabled"], bool):
+            raise ValueError("「覚え書きを使う」は true / false で指定してください。")
+        cur["enabled"] = values["enabled"]
+    if "model" in values:
+        model = str(values.get("model") or "").strip()
+        known = list(models.available())
+        if model and known and model not in known:
+            raise ValueError("そのモデルは「モデル設定」で使えるモデルに入っていません。")
+        cur["model"] = model
+    if "max_chars" in values:
+        try:
+            v = int(str(values["max_chars"]).strip())
+        except (TypeError, ValueError):
+            raise ValueError("「本文の上限（文字）」は数で入力してください。")
+        lo, hi = MEMORY_SETTING_RANGES["max_chars"]
+        if not (lo <= v <= hi):
+            raise ValueError(f"「本文の上限（文字）」は {lo}〜{hi} の範囲で入力してください。")
+        cur["max_chars"] = v
+    p = config.MEMORY_SETTINGS_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
+                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return memory_settings()
+
+
+#: 「忘れて」の意図。本文が減る書き直しは、これが質問に無ければ捨てる（AIが黙って落とすのを防ぐ）。
+#: ふつうの質問に出てくる言葉（更新・違う・やめる）は入れない。入れると、関係のない質問のたびに
+#: 守りが外れて、覚え書きが黙って消える。
+_MEMORY_FORGET_WORDS = ("忘れて", "忘れる", "消して", "削除して", "覚えないで", "覚えなくて",
+                        "もう違う", "もういらな", "要らな", "間違い", "間違っ")
+
+
+def _memory_path(user):
+    return config.USER_META_DIR / _key(user) / "memory.yaml"
+
+
+def _memory_raw(user) -> tuple[dict, bool]:
+    """({"text": str, "updated_at": str}, 壊れているか)。壊れていれば空を返し、足す・書き直す側は止める。"""
+    empty = {"text": "", "updated_at": ""}
+    if user is None:
+        return empty, False
+    p = _memory_path(user)
+    if not p.exists():
+        return empty, False
+    with _memory_lock:
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[memory] 読めませんでした: {p} ({e})")
+            return empty, True
+    if not isinstance(data, dict):
+        return empty, True
+    text = data.get("text")
+    if text is None and isinstance(data.get("items"), list):
+        # 以前の形（1件ずつ）。本文にまとめて読む（次の保存で新しい形になる）
+        text = "\n".join(f"- {i.get('text')}" for i in data["items"]
+                         if isinstance(i, dict) and str(i.get("text") or "").strip())
+    if not isinstance(text, str):
+        return empty, True
+    return {"text": _memory_clean(text), "updated_at": str(data.get("updated_at") or "")}, False
+
+
+def memory_load(user) -> dict:
+    return _memory_raw(user)[0]
+
+
+def _memory_save(user, data: dict) -> None:
+    """一時ファイルに書いてから置き換える（書きかけを読まれない・途中で落ちても前の中身が残る）。"""
+    p = _memory_path(user)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(yaml.safe_dump({"text": data.get("text") or "",
+                                   "updated_at": data.get("updated_at") or ""},
+                                  allow_unicode=True, sort_keys=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _memory_clean(text) -> str:
+    """本文を整える: 改行を揃え、行の前後の空白を落とし、空行を詰め、長すぎれば切る。"""
+    lines = [" ".join(str(ln).split()) for ln in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    out = "\n".join(lines)
+    cap = int(memory_settings()["max_chars"])
+    if len(out) > cap:
+        head = out[:cap]
+        if out[cap] == "\n" or "\n" not in head:
+            out = head              # ちょうど行の切れ目 ／ 1行しかない（そのまま切る）
+        else:
+            out = head[:head.rfind("\n")]      # 途中で切れた行は落とす
+    return out
+
+
+def memory_text(user) -> str:
+    return memory_load(user)["text"]
+
+
+def memory_enabled(user) -> bool:
+    """機能が生きていて（env）、本人が止めていない。"""
+    return bool(memory_settings()["enabled"]) and user is not None and not load(user).get("memory_off")
+
+
+def memory_set_text(user, text, *, force: bool = False) -> dict:
+    """本文を置き換える（本人の編集・全部消す）。壊れたファイルでも本人の操作なら上書きする。
+
+    戻り値: {"changed": bool, "text": 本文}
+    """
+    if user is None:
+        return {"changed": False, "text": ""}
+    with _memory_lock:
+        data, broken = _memory_raw(user)
+        if broken and not force:
+            return {"changed": False, "text": data["text"]}
+        new = _memory_clean(text)
+        if new == data["text"] and not broken:
+            return {"changed": False, "text": new}
+        _memory_save(user, {"text": new, "updated_at": chats.now()})
+        return {"changed": True, "text": new}
+
+
+def memory_apply(user, new_text, question: str = "", base=None) -> dict:
+    """AIが書き直した本文を当てる。形が崩れていれば捨てる。止めていれば書かない。
+
+    base … 書き直しを頼んだときの本文。いまの本文がそれと違えば書かない
+           （AIに聞いているあいだに本人が直した・全部消したものを巻き戻さないため）。
+    本文が空になる／行数が減る書き直しは、質問に「忘れて」などが無ければ捨てる
+    （AIが黙って覚え書きを落とすのを防ぐ）。
+    戻り値: {"changed": bool, "reason": str}
+    """
+    if user is None or not isinstance(new_text, str):
+        return {"changed": False, "reason": "変更なし"}
+    with _memory_lock:
+        if not memory_enabled(user):
+            return {"changed": False, "reason": "止めている"}
+        data, broken = _memory_raw(user)
+        if broken:
+            print(f"[memory] 保存ファイルが読めないので、覚え書きは書き直しません（{getattr(user, 'username', user)}）")
+            return {"changed": False, "reason": "読めない"}
+        new = _memory_clean(new_text)
+        old = data["text"]
+        if base is not None and old != _memory_clean(base):
+            # 聞いているあいだに本人が直した（または別の質問の書き直しが先に入った）
+            print(f"[memory] 先に本文が変わっていたので、書き直しは当てませんでした（{getattr(user, 'username', user)}）")
+            return {"changed": False, "reason": "先に変わった"}
+        if new == old:
+            return {"changed": False, "reason": "変更なし"}
+        forget = any(w in str(question or "") for w in _MEMORY_FORGET_WORDS)
+        old_n = len(old.split("\n")) if old else 0
+        new_n = len(new.split("\n")) if new else 0
+        if old and not forget and (not new or (old_n >= 3 and new_n * 2 < old_n)):
+            print(f"[memory] 本文が減る書き直し（{old_n}→{new_n}行）は捨てました（{getattr(user, 'username', user)}）")
+            return {"changed": False, "reason": "減りすぎ"}
+        _memory_save(user, {"text": new, "updated_at": chats.now()})
+        return {"changed": True, "reason": "書き直し"}
+
+
+def memory_clear(user) -> None:
+    memory_set_text(user, "", force=True)
+
+
+def memory_prompt(user) -> str:
+    """システムプロンプトに載せる「この利用者について」の節。無ければ空。"""
+    if not memory_enabled(user):
+        return ""
+    text = memory_text(user)
+    if not text:
+        return ""
+    return (
+        "# この利用者について（会話から自動で覚えた覚え書き。本人が直すこともある）\n"
+        f"{text}\n"
+        "- 質問に書かれていない前提・好み・期間はここから補う。ただし今回の質問の指定が常に優先。\n"
+        "- 覚え書きを使って答えたら、回答の末尾に「（覚え書き「…」を使いました）」と一言添える。\n"
+        "- 覚え書きに無いことは推測で決めない。利用者が「忘れて」「もう違う」と言ったら、それは使わず、"
+        "「次の回答のあとに自動で直ります。直っていなければメニューの覚え書きで直せます」と伝える。\n\n"
+    )
+
+
+def memory_payload(user) -> dict:
+    """画面に渡す形。"""
+    data, broken = _memory_raw(user)
+    st = memory_settings()
+    return {"enabled": bool(st["enabled"]),
+            "on": memory_enabled(user),
+            "text": data["text"], "updated_at": data["updated_at"],
+            "broken": bool(broken),
+            "max_chars": int(st["max_chars"])}
+
+
+def _last_turn_texts(chat: dict) -> tuple[str, str]:
+    """直近の質問と、その最終回答（文章）。最後がエラーや道具の呼び出しで終わっていれば空。"""
+    q = a = ""
+    for m in reversed(chat.get("messages") or []):
+        role = m.get("role")
+        if role == "assistant" and not a:
+            c = m.get("content")
+            if m.get("tool_calls") or not isinstance(c, str) or not c.strip():
+                return "", ""                       # 最終回答で終わっていない
+            a = c
+        elif role == "user" and not a:
+            return "", ""                           # 回答が無いまま終わった質問（前の質問には落ちない）
+        elif role == "user" and a:
+            c = m.get("content")
+            q = c if isinstance(c, str) else next(
+                (p.get("text", "") for p in (c or [])
+                 if isinstance(p, dict) and p.get("type") == "text"), "")
+            break
+    return q or "", a
+
+
+def memory_after_turn(user, chat_id: str, question: str, answer: str, model: str | None = None) -> dict:
+    """回答のあとの書き直し（同期）。AIを1回呼び、返ってきた本文を当てる。失敗しても黙る。
+
+    model は使うモデル（呼び元が決める: 管理者の決めごと ＞ 回答に使ったモデル）。
+    """
+    base = memory_text(user)          # 聞いているあいだに本人が直したら、書き戻さないための基準
+    try:
+        new_text = llm.extract_memory(base, question, answer, model=model)
+        done = memory_apply(user, new_text, question, base=base)
+    except Exception as e:
+        # 別スレッドなので、ここで受け止めないと英語の例外だけが出て誰にも伝わらない
+        print(f"[memory] 書き直しに失敗しました（{getattr(user, 'username', user)}）: {e}")
+        return {"changed": False, "reason": "失敗"}
+    if done.get("changed"):
+        print(f"[memory] {getattr(user, 'username', user)}: 覚え書きを書き直しました")
+    return done
+
+
+def _schedule_memory(user, chat: dict) -> None:
+    """回答のあとに、覚え書きの書き直しを別スレッドでAIに頼む（回答は待たせない）。
+
+    短すぎる質問（「はい」「続けて」）では呼ばない。ただし「忘れて」「覚えて」は短くても呼ぶ。
+    """
+    if user is None or not memory_enabled(user) or not llm.is_configured():
+        return
+    q, a = _last_turn_texts(chat)
+    if not a.strip() or (len(q.strip()) < 4 and not any(w in q for w in ("忘れ", "覚え"))):
+        return
+    # 書き直しに使うモデル: 管理者の指定（決めごと）> 回答に使ったモデル。スレッドの外で決めておく
+    model = memory_settings()["model"] or models.current(user)
+    threading.Thread(target=memory_after_turn, args=(user, chat.get("id") or "", q, a, model),
+                     daemon=True).start()
 
 
 # --- モデルの選択 ----------------------------------------------------------------
@@ -2719,6 +3042,7 @@ def er_payload(path, profile: dict | None = None,
         pos = layout.get(nid) or [40 + (i % 4) * 300, 40 + (i // 4) * 320]
         nodes.append({
             "id": nid, "alias": alias, "table": tname,
+            "type": t.get("type") or "table",          # 見出しのアイコン（表／ビュー）
             "x": pos[0], "y": pos[1], "rows": t.get("row_count"),
             "columns": [{"name": c["name"], "type": c["type"],
                          "pk": c["name"] in pk, "fk": c["name"] in fks}
@@ -4330,9 +4654,14 @@ CSV_ENCODINGS = ["utf-8-sig", "cp932", "utf-8", "shift_jis", "euc_jp"]
 
 # --- アップロードされたファイル（サーバのフォルダには置かない） --------------------
 
-def check_upload(data: bytes, filename: str) -> str:
-    """アップロードの受け入れ判定。戻り値は正規化した拡張子。"""
-    if not config.IMPORT_ALLOW_UPLOAD:
+def check_upload(data: bytes, filename: str, trusted: bool = False) -> str:
+    """アップロードの受け入れ判定。戻り値は正規化した拡張子。
+
+    trusted は「サーバ側の処理（スクレイピング）が作ったファイル」の印。
+    利用者のPCから来たものではないので IMPORT_ALLOW_UPLOAD の制限は掛けない
+    （形式とサイズの点検は同じ）。
+    """
+    if not trusted and not config.IMPORT_ALLOW_UPLOAD:
         raise ImportError_("アップロードからの取り込みは無効化されています（IMPORT_ALLOW_UPLOAD）。")
     ext = Path(filename or "").suffix.lower()
     if ext not in config.IMPORT_EXTENSIONS:
@@ -4345,18 +4674,19 @@ def check_upload(data: bytes, filename: str) -> str:
     return ext
 
 
-def upload_sheet_names(data: bytes, filename: str) -> list[str]:
-    if check_upload(data, filename) not in (".xlsx", ".xlsm"):
+def upload_sheet_names(data: bytes, filename: str, trusted: bool = False) -> list[str]:
+    if check_upload(data, filename, trusted) not in (".xlsx", ".xlsm"):
         return []
     import io
     return _sheet_names_of(io.BytesIO(data))
 
 
 def read_upload(data: bytes, filename: str, sheet: str | None = None, header_row: int = 0,
-                delimiter: str | None = None, nrows: int | None = None) -> pd.DataFrame:
+                delimiter: str | None = None, nrows: int | None = None,
+                trusted: bool = False) -> pd.DataFrame:
     """アップロードされたバイト列を DataFrame として読む。ディスクには書かない。"""
     import io
-    ext = check_upload(data, filename)
+    ext = check_upload(data, filename, trusted)
     try:
         if ext in (".xlsx", ".xlsm"):
             return pd.read_excel(io.BytesIO(data), sheet_name=sheet or 0,
@@ -4376,6 +4706,346 @@ def read_upload(data: bytes, filename: str, sheet: str | None = None, header_row
         raise
     except Exception as e:
         raise ImportError_(f"ファイルを読めませんでした: {e}") from e
+
+
+# --- Webスクレイピング（scrapers/ の .py を実行して、出来たファイルを読む） ----------
+#
+# 取り込み元が「サーバ上のファイル」ではなく「プログラムが取りに行く先」の場合。
+# 管理者が scrapers/ に置いた Python ファイルを別プロセスで実行し、一時フォルダに
+# 出来た Excel/CSV をメモリに読んだうえで、フォルダごと消す（取得したファイルは
+# サーバに残さない。残るのは表に入れた中身だけ）。
+#
+# スクリプトの約束は1つ: fetch(out_dir) を定義し、out_dir にファイルを書くこと。
+# 実行できるのは scrapers/ 直下の .py だけ。パスは受け取らず名前で選ぶ。
+# サーバ上で任意のコードが動く操作なので、呼び出し側は必ず管理者に限ること。
+
+SCRAPER_TIMEOUT_MIN_SEC = 10
+SCRAPER_TIMEOUT_MAX_SEC = 3600
+SCRAPER_INTERVAL_MAX_MIN = 10080
+
+# 別プロセスで動かす側のコード。スクリプトを読み込んで fetch(out_dir) を呼ぶだけ。
+_SCRAPER_RUNNER = """
+import pathlib, runpy, sys
+script, out = sys.argv[1], pathlib.Path(sys.argv[2])
+sys.path.insert(0, str(pathlib.Path(script).parent))
+ns = runpy.run_path(script, run_name="__scraper__")
+fetch = ns.get("fetch")
+if not callable(fetch):
+    sys.stderr.write("fetch(out_dir) が定義されていません。\\n")
+    sys.exit(3)
+fetch(out)
+"""
+
+
+def scraper_dir() -> Path:
+    return config.SCRAPER_DIR
+
+
+def list_scrapers() -> list[dict]:
+    """scrapers/ 直下の .py。先頭が _ のものは部品扱いで出さない。"""
+    d = scraper_dir()
+    try:
+        if not d.is_dir():
+            return []
+        out = []
+        for p in sorted(d.iterdir()):
+            if (p.suffix.lower() != ".py" or p.name.startswith(("_", "."))
+                    or not p.is_file()):
+                continue
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size,
+                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")})
+        return out
+    except OSError:
+        return []
+
+
+def scraper_path(name: str) -> Path:
+    """名前から実ファイルへ。scrapers/ 直下の .py 以外は断る（.. やリンク経由も）。"""
+    name = str(name or "").strip()
+    if (not name or name != Path(name).name or not name.lower().endswith(".py")
+            or name.startswith(("_", "."))):
+        raise ImportError_("スクレイピングのスクリプトは scrapers/ 直下の .py から選んでください。")
+    d = scraper_dir()
+    try:
+        real = (d / name).resolve(strict=True)
+        if real.parent != d.resolve() or not real.is_file():
+            raise OSError
+    except (OSError, RuntimeError):
+        raise ImportError_(f"スクリプト {name} が scrapers/ に見つかりません。") from None
+    return real
+
+
+def scrape_defaults() -> tuple[int, int]:
+    """既定のタイムアウト（秒）と最小間隔（分）。env の値を許される範囲に収める。
+
+    env に範囲外の値が書かれていると、画面の「試す」や登録がその既定値ごと
+    断られて、画面からは直しようがなくなる。ここで丸めておく。
+    """
+    t = max(SCRAPER_TIMEOUT_MIN_SEC, min(int(config.SCRAPER_TIMEOUT_SEC), SCRAPER_TIMEOUT_MAX_SEC))
+    m = max(0, min(int(config.SCRAPER_MIN_INTERVAL_MIN), SCRAPER_INTERVAL_MAX_MIN))
+    return t, m
+
+
+def _scraper_group_kwargs() -> dict:
+    """子プロセスを「まとめて止められる」形で起こすための引数。"""
+    import subprocess
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_tree(proc) -> None:
+    """時間切れのとき、スクリプトが起こした孫プロセス（ブラウザなど）ごと止める。"""
+    import signal
+    import subprocess
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    for step in (proc.kill, lambda: proc.wait(timeout=10)):
+        try:
+            step()
+        except Exception:
+            pass
+
+
+def _scraper_tail(*chunks, limit: int = 1500) -> str:
+    """スクリプトの出力の末尾。失敗の理由を管理者に見せるためのもの。"""
+    parts = []
+    for c in chunks:
+        if isinstance(c, bytes):
+            c = c.decode("utf-8", errors="replace")
+        if c and str(c).strip():
+            parts.append(str(c).strip())
+    text = "\n".join(parts)
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = "…" + text[-limit:]
+    return "\n--- スクリプトの出力 ---\n" + text
+
+
+def run_scraper(name: str, timeout_sec: int | None = None) -> dict:
+    """スクリプトを別プロセスで実行し、出来たファイルをメモリに読んで返す。
+
+    戻り値: {"files": [{"name", "data": bytes, "sheets": [...]}], "seconds": float, "log": str}
+    出来たファイルはこの関数を抜ける前に一時フォルダごと消す。
+    失敗（エラー終了・時間切れ・ファイルが出ない）は ImportError_ で、
+    スクリプトの出力の末尾を添えて投げる。
+    """
+    import io
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    script = scraper_path(name)
+    timeout = int(timeout_sec or config.SCRAPER_TIMEOUT_SEC)
+    timeout = max(SCRAPER_TIMEOUT_MIN_SEC, min(timeout, SCRAPER_TIMEOUT_MAX_SEC))
+    out_dir = Path(tempfile.mkdtemp(prefix="scrape_"))
+    started = datetime.now()
+    try:
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+        # 出力はパイプでなくファイルに受ける。パイプだと、スクリプトが起こした孫プロセス
+        # （ブラウザなど）が握ったままになり、時間切れで子を止めても戻ってこない（Windows）
+        log_out, log_err = out_dir / "_stdout.log", out_dir / "_stderr.log"
+        with log_out.open("w+b") as fo, log_err.open("w+b") as fe:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _SCRAPER_RUNNER, str(script), str(out_dir)],
+                cwd=str(out_dir), env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+                **_scraper_group_kwargs())
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)               # 孫ごと止める。止めないと一時フォルダも消せない
+                rc = None
+            fo.seek(0)
+            fe.seek(0)
+            out_text = fo.read().decode("utf-8", "replace")
+            err_text = fe.read().decode("utf-8", "replace")
+        log = _scraper_tail(out_text, err_text)
+        if rc is None:
+            raise ImportError_(
+                f"{name} が {timeout} 秒以内に終わりませんでした（時間切れ）。"
+                "相手サイトが遅いか、待ち続ける処理があります。"
+                "タイムアウトを延ばすか、スクリプトを見直してください。" + log)
+        if rc != 0:
+            raise ImportError_(
+                f"{name} がエラーで終了しました（終了コード {rc}）。{log}")
+        files = []
+        for p in sorted(out_dir.rglob("*")):
+            if (not p.is_file() or is_noise(p.name)
+                    or p.suffix.lower() not in config.IMPORT_EXTENSIONS):
+                continue
+            data = p.read_bytes()
+            mb = len(data) / (1024 * 1024)
+            if mb > config.IMPORT_MAX_FILE_MB:
+                raise ImportError_(
+                    f"{p.name} が大きすぎます（{mb:.1f}MB / 上限 {config.IMPORT_MAX_FILE_MB}MB）。")
+            sheets = (_sheet_names_of(io.BytesIO(data))
+                      if p.suffix.lower() in (".xlsx", ".xlsm") else [])
+            files.append({"name": p.name, "data": data, "sheets": sheets})
+        if not files:
+            raise ImportError_(
+                f"{name} は正常に終わりましたが、取り込めるファイル"
+                f"（{'、'.join(config.IMPORT_EXTENSIONS)}）が出来ていません。"
+                "fetch(out_dir) が out_dir にファイルを書いているか確認してください。" + log)
+        return {"files": files, "log": log,
+                "seconds": round((datetime.now() - started).total_seconds(), 1)}
+    finally:
+        # 取得したファイルはサーバに残さない（成功・失敗によらず）。
+        # 止めた直後は孫プロセスがまだ手を離していないことがあるので、少し待って再試行する
+        for wait in (0, 0.5, 2):
+            if wait:
+                time.sleep(wait)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            if not out_dir.exists():
+                break
+
+
+# --- 出力先フォルダ（作ったファイルを、サーバ上の決まった場所にも置く） ----------------
+#
+# ファイルは普段ブラウザでダウンロードするだけだが、共有フォルダに置きたい場面がある。
+# 管理者が出力先を1つ決め、利用者が「フォルダに出力して」と頼んだときだけ、
+#   出力先 / <利用者名> / <ファイル名>
+# へ書く。利用者名のフォルダは無ければ作り、あればそのまま使う。
+# 書く先はこの形に固定し、利用者にもAIにもパスは指定させない。
+
+_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+def _read_output_setting() -> dict:
+    p = config.OUTPUT_DIR_FILE
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        print(f"[importer] 出力先の設定を読めませんでした: {p} ({e})")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def output_dir() -> Path | None:
+    """出力先フォルダ。画面で保存した値 > env の OUTPUT_DIR。未設定なら None。"""
+    saved = _read_output_setting()
+    raw = str(saved.get("path") if "path" in saved else config.OUTPUT_DIR or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def check_output_dir(path) -> tuple[bool, str]:
+    """出力先として使えるか。(可否, 理由)。書けるかは実際に小さなファイルを作って確かめる。"""
+    p = Path(str(path or "")).expanduser()
+    if not str(path or "").strip():
+        return False, "未設定です。"
+    if not p.is_absolute():
+        return False, "絶対パスで指定してください（例: \\\\server\\share\\出力 や /mnt/out）。"
+    try:
+        real = p.resolve()
+    except OSError as e:
+        return False, f"パスを解決できません: {e}"
+    for guarded in (config.DATA_DIR, config.BASE_DIR):
+        g_ = Path(guarded).resolve()
+        if real == g_ or g_ in real.parents or real in g_.parents:
+            return False, (f"アプリのフォルダ（{Path(config.BASE_DIR).resolve()}）とデータのフォルダの中、"
+                           "およびその親フォルダは指定できません（更新やバックアップで消えたり、"
+                           "取り込みの対象になったりするため）。アプリの外に出力用のフォルダを作って"
+                           "指定してください（例: C:\\Users\\<名前>\\Desktop\\出力、\\\\server\\share\\出力）。")
+    if not real.is_dir():
+        return False, "フォルダがありません（共有のマウントや綴りを確認してください）。"
+    probe = real / f".書き込み確認_{os.getpid()}.tmp"
+    try:
+        probe.write_bytes(b"ok")
+        probe.unlink()
+    except OSError as e:
+        return False, f"書き込めません（権限を確認してください）: {e}"
+    return True, "使えます。"
+
+
+def output_dir_status() -> dict:
+    """画面に出す状態。{path, ok, message, source}"""
+    saved = _read_output_setting()
+    if "path" in saved:
+        source = "画面"
+    elif config.OUTPUT_DIR:
+        source = "env"
+    else:
+        source = ""
+    d = output_dir()
+    if d is None:
+        return {"path": "", "ok": False, "message": "未設定（ダウンロードだけ使えます）", "source": source}
+    ok, msg = check_output_dir(d)
+    return {"path": str(d), "ok": ok, "message": msg, "source": source}
+
+
+def save_output_dir(path: str, user: str | None = None) -> dict:
+    """出力先を保存する。空文字は「使わない」。"""
+    path = str(path or "").strip()
+    if path:
+        ok, msg = check_output_dir(path)
+        if not ok:
+            raise ImportError_(msg)
+    p = config.OUTPUT_DIR_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump({"path": path, "updated_by": user or "",
+                                 "updated_at": datetime.now().isoformat(timespec="seconds")},
+                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return output_dir_status()
+
+
+def user_folder_name(user) -> str:
+    """利用者名をフォルダ名にする。日本語はそのまま、パスに使えない文字だけ _ に。"""
+    name = str(getattr(user, "username", None) or user or "").strip()
+    name = _BAD_NAME_CHARS.sub("_", name).strip().strip(".")[:64]
+    return name or "_"
+
+
+#: ファイル名の末尾に付く日時（safe_filename が付ける _20260912_1005 と、日付だけの形）
+_STAMP_RE = re.compile(r"[_-]\d{8}[_-]\d{4}(?=\.[^.]+$)|[_-]\d{8}(?=\.[^.]+$)")
+
+
+def save_to_user_folder(user, filename: str, data: bytes, *, stamp: bool = True,
+                        overwrite: bool = False) -> tuple[Path, bool]:
+    """出力先 / 利用者名 / ファイル名 に書いて、(パス, 前のファイルを置き換えたか) を返す。
+
+    stamp=False なら名前の末尾の日時を外して置く（毎回同じ名前になる）。
+    overwrite=True なら同じ名前があれば置き換え、False なら _2, _3 を付けて残す。
+    利用者名のフォルダは無ければ作る（あればそのまま）。書く先は必ずこの形で、外には出ない。
+    """
+    base = output_dir()
+    if base is None:
+        raise ImportError_("出力先フォルダが設定されていません"
+                           "（管理者がデータカタログ → 出力の画面で設定します）。")
+    ok, msg = check_output_dir(base)
+    if not ok:
+        raise ImportError_(f"出力先フォルダに書けません: {msg}")
+    folder = base.resolve() / user_folder_name(user)
+    folder.mkdir(exist_ok=True)
+    safe = _BAD_NAME_CHARS.sub("_", str(filename or "")).strip().strip(".") or "file"
+    if not stamp:
+        safe = _STAMP_RE.sub("", safe) or safe
+    stem, ext = os.path.splitext(safe)
+    target = folder / safe
+    replaced = False
+    if target.exists():
+        if overwrite:
+            replaced = True
+        else:
+            n = 2
+            while target.exists():
+                target = folder / f"{stem}_{n}{ext}"
+                n += 1
+    tmp = folder / f"{safe}.{os.getpid()}.tmp"
+    tmp.write_bytes(data)
+    os.replace(tmp, target)
+    return target, replaced
 
 
 # 画面に出す区切り文字の選択肢（.txt は区切りがまちまちなので選べるようにする）
@@ -4969,8 +5639,8 @@ MODES = {
 # 追記のとき「何回分の取り込みを残すか」。これを超えた古い回は消す。
 # 上限を決めておかないと、日次で回すだけでもテーブルが際限なく膨らむ。
 MAX_KEEP_RUNS = 800
-# 既定値は置かない。何回分残すかは業務ごとに違うので、必ず自分で決めてもらう。
-DEFAULT_KEEP_RUNS = None
+# 保存回数に既定値は置かない。何回分残すかは業務ごとに違うので、必ず自分で決めてもらう
+# （validate_job が空を断る）。
 # 開始日時の判定に使う許容。送信のタイムラグで「今」が過去扱いになるのを防ぐ。
 START_GRACE_MINUTES = 2
 
@@ -5037,7 +5707,34 @@ def validate_job(job: dict, check_start: bool = True) -> list[str]:
             else:
                 if not (1 <= keep <= MAX_KEEP_RUNS):
                     errors.append(f"保存回数は 1〜{MAX_KEEP_RUNS} の範囲で指定してください。")
+
+    # スクレイピングの設定は、時間の上限と質問に応じた再取得の間隔を必ず数で持つ。
+    # 空のまま通すと、既定値が変わったときに登録済みの設定の挙動まで変わってしまう。
+    if is_scraper(job):
+        for key, label, lo, hi in (
+                ("scrape_timeout_sec", "タイムアウト（秒）",
+                 importer.SCRAPER_TIMEOUT_MIN_SEC, importer.SCRAPER_TIMEOUT_MAX_SEC),
+                ("scrape_interval_minutes", "最小間隔（分）",
+                 0, importer.SCRAPER_INTERVAL_MAX_MIN)):
+            try:
+                v = int(job.get(key))
+            except (TypeError, ValueError):
+                errors.append(f"{label}は数値で指定してください。")
+                continue
+            if not (lo <= v <= hi):
+                errors.append(f"{label}は {lo}〜{hi} の範囲で指定してください。")
     return errors
+
+
+def is_scraper(job: dict) -> bool:
+    """取り込み元がファイルではなく、スクレイピングのスクリプトか。"""
+    return (job.get("source_kind") or "file") == "scraper"
+
+
+def scrape_wait_minutes(job: dict) -> int:
+    """質問に応じて取得し直すときの最小間隔（分）。"""
+    v = job.get("scrape_interval_minutes")
+    return int(importer.scrape_defaults()[1] if v in (None, "") else v)
 
 
 def manual_run_blocked(job: dict) -> str | None:
@@ -5267,7 +5964,13 @@ def source_path(job: dict) -> Path:
 
 
 def _source_stamp(job: dict) -> str:
-    """元ファイルの版。更新時刻とサイズを見る（中身を読まずに変化を判定する）。"""
+    """元ファイルの版。更新時刻とサイズを見る（中身を読まずに変化を判定する）。
+
+    スクレイピングには「元ファイル」が無いので空。変わったかどうかは
+    取りに行くまで分からず、代わりに最小間隔（scrape_wait_minutes）で決める。
+    """
+    if is_scraper(job):
+        return ""
     try:
         st = source_path(job).stat()
         return f"{st.st_mtime_ns}:{st.st_size}"
@@ -5275,35 +5978,114 @@ def _source_stamp(job: dict) -> str:
         return ""
 
 
-def run_job(job: dict, kind: str = "auto", user: str | None = None) -> dict:
+def source_label(job: dict) -> str:
+    """履歴や画面に出す取り込み元の名前。"""
+    if is_scraper(job):
+        return f"スクレイピング: {job.get('source', '')}"
+    return str(job.get("source", ""))
+
+
+#: いまスクレイピングを実行中のジョブ。同じ設定を同時に2回走らせない
+#: （質問が重なるたびに相手サイトへ2回取りに行くのを防ぐ）。
+_scraping: set = set()
+_scraping_lock = threading.Lock()
+
+
+def _scraped_frame(job: dict, fetched: dict):
+    """スクレイパーの出力から、設定したファイルを DataFrame にする。戻りは (df, ファイル名)。"""
+    files = fetched.get("files") or []
+    want = str(job.get("scrape_file") or "")
+    hit = next((f for f in files if f["name"] == want), None)
+    if hit is None:
+        if len(files) == 1:
+            # ファイル名に日付が付くなど毎回変わる場合。1つしか出来ていなければそれを使う
+            hit = files[0]
+        else:
+            names = "、".join(f["name"] for f in files) or "（なし）"
+            raise importer.ImportError_(
+                f"設定したファイル「{want}」が出来ていません（出来たもの: {names}）。"
+                "スクリプトの出力が変わった可能性があります。"
+                "取り込み画面で試し直して設定を作り直してください。")
+    df = importer.read_upload(
+        hit["data"], hit["name"],
+        sheet=job.get("sheet") or None,
+        header_row=int(job.get("header_row") or 0),
+        delimiter=job.get("delimiter") or None,
+        trusted=True)
+    return df, hit["name"]
+
+
+def run_job(job: dict, kind: str = "auto", user: str | None = None,
+            fetched: dict | None = None) -> dict:
     """1ジョブを実行して、結果を定義ファイルに書き戻す。
 
     kind は履歴に残す実行のきっかけ。"auto"=スケジューラ、"job"=画面の「▶ 今すぐ更新」。
+    fetched はスクレイピングの出力（importer.run_scraper の戻り）。渡されなければ
+    ここで実行する。登録直後の初回は、画面で試した結果をそのまま渡して
+    相手サイトへ2回取りに行かないようにする。
 
     例外は投げず、結果を dict で返す（1本こけても他を止めないため）。
       {"ok": bool, "rows": int, "message": str, "degraded": [...]}
+    同じスクレイピングが実行中のときは走らせず {"ok": False, "skipped": True} を返す
+    （設定ファイルにも履歴にも残さない）。
     """
-    with _jobs_lock:                       # 同じテーブルへ同時に書かないように直列化する
-        return _run_job_locked(job, kind, user)
+    if not is_scraper(job) or fetched is not None:
+        with _jobs_lock:                   # 同じテーブルへ同時に書かないように直列化する
+            return _run_job_locked(job, kind, user, fetched)
+
+    # スクレイピングはロックの外で走らせる。ロックを握ったまま数分待つと、
+    # その間の質問（リアルタイム更新の確認）と定期実行が全部止まるため。
+    jid = job.get("id") or job.get("name") or ""
+    with _scraping_lock:
+        if jid in _scraping:
+            return {"ok": False, "rows": 0, "degraded": [], "skipped": True,
+                    "message": "このスクレイピングはいま実行中です（別の質問か定期実行）。"
+                               "終わるまで前回取り込んだ内容で答えます。"}
+        _scraping.add(jid)
+    try:
+        started = datetime.now()
+        try:
+            fetched = importer.run_scraper(job.get("source", ""), job.get("scrape_timeout_sec"))
+        except importer.ImportError_ as e:
+            fetched = {"error": str(e)}
+        except Exception as e:                # 想定外でもジョブ一覧は壊さない
+            fetched = {"error": f"想定外のエラー: {e}"}
+        with _jobs_lock:
+            return _run_job_locked(job, kind, user, fetched, started)
+    finally:
+        with _scraping_lock:
+            _scraping.discard(jid)
 
 
-def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None) -> dict:
-    started = datetime.now()
+def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
+                    fetched: dict | None = None, started=None) -> dict:
+    started = started or datetime.now()
     result = {"ok": False, "rows": 0, "message": "", "degraded": []}
     removed = 0
     kept = None
+    if job.get("id") and get_job(job["id"]) is None:
+        # スクレイピングの待ち時間のあいだに設定が削除された。ここで書くと、
+        # 消したはずの設定と表が戻ってくる。何も残さずに引き返す
+        return {**result, "skipped": True,
+                "message": "実行中に設定が削除されたため、取り込みませんでした。"}
     try:
-        path = source_path(job)
-        if not importer.is_allowed(path):
-            raise importer.ImportError_(
-                "取り込み元のファイルが見つかりません（移動・削除、または許可フォルダの設定変更）。")
-
-        df = importer.read_table(
-            path,
-            sheet=job.get("sheet") or None,
-            header_row=int(job.get("header_row") or 0),
-            delimiter=job.get("delimiter") or None,
-        )
+        if is_scraper(job):
+            if fetched is None or fetched.get("error"):
+                raise importer.ImportError_((fetched or {}).get("error")
+                                            or "スクレイピングの結果がありません。")
+            df, src_name = _scraped_frame(job, fetched)
+        else:
+            path = source_path(job)
+            src_name = path.name
+            if not importer.is_allowed(path):
+                raise importer.ImportError_(
+                    "取り込み元のファイルが見つかりません（移動・削除、または許可フォルダの設定変更）。")
+            df = importer.read_table(
+                path,
+                sheet=job.get("sheet") or None,
+                header_row=int(job.get("header_row") or 0),
+                delimiter=job.get("delimiter") or None,
+            )
         cols = [dict(c) for c in (job.get("columns") or [])]
         if not cols:
             cols = importer.plan_columns(df)
@@ -5329,7 +6111,7 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None) -> d
             # テーブルが空になり「成功」で終わる。前回の内容を残して止める。
             # 本当に0件にしたいときは、取り込み画面から手で入れ替える。
             raise importer.ImportError_(
-                f"{path.name} にデータ行がありません（見出しだけ）。"
+                f"{src_name} にデータ行がありません（見出しだけ）。"
                 f"{'テーブルを空にしないため、前回の内容を残しました。' if mode != 'append' else '追記する行が無いため何もしていません。'}"
                 "本当に0件なら、取り込み画面から手で入れ替えてください。")
         n, degraded = importer.import_dataframe(
@@ -5375,7 +6157,7 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None) -> d
                 result["ok"], result["message"], kind=kind,
                 mode=job.get("mode") or "replace", rows=result["rows"],
                 removed=removed, kept=kept, keep=job.get("keep_runs"),
-                source=job.get("source", ""), sheet=job.get("sheet"),
+                source=source_label(job), sheet=job.get("sheet"),
                 job_id=job.get("id"), job_name=job.get("name"),
                 user=user, started=started)
     return result
@@ -5442,9 +6224,29 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
     if not scope:
         return []
     wanted = {str(s.get("name") or Path(s["path"]).name) for s in scope}
+    # 表まで指定されていれば、その表の設定だけを見る（SQLガードも同じ表しか通さないので
+    # 外の表を追随させても読めない。ロボット実行は自分が使う表だけを渡してくる）
+    wanted_tables = {t for s in scope for t in (s.get("tables") or [])}
     done = []
     for job in realtime_jobs():
         if job.get("db_file") not in wanted:
+            continue
+        if wanted_tables and job.get("table") not in wanted_tables:
+            continue
+        if is_scraper(job):
+            # 「変わったか」は取りに行くまで分からない。前回の実行（成功・失敗とも）から
+            # 最小間隔が経っていれば取り直し、経っていなければ前回の内容で答える。
+            # 失敗も last_run に残るので、壊れたサイトへ質問のたびに行き続けることはない
+            last = parse_dt(job.get("last_run"))
+            if last and (datetime.now() - last) < timedelta(minutes=scrape_wait_minutes(job)):
+                continue
+            res = run_job(job, kind="realtime")
+            if res.get("skipped"):
+                continue                   # 別の質問が取得中。終われば次の質問から効く
+            done.append({"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
+                         "table": job.get("table"), "db_file": job.get("db_file"),
+                         "rows": res.get("rows"),
+                         "message": res.get("message") or ""})
             continue
         stamp = _source_stamp(job)
         if not stamp:
@@ -5539,10 +6341,19 @@ def is_running() -> bool:
     return any(t.name == _THREAD_NAME and t.is_alive() for t in threading.enumerate())
 
 
+def stopping() -> bool:
+    """終了の合図が出ているか（長い周回の途中で切り上げるために見る）。"""
+    return _stop.is_set()
+
+
 def scheduler_status() -> dict:
     return {**_state, "running": is_running(),
             "tick_sec": config.IMPORT_SCHEDULER_TICK_SEC,
             "enabled": config.IMPORT_SCHEDULER}
+
+
+#: マイロボットの定期実行を回すスレッドの名前（1本だけ立てる目印）
+_ROBOT_THREAD_NAME = "aiagent-robot-runner"
 
 
 def _scheduler_log(msg: str) -> None:
@@ -5568,10 +6379,15 @@ def tick() -> list:
                     "message": res["message"],
                     "at": datetime.now().isoformat(timespec="seconds")})
         _scheduler_log(("OK  " if res["ok"] else "NG  ") + f"{job.get('name')}: {res['message']}")
+    # マイロボットの定期実行は別のスレッドで（重いロボットが取り込みの周回や他の人のロボットを遅らせない）。
+    # 前の分がまだ動いていれば今回は起こさない（次の周回で拾う）
+    if not any(t.name == _ROBOT_THREAD_NAME and t.is_alive() for t in threading.enumerate()):
+        threading.Thread(target=_robots_pass, name=_ROBOT_THREAD_NAME, daemon=True).start()
     _state["last_tick"] = datetime.now().isoformat(timespec="seconds")
     _state["tick_count"] += 1
     if ran:
-        _state["last_ran"] = ran[-10:]
+        # 足す形にする。丸ごと置き換えると、別スレッドで動いたマイロボットの記録が消える
+        _state["last_ran"] = (list(_state.get("last_ran") or []) + ran)[-10:]
     # 「健全→失敗」「失敗→復旧」の変わり目だけ管理者に知らせる
     try:
         import mailer
@@ -5584,6 +6400,18 @@ def tick() -> list:
     except Exception as e:
         _scheduler_log(f"通知の判定に失敗（続行）: {e}")
     return ran
+
+
+def _robots_pass() -> None:
+    """時刻が来たマイロボットを1周分動かす（tick から別スレッドで起こされる）。"""
+    try:
+        for r in run_scheduled_robots():
+            entry = {"name": f"🤖 {r['name']}（{r['user']}）", "ok": r["ok"],
+                     "message": r["message"], "at": r["at"]}
+            _state["last_ran"] = (list(_state.get("last_ran") or []) + [entry])[-10:]
+            _scheduler_log(("OK  " if r["ok"] else "NG  ") + f"🤖 {r['name']}（{r['user']}）: {r['message']}")
+    except Exception as e:
+        _scheduler_log(f"マイロボットの定期実行でエラー（続行）: {e}")
 
 
 def _loop() -> None:
@@ -5601,10 +6429,15 @@ def _loop() -> None:
 
 
 def stop(timeout: float = 2.0) -> None:
-    """スレッドを止める（プロセス終了時に自動で呼ばれる）。"""
+    """スレッドを止める（プロセス終了時に自動で呼ばれる）。
+
+    マイロボットの周回も少しだけ待つ。実行し終えたのに書き戻す前に落とすと、
+    次に起動したときもう一度動いてしまう（ファイルやメールが二重になる）ため。
+    """
     _stop.set()
     for t in threading.enumerate():
-        if t.name == _THREAD_NAME and t.is_alive() and t is not threading.current_thread():
+        if (t.name in (_THREAD_NAME, _ROBOT_THREAD_NAME) and t.is_alive()
+                and t is not threading.current_thread()):
             t.join(timeout=timeout)
 
 
@@ -5899,6 +6732,10 @@ def table_impact(path: Path, table: str) -> dict:
     out["jobs"] = [{"id": j.get("id"), "name": j.get("name") or j.get("table"),
                     "text": _job_text(j)}
                    for j in _jobs_for(path.name, table)]
+    # 利用者が保存したマイロボット（画面側で定義）。消さないが、動かなくなることは伝える
+    using = _robots_using(table)
+    if using:
+        out["robots"] = using
     orphans = _orphan_terms(path, table)
     if orphans:
         out["orphan_terms"] = orphans
@@ -5928,7 +6765,7 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
         if not any(t.startswith(pref + "__") for t in prof["tables"]):
             meta = catalog.load_meta_for_edit(path)
             if pref in (meta.get("groups") or {}):
-                info = meta["groups"].pop(pref)
+                meta["groups"].pop(pref)
                 if not meta["groups"]:
                     meta.pop("groups", None)
                 catalog.save_meta(path, meta)
@@ -6157,6 +6994,7 @@ LABELS = {
     "er_layout": "ER図の配置",
     "groups": "まとまりのメモ",
     "jobs": "定期取り込みの設定",
+    "robots": "利用者のマイロボット（消すと実行できなくなります。設定は残ります）",
     "orphan_terms": "自動では消えない用語（表名の無いSQL式）",
     "broken_views": "これを使っているビュー（消すと動かなくなります）",
     "removed": "削除したファイル",
@@ -6236,7 +7074,7 @@ _TPL_403 = """{% extends "base.html" %}
       <b>{{ user.display_name or user.username }}</b>でログインしています。
     </div>
     <div class="row mt">
-      <a class="btn btn--primary" href="{{ url_for('chat.index') }}">チャットに戻る</a>
+      <a class="btn btn--primary" href="{{ url_for('chat.index') }}">マイエージェントに戻る</a>
     </div>
   </div>
 </div>
@@ -6259,10 +7097,15 @@ _fs_lock = threading.Lock()
 _files: OrderedDict[str, dict] = OrderedDict()
 
 
-def _fs_put(data: bytes, filename: str, mime: str, owner: str) -> str:
+def _fs_put(data: bytes, filename: str, mime: str, owner: str,
+            trusted: bool = False, label: str = "") -> str:
+    """trusted は「サーバ側の処理が作ったファイル」の印（スクレイピングの出力）。
+    利用者のPCから来たアップロードと区別し、取り込みの受け入れ判定で使う。
+    label は履歴に残す出どころ（例「スクレイピング: x.py → a.xlsx」）。"""
     token = secrets.token_urlsafe(16)
     with _fs_lock:
-        _files[token] = {"data": data, "filename": filename, "mime": mime, "owner": owner}
+        _files[token] = {"data": data, "filename": filename, "mime": mime, "owner": owner,
+                         "trusted": bool(trusted), "label": label}
         while len(_files) > _MAX_ITEMS:
             _files.popitem(last=False)
     return token
@@ -6362,6 +7205,8 @@ def _body() -> dict:
 def inject_globals() -> dict:
     """全テンプレートで使う値。"""
     return {"user": g.get("user"), "app_title": config.APP_TITLE,
+            "app_tagline": getattr(config, "APP_TAGLINE", ""),
+            "memory_feature": bool(memory_settings()["enabled"]),
             "nav": request.endpoint or ""}
 
 
@@ -6718,6 +7563,7 @@ def chat_index():
         # そのままAIの理解になるので、見る側にも同じ説明が見えている方がよい。
         off = set(rag.excluded_tables(g.user))
         tables = [{"name": t,
+                   "type": info.get("type") or "table",     # table / view（サイドバーの見分け）
                    "description": (tmeta.get(t) or {}).get("description") or "",
                    "rows": info.get("row_count"),
                    "columns": len(info.get("columns") or []),
@@ -6743,6 +7589,11 @@ def chat_index():
         knowledge=knowledge_prefs_payload(),
         chat_id=session.get("chat_id"),
         history=chats.list_chats(g.user),
+        folder_out=importer.output_dir_status()["ok"],
+        memory=memory_payload(g.user),
+        robot_intervals=INTERVALS,
+        robot_min_hours=robot_settings()["min_interval_hours"],
+        scheduler_on=scheduler.is_running(),
         starters=scope_starters(build_scope({f.name: [] for f in db.list_db_files()})),
         llm_ready=llm.is_configured(),
         placeholder=config.APP_INPUT_PLACEHOLDER,
@@ -6907,6 +7758,11 @@ def _persist(chat: dict) -> dict:
         db_names=chat["db_names"], tables={},
         table_names=chat.get("table_names") or [],
         title=chat.get("title") or "", created_at=chat.get("created_at") or "")
+    if saved.get("deleted"):
+        # 処理の途中で（別のタブから）消された会話。書き戻されず、開いている会話にもしない
+        if session.get("chat_id") == chat["id"]:
+            session.pop("chat_id", None)
+        return chat
     session["chat_id"] = chat["id"]
     chat["title"], chat["created_at"] = saved["title"], saved["created_at"]
     return chat
@@ -7266,7 +8122,7 @@ def _friendly_llm_error(e: Exception) -> str:
 
 _EMPTY_MESSAGE = ("（モデルから空の応答が返り、書き直しもできませんでした。"
                   "もう一度送ってみてください。繰り返すようなら、"
-                  "新規チャットで質問し直してください。）")
+                  "新しい会話で質問し直してください。）")
 
 _CUT_MESSAGE = ("（回答がモデルの出力上限で途中まででした。"
                 "「続けて」と送ると続きを書きます。）")
@@ -7471,7 +8327,7 @@ def _begin_turn():
     始められないときは _TurnError を投げる（呼び出し側で分岐を書かずに済む）。
     """
     body = _body()
-    text = (body.get("text") or "").strip()
+    text = str(body.get("text") or "").strip()
     if not text:
         raise _TurnError("質問を入力してください。")
     if not llm.is_configured():
@@ -7524,7 +8380,8 @@ def _begin_turn():
     chat["messages"][0] = {"role": "system",
                            "content": llm.build_system_prompt(
                                scope, admin=_is_admin(),
-                               model=models.current(g.user))}
+                               model=models.current(g.user),
+                               memory=memory_prompt(g.user))}
     return chat, scope, text
 
 
@@ -7534,6 +8391,7 @@ def _w_send():
     chat, scope, text = _begin_turn()
     before = len(chat["render_log"]) - 1
     _advance(chat, scope, text)
+    _schedule_memory(g.user, chat)
     return _reply(chat, before)
 
 
@@ -7677,6 +8535,7 @@ def stream():
                                 "message": _friendly_llm_error(e)})
         finally:
             _persist(chat)
+            _schedule_memory(user, chat)         # 覚え書きの抜き出し（別スレッド。end は待たない）
             if not aborted:
                 yield _sse("end", {"chat_id": chat.get("id"),
                                    "title": chat.get("title", "")})
@@ -7701,7 +8560,7 @@ def rewind():
         turn = int(body.get("turn"))
     except (TypeError, ValueError):
         return jsonify({"error": "巻き戻す位置が指定されていません。"}), 400
-    text = (body.get("text") or "").strip()
+    text = str(body.get("text") or "").strip()
 
     # 送信（_begin_turn）と同じ下ごしらえをここでもやる。どちらも
     # 処理中のスレッドに置いて渡す仕組みなので、書き直しだけ抜けていると
@@ -7744,13 +8603,15 @@ def rewind():
     chat["messages"][0] = {"role": "system",
                            "content": llm.build_system_prompt(
                                scope, admin=_is_admin(),
-                               model=models.current(g.user))}
+                               model=models.current(g.user),
+                               memory=memory_prompt(g.user))}
     chat["messages"].append({"role": "user", "content": text})
     llm.drop_old_images(chat["messages"])     # 送信と同じ扱いにする
     chat["render_log"].append({"role": "user", "kind": "text", "content": text,
                                "at": chats.now()})
 
     _advance(chat, scope, text)
+    _schedule_memory(g.user, chat)
     return _reply(chat, 0, replace=True)
 
 
@@ -7845,10 +8706,10 @@ def glossary_save():
     if not _may_contribute_catalog():
         return jsonify({"error": _CATALOG_CONTRIB_DENIED}), 403
     body = _body()
-    term = (body.get("term") or "").strip()
-    desc = (body.get("description") or "").strip()
-    sql = (body.get("sql") or "").strip()
-    table = (body.get("table") or "").strip()
+    term = str(body.get("term") or "").strip()
+    desc = str(body.get("description") or "").strip()
+    sql = str(body.get("sql") or "").strip()
+    table = str(body.get("table") or "").strip()
     if not term or not desc:
         return jsonify({"error": "用語と説明が必要です。"}), 400
     try:
@@ -7892,9 +8753,9 @@ def save_example():
         return jsonify({"error": _CATALOG_CONTRIB_DENIED}), 403
     scope = build_scope({f.name: [] for f in db.list_db_files()})
     body = _body()
-    q = (body.get("question") or "").strip()
-    sql = (body.get("sql") or "").strip()
-    desc = (body.get("description") or "").strip()
+    q = str(body.get("question") or "").strip()
+    sql = str(body.get("sql") or "").strip()
+    desc = str(body.get("description") or "").strip()
     if not q or not sql:
         return jsonify({"error": "質問とSQLの両方が必要です。"}), 400
 
@@ -7905,7 +8766,7 @@ def save_example():
     hits = dbs_in_sql(sql, scope)
     # 登録カード（propose_example）は置き場のDBを持っている。あればそれを使う。
     # SQLに DB名 が無い（単一DBの略記など）ときも、カードの db で決められる。
-    asked = (body.get("db") or "").strip()
+    asked = str(body.get("db") or "").strip()
     target = next((s for s in scope if s["name"] == asked or s.get("alias") == asked), None) if asked else None
     if target is None:
         target = hits[0] if hits else (scope[0] if len(scope) == 1 else None)
@@ -7948,6 +8809,1255 @@ def save_example():
     catalog_history.add_catalog_change("example", "add", p.name, q, user=g.user.username,
                         after=new_entry, source="chat")
     return jsonify({"ok": True, "added": True, "message": "例文に追加しました。"})
+
+
+# =============================================================================
+# マイロボット
+#
+# 利用者ごとに「気に入った処理の流れ」へ名前を付けて保存し、AIなしで再現する。
+#
+# 会話には、AIが実際に呼んだ道具（名前＋引数）とその結果が順に残っている。
+# それを抜き出して「手順」として保存し、あとで同じ順に tools.dispatch で呼び直す。
+# AIは介在しないので、数字は毎回同じになり、LLMの費用も待ち時間もかからない。
+#
+#   ・置き場は data/users/<利用者>/robots.json（本人だけ。会話と同じ扱い）
+#   ・実行は新しい会話の中で行い、表・グラフ・ファイルはいつもどおり並ぶ。
+#     会話には道具の呼び出しと結果も積むので、そのあと「これをグラフに」と続けられる
+#   ・「穴」＝引数の中の値（SQLの文字列・数値、その他の引数）を実行のたびに入れ替える口。
+#     引数の中では {{h1}} のような印で持ち、実行時に入力値で埋める
+#   ・道具は実行する本人の権限で呼ぶ（管理者限定の道具は一般利用者では止まる）。
+#     SQLは会話と同じ SELECT 専用ガードを通る
+#   ・手順同士の受け渡し（result_id）は、実行のたびに新しい id へ付け替える
+# =============================================================================
+
+#: 手順に入れない道具。調べ物（AIが列を知るためのもの）と、人が確定するカタログ登録
+_ROBOT_SKIP_TOOLS = {"describe_table", "propose_glossary_term", "propose_example"}
+ROBOT_NAME_MAX = 60
+#: 管理者が決める値（管理者メニュー → マイロボット）。画面・API・env のどこから来ても、この範囲に収める
+ROBOT_SETTING_RANGES = {"max_per_user": (1, 200), "min_interval_hours": (0, 720), "max_steps": (1, 100)}
+ROBOT_SETTING_LABELS = {"max_per_user": "1人あたりの登録上限数",
+                        "min_interval_hours": "同じロボットの実行の最低間隔（時間）",
+                        "max_steps": "1つのロボットの手順数の上限"}
+_ROBOT_SQL_STR = re.compile(r"'((?:[^']|'')*)'")
+_ROBOT_SQL_IDENT = re.compile(r'"(?:[^"]|"")*"')          # 二重引用符の識別子（列名など）
+# 数値は半角だけ（\d は全角の１２３にも当たり、SQLに埋めると列名扱いになる）
+_ROBOT_SQL_NUM = re.compile(r"(?<![\w.'\"])-?[0-9]+(?:\.[0-9]+)?(?![\w.'\"])")
+_ROBOT_HOLE = re.compile(r"\{\{(h\d+)\}\}")
+_ROBOT_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
+#: robots.json の「読む → 差し替える → 書き戻す」を直列にする。無いと2つのタブから
+#: 同時に保存したとき（実行の終わりに last_run を書くのも保存）、後勝ちで片方が消える
+_robots_lock = threading.RLock()
+#: いま実行中のロボット {(利用者名, id)}。別のタブから同時に押されても、同じ手順を二重に走らせない
+_robots_running: set = set()
+_ROBOTS_BROKEN = ("マイロボットの保存ファイル（robots.json）が読めません。壊れている可能性が"
+                  "あるため、上書きせずに止めました。管理者に連絡してください。")
+
+
+class RobotConflict(ValueError):
+    """同じ名前・同じ内容のマイロボットがすでにある（画面には 409 で返す）。"""
+
+
+def _robot_setting_defaults() -> dict:
+    return {"max_per_user": config.ROBOT_MAX_PER_USER,
+            "min_interval_hours": config.ROBOT_MIN_INTERVAL_HOURS,
+            "max_steps": config.ROBOT_MAX_STEPS}
+
+
+def _robot_clamp(key: str, value):
+    """範囲に収めて、件数・手順数は整数に、間隔は小数2桁の数にする。数でなければ ValueError。"""
+    lo, hi = ROBOT_SETTING_RANGES[key]
+    v = float(str(value).strip())
+    if v != v:                                   # NaN
+        raise ValueError(key)
+    v = max(lo, min(v, hi))
+    return round(v, 2) if key == "min_interval_hours" else int(v)
+
+
+def robot_settings() -> dict:
+    """マイロボットの決めごと。管理者が画面で保存した値 > env（config） > 既定。
+
+    範囲の外・数でない値が入っていても落とさず、範囲に寄せる／既定に戻す。
+    """
+    out = dict(_robot_setting_defaults())
+    p = config.ROBOT_SETTINGS_FILE
+    if p.exists():
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[robot] 決めごとの設定を読めませんでした: {p} ({e})")
+            data = {}
+        if isinstance(data, dict):
+            for k in out:
+                if k in data:
+                    out[k] = data[k]
+    for k in list(out):
+        try:
+            out[k] = _robot_clamp(k, out[k])
+        except (TypeError, ValueError):
+            out[k] = _robot_clamp(k, _robot_setting_defaults()[k])
+    return out
+
+
+def robot_settings_note() -> dict:
+    """誰がいつ保存したか（画面の添え書き用）。保存されていなければ空。"""
+    p = config.ROBOT_SETTINGS_FILE
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return ({"updated_by": str(data.get("updated_by") or ""),
+             "updated_at": str(data.get("updated_at") or "")}
+            if isinstance(data, dict) else {})
+
+
+def save_robot_settings(values: dict, user: str | None = None) -> dict:
+    """管理者が決めた値を保存する。範囲の外・数でないものは ValueError（保存しない）。"""
+    cur = robot_settings()
+    for k in ROBOT_SETTING_RANGES:
+        if k not in values:
+            continue
+        try:
+            v = float(str(values[k]).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"「{ROBOT_SETTING_LABELS[k]}」は数で入力してください。")
+        lo, hi = ROBOT_SETTING_RANGES[k]
+        if not (lo <= v <= hi):
+            raise ValueError(f"「{ROBOT_SETTING_LABELS[k]}」は {lo}〜{hi} の範囲で入力してください。")
+        cur[k] = _robot_clamp(k, v)
+    p = config.ROBOT_SETTINGS_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
+                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return robot_settings()
+
+
+def _hours_label(hours) -> str:
+    h = float(hours)
+    if h == int(h):
+        return f"{int(h)} 時間"
+    m = round(h * 60)
+    return f"{m} 分" if m < 60 else f"{h:g} 時間"
+
+
+def _robot_fingerprint(robot: dict) -> str:
+    """手順の中身の指紋。名前が違っても、同じ道具を同じ引数で同じ順に呼ぶなら同じ値になる。
+
+    手順同士の受け渡し（result_id）は会話ごとに番号が違う（r_3 と r_7）ので、
+    「何番目の手順の何番目の結果か」に置き換えてから比べる。AIの解説文（explanation）は
+    会話ごとに言い回しが変わるだけなので見ない。
+    """
+    ids: dict = {}
+    steps = robot.get("steps") or []
+    for i, s in enumerate(steps):
+        for rid in _as_ids(s.get("produced")):
+            ids.setdefault(rid, f"#{i}.{len(ids)}")
+
+    def walk(v):
+        if isinstance(v, str):
+            return ids.get(v, v)
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items() if k != "explanation"}
+        return v
+
+    return json.dumps([[s.get("name"), walk(s.get("arguments") or {})] for s in steps],
+                      ensure_ascii=False, sort_keys=True)
+
+
+def _robot_check_dup(robot: dict, others: list[dict], content: bool = True) -> None:
+    """同じ名前（content=True なら同じ内容も）のものがあれば RobotConflict。others は自分以外。"""
+    name = str(robot.get("name") or "").strip()
+    if any(str(r.get("name") or "").strip() == name for r in others):
+        raise RobotConflict(f"同じ名前のマイロボット「{name}」がすでにあります。別の名前にしてください。")
+    if not content:
+        return
+    fp = _robot_fingerprint(robot)
+    same = next((r for r in others if _robot_fingerprint(r) == fp), None)
+    if same is not None:
+        raise RobotConflict(f"同じ内容のマイロボット「{same.get('name')}」がすでにあります"
+                            "（同じ道具を同じ順・同じ値で呼ぶ手順です）。そちらを実行してください。")
+
+
+def _robot_next_run(robot: dict, settings: dict | None = None):
+    """次に実行できる時刻（datetime）。いま実行してよければ None。
+
+    間隔は「前回うまくいった実行」から数える。失敗した実行はすぐやり直せる
+    （表の改名などで止まったものを、何時間も待ってから直すことになるのを避ける）。
+    """
+    from datetime import timedelta
+    hours = float((settings or robot_settings())["min_interval_hours"])
+    if hours <= 0 or robot.get("last_status") != "ok" or not robot.get("last_run"):
+        return None
+    try:
+        last = datetime.fromisoformat(str(robot["last_run"]))
+    except ValueError:
+        return None
+    nxt = last + timedelta(hours=hours)
+    return nxt if nxt > datetime.now() else None
+
+
+def _robots_path(user) -> Path:
+    key = getattr(user, "safe_key", None) or str(user)
+    return config.USER_META_DIR / key / "robots.json"
+
+
+def _robots_raw(user) -> tuple[dict, bool]:
+    """(ファイルの中身 {"robots": [...], "last_ok": {...}}, 壊れているか)。
+
+    壊れているときに黙って空を返すと、次の保存で「新しい1件だけ」に上書きされて
+    残りが全部消える。読めないことを呼び元に伝え、書く側はそこで止める。
+    last_ok は「同じ内容の前回うまくいった実行」の台帳（指紋 → 時刻）。ロボットを消して
+    作り直しても実行の間隔がリセットされないように、ロボットとは別に持つ。
+    """
+    p = _robots_path(user)
+    if user is None or not p.exists():
+        return {"robots": []}, False
+    data = _read_json(p)
+    if not isinstance(data, dict) or not isinstance(data.get("robots"), list):
+        return {"robots": []}, True
+    return data, False
+
+
+def _robots_read(user) -> tuple[list[dict], bool]:
+    """(ロボットの一覧, ファイルが壊れているか)。"""
+    data, broken = _robots_raw(user)
+    return [r for r in data["robots"] if isinstance(r, dict) and r.get("id")], broken
+
+
+def _robots_ledger(data: dict) -> dict:
+    ledger = data.get("last_ok")
+    return dict(ledger) if isinstance(ledger, dict) else {}
+
+
+def _robots_write(user, items: list[dict], ledger: dict) -> None:
+    """robots.json を書く。台帳は古いもの（31日より前）を落として持ち回る。"""
+    from datetime import timedelta
+    keep: dict = {}
+    floor = datetime.now() - timedelta(days=31)
+    for fp, at in ledger.items():
+        try:
+            if datetime.fromisoformat(str(at)) >= floor:
+                keep[str(fp)] = str(at)
+        except ValueError:
+            continue
+    _write_json(_robots_path(user), {"robots": items, "last_ok": keep})
+
+
+def robots_list(user) -> list[dict]:
+    return _robots_read(user)[0]
+
+
+def robot_get(user, rid: str) -> dict | None:
+    return next((r for r in robots_list(user) if r.get("id") == rid), None)
+
+
+def robot_save(user, robot: dict, check_dup=None) -> dict:
+    """保存して、保存した形を返す。id が無ければ新規。
+
+    check_dup … True なら同じ名前・同じ内容のものがあれば断る（RobotConflict）。"name" なら名前だけ見る
+                （改名。中身が同じロボットが昔から2つあっても、名前は変えられるように）。
+                省略時は新規のときだけ True。実行結果（last_run）の書き戻しでは見ない。
+    """
+    with _robots_lock:
+        robot = dict(robot)
+        data, broken = _robots_raw(user)
+        if broken:
+            raise ValueError(_ROBOTS_BROKEN)
+        items = [r for r in data["robots"] if isinstance(r, dict) and r.get("id")]
+        ledger = _robots_ledger(data)
+        fp = _robot_fingerprint(robot)
+        if check_dup is None:
+            check_dup = not robot.get("id")
+        if check_dup:
+            _robot_check_dup(robot, [r for r in items if r.get("id") != robot.get("id")],
+                             content=(check_dup != "name"))
+        if not robot.get("id"):
+            limit = robot_settings()["max_per_user"]
+            if len(items) >= limit:
+                raise ValueError(f"マイロボットは1人 {limit} 件までです。使わないものを削除してください"
+                                 "（上限は管理者が決めています）。")
+            robot["id"] = chats.new_id()
+            robot["created_at"] = chats.now()
+            # 消して作り直しても間隔はリセットされない: 同じ内容の前回の実行を台帳から引き継ぐ
+            if not robot.get("last_run") and ledger.get(fp):
+                robot["last_run"], robot["last_status"] = ledger[fp], "ok"
+                robot["last_message"] = "（同じ内容のマイロボットの前回の実行）"
+        robot["updated_at"] = chats.now()
+        if robot.get("last_status") == "ok" and robot.get("last_run"):
+            ledger[fp] = max(str(ledger.get(fp) or ""), str(robot["last_run"]))
+        items = [r for r in items if r.get("id") != robot["id"]] + [robot]
+        items.sort(key=lambda r: r.get("created_at") or "")
+        _robots_write(user, items, ledger)
+        return robot
+
+
+def robot_delete(user, rid: str) -> bool:
+    with _robots_lock:
+        data, broken = _robots_raw(user)
+        if broken:
+            raise ValueError(_ROBOTS_BROKEN)
+        items = [r for r in data["robots"] if isinstance(r, dict) and r.get("id")]
+        left = [r for r in items if r.get("id") != rid]
+        if len(left) == len(items):
+            return False
+        _robots_write(user, left, _robots_ledger(data))   # 台帳は残す（消して作り直す抜け道を塞ぐ）
+        return True
+
+
+def _robot_result_ids(data) -> list[str]:
+    """道具の結果に含まれる result_id を、出てくる順に集める。
+
+    SQL実行はトップレベルに1つ持つが、分析系（ABC分析・予測など）は
+    tables[].result_id のように入れ子で持つ。どちらも次の手順が指すので、全部拾う。
+    """
+    out: list[str] = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            rid = v.get("result_id")
+            if isinstance(rid, str) and rid and rid not in out:
+                out.append(rid)
+            for k, x in v.items():
+                if k != "result_id":
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(data)
+    return out
+
+
+def _as_ids(produced) -> list[str]:
+    """古い保存（文字列1つ）と新しい保存（一覧）の両方を一覧として扱う。"""
+    if isinstance(produced, str):
+        return [produced] if produced else []
+    return [p for p in (produced or []) if isinstance(p, str) and p]
+
+
+def _robot_sqls(args) -> list[str]:
+    """引数の中の SQL を全部集める（export_excel の sheets[].sql のような入れ子も）。"""
+    out: list[str] = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k == "sql" and isinstance(x, str) and x.strip():
+                    out.append(x)
+                else:
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(args)
+    return out
+
+
+def _robot_steps_from_chat(chat: dict) -> list[dict]:
+    """会話から「AIが呼んだ道具」を順に抜き出す。失敗した呼び出しは入れない。
+
+    戻り値: [{"turn": 何回目の質問か(0始まり), "question", "name", "arguments": dict,
+              "produced": その呼び出しが返した result_id | None}]
+    """
+    msgs = [m for m in (chat.get("messages") or []) if isinstance(m, dict)]
+    out, turn, question = [], -1, ""
+    for idx, m in enumerate(msgs):
+        role = m.get("role")
+        if role == "user":
+            turn += 1
+            c = m.get("content")
+            question = c if isinstance(c, str) else next(
+                (p.get("text", "") for p in (c or [])
+                 if isinstance(p, dict) and p.get("type") == "text"), "")
+            continue
+        if role != "assistant" or not m.get("tool_calls"):
+            continue
+        # 結果は、この発言の直後に並ぶ tool メッセージから id で引く。会話全体の
+        # 辞書にしないのは、互換サーバが同じ id を使い回すことがあるため
+        follow: dict = {}
+        for m2 in msgs[idx + 1:]:
+            if m2.get("role") != "tool":
+                break
+            follow.setdefault(str(m2.get("tool_call_id")), m2.get("content") or "")
+        for tc in m["tool_calls"]:
+            fn = (tc or {}).get("function") or {}
+            name = str(fn.get("name") or "")
+            if not name or name in _ROBOT_SKIP_TOOLS:
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(args, dict):
+                continue
+            content = follow.get(str(tc.get("id")))
+            if content is None:
+                continue                       # 結果が無い（途中で切れた呼び出し）
+            try:
+                data = json.loads(content)
+            except (ValueError, TypeError):
+                data = None                    # 文章で返す道具（結果は成功扱い）
+            if isinstance(data, dict) and data.get("error"):
+                continue                       # 失敗・差し戻し（同じ呼び出しの繰り返し）
+            out.append({"turn": turn, "question": question, "name": name, "arguments": args,
+                        "produced": _robot_result_ids(data)})
+    return out
+
+
+def _robot_candidates(steps: list[dict]) -> list[dict]:
+    """穴にできる値。SQLは文字列リテラルと数値、それ以外の引数は値そのもの。
+
+    id は「手順:引数:開始:終了」。保存のときに同じ抜き出しをやり直して突き合わせる。
+    """
+    out = []
+    ids = {rid for s in steps for rid in _as_ids(s.get("produced"))}
+    for i, s in enumerate(steps):
+        for key, val in (s.get("arguments") or {}).items():
+            if key in ("result_id", "explanation", "purpose"):
+                continue
+            if isinstance(val, str) and val in ids:
+                continue                       # 前の手順の結果を指す印。穴にはしない
+            if key == "sql" and isinstance(val, str):
+                # 文字列リテラルの中身。'' は SQL の書き方なので、見せる値は ' に戻す
+                spans = [(m.start(1), m.end(1), "text", m.group(1).replace("''", "'"))
+                         for m in _ROBOT_SQL_STR.finditer(val)]
+                skip = [(a, b) for a, b, _, _ in spans]
+                # "2024" のような二重引用符の中は列名なので、数値の候補から外す
+                skip += [(m.start(), m.end()) for m in _ROBOT_SQL_IDENT.finditer(val)]
+                for m in _ROBOT_SQL_NUM.finditer(val):
+                    if any(a <= m.start() < b for a, b in skip):
+                        continue
+                    spans.append((m.start(), m.end(), "number", m.group(0)))
+                for a, b, kind, text in sorted(spans):
+                    if text.strip():
+                        out.append({"id": f"{i}:{key}:{a}:{b}", "step": i, "arg": key,
+                                    "kind": kind, "value": text})
+            elif isinstance(val, str) and val.strip() and len(val) <= 200:
+                out.append({"id": f"{i}:{key}:0:{len(val)}", "step": i, "arg": key,
+                            "kind": "text", "value": val})
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                out.append({"id": f"{i}:{key}:0:0", "step": i, "arg": key,
+                            "kind": "number", "value": str(val)})
+    return out
+
+
+def _robot_apply_holes(steps: list[dict], chosen: list[dict]) -> list[dict]:
+    """選ばれた値を {{hN}} に置き換える（steps はその場で書き換える）。穴の定義を返す。"""
+    cands = {c["id"]: c for c in _robot_candidates(steps)}
+    holes, picks = [], []
+    for n, ch in enumerate(chosen, 1):
+        c = cands.get(str((ch or {}).get("id")))
+        if c is None:
+            raise ValueError("穴にする値が見つかりません（会話が変わった可能性）。作り直してください。")
+        label = str(ch.get("label") or "").strip() or f"値{n}"
+        key = f"h{n}"
+        holes.append({"key": key, "label": label[:40], "kind": c["kind"], "sample": c["value"]})
+        picks.append((c, key))
+    # 同じ引数の中では後ろから置き換える（前を置き換えると位置がずれる）
+    for c, key in sorted(picks, key=lambda t: (t[0]["step"], t[0]["arg"],
+                                                 -int(t[0]["id"].split(":")[2]))):
+        step = steps[c["step"]]
+        val = step["arguments"][c["arg"]]
+        a, b = (int(x) for x in c["id"].split(":")[2:4])
+        token = "{{" + key + "}}"
+        step["arguments"][c["arg"]] = (val[:a] + token + val[b:]
+                                       if c["arg"] == "sql" and isinstance(val, str) else token)
+    return holes
+
+
+def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict):
+    """穴を入力値で埋め、前の手順の result_id を今回のものに付け替える。"""
+    by_key = {h["key"]: h for h in holes}
+
+    def value_of(key: str, in_sql: bool):
+        h = by_key.get(key)
+        if h is None:
+            raise ValueError(f"穴 {key} の定義がありません。作り直してください。")
+        v = str(values.get(key, "")).strip()
+        if not v:
+            raise ValueError(f"「{h['label']}」を入力してください。")
+        if h.get("kind") == "number":
+            v = unicodedata.normalize("NFKC", v)       # 全角の１２３を半角に
+            if not _ROBOT_NUMBER.fullmatch(v):
+                raise ValueError(f"「{h['label']}」は数値で入力してください（入力: {v}）。")
+            return v
+        return v.replace("'", "''") if in_sql else v
+
+    def walk(v, arg=None):
+        if isinstance(v, str):
+            if v in idmap:
+                return idmap[v]
+            m = _ROBOT_HOLE.fullmatch(v)
+            if m and (by_key.get(m.group(1)) or {}).get("kind") == "number" and arg != "sql":
+                text = value_of(m.group(1), False)
+                return float(text) if "." in text else int(text)
+            return _ROBOT_HOLE.sub(lambda mm: value_of(mm.group(1), arg == "sql"), v)
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x, k) for k, x in v.items()}
+        return v
+
+    return {k: walk(v, k) for k, v in (args or {}).items()}
+
+
+def _robot_missing_tables(robot: dict) -> list[str]:
+    """手順のSQLが使う表のうち、いま無いもの（改名・削除された）。"""
+    want = list(robot.get("tables") or [])
+    if not want:
+        return []
+    have: set = set()
+    for f in db.list_db_files():
+        try:
+            have |= set(catalog.profile_db(f)["tables"].keys())
+        except Exception:
+            continue
+    return [t for t in want if t not in have]
+
+
+def _robots_using(table: str) -> list[dict]:
+    """その表を使う、全利用者のマイロボット（表の削除の下見に載せる。消さない）。"""
+    out = []
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in sorted(dirs):
+        p = d / "robots.json"
+        if not p.exists():
+            continue
+        data = _read_json(p)
+        for r in (data.get("robots") if isinstance(data, dict) else None) or []:
+            if isinstance(r, dict) and table in (r.get("tables") or []):
+                out.append({"db": d.name, "text": f"{d.name} のマイロボット「{r.get('name')}」"})
+    return out
+
+
+def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
+    """新しい会話の中で手順を順に実行する。AIは呼ばない。戻り値は (会話, 成否, 一言)。"""
+    rag.set_current_user(g.user)
+    results.new_turn()
+    scope = build_scope({f.name: [] for f in db.list_db_files()})
+    holes = robot.get("holes") or []
+    filled = "、".join(f"{h['label']}＝{values.get(h['key'], '')}" for h in holes)
+    text = (f"マイロボット「{robot.get('name')}」を実行"
+            + (f"（{filled}）" if filled else ""))
+    chat = {"id": None, "created_at": "",
+            "title": f"🤖 {robot.get('name')} {datetime.now():%m/%d %H:%M}",
+            "messages": [llm.user_message(text)],
+            "render_log": [{"role": "user", "kind": "text", "content": text,
+                            "at": chats.now()}]}
+    _persist(chat)
+    # 質問と同じく、実行前に元ファイルへ追随させる。ただし対象はこのロボットが使う表だけ
+    # （無関係な表のスクレイピングまで待たされないように）。表を使わない手順だけなら何もしない
+    used = set(robot.get("tables") or [])
+    if used:
+        _realtime_refresh([dict(s, tables=[t for t in s.get("tables") or [] if t in used])
+                           for s in scope])
+
+    idmap: dict = {}
+    ok, message = True, ""
+    steps = robot.get("steps") or []
+    for i, step in enumerate(steps, 1):
+        label = TOOL_LABELS.get(step.get("name"), step.get("name"))
+        try:
+            args = _robot_fill(step.get("arguments") or {}, holes, values, idmap)
+            if step.get("name") in tools.FOLDER_TOOLS:
+                # フォルダ出力はロボットの決めごとが優先（元の会話の指定より）
+                args["save_to_folder"] = bool(robot.get("folder_out"))
+                if args["save_to_folder"]:
+                    args["folder_stamp"] = robot.get("folder_stamp") is not False
+                    args["folder_overwrite"] = bool(robot.get("folder_overwrite"))
+                else:
+                    args.pop("folder_stamp", None)
+                    args.pop("folder_overwrite", None)
+        except ValueError as e:
+            ok, message = False, f"手順{i}（{label}）: {e}"
+            chat["render_log"].append({"role": "assistant", "kind": "error", "message": message})
+            break
+        call = {"id": f"robot_{i}", "name": step["name"],
+                "arguments": json.dumps(args, ensure_ascii=False)}
+        chat["messages"].append({"role": "assistant", "content": None,
+                                 "tool_calls": [{"id": call["id"], "type": "function",
+                                                 "function": {"name": call["name"],
+                                                              "arguments": call["arguments"]}}]})
+        chat["render_log"].extend(_call_previews([call], scope, text))
+        _execute(chat, [call], scope)
+        content = next((m.get("content") for m in reversed(chat["messages"])
+                        if m.get("role") == "tool" and m.get("tool_call_id") == call["id"]), "")
+        try:
+            data = json.loads(content or "")
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and data.get("error"):
+            ok, message = False, f"手順{i}（{label}）で止まりました: {data['error']}"
+            break
+        # この手順が返した result_id を、登録時のものと出てきた順で対応付ける
+        for old, new in zip(_as_ids(step.get("produced")), _robot_result_ids(data)):
+            idmap[old] = new
+    final = (f"マイロボット「{robot.get('name')}」の {len(steps)} 手順を実行しました。"
+             if ok else f"⚠ {message}（それより前の手順の結果は上に出ています）")
+    chat["messages"].append({"role": "assistant", "content": final})
+    chat["render_log"].append({"role": "assistant", "kind": "text", "content": final})
+    _persist(chat)
+    return chat, ok, message or final
+
+
+def _robot_folder_defaults(steps: list[dict]) -> dict:
+    """フォルダ出力の決めごとの初期値。元の会話でAIが付けた指定から拾う。
+
+    has_file_steps … ファイルを作る手順があるか（無ければ決めごと自体を出さない）
+    folder_out     … その手順のどれかが「フォルダにも置く」だったか
+    folder_stamp / folder_overwrite … 最初のファイル手順の指定（無ければ 日時あり・残す）
+    """
+    file_steps = [s for s in steps if s.get("name") in tools.FOLDER_TOOLS]
+    first = next((s.get("arguments") or {} for s in file_steps
+                  if (s.get("arguments") or {}).get("save_to_folder")), None)
+    return {"has_file_steps": bool(file_steps),
+            "folder_out": first is not None,
+            "folder_stamp": (first or {}).get("folder_stamp") is not False,
+            "folder_overwrite": bool((first or {}).get("folder_overwrite"))}
+
+
+_SCHEDULE_KEYS = ("interval_minutes", "start_at", "enabled", "values", "last_run", "last_status", "last_message")
+#: create_app が入れる Flask アプリ。定期実行のスレッドは要求の外なので、これで要求の文脈を作って動かす
+_flask_app = None
+
+
+def _robot_schedule_norm(robot: dict) -> dict:
+    """保存されている定期実行の設定を、欠けを埋めた形で返す（無ければ「手動のみ」）。"""
+    sch = robot.get("schedule") if isinstance(robot.get("schedule"), dict) else {}
+    try:
+        minutes = int(sch.get("interval_minutes") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes not in INTERVALS.values():
+        minutes = 0
+    values = sch.get("values") if isinstance(sch.get("values"), dict) else {}
+    return {"interval_minutes": minutes,
+            "interval_label": next((k for k, v in INTERVALS.items() if v == minutes), "手動のみ"),
+            "start_at": str(sch.get("start_at") or ""),
+            "enabled": sch.get("enabled") is not False,
+            "values": {str(k): str(v) for k, v in values.items()},
+            "last_run": str(sch.get("last_run") or ""),
+            "last_status": str(sch.get("last_status") or ""),
+            "last_message": str(sch.get("last_message") or "")}
+
+
+def robot_next_scheduled(robot: dict, now: datetime | None = None):
+    """定期実行の次の時刻（datetime）。手動のみ・止めているなら None。
+
+    開始日時を起点に、間隔の刻みで進む（前回の実行時刻からではなく、決めた時刻の並びを守る。
+    毎日 8:00 なら手動で 10:00 に動かしても次は翌日 8:00）。
+    まだ一度も動いていなければ、いまより後の最初の刻み（開始日時が未来ならその時刻）。
+    サーバが止まっていて刻みを何回か過ぎていたら、次の周回で1回だけ動く。
+    """
+    from datetime import timedelta
+    sch = _robot_schedule_norm(robot)
+    minutes = sch["interval_minutes"]
+    if minutes <= 0 or not sch["enabled"]:
+        return None
+    now = now or datetime.now()
+    start = parse_dt(sch["start_at"]) or parse_dt(robot.get("created_at")) or now
+    step = timedelta(minutes=minutes)
+    last = parse_dt(sch["last_run"])
+    if last is None:
+        if start >= now:
+            return start
+        return start + step * (int((now - start) / step) + 1)
+    if last < start:
+        return start
+    return start + step * (int((last - start) / step) + 1)
+
+
+def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
+    """画面から来た定期実行の設定を検査して、保存する形にする。ValueError は画面にそのまま出す。
+
+    間隔は定期取り込みと同じ一覧から。管理者が決めた最低間隔より短くはできない。
+    穴の値は定期実行のたびに使うもの（空なら登録時の値）。間隔や開始を変えたら刻みは数え直す。
+    """
+    raw = body.get("schedule")
+    if not isinstance(raw, dict):
+        raise ValueError("定期実行の設定の形が正しくありません。")
+    cur = _robot_schedule_norm(robot)
+    try:
+        minutes = int(raw.get("interval_minutes", cur["interval_minutes"]) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("定期実行の間隔が正しくありません。")
+    if minutes not in INTERVALS.values():
+        raise ValueError("定期実行の間隔は一覧から選んでください。")
+    floor_min = float(settings.get("min_interval_hours") or 0) * 60
+    # 最低間隔は「間隔を変えるとき」だけ見る。止める・穴の値を直すだけなら、いまの間隔のまま通す
+    if minutes != cur["interval_minutes"] and minutes > 0 and floor_min > 0 and minutes < floor_min:
+        raise ValueError("定期実行の間隔は、管理者が決めた最低間隔"
+                         f"（{_hours_label(settings['min_interval_hours'])}）より短くはできません。")
+    # 空で送られてきても、いまの開始日時は消さない（欄を消しただけで刻みが動かないように）。
+    # 登録のときは cur が空なので、そのまま「作った時刻から」になる。
+    start_raw = raw.get("start_at") or cur["start_at"]
+    start_at = ""
+    if str(start_raw or "").strip():
+        dt = parse_dt(start_raw)
+        if dt is None:
+            raise ValueError("開始日時の形式が正しくありません（例: 2026-09-14T08:00）。")
+        if dt.tzinfo is not None:
+            raise ValueError("開始日時に時差（+09:00 など）は付けられません。")
+        start_at = dt.isoformat(timespec="minutes")
+    values = raw.get("values") if isinstance(raw.get("values"), dict) else cur["values"]
+    vals = {}
+    for h in robot.get("holes") or []:
+        v = str(values.get(h["key"], "")).strip() or str(h.get("sample") or "")
+        if h.get("kind") == "number":
+            v = unicodedata.normalize("NFKC", v)
+            if not _ROBOT_NUMBER.fullmatch(v):
+                raise ValueError(f"穴「{h.get('label')}」は数値で入力してください（入力: {v}）。")
+        vals[h["key"]] = v
+    enabled = raw.get("enabled", cur["enabled"])
+    out = {"interval_minutes": minutes, "start_at": start_at,
+           "enabled": True if enabled is None else bool(enabled), "values": vals}
+    if minutes != cur["interval_minutes"] or start_at != cur["start_at"]:
+        out.update({"last_run": "", "last_status": "", "last_message": ""})
+    else:
+        out.update({k: cur[k] for k in ("last_run", "last_status", "last_message")})
+    return out
+
+
+def _robot_send_mails(chat: dict, user) -> tuple[int, str]:
+    """この実行で作ったメールの下書きを、そのまま送る（「実行のたびにメールを送る」を選んだロボットだけ）。
+
+    宛先の許可・件数の上限・試送モードは、画面の「送信」ボタンと同じ検査（mailer.send）を通る。
+    戻り値は (送った数, 一言)。送れなかった下書きは理由を会話に残す。
+    """
+    sent, checked, notes = 0, 0, []
+    for item in list(chat.get("render_log") or []):
+        if item.get("kind") != "mail_draft" or item.get("sent_at"):
+            continue
+        draft = item.get("draft") or {}
+        errors = (item.get("preview") or {}).get("errors") or []
+        if errors:
+            notes.append("メールは送れません: " + " / ".join(str(e) for e in errors)[:200])
+            continue
+        files, missing = _attachments_for(chat, draft.get("attach_filenames"))
+        if missing:
+            notes.append(f"添付が見つからないので送りません: {', '.join(missing)}")
+            continue
+        try:
+            record = mailer.send(draft, files, user=user.username)
+        except mailer.MailError as e:
+            notes.append(f"メールを送れませんでした: {e}")
+            continue
+        except Exception as e:
+            notes.append(f"メールの送信に失敗しました: {e}")
+            continue
+        if record.get("dry_run"):
+            checked += 1                       # 試送モード: 送っていない。手で送れるようにボタンは残す
+        else:
+            item["sent_at"] = record["at"]
+            sent += 1
+        chat["render_log"].append({
+            "role": "assistant", "kind": "text",
+            "content": ("📤 " + record["message"]
+                        + f"（件名: {record['subject']} / 宛先: {', '.join(record['to'])}"
+                        + (f" / 添付: {', '.join(record['attachments'])}" if record["attachments"] else "")
+                        + "）")})
+    if notes:
+        chat["render_log"].append({"role": "assistant", "kind": "error", "message": " ".join(notes)})
+    if sent or checked or notes:
+        _persist(chat)
+    words = ([f"メール {sent} 件を送信。"] if sent else []) + \
+        ([f"メール {checked} 件を確認（テスト送信モード・未送信）。"] if checked else []) + notes
+    return sent, " ".join(words).strip()
+
+
+def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> None:
+    """実行結果をロボットに書き戻す。定期実行なら定期実行の欄にも（次の刻みの起点になる）。"""
+    with _robots_lock:
+        saved = robot_get(user, rid)
+        if saved is None:                     # 実行中に別のタブで削除された。書くと消したはずのものが戻る
+            return
+        now = chats.now()
+        saved.update({"last_run": now, "last_status": "ok" if ok else "error", "last_message": message})
+        if source == "schedule":
+            sch = _robot_schedule_norm(saved)
+            sch.update({"last_status": "ok" if ok else "error", "last_message": message})
+            sch["last_run"] = sch["last_run"] or now      # 始めるときに押さえた時刻を残す
+            saved["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
+        try:
+            robot_save(user, saved)
+        except ValueError as e:
+            print(f"[robot] 実行結果を書き戻せませんでした: {e}")
+
+
+def _robot_claim(user, rid: str):
+    """定期実行を始める直前に、登録を読み直して「いま動かす」と印を付ける。
+
+    戻り値は動かすロボット（止められた・消された・時刻がまだなら None）。
+    先に刻みを押さえるのは、実行の途中でアプリが落ちたときに、次の起動で
+    もう一度動いてファイルやメールが二重になるのを防ぐため（1回抜けるほうが安全）。
+    """
+    with _robots_lock:
+        fresh = robot_get(user, rid)
+        if fresh is None:
+            return None
+        nxt = robot_next_scheduled(fresh)
+        if nxt is None or nxt > datetime.now():
+            return None                        # 管理者が止めた・本人が設定を変えた
+        sch = _robot_schedule_norm(fresh)
+        sch.update({"last_run": chats.now(), "last_status": "running", "last_message": "実行中…"})
+        fresh["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
+        try:
+            robot_save(user, fresh, check_dup=False)
+        except ValueError as e:
+            print(f"[robot] 定期実行の印を書けませんでした: {e}")
+            return None
+        return fresh
+
+
+def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
+    """1回の実行（手動・定期の共通部分）。二重実行の見張り → 手順の実行 → メールの自動送信 → 書き戻し。
+
+    戻り値は (会話, 成否, 一言)。二重実行で断ったときは会話が None。
+    """
+    key = (getattr(user, "safe_key", None) or user.username, robot["id"])
+    with _robots_lock:
+        if key in _robots_running:
+            return None, False, "このマイロボットはいま実行中です。終わってから押してください。"
+        _robots_running.add(key)
+    try:
+        chat, ok, message = _robot_run(robot, values)
+        if ok and robot.get("mail_auto"):
+            _sent, mail_msg = _robot_send_mails(chat, user)
+            if mail_msg:
+                message = f"{message} {mail_msg}"
+        _robot_write_back(user, robot["id"], ok, message, source)
+        return chat, ok, message
+    finally:
+        with _robots_lock:
+            _robots_running.discard(key)
+
+
+def _owner_snapshot(user) -> dict:
+    """定期実行で名乗るための本人の写し。権限は登録・変更した時点のもの。"""
+    return {"username": user.username, "display_name": getattr(user, "display_name", "") or "",
+            "groups": list(getattr(user, "groups", None) or []), "is_admin": bool(getattr(user, "is_admin", False))}
+
+
+def _robot_owner(dir_name: str, robot: dict):
+    """定期実行で名乗る利用者。登録時に写した本人の情報（無ければフォルダ名の一般利用者）。
+
+    権限は登録時のもの。管理者でなくなった人のロボットが管理者の道具を使い続けないよう、
+    登録し直せば新しい権限の写しになる。
+    """
+    o = robot.get("owner") if isinstance(robot.get("owner"), dict) else {}
+    return auth.User(username=str(o.get("username") or dir_name),
+                     display_name=str(o.get("display_name") or ""),
+                     groups=list(o.get("groups") or []), is_admin=bool(o.get("is_admin")))
+
+
+def robots_due(now: datetime | None = None) -> list[tuple]:
+    """時刻が来た定期実行のロボット [(利用者, ロボット)]。全利用者のファイルを見る。"""
+    now = now or datetime.now()
+    out = []
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    floor_min = float(robot_settings().get("min_interval_hours") or 0) * 60
+    for d in sorted(dirs):
+        p = d / "robots.json"
+        if not p.exists():
+            continue
+        data = _read_json(p)
+        for r in ((data.get("robots") if isinstance(data, dict) else None) or []):
+            if not isinstance(r, dict) or not r.get("id"):
+                continue
+            sch = _robot_schedule_norm(r)
+            if floor_min > 0 and 0 < sch["interval_minutes"] < floor_min:
+                continue                      # 管理者が後から最低間隔を上げた。短い設定はそのまま止まる（画面に出る）
+            try:
+                nxt = robot_next_scheduled(r, now)
+            except (TypeError, ValueError):
+                continue                      # 壊れた日時のロボット1つで、全員の定期実行を止めない
+            if nxt is not None and nxt <= now:
+                out.append((_robot_owner(d.name, r), r))
+    return out
+
+
+def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
+    """時刻が来たロボットを、本人の名前で順に実行する（スケジューラの1周分。テストからも呼べる）。
+
+    要求の外で動くので、Flask の要求の文脈を作って g.user に本人を入れる
+    （手順の実行・会話の保存・権限の判断が、画面から押したときと同じ経路を通る）。
+    穴の値は定期実行の設定のもの（無ければ登録時の値）。
+    """
+    app = _flask_app
+    ran = []
+    if app is None:
+        return ran
+    for user, robot in robots_due(now):
+        if scheduler.stopping():          # 終了の合図。次のロボットには進まない
+            break
+        robot = _robot_claim(user, robot["id"])
+        if robot is None:                 # 直前に止められた・消された・時刻が変わった
+            continue
+        values = dict(_robot_schedule_norm(robot)["values"])
+        for h in robot.get("holes") or []:
+            values.setdefault(h["key"], str(h.get("sample") or ""))
+        ok, message = False, ""
+        try:
+            with app.test_request_context("/robots/scheduled"):
+                g.user = user
+                missing = _robot_missing_tables(robot)
+                if missing:
+                    message = f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。"
+                    _robot_write_back(user, robot["id"], False, message, "schedule")
+                else:
+                    chat, ok, message = _robot_execute(user, robot, values, source="schedule")
+                    if chat is None:      # 手で実行中だった。押さえた印のままにせず理由を残す
+                        _robot_write_back(user, robot["id"], False, message, "schedule")
+        except Exception as e:
+            message = f"定期実行でエラー: {e}"
+            try:
+                _robot_write_back(user, robot["id"], False, message, "schedule")
+            except Exception:
+                pass
+        ran.append({"user": user.username, "name": robot.get("name") or "（無題）", "ok": ok,
+                    "message": message, "at": chats.now()})
+        print(f"[robot] 定期実行 {'OK' if ok else 'NG'} 「{robot.get('name')}」（{user.username}）: {message[:120]}")
+    return ran
+
+
+def _robot_steps_detail(steps: list[dict]) -> list[dict]:
+    """詳細表示用: 手順ごとの中身（SQLはそのまま、他の道具は引数）。"""
+    out = []
+    for i, s in enumerate(steps, 1):
+        args = s.get("arguments") or {}
+        if s.get("name") in tools.SQL_TOOLS and isinstance(args.get("sql"), str):
+            text = args["sql"]
+        else:
+            text = json.dumps({k: v for k, v in args.items() if k != "explanation"},
+                              ensure_ascii=False, indent=1)
+        out.append({"i": i, "name": s.get("name"), "label": TOOL_LABELS.get(s.get("name"), s.get("name")),
+                    "text": text[:4000], "explanation": str(args.get("explanation") or "")})
+    return out
+
+
+def _robot_row(r: dict, settings: dict | None = None) -> dict:
+    """画面の一覧に出す形（本人の一覧・管理者の一覧）。詳細（手順の中身）は steps_detail に。"""
+    steps = r.get("steps") or []
+    nxt = _robot_next_run(r, settings)
+    sch = _robot_schedule_norm(r)
+    floor_min = float((settings or robot_settings()).get("min_interval_hours") or 0) * 60
+    floor_blocked = bool(floor_min > 0 and 0 < sch["interval_minutes"] < floor_min)
+    try:
+        nxt_s = None if floor_blocked else robot_next_scheduled(r)
+    except (TypeError, ValueError):
+        nxt_s = None
+    return {"id": r.get("id"), "name": r.get("name") or "（無題）",
+            "n_steps": len(steps),
+            "schedule": {**sch, "next_at": nxt_s.isoformat(timespec="minutes") if nxt_s else "",
+                         # 管理者の最低間隔より短い設定。動かない（間隔を直すまで）
+                         "floor_blocked": floor_blocked},
+            "mail_auto": bool(r.get("mail_auto")),
+            "has_mail_steps": any(s.get("name") == "compose_email" for s in steps),
+            "steps_detail": _robot_steps_detail(steps),
+            "owner": str((r.get("owner") or {}).get("username") or ""),
+            # 間隔の決めごとで、まだ実行できないならその時刻（画面はボタンを止めて理由を出す）
+            "next_run": nxt.isoformat(timespec="seconds") if nxt else "",
+            "has_file_steps": any(s.get("name") in tools.FOLDER_TOOLS for s in steps),
+            "folder_out": bool(r.get("folder_out")),
+            "folder_stamp": r.get("folder_stamp") is not False,
+            "folder_overwrite": bool(r.get("folder_overwrite")),
+            "tools": [TOOL_LABELS.get(s.get("name"), s.get("name")) for s in steps],
+            "questions": list(r.get("questions") or []),
+            "holes": [{k: h.get(k) for k in ("key", "label", "kind", "sample")}
+                      for h in (r.get("holes") or [])],
+            "tables": list(r.get("tables") or []),
+            "from_title": r.get("from_title") or "",
+            "created_at": r.get("created_at") or "", "updated_at": r.get("updated_at") or "",
+            "last_run": r.get("last_run") or "", "last_status": r.get("last_status") or "",
+            "last_message": r.get("last_message") or ""}
+
+
+def _robot_rows(user) -> list[dict]:
+    """一覧を画面の形で。決めごとの読み込みは1回で済ませる。"""
+    settings = robot_settings()
+    return [_robot_row(r, settings) for r in robots_list(user)]
+
+
+def _robot_turns(steps: list[dict]) -> list[dict]:
+    turns: list[dict] = []
+    for i, s in enumerate(steps):
+        if not turns or turns[-1]["turn"] != s["turn"]:
+            turns.append({"turn": s["turn"], "question": s["question"], "steps": []})
+        args = s.get("arguments") or {}
+        summary = (str(args.get("sql", ""))[:300] if s["name"] in tools.SQL_TOOLS
+                   else json.dumps({k: v for k, v in args.items()
+                                    if k not in ("explanation",)},
+                                   ensure_ascii=False)[:300])
+        turns[-1]["steps"].append({"i": i, "name": s["name"],
+                                   "label": TOOL_LABELS.get(s["name"], s["name"]),
+                                   "summary": summary})
+    return turns
+
+
+@bp_chat.get("/api/robots")
+@login_required
+def robots_index():
+    return jsonify({"robots": _robot_rows(g.user)})
+
+
+@bp_chat.post("/api/robots/extract")
+@login_required
+def robots_extract():
+    """会話から手順の候補を取り出す（登録ダイアログに出す。まだ保存しない）。"""
+    body = _body()
+    chat = chats.load_chat(g.user, str(body.get("chat_id") or ""))
+    if chat is None:
+        return jsonify({"error": "この会話は見つかりませんでした。"}), 404
+    try:
+        upto = int(body.get("upto")) if body.get("upto") not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "発言の番号が正しくありません。"}), 400
+    steps = [s for s in _robot_steps_from_chat(chat) if upto is None or s["turn"] <= upto]
+    return jsonify({"ok": True, "title": chat.get("title") or "",
+                    "turns": _robot_turns(steps), "candidates": _robot_candidates(steps),
+                    "has_mail_steps": any(s["name"] == "compose_email" for s in steps),
+                    **_robot_folder_defaults(steps)})
+
+
+@bp_chat.post("/api/robots/save")
+@login_required
+def robots_save():
+    body = _body()
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "マイロボットの名前を入力してください。"}), 400
+    if len(name) > ROBOT_NAME_MAX:
+        return jsonify({"error": f"名前は {ROBOT_NAME_MAX} 文字以内にしてください。"}), 400
+    chat = chats.load_chat(g.user, str(body.get("chat_id") or ""))
+    if chat is None:
+        return jsonify({"error": "この会話は見つかりませんでした。"}), 404
+    try:
+        upto = int(body.get("upto")) if body.get("upto") not in (None, "") else None
+        include = ({int(t) for t in body.get("turns")}
+                   if isinstance(body.get("turns"), list) else None)
+    except (TypeError, ValueError):
+        return jsonify({"error": "発言の番号が正しくありません。"}), 400
+    steps = [s for s in _robot_steps_from_chat(chat) if upto is None or s["turn"] <= upto]
+    try:
+        holes = _robot_apply_holes(steps, [h for h in (body.get("holes") or [])
+                                           if isinstance(h, dict)])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    kept = [s for s in steps if include is None or s["turn"] in include]
+    if not kept:
+        return jsonify({"error": "手順が1つもありません。道具（SQLの実行やグラフなど）を"
+                                 "使ったやり取りを含めてください。"}), 400
+    # 外した質問の結果（result_id）を使う手順が残っていると、実行時に必ず失敗する
+    produced_all = {rid for s in steps for rid in _as_ids(s.get("produced"))}
+    produced_kept = {rid for s in kept for rid in _as_ids(s.get("produced"))}
+    for n, s in enumerate(kept, 1):
+        blob = json.dumps(s["arguments"], ensure_ascii=False)
+        lost = [p for p in (produced_all - produced_kept) if p in blob]
+        if lost:
+            return jsonify({"error": f"手順{n}（{TOOL_LABELS.get(s['name'], s['name'])}）は、"
+                                     "外した質問で取ったデータを使っています。"
+                                     "その質問も含めてください。"}), 400
+    limit_steps = robot_settings()["max_steps"]
+    if len(kept) > limit_steps:
+        return jsonify({"error": f"手順が {len(kept)} 個あります。1つのマイロボットに入れられる手順は"
+                                 f" {limit_steps} 個までです（管理者が決めています）。含める質問を減らしてください。"}), 400
+    used = json.dumps([s["arguments"] for s in kept], ensure_ascii=False)
+    holes = [h for h in holes if "{{" + h["key"] + "}}" in used]
+    scope = build_scope({f.name: [] for f in db.list_db_files()})
+    # 使う表。Excel出力の sheets[].sql のような入れ子の SQL も見る
+    tables = sorted({t["table"] for s in kept for sql in _robot_sqls(s["arguments"])
+                     for t in tables_in_sql(sql, scope, limit=200)})
+    questions = []
+    for s in kept:
+        if s["question"] and s["question"] not in questions:
+            questions.append(s["question"])
+    # フォルダ出力の決めごと。画面で指定があればそれ、無ければ元の会話の指定から
+    fd = _robot_folder_defaults(kept)
+    robot = {"id": None, "name": name, "from_chat": chat.get("id"),
+             "from_title": chat.get("title") or "", "questions": questions,
+             "steps": [{"name": s["name"], "arguments": s["arguments"],
+                        "produced": s.get("produced")} for s in kept],
+             "holes": holes, "tables": tables,
+             "folder_out": bool(body.get("folder_out", fd["folder_out"])),
+             "folder_stamp": bool(body.get("folder_stamp", fd["folder_stamp"])),
+             "folder_overwrite": bool(body.get("folder_overwrite", fd["folder_overwrite"])),
+             # 定期実行で名乗る本人（権限は登録時のもの）
+             "owner": _owner_snapshot(g.user),
+             # 実行のたびに、作ったメールの下書きをそのまま送る（下書きを作る手順があるときだけ）
+             "mail_auto": bool(body.get("mail_auto")) and any(s["name"] == "compose_email" for s in kept)}
+    if isinstance(body.get("schedule"), dict):
+        try:
+            robot["schedule"] = _robot_schedule_from_body(body, robot, robot_settings())
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    try:
+        saved = robot_save(g.user, robot)
+    except RobotConflict as e:
+        return jsonify({"error": str(e), "duplicate": True}), 409
+    except ValueError as e:
+        return jsonify({"error": str(e)}), (409 if str(e) == _ROBOTS_BROKEN else 400)
+    print(f"[robot] 登録: 「{name}」{len(kept)}手順・穴{len(holes)}（{g.user.username}）")
+    return jsonify({"ok": True, "robot": _robot_row(saved),
+                    "robots": _robot_rows(g.user)})
+
+
+@bp_chat.post("/api/robots/run")
+@login_required
+def robots_run():
+    body = _body()
+    robot = robot_get(g.user, str(body.get("id") or ""))
+    if robot is None:
+        return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    values = body.get("values") if isinstance(body.get("values"), dict) else {}
+    for h in robot.get("holes") or []:
+        if not str(values.get(h["key"], "")).strip():
+            return jsonify({"error": f"「{h['label']}」を入力してください。"}), 400
+    missing = _robot_missing_tables(robot)
+    if missing:
+        return jsonify({"error": f"表 {'、'.join(missing)} が見つかりません"
+                                 "（改名・削除された可能性）。マイロボットを作り直してください。"}), 400
+    settings = robot_settings()
+    nxt = _robot_next_run(robot, settings)
+    if nxt is not None:
+        return jsonify({"error": f"前回の実行から {_hours_label(settings['min_interval_hours'])} は"
+                                 f"同じマイロボットを実行できません（次は {nxt:%m/%d %H:%M} 以降。"
+                                 "間隔は管理者が決めています）。",
+                        "next_run": nxt.isoformat(timespec="seconds")}), 409
+    # 定期実行は「登録した時点の権限」で動く。手で実行したこの機会に写しを取り直しておく
+    # （管理者でなくなった人のロボットが、いつまでも管理者の道具を使わないように）
+    if robot.get("owner") != _owner_snapshot(g.user):
+        robot["owner"] = _owner_snapshot(g.user)
+        try:
+            robot_save(g.user, robot, check_dup=False)
+        except ValueError:
+            pass
+    chat, ok, message = _robot_execute(g.user, robot, values)
+    if chat is None:
+        return jsonify({"error": message}), 409
+    print(f"[robot] {'OK' if ok else 'NG'} 「{robot.get('name')}」（{g.user.username}）: {message[:80]}")
+    return jsonify({"ok": True, "run_ok": ok, "message": message,
+                    "chat_id": chat.get("id"), "title": chat.get("title", ""),
+                    "items": _web_log(chat["render_log"]),
+                    "robots": _robot_rows(g.user)})
+
+
+@bp_chat.post("/api/robots/update")
+@login_required
+def robots_update():
+    body = _body()
+    robot = robot_get(g.user, str(body.get("id") or ""))
+    if robot is None:
+        return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    changed = False
+    if "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not name or len(name) > ROBOT_NAME_MAX:
+            return jsonify({"error": f"名前は 1〜{ROBOT_NAME_MAX} 文字で入力してください。"}), 400
+        robot["name"] = name
+        changed = True
+    # フォルダ出力の決めごと（作り直さずに変えられる）
+    for key in ("folder_out", "folder_stamp", "folder_overwrite"):
+        if key in body:
+            robot[key] = bool(body[key])
+            changed = True
+    if "mail_auto" in body:
+        robot["mail_auto"] = bool(body["mail_auto"]) and any(
+            s.get("name") == "compose_email" for s in robot.get("steps") or [])
+        changed = True
+    if "schedule" in body:
+        try:
+            robot["schedule"] = _robot_schedule_from_body(body, robot, robot_settings())
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        changed = True
+    if changed:
+        robot["owner"] = _owner_snapshot(g.user)   # いまの権限の写しにする（定期実行で名乗るため）
+    if not changed:
+        return jsonify({"error": "変える内容がありません。"}), 400
+    try:
+        robot_save(g.user, robot, check_dup=("name" if "name" in body else False))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify({"ok": True, "robots": _robot_rows(g.user)})
+
+
+@bp_chat.post("/api/robots/delete")
+@login_required
+def robots_delete():
+    try:
+        deleted = robot_delete(g.user, str(_body().get("id") or ""))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify({"ok": True, "deleted": bool(deleted),
+                    "robots": _robot_rows(g.user)})
+
+
+# --- 覚え書き（メニューの「マイロボット」の下。本文は1つのテキスト） ------------------
+
+@bp_chat.get("/memory", endpoint="memory")
+@login_required
+def memory_page():
+    return render_template("memory.html", memory=memory_payload(g.user))
+
+
+@bp_chat.get("/api/memory")
+@login_required
+def memory_index():
+    return jsonify({"ok": True, **memory_payload(g.user)})
+
+
+@bp_chat.post("/api/memory/save")
+@login_required
+def memory_save():
+    """本人が本文を直す。空にすれば全部消したのと同じ。"""
+    body = _body()
+    if not isinstance(body.get("text"), str):
+        return jsonify({"error": "本文がありません。"}), 400
+    memory_set_text(g.user, body["text"], force=True)
+    return jsonify({"ok": True, **memory_payload(g.user)})
+
+
+@bp_chat.post("/api/memory/clear")
+@login_required
+def memory_clear_all():
+    memory_clear(g.user)
+    return jsonify({"ok": True, **memory_payload(g.user)})
+
+
+@bp_chat.post("/api/memory/toggle")
+@login_required
+def memory_toggle():
+    """覚えるのをやめる／再開する。止めているあいだは、いまある覚え書きもAIに渡さない。"""
+    on = _body().get("on")
+    if not isinstance(on, bool):
+        return jsonify({"error": "on は true / false で指定してください。"}), 400
+    set_value(g.user, "memory_off", not on)
+    return jsonify({"ok": True, **memory_payload(g.user)})
+
+
+# マイロボットの画面（メニューの「マイエージェント」の直下）。一覧・実行・改名・削除。
+# 実行すると、その結果の会話が「いま開いている会話」になるので、画面はマイエージェントへ移る。
+bp_robots = Blueprint("robots", __name__)
+
+
+@bp_robots.get("/robots", endpoint="index")
+@login_required
+def robots_page():
+    settings = robot_settings()
+    return render_template("robots.html", robots=_robot_rows(g.user), settings=settings,
+                           intervals=INTERVALS, scheduler_on=scheduler.is_running(),
+                           interval_label=(_hours_label(settings["min_interval_hours"])
+                                           if settings["min_interval_hours"] > 0 else ""))
 
 
 # ==========================================================================
@@ -8491,6 +10601,64 @@ def _view_check_sql(sql: str) -> str:
     return sql
 
 
+def view_used_data(path, sql: str, profile: dict | None = None, tmeta: dict | None = None) -> list[dict]:
+    """このSQLが読む表と列（何のデータを使ったか）。説明はカタログから添える。
+
+    SQLite のオーソライザは SELECT の下ごしらえ（prepare）の段階で「どの表のどの列を読むか」を
+    1つずつ知らせてくる。EXPLAIN を付けて下ごしらえだけさせるので、データは読まず、重いSQLでもすぐ返る。
+    ビューを使っていれば、そのビューが中で読む元の表まで出る（SQLite が展開して知らせる）。
+    表名の大小の違い（SQLに 品質__CLAIMS と書かれていても）はカタログの綴りに寄せる。
+    """
+    sql = str(sql or "").strip().rstrip(";").strip()
+    if not sql:
+        return []
+    reads: dict[str, list[str]] = {}
+
+    def _rec(action, arg1, arg2, _db_name, _trigger):
+        if action == sqlite3.SQLITE_READ and arg1 and not str(arg1).startswith("sqlite_"):
+            cols = reads.setdefault(str(arg1), [])
+            if arg2 and str(arg2) not in cols:
+                cols.append(str(arg2))
+        return sqlite3.SQLITE_OK
+
+    conn = db.connect_scope([(str(path), db.alias_for(path))])
+    try:
+        conn.set_authorizer(_rec)
+        conn.execute("EXPLAIN " + sql).fetchall()
+    finally:
+        conn.close()
+
+    if profile is None:
+        profile = catalog.profile_db(path)
+    if tmeta is None:
+        tmeta = catalog.load_meta(path).get("tables") or {}
+    by_lower = {t.lower(): t for t in (profile.get("tables") or {})}
+    out = []
+    for raw, cols in reads.items():
+        name = by_lower.get(raw.lower(), raw)
+        info = (profile.get("tables") or {}).get(name) or {}
+        col_by_lower = {c["name"].lower(): c["name"] for c in info.get("columns") or []}
+        cmeta = (tmeta.get(name) or {}).get("columns") or {}
+        columns = []
+        for c in cols:
+            cname = col_by_lower.get(c.lower(), c)
+            if cname not in {x["name"] for x in columns}:
+                columns.append({"name": cname,
+                                "description": str((cmeta.get(cname) or {}).get("description") or "")})
+        out.append({"name": name, "type": "view" if info.get("type") == "view" else "table",
+                    "description": str((tmeta.get(name) or {}).get("description") or ""),
+                    "columns": columns})
+    return out
+
+
+def _view_used_safe(path, sql: str, profile: dict | None = None, tmeta: dict | None = None) -> list[dict]:
+    """使ったデータ。動かないSQL（元表が消えた等）なら空（本体の結果や一覧は止めない）。"""
+    try:
+        return view_used_data(path, sql, profile, tmeta)
+    except Exception:
+        return []
+
+
 def _view_run(path, sql: str, limit: int = VIEW_PREVIEW_ROWS) -> dict:
     """定義SQLを実データで動かして、列と先頭数行と件数を返す。"""
     scope = [{"path": str(path), "alias": db.alias_for(path), "name": path.name}]
@@ -8513,11 +10681,75 @@ def view_preview():
     try:
         path = db.path_for(body.get("db") or "")
         sql = _view_check_sql(body.get("sql"))
-        return jsonify({"ok": True, "sql": sql, **_view_run(path, sql)})
+        return jsonify({"ok": True, "sql": sql, **_view_run(path, sql),
+                        "used": _view_used_safe(path, sql)})
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@bp_catalog.post("/api/catalog/view/export")
+@admin_required
+def view_export():
+    """定義SQLを実データで動かし、結果を全件 Excel にして渡す（保存はしない）。
+
+    画面の「結果をExcelでダウンロード」。SQLを自分で書いた場合の確かめにもなる
+    （先頭数行のプレビューも返す）。行数の上限はファイル出力と同じ。
+    """
+    body = _body()
+    try:
+        path = db.path_for(body.get("db") or "")
+        sql = _view_check_sql(body.get("sql"))
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    scope = [{"path": str(path), "alias": db.alias_for(path), "name": path.name}]
+    cap = min(config.EXPORT_MAX_ROWS, 1_048_575)      # Excel の行数の上限
+    try:
+        cols, rows, truncated = db.run_select(sql, scope, max_rows=cap)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    name = str(body.get("name") or "").strip() or "view"
+    filename = exports.safe_filename(name, "xlsx")      # 末尾に日時が付く
+    data = excel.build_excel([{"name": name[:31], "columns": cols, "rows": rows,
+                               "note": ("上限で切り詰めています。" if truncated else "")
+                                       + f"SQL: {sql}"}])
+    token = _fs_put(data, filename, exports.XLSX_MIME, g.user.username)
+    return jsonify({"ok": True, "url": f"/api/file/{token}", "filename": filename,
+                    "rows": len(rows), "truncated": bool(truncated),
+                    "columns": cols, "preview": jsonable(rows[:VIEW_PREVIEW_ROWS]),
+                    "used": _view_used_safe(path, sql)})
+
+
+@bp_catalog.post("/api/catalog/view/explain")
+@admin_required
+def view_explain():
+    """いま書いてあるSQLの日本語の解説をAIに書かせる（「SQLを自分で書く」で作ったとき用）。
+
+    使ったデータ（表と列）も一緒に返す。AIには、そのSQLが読む表だけを見せる。
+    """
+    body = _body()
+    try:
+        path = db.path_for(body.get("db") or "")
+        sql = _view_check_sql(body.get("sql"))
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    if not llm.is_configured():
+        return jsonify({"error": "AIが未設定です。「モデル設定」で接続先とAPIキーを設定してください。"}), 400
+    try:
+        _view_run(path, sql, limit=1)               # 動かないSQLの解説は書かせない
+    except Exception as e:
+        return jsonify({"error": f"このSQLは実データで動きませんでした: {e}"}), 400
+    used = _view_used_safe(path, sql)
+    try:
+        text = llm.explain_sql(path, sql, tables=[u["name"] for u in used])
+    except Exception as e:
+        return jsonify({"error": f"AIの解説に失敗しました: {e}"}), 400
+    return jsonify({"ok": True, "explanation": text, "used": used})
 
 
 @bp_catalog.post("/api/catalog/view/draft")
@@ -8553,7 +10785,8 @@ def view_draft():
         except Exception as e:
             last_err = str(e)
             continue
-        return jsonify({**draft, "ok": True, "sql": sql, **preview})
+        return jsonify({**draft, "ok": True, "sql": sql, **preview,
+                        "used": _view_used_safe(path, sql)})
     return jsonify({"error": f"AIが書いたSQLが実データで通りませんでした: {last_err}",
                     "sql": (draft or {}).get("sql", "")}), 400
 
@@ -8599,6 +10832,13 @@ def view_save():
     except Exception as e:
         return jsonify({"error": f"このSQLは実データで動きませんでした: {e}"}), 400
 
+    # 作り直しのとき、前の定義SQL。解説が付いてこなければ「SQLが変わったか」で残すか決める
+    prev_name = old or (name if existing else "")
+    try:
+        prev_sql = importer.view_body(path, prev_name) if prev_name else ""
+    except Exception:
+        prev_sql = ""
+
     try:
         # 改名は表と同じ経路に通す。説明だけでなく、関連・ER配置・例文・用語・
         # 検算・まとまりメモ・利用者の「対象から外した表」まで一緒に付け替わる。
@@ -8621,6 +10861,14 @@ def view_save():
     if desc:
         entry["description"] = desc
         entry.pop("ai_draft", None)
+    # 「このSQLがしていること」（AIの解説）。登録後も読めるように一緒に残す。
+    # 解説なしで SQL だけ変わったら、前の解説は当てはまらないので外す
+    if "explanation" in body:
+        text = str(body.get("explanation") or "").strip()
+        if text:
+            entry["explanation"] = text
+        elif prev_sql.strip().rstrip(";").strip() != sql:
+            entry.pop("explanation", None)
     catalog.save_meta(path, meta)
     catalog.forget(path)
 
@@ -8669,15 +10917,194 @@ def _views_payload(path) -> list:
     out = []
     for v in importer.list_views(path):
         t = (profile.get("tables") or {}).get(v["name"]) or {}
+        sql = importer.view_body(path, v["name"])
         out.append({
             "name": v["name"],
-            "sql": importer.view_body(path, v["name"]),
+            "sql": sql,
             "description": (tmeta.get(v["name"]) or {}).get("description", ""),
+            "explanation": (tmeta.get(v["name"]) or {}).get("explanation", ""),
+            "used": _view_used_safe(path, sql, profile, tmeta),
             "columns": [c["name"] for c in t.get("columns", [])],
             "rows": t.get("row_count"),
             "error": t.get("error") or "",
         })
     return out
+
+
+# --- マイロボットの決めごと（管理者メニューのタブ） ---------------------------------
+
+def _robot_overview() -> list[dict]:
+    """利用者ごとのマイロボット（管理者の画面用）。件数・最後の実行と、各ロボットの登録内容の詳細。"""
+    out = []
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    settings = robot_settings()
+    for d in sorted(dirs):
+        p = d / "robots.json"
+        if not p.exists():
+            continue
+        data = _read_json(p)
+        items = [r for r in ((data.get("robots") if isinstance(data, dict) else None) or [])
+                 if isinstance(r, dict) and r.get("id")]
+        if not items:
+            continue
+        rows = [_robot_row(r, settings) for r in items]
+        out.append({"user": d.name,
+                    "display_name": next((str((r.get("owner") or {}).get("display_name") or "")
+                                          for r in items if (r.get("owner") or {}).get("display_name")), ""),
+                    "count": len(items),
+                    "scheduled": sum(1 for r in rows if r["schedule"]["interval_minutes"] > 0),
+                    "last_run": max((str(r.get("last_run") or "") for r in items), default=""),
+                    "robots": rows})
+    return out
+
+
+@bp_catalog.get("/catalog/robots", endpoint="robot_settings")
+@admin_required
+def robot_settings_page():
+    return render_template("robot_settings.html", settings=robot_settings(),
+                           defaults=_robot_setting_defaults(), ranges=ROBOT_SETTING_RANGES,
+                           note=robot_settings_note(), overview=_robot_overview())
+
+
+def robot_admin_stop(dir_name: str, rid: str) -> dict | None:
+    """管理者が、他の利用者のロボットの定期実行と自動送信を止める（中身は変えない）。無ければ None。"""
+    key = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in str(dir_name))[:64]
+    if not key or key.startswith(".") or key != str(dir_name):
+        return None
+    user = auth.User(username=key)
+    with _robots_lock:
+        data, broken = _robots_raw(user)
+        if broken:
+            raise ValueError(_ROBOTS_BROKEN)
+        items = [r for r in data["robots"] if isinstance(r, dict) and r.get("id")]
+        robot = next((r for r in items if r.get("id") == rid), None)
+        if robot is None:
+            return None
+        sch = _robot_schedule_norm(robot)
+        sch["enabled"] = False
+        robot["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
+        robot["mail_auto"] = False
+        robot["updated_at"] = chats.now()
+        _robots_write(user, items, _robots_ledger(data))
+        return robot
+
+
+
+
+def stop_robots_of(username: str) -> list[str]:
+    """その利用者の定期実行と自動送信を全部止める（手順は消さない）。止めた名前を返す。
+
+    退職などでアカウントを消したとき、data/users/ に残ったロボットが動き続けないように。
+    """
+    user = auth.User(username=str(username or ""))
+    with _robots_lock:
+        data, broken = _robots_raw(user)
+        if broken:
+            print("[robot] 保存ファイルが読めないので、止められませんでした。")
+            return []
+        items = [r for r in data["robots"] if isinstance(r, dict) and r.get("id")]
+        names = []
+        for r in items:
+            sch = _robot_schedule_norm(r)
+            if not sch["enabled"] and not r.get("mail_auto"):
+                continue
+            sch["enabled"] = False
+            r["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
+            r["mail_auto"] = False
+            r["updated_at"] = chats.now()
+            names.append(str(r.get("name") or ""))
+        if names:
+            _robots_write(user, items, _robots_ledger(data))
+        return names
+
+
+@bp_catalog.post("/api/catalog/robots/stop")
+@admin_required
+def robot_admin_stop_route():
+    body = _body()
+    try:
+        robot = robot_admin_stop(str(body.get("user") or ""), str(body.get("id") or ""))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    if robot is None:
+        return jsonify({"error": "そのマイロボットが見つかりません。"}), 404
+    print(f"[robot] 管理者が止めました: 「{robot.get('name')}」（{body.get('user')}）（{g.user.username}）")
+    return jsonify({"ok": True, "name": robot.get("name")})
+
+
+# --- 覚え書き（管理者メニューのタブ） -----------------------------------------------
+
+def _memory_overview() -> list[dict]:
+    """利用者ごとの覚え書き（管理者の画面用）。本文そのもの・止めているか・最終更新。"""
+    out = []
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in sorted(dirs):
+        user = auth.User(username=d.name)
+        data, broken = _memory_raw(user)
+        off = bool(load(user).get("memory_off"))
+        if not data["text"] and not broken and not off:
+            continue
+        out.append({"user": d.name, "text": data["text"], "updated_at": data["updated_at"],
+                    "on": not off, "broken": broken, "chars": len(data["text"])})
+    return out
+
+
+@bp_catalog.get("/catalog/memory", endpoint="memory_admin")
+@admin_required
+def memory_admin_page():
+    return render_template("memory_admin.html", settings=memory_settings(),
+                           defaults=_memory_setting_defaults(), ranges=MEMORY_SETTING_RANGES,
+                           note=memory_settings_note(), models=list(models.available()),
+                           overview=_memory_overview())
+
+
+@bp_catalog.get("/api/catalog/memory-settings")
+@admin_required
+def memory_settings_get():
+    return jsonify({"ok": True, "settings": memory_settings(), "defaults": _memory_setting_defaults(),
+                    "ranges": MEMORY_SETTING_RANGES, "models": list(models.available()),
+                    **memory_settings_note()})
+
+
+@bp_catalog.post("/api/catalog/memory-settings")
+@admin_required
+def memory_settings_post():
+    body = _body()
+    if not any(k in body for k in ("enabled", "model", "max_chars")):
+        return jsonify({"error": "変える内容がありません。"}), 400
+    try:
+        saved = save_memory_settings(body, g.user.username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    print(f"[memory] 決めごとを保存: {saved}（{g.user.username}）")
+    return jsonify({"ok": True, "settings": saved, **memory_settings_note()})
+
+
+@bp_catalog.get("/api/catalog/robot-settings")
+@admin_required
+def robot_settings_get():
+    return jsonify({"ok": True, "settings": robot_settings(), "defaults": _robot_setting_defaults(),
+                    "ranges": ROBOT_SETTING_RANGES, **robot_settings_note()})
+
+
+@bp_catalog.post("/api/catalog/robot-settings")
+@admin_required
+def robot_settings_post():
+    body = _body()
+    if not any(k in body for k in ROBOT_SETTING_RANGES):
+        return jsonify({"error": "変える内容がありません。"}), 400
+    try:
+        saved = save_robot_settings(body, g.user.username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    print(f"[robot] 決めごとを保存: {saved}（{g.user.username}）")
+    return jsonify({"ok": True, "settings": saved, **robot_settings_note()})
 
 
 @bp_catalog.post("/api/catalog/layout")
@@ -8760,7 +11187,8 @@ def save_table():
     else:
         tm.pop("columns", None)
     tm.pop("ai_draft", None)
-    if not any(tm.get(k) for k in ("description", "columns", "primary_key", "glossary")):
+    # explanation はビューの「このSQLがしていること」。説明を空にして保存しても消さない
+    if not any(tm.get(k) for k in ("description", "columns", "primary_key", "glossary", "explanation")):
         tables.pop(table, None)
     catalog.save_meta(path, meta)
     return jsonify({"ok": True})
@@ -9089,7 +11517,7 @@ def verify_examples():
         scope = _sql_scope(sql, path)
         others = [s["alias"] for s in scope[1:]]
         cross = (f"／ {'、'.join(others)} も参照しています"
-                 "（チャットではこれらのDBも一緒に選ぶ必要があります）") if others else ""
+                 "（マイエージェントではこれらのDBも一緒に選ぶ必要があります）") if others else ""
         try:
             columns, rows, truncated = db.run_select(sql, scope, max_rows=5)
         except Exception as e:
@@ -9579,9 +12007,14 @@ def import_index():
         modes=jobs.MODES,
         default_ts=config.IMPORT_TIMESTAMP_COLUMN,
         max_keep=jobs.MAX_KEEP_RUNS,
-        default_keep=jobs.DEFAULT_KEEP_RUNS,
         dirs_editable=config.IMPORT_DIRS_EDITABLE,
         allow_upload=config.IMPORT_ALLOW_UPLOAD,
+        scraper_dir=str(config.SCRAPER_DIR),
+        scrape_timeout=importer.scrape_defaults()[0],
+        scrape_interval=importer.scrape_defaults()[1],
+        scrape_limits={"timeout_min": importer.SCRAPER_TIMEOUT_MIN_SEC,
+                       "timeout_max": importer.SCRAPER_TIMEOUT_MAX_SEC,
+                       "interval_max": importer.SCRAPER_INTERVAL_MAX_MIN},
     )
 
 
@@ -9663,11 +12096,15 @@ def _job_row(j: dict) -> dict:
                 "realtime": False,
                 "timestamp_column": None, "keep_runs": None, "enabled": True,
                 "last_run": "", "last_status": "", "last_message": "", "columns": [],
-                "last_degraded": []}
+                "last_degraded": [],
+                "source_kind": "file", "scrape_file": "",
+                "scrape_timeout_sec": importer.scrape_defaults()[0],
+                "scrape_interval_minutes": importer.scrape_defaults()[1]}
     return {**defaults, **j,
             "interval_label": jobs.interval_label(j.get("interval_minutes", 0)),
             "mode_label": "追記" if j.get("mode") == "append" else "全件入れ替え",
-            "source_label": importer.display_name(Path(j.get("source", ""))),
+            "source_label": (jobs.source_label(j) if jobs.is_scraper(j)
+                             else importer.display_name(Path(j.get("source", "")))),
             "kept": kept,
             "manual_blocked": jobs.manual_run_blocked(j),
             "next_label": nxt.strftime("%m-%d %H:%M") if nxt else "手動のみ"}
@@ -9728,9 +12165,85 @@ def _read_source(body: dict, nrows=None):
             raise importer.ImportError_(
                 "アップロードしたファイルが見つかりません。もう一度選び直してください。")
         return importer.read_upload(item["data"], item["filename"], sheet=sheet,
-                                    header_row=header, delimiter=delim, nrows=nrows)
+                                    header_row=header, delimiter=delim, nrows=nrows,
+                                    trusted=bool(item.get("trusted")))
     return importer.read_table(Path(body.get("path", "")), sheet=sheet, header_row=header,
                                delimiter=delim, nrows=nrows)
+
+
+# =============================================================================
+# Webスクレイピング（scrapers/ の .py を試して、出来たファイルを取り込み元にする）
+# =============================================================================
+
+@bp_import.get("/api/scrapers")
+@admin_required
+def scrapers_list():
+    d = importer.scraper_dir()
+    timeout, interval = importer.scrape_defaults()
+    return jsonify({"dir": str(d), "ok": d.is_dir(), "scrapers": importer.list_scrapers(),
+                    "timeout_sec": timeout, "interval_minutes": interval})
+
+
+@bp_import.post("/api/scrapers/test")
+@admin_required
+def scrapers_test():
+    """スクリプトを1回実行して、出来たファイルの名前とシート名を返す。
+
+    出来たファイルはアップロードと同じ預かり場所（メモリ）に置き、
+    プレビューと登録直後の初回取り込みはそこから読む。ディスクには残さない。
+    """
+    body = _body()
+    try:
+        timeout = int(body.get("timeout_sec") or config.SCRAPER_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        return jsonify({"error": "タイムアウト（秒）は数値で指定してください。"}), 400
+    if not (importer.SCRAPER_TIMEOUT_MIN_SEC <= timeout <= importer.SCRAPER_TIMEOUT_MAX_SEC):
+        return jsonify({"error": f"タイムアウト（秒）は {importer.SCRAPER_TIMEOUT_MIN_SEC}〜"
+                                 f"{importer.SCRAPER_TIMEOUT_MAX_SEC} の範囲で指定してください。"}), 400
+    try:
+        out = importer.run_scraper(body.get("name", ""), timeout)
+    except importer.ImportError_ as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"実行に失敗しました: {e}"}), 500
+    files = [{"name": f["name"], "size": len(f["data"]), "sheets": f["sheets"],
+              "upload": _fs_put(f["data"], f["name"], "application/octet-stream",
+                                g.user.username, trusted=True,
+                                label=f"スクレイピング: {body.get('name')} → {f['name']}")}
+             for f in out["files"]]
+    print(f"[scraper] {body.get('name')} を試行: {len(files)}ファイル / "
+          f"{out['seconds']}秒（{g.user.username}）")
+    return jsonify({"ok": True, "files": files, "seconds": out["seconds"],
+                    "log": out["log"]})
+
+
+# =============================================================================
+# 出力先フォルダ（作ったファイルをサーバ上の決まった場所にも置く）
+# =============================================================================
+
+@bp_import.get("/output", endpoint="output")
+@admin_required
+def output_index():
+    """データカタログの「出力」タブ。出力先フォルダの設定。"""
+    return render_template("output.html", output=importer.output_dir_status())
+
+
+@bp_import.get("/api/output-dir")
+@admin_required
+def output_dir_get():
+    return jsonify(importer.output_dir_status())
+
+
+@bp_import.post("/api/output-dir")
+@admin_required
+def output_dir_set():
+    """出力先フォルダを保存する（空で「使わない」）。書けるかまで確かめてから保存。"""
+    try:
+        st = importer.save_output_dir(_body().get("path") or "", user=g.user.username)
+    except importer.ImportError_ as e:
+        return jsonify({"error": str(e)}), 400
+    print(f"[output] 出力先フォルダ: {st['path'] or '（なし）'}（{g.user.username}）")
+    return jsonify({"ok": True, **st})
 
 
 @bp_import.post("/api/import/upload")
@@ -9767,7 +12280,8 @@ def _w_preview():
                 raise importer.ImportError_(
                     "アップロードしたファイルが見つかりません。もう一度選び直してください。")
             stem = Path(item["filename"]).stem
-            sheets = importer.upload_sheet_names(item["data"], item["filename"])
+            sheets = importer.upload_sheet_names(item["data"], item["filename"],
+                                                 trusted=bool(item.get("trusted")))
         else:
             path = Path(body.get("path", ""))
             stem = path.stem
@@ -9795,7 +12309,9 @@ def _log_manual(db_path, body: dict, mode: str, ok: bool, message: str,
                 started, **kw) -> None:
     """画面からの1回きりの取り込みを履歴に残す（成功も失敗も）。"""
     upload = body.get("upload")
-    source = "（自分のPCからアップロード）" if upload else body.get("path", "")
+    item = _fs_get(upload, g.user.username) if upload else None
+    source = (((item or {}).get("label") or "（自分のPCからアップロード）") if upload
+              else body.get("path", ""))
     history.add_import_record(db_path.name if db_path else (body.get("db_file") or ""),
                 importer.safe_name(body.get("table", ""), table=True), ok, message,
                 kind="manual", mode=mode, source=source,
@@ -9988,7 +12504,15 @@ def _w_drop_table():
 @admin_required
 def job_save():
     body = _body()
-    if body.get("upload") or not body.get("path"):
+    # 取り込み元は「サーバのフォルダのファイル」か「スクレイピングのスクリプト」。
+    # スクリプトは名前だけ受け取り、scrapers/ 直下にある実物に限る
+    scraper = str(body.get("scraper") or "").strip()
+    if scraper:
+        try:
+            importer.scraper_path(scraper)
+        except importer.ImportError_ as e:
+            return jsonify({"error": str(e)}), 400
+    elif body.get("upload") or not body.get("path"):
         return jsonify({"error": "アップロードしたファイルは定期取り込みに登録できません"
                                  "（サーバ上に置かれていないため、次回以降読み直せません）。"
                                  "取り込み元フォルダに置いたファイルを選んでください。"}), 400
@@ -10001,8 +12525,9 @@ def job_save():
     db_file = sole[0].name
     draft = {
         "id": body.get("id"),
-        "name": (body.get("name") or "").strip() or Path(body.get("path", "")).stem,
-        "source": body.get("path"), "sheet": body.get("sheet") or None,
+        "name": (body.get("name") or "").strip() or Path(scraper or body.get("path", "")).stem,
+        "source": scraper or body.get("path"), "sheet": body.get("sheet") or None,
+        "source_kind": "scraper" if scraper else "file",
         "header_row": int(body.get("header_row") or 0),
         "delimiter": importer.DELIMITERS.get(body.get("delimiter") or "自動判定"),
         # table=True でないと「まとまり__表名」の __ が _ に潰され、
@@ -10031,9 +12556,26 @@ def job_save():
     else:
         draft["realtime"] = True
         draft["interval_minutes"] = 0
+    if scraper:
+        # どの出来上がりファイルを使うか、1回にどれだけ待つか、質問に応じた
+        # 取り直しを最短で何分あけるか。空なら既定値（validate_job が範囲を見る）
+        draft["scrape_file"] = str(body.get("scrape_file") or "").strip()
+        def_timeout, def_interval = importer.scrape_defaults()
+        draft["scrape_timeout_sec"] = (body.get("scrape_timeout_sec")
+                                       if body.get("scrape_timeout_sec") not in (None, "")
+                                       else def_timeout)
+        # 最小間隔は「質問に応じた取り直し」＝全件入れ替えのときだけ意味を持つ。
+        # 追記では画面の欄も隠れているので、送られてきても既定に戻す
+        draft["scrape_interval_minutes"] = (body.get("scrape_interval_minutes")
+                                            if draft["mode"] != "append"
+                                            and body.get("scrape_interval_minutes") not in (None, "")
+                                            else def_interval)
     errors = jobs.validate_job(draft)
     if errors:
         return jsonify({"error": " / ".join(errors)}), 400
+    if scraper:
+        draft["scrape_timeout_sec"] = int(draft["scrape_timeout_sec"])
+        draft["scrape_interval_minutes"] = int(draft["scrape_interval_minutes"])
     # 同じ取り込み元→同じテーブルは1つだけ。2つあると同時刻に2回追記されて全行が二重になる
     dup = jobs.find_duplicate(draft)
     if dup:
@@ -10061,7 +12603,17 @@ def job_save():
     # 最初の質問が来るまでテーブルができない。
     first = None
     if saved.get("mode") != "append":
-        res = jobs.run_job(saved, kind="job", user=getattr(g.user, "username", None))
+        # スクレイピングは、画面で「試す」を押したときの出来上がりがまだ預かり場所に
+        # あれば、それを使う（登録のために相手サイトへもう一度取りに行かない）。
+        # 無ければ（預かり場所から溢れた等）その場で取りに行く
+        fetched = None
+        if scraper and body.get("upload"):
+            item = _fs_get(body["upload"], g.user.username)
+            if item is not None and item.get("trusted"):
+                fetched = {"files": [{"name": item["filename"], "data": item["data"],
+                                      "sheets": []}]}
+        res = jobs.run_job(saved, kind="job", user=getattr(g.user, "username", None),
+                           fetched=fetched)
         if res.get("ok"):
             catalog.profile_db(config.DATA_DIR / saved["db_file"], force=True)
         else:
@@ -10107,10 +12659,18 @@ def job_update():
         job["interval_minutes"] = jobs.INTERVALS.get(body["interval"], 0)
     if "realtime" in body:
         job["realtime"] = bool(body["realtime"])
+    # スクレイピングの「1回にどれだけ待つか」「質問に応じた取り直しの最小間隔」は
+    # 登録した設定ごとに変えられる（範囲は validate_job が見る）
+    scrape_keys = [k for k in ("scrape_timeout_sec", "scrape_interval_minutes")
+                   if k in body and jobs.is_scraper(job)]
+    for k in scrape_keys:
+        job[k] = body[k]
     # 開始日時は触らないので過去チェックはしない（登録時に済んでいる）
     errors = jobs.validate_job(job, check_start=False)
     if errors:
         return jsonify({"error": " / ".join(errors)}), 400
+    for k in scrape_keys:
+        job[k] = int(job[k])
     jobs.save_job(job)
     return jsonify({"ok": True, "jobs": [_job_row(x) for x in jobs.list_jobs()]})
 
@@ -10913,6 +13473,25 @@ from flask import Blueprint, Response, abort, g, send_file
 bp_api = Blueprint("api", __name__)
 
 
+@bp_api.post("/api/file/save-to-folder")
+@login_required
+def file_save_to_folder():
+    """会話に出たファイルを、出力先フォルダの中の自分の名前のフォルダへ書く（AIは呼ばない）。"""
+    token = str(_body().get("token") or "")
+    item = _fs_get(token, g.user.username)
+    if item is None:
+        return jsonify({"error": "そのファイルはもう手元にありません。"
+                                 "会話を開き直してから、もう一度押してください。"}), 404
+    try:
+        path, replaced = importer.save_to_user_folder(g.user, item["filename"], item["data"])
+    except importer.ImportError_ as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"保存に失敗しました: {e}"}), 500
+    print(f"[output] {g.user.username} → {path}")
+    return jsonify({"ok": True, "path": str(path), "replaced": replaced})
+
+
 @bp_api.get("/api/file/<token>")
 @login_required
 def download(token: str):
@@ -11017,7 +13596,7 @@ def _warn_if_no_admin() -> None:
     print(f"[auth] 警告: 管理者が1人も居ません。{how}"
           "auth.py の ADMIN_PASS を設定してください。"
           "このままではデータカタログ・データ取り込み・モデル設定・メール設定を"
-          "誰も開けません（チャットは使えます）。")
+          "誰も開けません（マイエージェントは使えます）。")
 
 
 def create_app() -> Flask:
@@ -11037,6 +13616,7 @@ def create_app() -> Flask:
 
     app.register_blueprint(bp_auth)
     app.register_blueprint(bp_chat)
+    app.register_blueprint(bp_robots)
     app.register_blueprint(bp_catalog)
     app.register_blueprint(bp_import)
     app.register_blueprint(bp_mail)
@@ -11069,6 +13649,8 @@ def create_app() -> Flask:
 
     # 定期取り込みの裏スレッド。Streamlit版と同じく cron 不要。
     # Flask では起動時に1回通るので、誰かがページを開くのを待たずに動き出す。
+    global _flask_app
+    _flask_app = app                          # マイロボットの定期実行（要求の外で動かす）に使う
     scheduler.start()
     return app
 
@@ -11167,7 +13749,11 @@ def _mu_cmd_remove(args):
     users.pop(i)
     auth.save_users_file(data)
     print(f"削除しました: {args.username}")
-    print("※ 個人カタログ（data/users/配下）は残ります。不要なら手動で削除してください。")
+    stopped = stop_robots_of(args.username)
+    if stopped:
+        print(f"※ この人のマイロボットの定期実行と自動送信を止めました（{len(stopped)}件）: "
+              + "、".join(stopped))
+    print("※ 個人カタログ・会話・マイロボット（data/users/配下）は残ります。不要なら手動で削除してください。")
 
 
 def users_cli(argv=None):

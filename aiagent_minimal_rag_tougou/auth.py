@@ -95,8 +95,15 @@ class User:
 
     @property
     def safe_key(self) -> str:
-        """フォルダ名に使える識別子（個人カタログの保存先）。"""
-        return "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in self.username)[:64]
+        """フォルダ名に使える識別子（個人カタログの保存先）。
+
+        "." と ".." はそのまま通すと data/users の外（親フォルダ）を指してしまう。
+        "." 始まりの名前は隠しフォルダになる。どちらも頭に _ を付けて逃がす。
+        """
+        key = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in self.username)[:64]
+        if not key or key.startswith("."):
+            key = "_" + key
+        return key
 
 
 # --- パスワードのハッシュ（localプロバイダ用） --------------------------------------

@@ -3044,7 +3044,8 @@ def questions(records: list[dict]) -> dict:
     # 形態素解析を入れてまで出す価値のある表ではないと判断して廃止した。
     notes = [_period_note(records),
              f"質問 {len(asked)} 件を記録しています。",
-             "うまく答えられた質問は、チャットの⭐から例文としてカタログに登録できます。"
+             "うまく答えられた質問は、マイエージェントの「この質問と答え方を例文にする」から"
+             "例文としてカタログに登録できます。"
              "例文が増えるほど、同じ聞き方への精度が上がります。"]
     failed = sum(1 for *_, bad in asked if bad)
     if failed:
@@ -7161,41 +7162,49 @@ def _cells(entry: dict) -> int:
     return len(entry["rows"]) * max(1, len(entry["columns"]))
 
 
+#: 置き場の出し入れを直列にする。定期実行のスレッドと画面の要求が同時に道具を使うようになったため
+#: （片方が数えている最中にもう片方が足すと、途中で落ちる）
+_store_lock = threading.RLock()
+
+
 def _evict() -> None:
     """上限を超えたぶんを、古い順に捨てる。"""
-    while len(_store) > MAX_ENTRIES:
-        _store.popitem(last=False)
-    total = sum(_cells(e) for e in _store.values())
-    while total > MAX_CELLS and len(_store) > 1:
-        _, old = _store.popitem(last=False)
-        total -= _cells(old)
+    with _store_lock:
+        while len(_store) > MAX_ENTRIES:
+            _store.popitem(last=False)
+        total = sum(_cells(e) for e in _store.values())
+        while total > MAX_CELLS and len(_store) > 1:
+            _, old = _store.popitem(last=False)
+            total -= _cells(old)
 
 
 def put(scope: list[dict], columns: list, rows: list, truncated: bool = False,
         sql: str | None = None, label: str | None = None) -> str:
     """結果を預けて result_id を返す。"""
     rid = "r_" + uuid.uuid4().hex[:8]
-    _store[rid] = {
-        "scope": scope_key(scope),
-        "columns": list(columns),
-        "rows": [tuple(r) for r in rows],
-        "truncated": bool(truncated),
-        "sql": sql,
-        "norm_sql": normalize_sql(sql) if sql else "",
-        "turn": current_turn(),
-        "label": label,
-    }
-    _evict()
+    with _store_lock:
+        _store[rid] = {
+            "scope": scope_key(scope),
+            "columns": list(columns),
+            "rows": [tuple(r) for r in rows],
+            "truncated": bool(truncated),
+            "sql": sql,
+            "norm_sql": normalize_sql(sql) if sql else "",
+            "turn": current_turn(),
+            "label": label,
+        }
+        _evict()
     return rid
 
 
 def get(scope: list[dict], rid: str) -> dict | None:
     """預けた結果を取り出す。無い・別のDBの組み合わせ、のときは None。"""
-    entry = _store.get(str(rid or ""))
-    if entry is None or entry["scope"] != scope_key(scope):
-        return None
-    _store.move_to_end(rid)          # 使ったものは新しい扱いにして残す
-    return entry
+    with _store_lock:
+        entry = _store.get(str(rid or ""))
+        if entry is None or entry["scope"] != scope_key(scope):
+            return None
+        _store.move_to_end(rid)          # 使ったものは新しい扱いにして残す
+        return entry
 
 
 def find_by_sql(scope: list[dict], sql: str) -> str | None:
@@ -7214,10 +7223,11 @@ def find_by_sql(scope: list[dict], sql: str) -> str | None:
     if not want:
         return None
     key = scope_key(scope)
-    for rid, entry in reversed(_store.items()):
-        if (entry.get("turn") == turn and entry.get("scope") == key
-                and entry.get("norm_sql") == want):
-            return rid
+    with _store_lock:
+        for rid, entry in reversed(list(_store.items())):
+            if (entry.get("turn") == turn and entry.get("scope") == key
+                    and entry.get("norm_sql") == want):
+                return rid
     return None
 
 
@@ -9053,6 +9063,32 @@ def _allow_result_id(node) -> None:
 
 
 _allow_result_id(BUILTIN_TOOLS)
+
+#: ファイルを作る道具に付ける「フォルダにも置く」の引数。dispatch が一括で面倒を見る
+_SAVE_TO_FOLDER = {
+    "type": "boolean",
+    "description": "利用者が「フォルダに出力して」「共有フォルダに保存して」のように、"
+                   "ダウンロードではなく決まった置き場への保存を頼んだときだけ true。"
+                   "置き場は管理者が決めた出力先フォルダの中の、その利用者の名前のフォルダ。",
+}
+_FOLDER_STAMP = {
+    "type": "boolean",
+    "description": "フォルダに置くファイル名に日時を付けるか。既定 true。利用者が「日時なしで」"
+                   "「名前は固定で」「いつも同じ名前で」と言ったら false（毎回同じ名前になる）。",
+}
+_FOLDER_OVERWRITE = {
+    "type": "boolean",
+    "description": "フォルダに同じ名前のファイルがあるとき置き換えるか。既定 false（_2, _3 を付けて残す）。"
+                   "利用者が「置き換えて」「上書きで」「最新だけ残して」と言ったら true。",
+}
+FOLDER_TOOLS = {"export_excel", "export_csv", "export_text", "export_pptx", "export_docx"}
+for _t in BUILTIN_TOOLS:
+    if _t["function"]["name"] in FOLDER_TOOLS:
+        _p = _t["function"]["parameters"]["properties"]
+        _p["save_to_folder"] = dict(_SAVE_TO_FOLDER)
+        _p["folder_stamp"] = dict(_FOLDER_STAMP)
+        _p["folder_overwrite"] = dict(_FOLDER_OVERWRITE)
+del _t, _p
 
 # plot_chart は用途別のグラフツール（plot_comparison など）で完全に置き換えられる。
 # 同じことが2通りでできると、AIはどちらを使うか毎回迷い、定義の文字数も倍かかる。
@@ -11923,7 +11959,7 @@ def _search_knowledge_base(args: dict, scope: list[dict]) -> dict:
             note = (f"文章は {dropped} 件見つかりましたが、1件も参考情報に入りませんでした"
                     "（1件あたりが長く、渡せる文字数の上限を超えたため）。"
                     "「見つからなかった」とは言わないこと。"
-                    "利用者には、チャット画面の検索設定で"
+                    "利用者には、マイエージェント画面のサイドバーにある検索設定で"
                     "「参考情報の文字数上限」を上げるよう案内すること。")
         return {"ok": True, "llm_content": _json({
             "tool": "search_knowledge_base",
@@ -12436,7 +12472,7 @@ def dispatch(name: str, arguments_json: str | None, scope: list[dict],
     handler = _HANDLERS.get(name)
     if handler:
         try:
-            return _attach_verification(handler(args, scope), sqls, scope)
+            return _attach_folder_save(args, _attach_verification(handler(args, scope), sqls, scope))
         except Exception as e:  # ツールの例外でアプリを落とさない
             return _err(f"ツール '{name}' の実行でエラー: {e}")
 
@@ -12445,9 +12481,42 @@ def dispatch(name: str, arguments_json: str | None, scope: list[dict],
         return {"ok": False, "llm_content": _json({"error": f"未知のツール: {name}"}), "render": None}
     try:
         sqls.append(render_sql(tool))
-        return _attach_verification(_run_custom(tool, args, scope), sqls, scope)
+        return _attach_folder_save(args, _attach_verification(_run_custom(tool, args, scope), sqls, scope))
     except Exception as e:
         return _err(f"ツール '{name}' の実行でエラー: {e}")
+
+
+def _attach_folder_save(args: dict, res: dict) -> dict:
+    """save_to_folder: true のとき、出来たファイルを出力先フォルダの利用者名フォルダにも書く。
+
+    ファイルを作る道具はどれも render に {kind: "file", filename, data} を返すので、
+    1つずつ手で足さず、ここで一括して面倒を見る。失敗してもダウンロードは残る。
+    """
+    if not isinstance(res, dict) or not args.get("save_to_folder"):
+        return res
+    render = res.get("render") or {}
+    if render.get("kind") != "file" or not render.get("data"):
+        return res
+    import importer
+    try:
+        path, replaced = importer.save_to_user_folder(
+            _current_user(), render.get("filename") or "file", render["data"],
+            stamp=args.get("folder_stamp") is not False,      # 省略時は日時を付ける
+            overwrite=bool(args.get("folder_overwrite")))
+        render["saved_to"] = str(path)
+        render["replaced"] = replaced
+        note = f"フォルダにも保存した: {path}" + ("（前のファイルを置き換えた）" if replaced else "")
+    except Exception as e:
+        render["save_error"] = str(e)
+        note = f"フォルダへの保存は失敗（ダウンロードはできる）: {e}"
+    try:
+        data = json.loads(res.get("llm_content") or "{}")
+        if isinstance(data, dict):
+            data["folder"] = note
+            res["llm_content"] = _json(data)
+    except (ValueError, TypeError):
+        pass
+    return res
 
 
 # ==========================================================================
@@ -12793,13 +12862,14 @@ def expand_tables_by_relations(picked: dict, scope: list[dict]) -> dict:
 # --- system prompt -----------------------------------------------------------
 
 def build_system_prompt(scope: list[dict], admin: bool = False,
-                        model: str | None = None) -> str:
+                        model: str | None = None, memory: str = "") -> str:
     """選択スコープのデータカタログを埋め込んだ system prompt を組み立てる。
 
     admin は「管理者だけに渡すツール」を一覧に載せるかどうか。
     渡していないツールを説明に書くと、AIが呼ぼうとして失敗するだけになる。
     model を渡すと、カタログをインラインするかの判定を「そのモデルが読める量」で行う
     （渡さなければ管理者設定/envの上限）。
+    memory は利用者の覚え書きの節（core.memory_prompt）。空なら載せない。
     """
     inline_cap = None
     if model:
@@ -12835,6 +12905,13 @@ def build_system_prompt(scope: list[dict], admin: bool = False,
     # 見せるのは、その利用者がサイドバーで選んでいるものだけ。外したものまで
     # 並べると「選んでいないものの中身」を語り出す。
     kbs = rag_targets()
+    # 出力先フォルダ（管理者が決める）が設定されているかで、AIの案内を変える。
+    # 設定の有無だけを見る（書けるかは実際に書くときに確かめ、失敗は道具が伝える）
+    import importer as _imp
+    folder_note = ("出力先フォルダは設定済みで使える。" if _imp.output_dir() is not None
+                   else "いまは管理者が出力先フォルダを設定していないので使えない。頼まれたら"
+                        "ダウンロードで渡したうえで、管理者に設定を頼むよう伝える。")
+
     kb_note = ""
     if kbs:
         kb_lines = "\n".join(
@@ -12964,6 +13041,12 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
 - ファイル出力ツールを呼んだ後は、画面に保存済み。中身の全件を文章で繰り返さず、
   何を入れたかだけ簡潔に伝える。ダウンロードのリンクやURLを自分で書かないこと
   （画面に本物のダウンロードボタンが出る。あなたが書くリンクは偽物になり押せない）。
+- 「フォルダに出力して」「共有フォルダに保存」のように、ダウンロードではなく決まった置き場への
+  保存を頼まれたら、そのファイル出力ツールに save_to_folder: true を付けて呼ぶ。置き場は
+  管理者が決めた出力先フォルダの中の、その利用者の名前のフォルダ（パスは指定できない）。
+  「日時なしで」「いつも同じ名前で」と言われたら folder_stamp: false、「置き換えて」「上書きで」
+  「最新だけ残して」と言われたら folder_overwrite: true も付ける（言われなければ付けない）。
+  結果の folder に保存先が返るので、それを利用者に伝える。{folder_note}
 - **表に無いデータもファイルにできる。** 社内文書を調べて分かったこと、会話の中で
   決まったこと、あなたが自分で整理した表は、sql の代わりに rows で渡す。
   データが1つも無い環境でも、これで Excel / CSV / グラフ / レポートを作れる。
@@ -12971,7 +13054,17 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
     rows: [["分類A", 47], ["分類B", 18]] と columns: ["分類", "値"]
   「データが無いので出力できません」と答えてはいけない。rows を使うこと。
 
-# 利用可能なツール
+# マイロボット（画面の機能。あなたが登録・実行するものではない）
+- 利用者が気に入った処理の流れ（あなたが使った道具の列）に名前を付けて保存し、あとでAIなしで
+  同じ手順を繰り返す機能。登録も実行も画面の操作で、あなたにはできない。
+  定期実行（決めた時刻に自動で動く）と「実行のたびにメールの下書きをそのまま送る」設定も、
+  登録するときとマイロボットの画面で本人が決める。あなたが設定したり予約したりすることはできない。
+- 「マイロボットに登録して」「ロボットにして」「毎朝送って」と言われたら、頻度や通知先などを聞き返さず、
+  次の手順だけを案内する: 「登録したい質問（自分の吹き出し）の右上に出る『ロボットにする』を
+  押し、含める質問にチェックして名前を付けて保存します。定期実行やメールの自動送信もその画面で
+  決められます。実行はメニューの『マイロボット』からです」。
+
+{memory}# 利用可能なツール
 {tool_list}
 
 {kb_note}{stale_note}# SQLルール
@@ -13332,7 +13425,7 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
 
 # --- AI下書き（データカタログ用） ----------------------------------------------
 
-def _ask_json(system: str, user: str, what: str = "AIの応答") -> dict:
+def _ask_json(system: str, user: str, what: str = "AIの応答", model: str | None = None) -> dict:
     """AIに聞いて、応答からJSONオブジェクトを取り出す。
 
     下書き系（表の説明・用語のSQL式・ビュー・ツール）が全部この形なので、
@@ -13341,7 +13434,7 @@ def _ask_json(system: str, user: str, what: str = "AIの応答") -> dict:
     what はエラー文に出す呼び名（どの下書きで失敗したかが分かるように）。
     """
     resp = _create(
-        model=config.OPENAI_MODEL,
+        model=model or config.OPENAI_MODEL,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
         temperature=0,
@@ -13697,6 +13790,73 @@ def draft_view(db_path, purpose: str, previous: dict | None = None,
         "sql": sql,
         "explanation": str(data.get("explanation") or "").strip(),
     }
+
+
+_EXPLAIN_SQL_SYSTEM = """あなたはSQLiteに詳しいデータ分析アプリの説明担当です。
+与えられたSQL（ビューの定義）が何をしているかを、SQLを読めない人にも分かる日本語で解説してください。
+SQLは書き換えません。解説だけを書きます。
+
+出力形式（JSON以外の文字を含めないこと）:
+{
+  "explanation": "解説"
+}
+
+explanation（解説）の書き方:
+- 日本語で3〜6行。SQLを読めない人にも分かる言葉で書く。
+- 「どの表を使うか」「どうつないだか（結合の条件と理由）」「どう絞ったか／集計したか」
+  「1行が何を表すか」の順に書く。
+- SQLの構文用語（INNER JOIN など）をそのまま並べない。何をしているかを説明する。
+- 表や列の意味は、与えられたカタログの説明に従う。カタログに無いことは推測で断定しない。"""
+
+
+def explain_sql(db_path, sql: str, tables: list[str] | None = None) -> str:
+    """SQLの日本語の解説を書かせる（ビューの「SQLを自分で書く」で作ったとき用）。
+
+    tables を渡すと、その表のカタログだけを見せる（全表を見せるより短く、的も外さない）。
+    """
+    import db                       # 循環importを避けるため、使うときに読む
+
+    paths = [Path(db_path)] if db_path else db.list_db_files()
+    context = catalog.prompt_for_scope(
+        [{"path": str(p), "alias": db.alias_for(p), "tables": (tables or None)} for p in paths])
+    data = _ask_json(_EXPLAIN_SQL_SYSTEM, f"{context}\n\nSQL:\n{sql}", "SQLの解説")
+    return str(data.get("explanation") or "").strip()
+
+
+_MEMORY_SYSTEM = """あなたは、社内データ分析アプリの利用者について「次回以降の質問でも使える事実」を覚える係です。
+いま覚えている本文と、直近のやり取り（利用者の質問と、AIの回答）を渡します。
+本文を読み直して、必要なら書き直した本文を JSON で返してください。
+
+本文の書き方:
+- 箇条書き。1行に1つの事実。「- 」で始め、60字以内の「〜は〜」の形で、主語を省かない。
+- 覚えるのは利用者本人について、今後の質問に効くことだけ:
+  ・前提: 所属・担当・よく見る表や範囲、用語の解釈（例「うちの部署は関西工場」「売上は受注ベースで見る」）
+  ・好み: 出力の形式や見せ方（例「Excel で欲しい」「日時なしでフォルダに置く」「グラフは棒がよい」）
+  ・期間: 期間の既定（例「特に言わなければ先月分を見る」「年度は4月始まり」）
+- 覚えないもの: データの中身や集計結果（数字・順位・一覧）、1回きりの指示（「今回は九州も含めて」）、
+  質問の言い回しだけから推測したこと、健康・家族・信条などの私的なこと。利用者がはっきり言ったことだけ。
+- いまの本文の行は、そのまま残す。消してよいのは、利用者が「忘れて」「もう違う」「覚えないで」と言ったものと、
+  新しい発言と矛盾する行（その場合は新しい内容に書き換える）だけ。言い回しを整えるだけの変更はしない。
+- 同じ内容の行を増やさない。本文は30行まで。
+
+出力形式（JSON以外の文字を含めないこと）:
+{"text": "書き直した本文（変える必要が無ければ null）"}
+迷ったら null（変えない）。"""
+
+
+def extract_memory(existing_text: str, question: str, answer: str,
+                   model: str | None = None):
+    """直近のやり取りを踏まえて覚え書きの本文を書き直させる（回答のあとに1回呼ぶ）。
+
+    戻り値は書き直した本文（str）。変えないときは None。
+    使うモデルは呼び元（core._schedule_memory）が決める: 管理者の決めごと > 回答に使ったモデル。
+    """
+    user = (f"いま覚えている本文:\n{(existing_text or '').strip() or '（まだ無い）'}\n\n"
+            f"利用者の質問:\n{str(question or '')[:1000]}\n\n"
+            f"AIの回答（先頭のみ）:\n{str(answer or '')[:1500]}")
+    data = _ask_json(_MEMORY_SYSTEM, user, "覚え書きの書き直し", model=model or None)
+    text = data.get("text")
+    return text if isinstance(text, str) else None
 
 
 def draft_tool(db_path, purpose: str, params_wanted: list[str] | None = None,

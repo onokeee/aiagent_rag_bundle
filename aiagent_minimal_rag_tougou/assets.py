@@ -56,10 +56,6 @@ TEMPLATES = {
       <path d="M4 5.2A2.2 2.2 0 0 1 6.2 3H12v16H6.2A2.2 2.2 0 0 0 4 21.2Z"/>
       <path d="M20 5.2A2.2 2.2 0 0 0 17.8 3H12v16h5.8A2.2 2.2 0 0 1 20 21.2Z"/>
     </symbol>
-    <symbol id="i-model" viewBox="0 0 24 24">
-      <rect x="4.5" y="4.5" width="15" height="15" rx="4"/>
-      <circle cx="12" cy="12" r="3.2"/>
-    </symbol>
     <symbol id="i-mail" viewBox="0 0 24 24">
       <rect x="3" y="5" width="18" height="14" rx="2.5"/>
       <path d="m3.6 6.8 7.3 5.2a2 2 0 0 0 2.2 0l7.3-5.2"/>
@@ -112,9 +108,6 @@ TEMPLATES = {
     </symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9.5 6 6 6-6"/></symbol>
-    <symbol id="i-chart" viewBox="0 0 24 24">
-      <path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>
-    </symbol>
   <symbol id="i-help" viewBox="0 0 24 24">
       <circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.4 2.4 0 1 1 3.3 2.3c-.7.3-.9.8-.9 1.6M12 16.6h.01"/>
     </symbol>
@@ -122,12 +115,39 @@ TEMPLATES = {
       <rect x="3.5" y="4.5" width="17" height="15" rx="2"/>
       <path d="M3.5 9.5h17M9.5 9.5v10"/>
     </symbol>
+  {# ビュー（保存したSELECT）。実体の無い「写し」なので、重なった2枚の紙 #}
+  <symbol id="i-view" viewBox="0 0 24 24">
+      <rect x="7.5" y="3.5" width="13" height="14" rx="2"/>
+      <path d="M3.5 7.5v11a2 2 0 0 0 2 2h11M11 8.5h6M11 12.5h6"/>
+    </symbol>
     <symbol id="i-tool" viewBox="0 0 24 24">
       <path d="M14.5 6.5a4 4 0 0 1 5.2 5.2l-8 8a2.5 2.5 0 0 1-3.6-3.6l8-8"/>
       <path d="m9 9-5.2 5.2a3 3 0 0 0 4.2 4.2"/>
     </symbol>
   </defs>
 </svg>
+""",
+
+# --- _admintabs.html ---
+"_admintabs.html": r"""{# 管理者メニューのタブの帯。どの画面でも同じ並びを出し、いま開いている画面に印を付ける。
+   データカタログの中のタブ（テーブル…ビュー）は、カタログ画面ではその場で切り替えるボタン、
+   ほかの画面ではカタログ画面へ渡すリンク。取り込み以降は画面そのものが別なので常にリンク。
+   使い方: {% from "_admintabs.html" import admintabs %} … <div class="tabs tabs--bar">{{ admintabs('import') }}</div> #}
+{% macro admintabs(active) -%}
+{% for key, label in [('tables', 'テーブル'), ('er', '結合・ER図'), ('glossary', '用語集・例文'), ('tools', 'ツール'), ('views', 'ビュー')] -%}
+{% if active == 'catalog' %}<button class="tab {{ 'is-active' if loop.first }}" data-pane="{{ key }}">{{ label }}</button>
+{% else %}<a class="tab" href="{{ url_for('catalog.index') }}#tab={{ key }}">{{ label }}</a>
+{% endif %}{% endfor -%}
+{% for key, ep, label in [('import', 'imp.index', '取り込み'), ('output', 'imp.output', '出力'), ('sep', '', ''),
+                          ('knowledge', 'knowledge.index', 'ナレッジベース'), ('models', 'models.index', 'モデル設定'),
+                          ('mail', 'mail.index', 'メール設定'), ('robots', 'catalog.robot_settings', 'マイロボット'),
+                          ('memory', 'catalog.memory_admin', '覚え書き'),
+                          ('usage', 'usage.index', '利用状況')] -%}
+{% if key == 'sep' %}<span class="tabs__sep" aria-hidden="true"></span>
+{% elif key == active %}<button class="tab is-active">{{ label }}</button>
+{% else %}<a class="tab" href="{{ url_for(ep) }}">{{ label }}</a>
+{% endif %}{% endfor -%}
+{%- endmacro %}
 """,
 
 # --- base.html ---
@@ -145,7 +165,7 @@ TEMPLATES = {
 {% include "_icons.html" %}
 <div class="layout">
   <aside class="sidebar" id="sidebar">
-    {# 管理者以外はチャットしか使えないので、行き先が1つだけのメニューは出さない。
+    {# 管理者以外はマイエージェントしか使えないので、行き先が1つだけのメニューは出さない。
        URLを直に叩かれても admin_required で止まるので、ここは見た目の整理。 #}
     {# 各画面が何をする所かは data-desc に持たせ、マウスを乗せたときに出す。
        画面の上に固定で置くと、毎回読むものでもないのに場所だけ取り続けるため。
@@ -154,31 +174,37 @@ TEMPLATES = {
     <div class="sidebar__section">
       <a class="navlink {{ 'is-active' if nav.startswith('chat.') }}" href="{{ url_for('chat.index') }}"
          data-desc="データについて日本語で質問すると、AIがSQLを書いて答えます。">
-        {{ icon('chat') }} チャット</a>
-      <a class="navlink {{ 'is-active' if nav.startswith('catalog.') or nav.startswith('imp.') }}" href="{{ url_for('catalog.index') }}"
-         data-desc="データとテーブルの説明・結合・用語・例文・ツール・取り込み。ここに書いた内容がそのまま AI の理解になります。">
-        {{ icon('catalog') }} データカタログ</a>
-      <a class="navlink {{ 'is-active' if nav.startswith('knowledge.') }}" href="{{ url_for('knowledge.index') }}"
-         data-desc="社内文書を検索するナレッジベース（LightRAG）の接続先を登録します。ここに書いた説明が、AIがどのナレッジベースを調べるかの判断材料になります。">
-        {{ icon('book') }} ナレッジベース</a>
-      <a class="navlink {{ 'is-active' if nav.startswith('models.') }}" href="{{ url_for('models.index') }}"
-         data-desc="チャット画面で選べるモデルを決めます。">
-        {{ icon('model') }} モデル設定</a>
-      <a class="navlink {{ 'is-active' if nav.startswith('mail.') }}" href="{{ url_for('mail.index') }}"
-         data-desc="送信サーバ・差出人・送ってよい宛先を決めます。">
-        {{ icon('mail') }} メール設定</a>
-      <a class="navlink {{ 'is-active' if nav.startswith('usage.') }}" href="{{ url_for('usage.index') }}"
-         data-desc="このアプリの使われ方の集計（管理者だけ）。">
-        {{ icon('chart') }} 利用状況</a>
+        {{ icon('chat') }} マイエージェント</a>
+      <a class="navlink {{ 'is-active' if nav.startswith('robots.') }}" href="{{ url_for('robots.index') }}"
+         data-desc="保存した処理の流れ。押すと同じ手順をAIなしでそのまま実行します。作るのはマイエージェントの発言の「ロボットにする」から。">
+        {{ icon('spark') }} マイロボット</a>
+      {% if memory_feature %}
+      <a class="navlink {{ 'is-active' if nav == 'chat.memory' }}" href="{{ url_for('chat.memory') }}"
+         data-desc="AIがあなたについて覚えていること（前提・好み・期間）。会話から自動で書き足され、ここで直せます。本人だけのものです。">
+        {{ icon('user') }} 覚え書き</a>
+      {% endif %}
+      {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
+         データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・利用状況 #}
+      <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.')) }}" href="{{ url_for('catalog.index') }}"
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、覚え書き、利用状況を、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+        {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
     <div class="sidebar__section">
-      {# 上の「チャット」は管理者限定の囲みの中にある。一般利用者は
+      {# 上の「マイエージェント」は管理者限定の囲みの中にある。一般利用者は
          ヘルプやテーブル画面を開くと、戻る道が無くなってしまうのでここにも置く #}
       {% if not user.is_admin %}
       <a class="navlink {{ 'is-active' if nav.startswith('chat.') }}" href="{{ url_for('chat.index') }}"
          data-desc="データについて日本語で質問すると、AIがSQLを書いて答えます。">
-        {{ icon('chat') }} チャット</a>
+        {{ icon('chat') }} マイエージェント</a>
+      <a class="navlink {{ 'is-active' if nav.startswith('robots.') }}" href="{{ url_for('robots.index') }}"
+         data-desc="保存した処理の流れ。押すと同じ手順をAIなしでそのまま実行します。作るのはマイエージェントの発言の「ロボットにする」から。">
+        {{ icon('spark') }} マイロボット</a>
+      {% if memory_feature %}
+      <a class="navlink {{ 'is-active' if nav == 'chat.memory' }}" href="{{ url_for('chat.memory') }}"
+         data-desc="AIがあなたについて覚えていること（前提・好み・期間）。会話から自動で書き足され、ここで直せます。本人だけのものです。">
+        {{ icon('user') }} 覚え書き</a>
+      {% endif %}
       {% endif %}
       <a class="navlink {{ 'is-active' if nav.startswith('help.') }}" href="{{ url_for('help.index') }}"
          data-desc="全機能の説明書と、システム構成の説明。">
@@ -234,13 +260,16 @@ TEMPLATES = {
 # --- catalog.html ---
 "catalog.html": r"""{% extends "base.html" %}
 {% from "_icons.html" import icon %}
-{% block title %}データカタログ — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 
 {% block body %}
 <div class="content content--wide">
 {% if not target %}
+  {# DBが無くても、モデル設定・取り込みなどほかのタブへは行けるようにする #}
+  <div class="tabs tabs--bar">{{ admintabs('') }}</div>
   <div class="empty">
     <div class="empty__icon">{{ icon('database') }}</div>
     <div>データがまだ取り込まれていません。</div>
@@ -254,12 +283,7 @@ TEMPLATES = {
      縦を60px以上使い、いちばん見たいテーブル一覧が画面から押し出される。
      充実度はクリックでそのタブへ移動する（テーブル説明は未記入だけに絞って開く）。 #}
   <div class="tabs tabs--bar">
-    <button class="tab is-active" data-pane="tables">テーブル</button>
-    <button class="tab" data-pane="er">結合・ER図</button>
-    <button class="tab" data-pane="glossary">用語集・例文</button>
-    <button class="tab" data-pane="tools">ツール</button>
-    <button class="tab" data-pane="views">ビュー</button>
-    <a class="tab" href="{{ url_for('imp.index') }}">取り込み</a>
+    {{ admintabs('catalog') }}
 
     <div class="tabs__end">
       <div class="metrics metrics--inline">
@@ -344,6 +368,8 @@ TEMPLATES = {
     {% for t in g.tables %}
     <details class="acc" data-table="{{ t.name }}">
       <summary>
+        {# 種類のアイコン（格子＝表、重なった紙＝ビュー）。マイエージェントのサイドバー・ER図と同じ #}
+        <span class="dbpick__kind" title="{{ 'ビュー（保存したSELECT）' if t.is_view else 'テーブル' }}">{{ icon('view' if t.is_view else 'table', 'icon--sm') }}</span>
         <strong>{{ t.name }}</strong>
         {% if t.is_view %}<span class="badge" title="実体を持たないビュー。定義の変更は「ビュー」タブで行います">ビュー</span>{% endif %}
         <span class="muted small">{{ '{:,}'.format(t.rows) if t.rows is not none else '行数不明' }} / {{ t.columns|length }}列</span>
@@ -435,6 +461,8 @@ TEMPLATES = {
                   aria-label="やり直す" data-tip="やり直す（Ctrl+Y）">{{ icon('redo') }}</button>
         </span>
         <button class="btn btn--sm" id="erFull">全画面</button>
+        <button class="btn btn--sm" id="erArrange"
+                title="表示中の表を関連にそって並べ直します（参照される側の表を右に、つながりのない表は下にまとめて）。&#10;この配置で残すには保存を押してください。Ctrl+Z で戻せます">整列</button>
         {% if grouped %}
         {# 表が多いときの絞り込み。元DB（表名の「__」より前）単位で表示する #}
         <select id="erGroup" style="width:auto"
@@ -513,7 +541,7 @@ TEMPLATES = {
       <div class="card">
         <div class="card__desc">
           <b>一致するはずの2つの数字</b>を登録しておくと、AIがそのテーブルに触れる
-          SQLを実行するたびに自動で突き合わせ、食い違っていたらチャットに警告を出します
+          SQLを実行するたびに自動で突き合わせ、食い違っていたらマイエージェントに警告を出します
           （例: 入金の合計 = 請求のうち入金済みの合計）。
           同じ「売上」でも明細から数えるか請求から数えるかで答えが変わる——
           その食い違いに、聞いた人が気づけるようにする仕組みです。
@@ -541,7 +569,7 @@ TEMPLATES = {
           正しいと確認済みの質問とSQLの組。そのままAIのお手本になります（最大{{ examples_max }}件）。
           <b>説明は任意です。</b>「なぜこの書き方なのか」「どこに気をつけるか」を書いておくと、
           AIは似た質問のときも同じ勘所を守ります。
-          チャットで回答が正しかったときの「この質問とSQLを例文として保存」からも増えます。
+          マイエージェントで回答が正しかったときの「この質問とSQLを例文として保存」からも増えます。
         </div>
         <div class="row mb" style="align-items:center">
           <input type="text" id="exFilter" style="max-width:260px"
@@ -603,7 +631,8 @@ TEMPLATES = {
       <div class="card__desc">
         よく使う結合や絞り込みに名前を付けて保存します。<b>データは複製されず</b>、
         開くたびに元のテーブルから最新が計算されます。<br>
-        登録するとテーブルと同じ扱いになり、テーブル一覧・ER図・チャットの表選択に出ます。
+        登録するとテーブルと同じ扱いになり、テーブル一覧・ER図・マイエージェントの表選択に出ます
+        （名前の前のアイコンで見分けられます: 格子＝表、重なった紙＝ビュー。マウスを乗せると「ビュー」と出ます）。
         説明や列の説明、用語も<b>テーブルと同じように付けられます</b>（「テーブル」タブで編集）。
       </div>
       <div id="viewList"></div>
@@ -630,20 +659,27 @@ TEMPLATES = {
         <textarea id="viewSql" rows="8" class="mono" style="width:100%"
                   placeholder="SELECT ..."></textarea>
         <div id="viewExplain"></div>
-        <div class="row mt mb">
-          <button class="btn btn--sm" id="viewRun">実データで動かして確かめる</button>
+        <div id="viewUsed"></div>
+        <div class="row mt mb" style="align-items:center;gap:10px;flex-wrap:wrap">
+          <button class="btn btn--sm" id="viewExport"
+                  title="このSQLを実データで動かし、結果を全件 Excel にしてダウンロードします（下に先頭の行も出ます）">結果をExcelでダウンロード</button>
+          <button class="btn btn--sm" id="viewExplainBtn"
+                  title="いま書いてあるSQLの解説（このSQLがしていること）と、使ったデータ（読む表と列）を出します。自分で書いたSQLや、直したあとに">AIに解説を書かせる</button>
+          <span class="small muted">保存前でも、いま書いてあるSQLで動かします</span>
         </div>
         <div id="viewPreview"></div>
 
-        <label class="field mt">3. 名前と説明</label>
-        <div class="row mb">
-          <input type="text" id="viewName" class="mono" style="max-width:320px"
-                 placeholder="まとまり__名前">
+        <label class="field mt">3. まとまり・名前・説明</label>
+        <div class="row mb" style="flex-wrap:wrap;align-items:center;gap:6px">
+          <select id="viewGroup" style="max-width:240px" title="まとまり（表と同じ接頭辞）"></select>
+          <input type="text" id="viewGroupNew" class="mono hidden" style="max-width:200px" placeholder="新しいまとまり名">
+          <span class="mono muted">__</span>
+          <input type="text" id="viewNameBody" class="mono" style="max-width:240px" placeholder="名前（例: 発注一覧）">
           <input type="text" id="viewDesc" class="grow"
                  placeholder="この一覧が何かの説明（AIが読みます）">
         </div>
-        <div class="small muted mb">
-          名前は「まとまり__名前」の形にしてください（まとまりは表と同じ接頭辞）。
+        <div class="small muted mb" id="viewNameHint">
+          まとまりは既存から選ぶか「＋ 新しいまとまりを作る」で作ります（取り込みと同じ）。保存する名前は「まとまり__名前」です。
           説明はそのままAIに渡り、どんなときに使うかの判断材料になります。
         </div>
         <div class="row">
@@ -670,7 +706,6 @@ TEMPLATES = {
 <script>
 window.CAT = {
   db: {{ target|tojson }},
-  grouped: {{ grouped|tojson }},
   examplesMax: {{ examples_max|tojson }},
   er: {{ er|tojson }},
   suggestions: {{ suggestions|tojson }},
@@ -688,8 +723,7 @@ window.CAT = {
   llmReady: {{ llm_ready|tojson }},
   // グラフ種別ごとの必須項目。種別によって要る欄が違うので、
   // サーバの定義をそのまま渡して画面側で入力欄を出し分ける
-  chartFields: {{ chart_fields|tojson }},
-  intervals: {{ intervals|tojson }}
+  chartFields: {{ chart_fields|tojson }}
 };
 window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(true) };
 </script>
@@ -700,8 +734,8 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
 # --- chat.html ---
 "chat.html": r"""{% extends "base.html" %}
 {% from "_icons.html" import icon %}
-{% block title %}チャット — {{ app_title }}{% endblock %}
-{# チャットだけ画面固定（ログの中をスクロールさせる）。CSSの .is-chat 参照 #}
+{% block title %}マイエージェント — {{ app_title }}{% endblock %}
+{# この画面だけ画面固定（ログの中をスクロールさせる）。CSSの .is-chat 参照 #}
 {% block body_class %}is-chat{% endblock %}
 {# 見出しは置かない。何の画面かはサイドバーで分かるので、ログに縦を使う。 #}
 
@@ -743,16 +777,22 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
     {% if data.problem %}
     <div class="small muted" style="margin-bottom:6px">⚠ {{ data.problem }}</div>
     {% endif %}
-    {% macro table_row(t) %}
+    {# prefix はまとまり名。見出しに出ているので、表の行では「まとまり__」を省いて名前だけ見せる
+       （データ属性と説明の見出しは正式名のまま。AIやSQLで使うのは正式名） #}
+    {% macro table_row(t, prefix='') %}
+      {% set short = t.name[(prefix|length) + 2:] if prefix and t.name.startswith(prefix ~ '__') else t.name %}
       <div class="dbpick__table">
         <input type="checkbox" class="tblpick" data-table="{{ t.name }}"
                {{ 'checked' if t.on }} title="AIが使う対象にする">
+        {# 表とビューの見分け: 格子＝表、重なった紙＝ビュー（保存したSELECT） #}
+        <span class="dbpick__kind" title="{{ 'ビュー（保存したSELECT。実体は無く、開くたびに計算します）' if t.type == 'view' else 'テーブル' }}">{{ icon('view' if t.type == 'view' else 'table', 'icon--sm') }}</span>
         <a href="{{ url_for('tableview.index') }}?db={{ data.db|urlencode }}&table={{ t.name|urlencode }}"
            target="_blank" rel="noopener" class="dbpick__tname"
-           data-desc-title="{{ t.name }}" data-desc="{{ t.description }}{% if t.problem %}
+           data-desc-title="{{ t.name }}{% if t.type == 'view' %}（ビュー）{% endif %}" data-desc="{% if t.type == 'view' %}ビュー: 保存したSELECT。実体は無く、開くたびに元の表から計算します。
+{% endif %}{{ t.description }}{% if t.problem %}
 ⚠ 定期取り込み: {{ t.problem }}{% endif %}
 （クリックで中身を別タブで開きます）"
-           data-desc-meta="{{ '{:,}行'.format(t.rows) if t.rows is not none else '行数不明' }} / {{ t.columns }}列">{{ t.name }}</a>
+           data-desc-meta="{{ '{:,}行'.format(t.rows) if t.rows is not none else '行数不明' }} / {{ t.columns }}列">{{ short }}</a>
         {% if t.problem %}<span class="warnmark" title="{{ t.problem }}">{{ icon('alert', 'icon--sm') }}</span>{% endif %}
       </div>
     {% endmacro %}
@@ -768,7 +808,7 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
           <span class="badge">{{ g.tables|length }}</span>
         </div>
         <div class="dbpick__tables">
-          {% for t in g.tables %}{{ table_row(t) }}{% endfor %}
+          {% for t in g.tables %}{{ table_row(t, g.key) }}{% endfor %}
         </div>
       </div>
       {% else %}
@@ -810,7 +850,7 @@ window.MANAGE = { intervals: {{ intervals|tojson }}, refresh: () => loadManage(t
 
 <details class="sidebar__section sbsec" id="secHistory" open>
   <summary>
-    <span class="sidebar__label">チャット履歴</span>
+    <span class="sidebar__label">会話の履歴</span>
     <button class="btn btn--sm sbsec__act" id="newChat">＋ 新規</button>
   </summary>
   <div class="sbsec__body">
@@ -861,7 +901,12 @@ window.CHAT_INIT = {
   autoDownload: {{ auto_download|default(true)|tojson }},
   llmReady: {{ llm_ready|tojson }},
   isAdmin: {{ user.is_admin|tojson }},
+  folderOut: {{ folder_out|default(false)|tojson }},
   knowledge: {{ knowledge|tojson }},
+  memory: {{ memory|tojson }},
+  robotIntervals: {{ robot_intervals|tojson }},
+  robotMinIntervalHours: {{ robot_min_hours|tojson }},
+  schedulerOn: {{ scheduler_on|tojson }},
   starters: {{ starters|tojson }}
 };
 </script>
@@ -903,7 +948,7 @@ window.CHAT_INIT = {
   <h2 id="manual" class="mt" style="font-size:20px">第1部 全機能の説明書</h2>
 
   <div class="card mt">
-    <div class="card__title">1. チャット</div>
+    <div class="card__title">1. マイエージェント</div>
     <div class="card__desc">全員が使えるメイン画面。データと文書について日本語で質問すると、AIが調べて答えます。</div>
     <div class="tablewrap">
       <table class="data">
@@ -917,6 +962,14 @@ window.CHAT_INIT = {
                   文書の質問（手順・原因・規則）はナレッジベースを検索し、<b>[出典n]の番号つき</b>で
                   答えます。両方を組み合わせた質問（「一番停止が多い装置の対処方法は？」）もそのまま
                   聞けます。範囲の取り方で答えが変わる質問には、AIのほうから確認してきます。</td></tr>
+          <tr><td>覚え書き</td>
+              <td>ChatGPT のメモリと同じ発想。回答のあとにAIがもう一度だけ働き、やり取りの中から
+                  <b>次回以降の質問でも使える前提・好み・期間</b>（「うちの部署は関西工場」「Excel で欲しい」
+                  「特に言わなければ先月分」）を、あなたの覚え書き（1つの本文）に書き足します。データの中身や1回きりの指示は覚えません。
+                  次の質問からAIに渡り、使ったときは回答の末尾に「（覚え書き「…」を使いました）」と出ます。
+                  メニューの「<b>覚え書き</b>」（マイロボットの下）で本文をそのまま読んで直せます。「覚えない」にすると止まり、
+                  いまの本文もAIに渡しません。会話で「忘れて」と言えば、その回答のあとに消えます（消えていなければ本文から消してください）。
+                  他の利用者には見えませんが、<b>管理者は管理者メニューで内容を見られます</b>（利用状況の質問履歴と同じ扱い）。</td></tr>
           <tr><td>モデルの選択</td>
               <td>サイドバー上部のプルダウン。候補は管理者が「モデル設定」で決めた一覧で、選択は
                   利用者ごとに保存されます。「画像OK」の表示があるモデルでは、貼り付け（Ctrl+V）や
@@ -957,7 +1010,74 @@ window.CHAT_INIT = {
   </div>
 
   <div class="card mt">
-    <div class="card__title">使い方の注意（チャット）</div>
+    <div class="card__title">1-2. マイロボット（気に入った処理の流れを保存して、AIなしで繰り返す）</div>
+    <div class="card__desc">
+      マイエージェントとのやり取りの中でAIが実際に使った道具（SQLの実行・グラフ・Excel作成・メール下書き…）の
+      並びに名前を付けて保存し、あとから同じ順にそのまま実行します。AIは介在しないので、
+      <b>数字は毎回同じ・待ち時間なし・LLMの費用なし</b>。月次で同じ集計を同じ形で出す、といった定型作業向けです。
+    </div>
+    <div class="tablewrap">
+      <table class="data">
+        <thead><tr><th style="width:170px">操作</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><td>作る</td>
+              <td>やり取りの自分の発言にマウスを乗せると右上に出る「<b>ロボットにする</b>」を押します。
+                  その発言までの流れが「質問ごとの手順（道具の列）」として一覧になるので、含める質問にチェックを付け、名前を付けて保存。
+                  AIに「マイロボットに登録して」と頼んでも登録はされません（ボタンの操作です。頼まれたAIはこの手順を案内します）。
+                  文章の回答（AIの説明文）や、AIが列を確かめるための調べ物は手順に入りません。</td></tr>
+          <tr><td>穴を空ける（任意）</td>
+              <td>一覧の下に「穴にできる値」（SQLの中の文字列・数値、グラフの題名など）が並びます。
+                  チェックしてラベル（例「対象月」）を付けると、実行のたびにその値を聞かれます。
+                  穴が無ければそのまま再実行。<code>date('now','-1 month')</code> のような相対指定のSQLなら
+                  穴を空けなくても毎月使えます。</td></tr>
+          <tr><td>実行する</td>
+              <td>メニューの「<b>マイロボット</b>」（マイエージェントの下）で「実行」を押します（穴があれば値を入れてから）。
+                  マイエージェントの<b>新しい会話</b>の中で手順が順に実行され、表・グラフ・ファイルはいつもどおり並びます。
+                  結果はふつうの会話として残るので、そのあと「これをグラフにして」と続けられます。</td></tr>
+          <tr><td>止まるとき</td>
+              <td>途中の手順が失敗すると、そこで止まって理由を出します（前の手順の結果は残ります）。
+                  表が改名・削除されていると実行前に止まります。管理者だけの道具を含む手順は、
+                  一般利用者が実行するとその手順で止まります（権限は実行する本人のもの）。</td></tr>
+          <tr><td>定期実行（RPAのように動かす）</td>
+              <td>登録するとき、またはマイロボットの画面のカード「定期実行」で、<b>間隔</b>（15分ごと〜1週間ごと。定期取り込みと同じ一覧）と
+                  <b>開始日時</b>を決めると、その時刻から間隔ごとにサーバが自動で動かします。画面を閉じていても・自分のPCを消していても、
+                  アプリのサーバが動いていれば動きます（サーバが止まっていた分は、次に動いたときに1回だけ実行）。
+                  結果はマイエージェントの新しい会話に残り、フォルダ出力を選んでいればファイルも置かれます。穴がある場合は
+                  カードの「定期実行」で「定期実行のたびに使う値」を決めます（空なら登録時の値）。
+                  <code>date('now','-1 month')</code> のような相対指定のSQLにしておくと、毎回その時点の期間で動きます。
+                  止めるときはチェックを外します（設定は残ります）。間隔は管理者が決めた最低間隔より短くはできません。</td></tr>
+          <tr><td>メールの自動送信</td>
+              <td>手順にメールの下書きが含まれるロボットで「<b>実行のたびに、作ったメールの下書きをそのまま送る</b>」にチェックすると、
+                  実行（手動も定期も）のたびに、その下書きを確認なしで送ります。宛先の許可・件数の上限・テスト送信モードは
+                  「メール設定」のとおりで、許可されていない宛先には送りません（会話にその理由が残ります）。
+                  チェックしなければ、これまでどおり下書きが会話に出て、送るかは「送信」ボタンで決めます。</td></tr>
+          <tr><td>詳細を見る</td>
+              <td>マイロボットの画面の各カードの「詳細」を開くと、手順ごとの中身（SQLや引数）・穴・使う表・フォルダ出力・定期実行・
+                  メール・作成日時・前回の実行結果が全部見られます。</td></tr>
+          <tr><td>上限と間隔</td>
+              <td>1人あたりの登録数・同じロボットの実行の最低間隔・1つのロボットの手順数の上限は、管理者が
+                  「管理者メニュー → マイロボット」で決めます（既定 5 件・12 時間・20 手順）。間隔は前回うまくいった実行から数えます
+                  （失敗した実行はすぐやり直せます。まだ実行できないときは「実行」が押せず、いつから押せるかがカードに出ます。
+                  消して同じ内容で作り直しても、間隔は引き継がれます）。
+                  同じ名前・同じ内容（同じ道具を同じ順・同じ値で呼ぶ手順）のロボットは二重に登録できません。</td></tr>
+          <tr><td>フォルダ出力</td>
+              <td>ファイルを作る手順（Excel／CSV／テキスト／PowerPoint／Word）があるロボットには、登録ダイアログとカードに
+                  「<b>実行結果をフォルダにも置く</b>」の欄が出ます（元の会話で「フォルダに出力して」と頼んでいれば最初からオン）。
+                  オンにすると実行のたびに出力先フォルダの自分の名前のフォルダへ置かれ、名前の日時（付ける／付けない）と
+                  同じ名前があるときの扱い（番号を付けて残す／置き換える）もここで決めます。「日時なし・置き換える」にすると、
+                  いつも同じ名前のファイルが最新に入れ替わります。管理者が出力先フォルダを設定していないときは効きません。</td></tr>
+          <tr><td>保存場所</td>
+              <td>会話の履歴と同じ場所に、利用者ごとに保存します（1人あたりの件数は管理者が決めます。既定 5 件）。
+                  実行や編集ができるのは本人だけで、他の利用者には見えません。管理者は管理者メニューで
+                  全員の登録内容を見られます（止めることもできます）。
+                  全員で使いたい流れは、管理者が「例文」や「ユーザー定義ツール」として登録してください。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">使い方の注意（マイエージェント）</div>
     <div class="card__desc">
       知らないと結果を読み違えたり、できるはずのことを諦めたりしやすいポイントです。
     </div>
@@ -1020,8 +1140,10 @@ window.CHAT_INIT = {
 
   {% if user.is_admin %}
   <div class="card mt">
-    <div class="card__title">2. データカタログ（管理者）</div>
+    <div class="card__title">2. 管理者メニュー — データカタログ（テーブル・結合・用語集・ツール・ビュー・取り込み・出力）</div>
     <div class="card__desc">
+      管理者の画面はサイドバーの「<b>管理者メニュー</b>」1つにまとまっていて、上のタブで切り替えます
+      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・覚え書き・利用状況）。
       ここに書いた内容が<b>そのままAIの理解</b>になります。回答の質はカタログの質で決まります。
       未保存の変更は下部の「まとめて保存 (Ctrl+S)」でまとめて確定できます。
     </div>
@@ -1050,7 +1172,9 @@ window.CHAT_INIT = {
           <tr><td>結合・ER図</td>
               <td>表どうしの繋がり（AIがJOINに使う関連）を管理します。列の右端から相手の列へ
                   ドラッグで作成、線をクリックで多重度（N:1＝多対1 など）の変更・削除。
-                  Ctrl+Z/Ctrl+Yで取り消し・やり直し、Ctrl+Sで配置保存。表示はまとまり単位で、
+                  Ctrl+Z/Ctrl+Yで取り消し・やり直し、Ctrl+Sで配置保存。「<b>整列</b>」で表示中の表を
+                  関連にそって並べ直せます（参照される側の表を右へ、つながりのない表は下に格子で。
+                  1手として積むので Ctrl+Z で戻せ、残すには保存を押す）。表示はまとまり単位で、
                   関連で繋がった隣のまとまりの表は破線枠で自動表示。「＋別のまとまりの表」で
                   相手を1つずつ足せます。線の濃さは過去の分析で実際に使われた回数
                   （薄い灰色＝未使用）。登録時には実データで値の重なりを検証し、
@@ -1066,7 +1190,7 @@ window.CHAT_INIT = {
                   置き場所は迷ったら「全体」で構いません。「検証」で式を実データに当てて確かめられ、
                   該当行の実物まで表示されます。SQL式の下には日本語の読み下しが自動表示されます。</td></tr>
           <tr><td>質問とSQLの例文</td>
-              <td>「この質問には、このSQLが正解」というお手本（最大200件）。チャットの⭐からも
+              <td>「この質問には、このSQLが正解」というお手本（最大200件）。マイエージェントの⭐からも
                   貯まります。「検証」で実行結果の先頭5行まで確認でき、SQLの日本語解説も
                   自動表示。「ツールにする」で例文をそのままユーザー定義ツールに変換できます。</td></tr>
           <tr><td>検算</td>
@@ -1078,20 +1202,37 @@ window.CHAT_INIT = {
               <td>組み込み44ツールの説明・パラメータ・<b>実装コード</b>（実際に何をするか）を確認でき、
                   説明の上書きや「AIに渡さない」設定ができます。ユーザー定義ツール（よく使うSQLを
                   名前つきの道具に）もここで管理します。</td></tr>
+          <tr><td>ビュー</td>
+              <td>よく使う結合や絞り込みに名前を付けて保存します（データは複製されず、開くたびに元の表から計算）。
+                  日本語で「欲しい一覧」を書くとAIがSQLを組み立て、<b>「このSQLがしていること」</b>の日本語の解説と、
+                  <b>「使ったデータ」</b>（そのSQLが読む表と列。ビュー経由で読む元の表も）が下に出ます。
+                  SQLを自分で書いたときは「AIに解説を書かせる」で同じものを付けられます。
+                  名前は「まとまり」を既存の一覧から選ぶか「＋ 新しいまとまりを作る」で作り（取り込みと同じ）、名前を付けます。
+                  解説と使ったデータは<b>登録したあとも</b>そのビューの行にそのまま出ます（SQLを直して保存すると、古い解説は外れます）。</td></tr>
           <tr><td>取り込み</td>
               <td>Excel／CSV／TXTをテーブルにします。ファイルを選ぶ→シート・区切り・見出し行を
                   確認→型推定つきのプレビュー→<b>まとまりを選び</b>テーブル名を付けて実行。
                   「できるテーブル: 社内Webリンク集__links」と結果が常に表示され、既存の表と重なる場合は
                   警告が出ます。取得日時列（いつ時点のデータか）は必須で自動付与。
                   更新のしかたは「全件入れ替え」と「追記」（追記は定期取り込み専用で、
-                  間隔・開始日時・保持回数を決めて登録。内蔵スケジューラが自動実行）。</td></tr>
+                  間隔・開始日時・保持回数を決めて登録。内蔵スケジューラが自動実行）。<br>
+                  ファイルの代わりに<b>スクレイピングで取得する</b>こともできます。<code>scrapers/</code>
+                  フォルダに <code>fetch(out_dir)</code> を定義した .py を置くと画面に出るので、「試す」で1回実行して
+                  出来たファイル名とシート名を確認し、選んで登録します。取得したファイルはサーバに残しません
+                  （表に入れたら消します）。全件入れ替えなら質問のたびに（前回から<b>最小間隔</b>が経っていれば）
+                  実行し直して表を入れ替え、追記なら定期実行で溜めます。最小間隔（既定30分）と
+                  タイムアウト（既定5分）は登録ごとに「管理」で変えられます。<br>
+                  隣の「<b>出力</b>」タブで、作ったファイルを置くサーバ上のフォルダ（出力先フォルダ）を決められます。
+                  利用者がマイエージェントで「フォルダに出力して」と頼むと、そのフォルダの中の
+                  <b>利用者名のフォルダ</b>（無ければ作る）に Excel／CSV／テキスト／PowerPoint／Word が置かれ、
+                  会話に出たファイルの「フォルダに保存」ボタンでも同じ場所に置けます。パスは利用者もAIも指定できません。</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 
   <div class="card mt">
-    <div class="card__title">3. ナレッジベース／4. モデル設定／5. メール設定（管理者）</div>
+    <div class="card__title">3. 管理者メニュー — ナレッジベース／モデル設定／メール設定／マイロボット／覚え書き／利用状況</div>
     <div class="tablewrap">
       <table class="data">
         <thead><tr><th style="width:210px">画面</th><th>説明</th></tr></thead>
@@ -1101,24 +1242,38 @@ window.CHAT_INIT = {
                   <b>ここに書く説明文が、AIがどのナレッジベースを調べるかの判断材料</b>になるので、
                   中身が分かる説明を書いてください。0件だとAIに検索ツール自体が渡りません。</td></tr>
           <tr><td>モデル設定</td>
-              <td>チャットで選べるモデルの候補と既定を決めます。「一覧を取得」でAPIから使える
+              <td>マイエージェントで選べるモデルの候補と既定を決めます。「一覧を取得」でAPIから使える
                   モデルを取り直せます。候補から外しても、誰かが使用中のモデルは選択肢に残ります。</td></tr>
           <tr><td>メール設定</td>
               <td>送信サーバ（SMTP）・差出人・送ってよい宛先ドメイン・宛先件数の上限を決めます。
                   既定は試送モード（実際には送らない）。接続確認ボタンで疎通を確かめられます。</td></tr>
+          <tr><td>マイロボット</td>
+              <td>利用者のマイロボットの決めごと: <b>1人あたりの登録上限数</b>（既定 5 件）、<b>同じロボットの実行の最低間隔</b>
+                  （既定 12 時間。前回うまくいった実行から数え、0 で制限なし）、<b>1つのロボットの手順数の上限</b>（既定 20）。
+                  全利用者に同じ値が効き、保存するとすぐ反映されます。その下に<b>全利用者の登録内容</b>が並び、
+                  利用者 → ロボットと開くと、手順の中身（SQL）・穴・定期実行の設定と次回・メールの自動送信・前回の実行まで見られます
+                  （管理者が把握するためのもので、実行や編集は本人だけです）。
+                  同じ名前・同じ内容のロボットは、決めごとに関係なく二重には登録できません。</td></tr>
+          <tr><td>覚え書き</td>
+              <td>利用者の覚え書き（AIが会話から覚える前提・好み・期間。1人1つの本文）の決めごと: <b>機能を使うか</b>（外すとメニューから消え、AIにも渡さない）、
+                  <b>書き直しに使うモデル</b>（回答のたびに1回呼ぶので、安いモデルにできる）、<b>本文の上限（文字）</b>。
+                  その下に<b>全利用者の本文</b>がそのまま並びます（閲覧のみ。直せるのは本人だけ）。</td></tr>
+          <tr><td>利用状況</td>
+              <td>このアプリの使われ方の集計（質問数・利用者・推移・道具・失敗の内訳）と、質問と回答の履歴。
+                  期間と利用者で絞り、Excel に出せます。他の利用者の質問がそのまま見えるので取り扱いに注意。</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 
   <div class="card mt">
-    <div class="card__title">6. アカウントと権限</div>
+    <div class="card__title">4. アカウントと権限</div>
     <div class="tablewrap">
       <table class="data">
         <thead><tr><th style="width:210px">項目</th><th>説明</th></tr></thead>
         <tbody>
           <tr><td>権限</td>
-              <td>一般利用者＝チャットとヘルプ。管理者＝全画面（カタログ・取り込み・各設定）。
+              <td>一般利用者＝マイエージェント・マイロボット・ヘルプ。管理者＝全画面（カタログ・取り込み・各設定）。
                   管理者だけに渡るAIツールは、一般利用者のAIには渡りません。</td></tr>
           <tr><td>アカウント管理</td>
               <td>サーバ上のコマンドで行います:
@@ -1193,13 +1348,22 @@ window.CHAT_INIT = {
                   <b>誰かが質問したときのファイル変更検知だけ</b>で、変更検知は更新時刻＋サイズ
                   です（同時刻・同サイズの差し替えは検知されません）。列構成は登録時に固定され、
                   元ファイルの列が増えても取り込まれません。</td></tr>
+          <tr><td>取り込み: スクレイピング</td>
+              <td>スクリプトは<b>アプリと同じ権限で別プロセスとして動く</b>ので、<code>scrapers/</code> に置けるのは
+                  管理者だけにしてください（画面からは置けません）。「変わったか」は取りに行くまで
+                  分からないため、全件入れ替えは<b>質問のたびに最小間隔を過ぎていれば実行</b>されます
+                  （0分にすると毎回。相手サイトへの負荷と、質問がスクリプトの実行時間ぶん待つことに注意）。
+                  失敗・時間切れ・ファイルが出ないときは前回の内容で答え、⚠と管理者メールが出ます。
+                  登録時に選んだファイル名が無く、出来たファイルが1つだけならそれを使います
+                  （日付入りのファイル名でも動くように）。時間切れで打ち切っても、スクリプトが起動した
+                  ブラウザなど孫プロセスは残ることがあります。</td></tr>
           <tr><td>表の削除</td>
               <td>巻き添え削除は「SQLにその表名が書かれているか」の文字列照合です。表名を
                   書いた用語・例文・検算は消え、書いていないものは残ります（確認画面の一覧を
                   必ず見ること）。「ジョブを残す」を選ぶと<b>次の定期実行で表が復活</b>します。
                   ユーザー定義ツールは巻き添え削除の対象外なので手で直してください。</td></tr>
           <tr><td>改名</td>
-              <td>カタログ・定期取り込み・利用者の選択は追随しますが、<b>チャット履歴と
+              <td>カタログ・定期取り込み・利用者の選択は追随しますが、<b>会話の履歴と
                   取り込み履歴は旧名のまま</b>です。過去の会話のSQLを再実行すると
                   「表がありません」になります。</td></tr>
           <tr><td>ユーザー定義ツール</td>
@@ -1354,7 +1518,7 @@ window.CHAT_INIT = {
       <text x="350" y="54" fill="var(--text)" font-weight="bold">アプリサーバ（Flask・1台）</text>
 
       <rect x="230" y="70" width="240" height="48" rx="6" fill="none" stroke="var(--border-2)"/>
-      <text x="350" y="90" fill="var(--text)">画面（チャット・カタログ ほか）</text>
+      <text x="350" y="90" fill="var(--text)">画面（マイエージェント・カタログ ほか）</text>
       <text x="350" y="107" fill="var(--muted)" font-size="11">ログイン必須／画面ごとに権限</text>
 
       <rect x="230" y="130" width="240" height="48" rx="6" fill="none" stroke="var(--border-2)"/>
@@ -1465,7 +1629,7 @@ window.CHAT_INIT = {
   <text class="cap" x="40" y="84">利用者</text>
   <rect class="b" x="40" y="100" width="148" height="76" rx="8"/>
   <text class="t" x="54" y="126">ブラウザ</text>
-  <text class="s" x="54" y="146">チャットなどの画面を</text>
+  <text class="s" x="54" y="146">マイエージェントなどの画面を</text>
   <text class="s" x="54" y="162">開くだけ（導入物なし）</text>
   <text class="m" x="40" y="222">権限は一般／管理者の2段階</text>
 
@@ -1521,7 +1685,7 @@ window.CHAT_INIT = {
   <rect class="zone" x="800" y="458" width="376" height="96" rx="10"/>
   <text class="cap" x="816" y="482">記録</text>
   <rect class="b" x="816" y="494" width="344" height="48" rx="8"/>
-  <text class="s" x="830" y="514">チャット履歴・実行ログ・各種設定</text>
+  <text class="s" x="830" y="514">会話の履歴・実行ログ・各種設定</text>
   <text class="m" x="830" y="532">サーバ内のファイルに保存</text>
 
   <!-- 質問の道（茶） -->
@@ -1667,7 +1831,7 @@ window.CHAT_INIT = {
         <tbody>
           <tr><td>構成</td>
               <td>Python + Flask の1プロセス。画面（Jinja2テンプレート）とAPIを同じサーバが返します。
-                  機能ごとに11個のブループリント（チャット／カタログ／取り込み／メール／モデル／
+                  機能ごとに11個のブループリント（マイエージェント／カタログ／取り込み／メール／モデル／
                   ナレッジ／表示／ヘルプ／認証ほか）に分かれています。</td></tr>
           <tr><td>起動</td>
               <td><code>python core.py</code>。内部では waitress（1プロセス・マルチスレッドの
@@ -2221,15 +2385,22 @@ window.CHAT_INIT = {
                   計算し直すので、常に最新です。書き込みはできません（読み取り専用）。</td></tr>
           <tr><td>作り方</td>
               <td>日本語で「欲しい一覧」を書くとAIがSQLを組み立て、その場で実データに当てて確かめます。
-                  通らなければエラーを添えて1回だけ書き直させます。SQLを自分で書くこともできます。
+                  通らなければエラーを添えて1回だけ書き直させます。SQLを自分で書くこともできます
+                  （「AIに解説を書かせる」で解説だけを後から付けられます）。
                   保存前には必ず実行し、動かないSQLはカタログに入れません。</td></tr>
+          <tr><td>解説と使ったデータ</td>
+              <td>AIの解説（「このSQLがしていること」）はカタログの表の記述（<code>tables.&lt;名前&gt;.explanation</code>）に残し、
+                  登録後の行にも出します。SQLを直して解説なしで保存すると外れます。
+                  「使ったデータ」は保存せず、そのつど SQLite のオーソライザで数えます: 定義SQLに <code>EXPLAIN</code> を付けて
+                  下ごしらえだけさせると、読む表と列（<code>SQLITE_READ</code>）が1つずつ知らされ、データは読みません。
+                  ビューが中で読む元の表も SQLite が展開して知らせるので、そのまま出ます。</td></tr>
           <tr><td>安全</td>
               <td>定義SQLはSELECT専用ガードを通します（書き込み・DDL・複数文は登録できません）。
                   ビューを読むときも通常の権限が効き、<b>元の表を選択から外している人はビューも読めません</b>
                   （SQLiteのオーソライザが元の表への読み取りを止めるため）。</td></tr>
           <tr><td>扱い</td>
               <td>名前は表と同じ「まとまり__名前」の規約。登録するとテーブル一覧（「ビュー」の印つき）・
-                  ER図・チャットの表選択に出て、説明・列の説明・用語も表と同じように付けられます。
+                  ER図・マイエージェントの表選択に出て、説明・列の説明・用語も表と同じように付けられます。
                   削除すると定義だけが消え、元の表とデータは残ります。</td></tr>
           <tr><td>注意</td>
               <td>SQLiteには結果を保存しておく仕組み（マテリアライズドビュー）がありません。重い集計を
@@ -2479,7 +2650,7 @@ window.CHAT_INIT = {
              手がかりになるので書かない（設定の在り処だけ示す） #}
           <tr><td>常設の一般ユーザー</td>
               <td>設定ファイル（auth.py の BUILTIN_USERS）に書かれた、動作確認用の
-                  固定アカウント。チャットだけ使える一般権限です。管理者と同じく、
+                  固定アカウント。マイエージェントだけ使える一般権限です。管理者と同じく、
                   IDが一致したら外部認証には回しません。
                   <b>本番ではリストを空にして、この仕組みごと止めてください。</b></td></tr>
           <tr><td>セッション</td>
@@ -2497,7 +2668,7 @@ window.CHAT_INIT = {
                   削除はユーザー定義だけで、その人の設定・履歴フォルダは残ります。</td></tr>
           <tr><td>その他の防御</td>
               <td>ナレッジベースのAPIキーは画面・APIの応答から必ず落とします（設定済みか否かだけ返す）。
-                  チャットからのカタログ登録は既定で管理者のみ
+                  マイエージェントからのカタログ登録は既定で管理者のみ
                   （カタログは全利用者のプロンプトに載るため）。</td></tr>
         </tbody>
       </table>
@@ -2533,10 +2704,23 @@ window.CHAT_INIT = {
           <tr><td class="mono small">data/mail_settings.yaml</td>
               <td>メール設定。<b>そのまま画面に出す前提なので秘密は入れません</b>
                   （SMTPのユーザー・パスワード・暗号化方式は起動環境の設定のみ）。</td></tr>
+          <tr><td class="mono small">data/robot_settings.yaml</td>
+              <td>マイロボットの決めごと（1人あたりの上限・実行の最低間隔・手順数の上限）。無ければ env の初期値。</td></tr>
+          <tr><td class="mono small">data/memory_settings.yaml</td>
+              <td>覚え書きの決めごと（機能のON/OFF・書き直しに使うモデル・本文の上限）。無ければ env の初期値。</td></tr>
+          <tr><td class="mono small">data/output_dir.yaml</td>
+              <td>出力先フォルダ（作ったファイルを置くサーバ上の場所）。空なら機能自体を出しません。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/prefs.yaml</td>
-              <td>個人設定。読み書きするのは4項目だけ（モデル／検索対象から外したナレッジベース／
-                  検索の効き方／分析対象から外した表）。Cookieでなくファイルに置くのは、
+              <td>個人設定。読み書きするのは5項目だけ（モデル／検索対象から外したナレッジベース／
+                  検索の効き方／分析対象から外した表／覚え書きを止めているか）。Cookieでなくファイルに置くのは、
                   ログアウトやブラウザを閉じても残すためです。</td></tr>
+          <tr><td class="mono small">data/users/&lt;利用者&gt;/robots.json</td>
+              <td>その人のマイロボット（手順・穴・フォルダ出力・定期実行・本人の写し）と、
+                  <code>last_ok</code>（同じ内容の前回うまくいった実行の台帳。消して作り直しても間隔が戻らないように）。
+                  一時ファイル経由の<b>原子的な置き換え</b>で書きます。</td></tr>
+          <tr><td class="mono small">data/users/&lt;利用者&gt;/memory.yaml</td>
+              <td>その人の覚え書き（1つの本文と最終更新）。同じく原子的に置き換えます。
+                  読めないファイルには書き足しません（全部消えるのを防ぐため）。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/chats/</td>
               <td>会話の実体（1会話1ファイル）と一覧ファイル。一覧を分けているのは、
                   サイドバーを描くたびに全会話を読まないため。一覧が壊れても実体から作り直します。
@@ -2555,6 +2739,12 @@ window.CHAT_INIT = {
       <table class="data">
         <thead><tr><th style="width:250px">対象</th><th>方式</th></tr></thead>
         <tbody>
+          <tr><td>裏で動くスレッド</td>
+              <td>3本あります。<b>定期取り込みのスケジューラ</b>（60秒ごとに1周）、その周回が起こす
+                  <b>マイロボットの定期実行</b>（前の分が終わっていなければ起こさない＝1本まで）、
+                  回答のあとに1回だけ動く<b>覚え書きの書き直し</b>（利用者ごと・回答は待たせない）。
+                  ロボットの実行は要求の外なので、Flaskの要求の文脈を作り、本人の名前（登録時の写し）で動かします。
+                  同じロボットの二重実行は実行中の目印で止め、結果の置き場とマイロボットの保存は錠で直列にします。</td></tr>
           <tr><td>定期取り込みのジョブ</td>
               <td>再入可能な鍵で直列化（裏で回るスケジューラと画面の「今すぐ更新」が
                   同時に走りうるため）。同じ表へ同時に書きません。</td></tr>
@@ -2592,6 +2782,10 @@ window.CHAT_INIT = {
           <tr><td>取り込みの行数／ファイル容量</td><td>1,000,000行／100MB</td><td>変更可</td></tr>
           <tr><td>取得日時の列名</td><td>取得日時</td><td>変更可</td></tr>
           <tr><td>スケジューラの巡回間隔</td><td>60秒</td><td>変更可</td></tr>
+          <tr><td>マイロボット: 1人あたりの上限／実行の最低間隔／手順数</td><td>5件／12時間／20手順</td><td>管理者メニュー（初期値は変更可）</td></tr>
+          <tr><td>覚え書き: 機能／書き直しのモデル／本文の上限</td><td>使う／回答と同じ／2,000字</td><td>管理者メニュー（初期値は変更可）</td></tr>
+          <tr><td>出力先フォルダ</td><td>未設定（ダウンロードのみ）</td><td>管理者メニュー（初期値は変更可）</td></tr>
+          <tr><td>スクレイピング: 最小間隔／タイムアウト</td><td>30分／5分</td><td>登録ごと（初期値は変更可）</td></tr>
           <tr><td>アップロードの可否</td><td>無効</td><td>変更可</td></tr>
           <tr><td>文書検索のタイムアウト／並列数</td><td>180秒／8台</td><td>変更可</td></tr>
           <tr><td>宛先の上限／試送モード</td><td>20件／有効</td><td>変更可</td></tr>
@@ -2680,7 +2874,7 @@ window.CHAT_INIT = {
   <div class="card mt">
       <div class="card__title">4-1. 生成AIの基礎</div>
       <div class="card__desc">
-        チャットの答えを書いているのは「生成AI」と呼ばれるプログラムです。生成AIは確率で文章を作る道具で、
+        マイエージェントの答えを書いているのは「生成AI」と呼ばれるプログラムです。生成AIは確率で文章を作る道具で、
         間違うことがあります（だからこのアプリには、SQLの表示・出典・検算という人が確かめる仕組みがあります）。
         最初にこのカードを読むと、以降の用語解説と第1〜3部の説明が読みやすくなります。
       </div>
@@ -2693,7 +2887,7 @@ window.CHAT_INIT = {
                     その予測を繰り返して文章を組み立てます。中に人が入って答えているわけではなく、
                     Web検索とも別物です（どこかにある文章を探して写すのではなく、その場で文章を作っているため）。
                     このうち文章を読み書きするタイプをLLM（大規模言語モデル）と呼びます。
-                    <b>このアプリでは</b>チャットの回答の書き手がこの生成AIです。確率で文章を作る以上は
+                    <b>このアプリでは</b>マイエージェントの回答の書き手がこの生成AIです。確率で文章を作る以上は
                     間違い得るため、根拠のSQLを必ず表示し、文書の答えには出典番号を付け、
                     検算を裏で走らせています。</td></tr>
             <tr><td>AIモデル</td>
@@ -2710,7 +2904,7 @@ window.CHAT_INIT = {
                 <td>文章だけでなく画像も読み取れるモデルの呼び名です（複数の種類の情報を扱えるため
                     マルチモーダルと呼びます）。<b>このアプリでは</b>モデル選択の「画像OK」表示が目印で、
                     エラー画面の写真や帳票の画像を貼り付け（Ctrl+V）やドラッグ＆ドロップで添付して
-                    質問できます。枚数などの制限は第1部「使い方の注意（チャット）」を参照してください。</td></tr>
+                    質問できます。枚数などの制限は第1部「使い方の注意（マイエージェント）」を参照してください。</td></tr>
             <tr><td>ChatGPTとこのアプリの関係</td>
                 <td>ChatGPTはOpenAI社のAIを個人が画面で使うサービスで、API（ChatGPT-API）は同じ会社のAIを
                     プログラムから部品として借りるための窓口です。<b>このアプリでは</b>後者を使い、
@@ -2791,13 +2985,13 @@ window.CHAT_INIT = {
           <thead><tr><th style="width:210px">用語</th><th>説明</th></tr></thead>
           <tbody>
             <tr><td>ツール呼び出し（tool calling／function calling）</td>
-                <td>AIが「この道具を、この引数で使いたい」という依頼文を返し、それを受け取ったプログラム側が実際の作業を行う分業の仕組みです。AI本人は文章を書いているだけで、手は動かしていません。<b>このアプリでは</b>チャット途中の「SQL実行 (SELECT)」「グラフ描画」の表示が、依頼を受けたアプリが道具を動かしている瞬間です。AIはデータベースに直接触れないため、<b>読むだけ</b>（<code>SELECT</code>専用）の約束をアプリ側で確実に守れます（安全機構は4層。詳細は3-8を参照）。</td></tr>
+                <td>AIが「この道具を、この引数で使いたい」という依頼文を返し、それを受け取ったプログラム側が実際の作業を行う分業の仕組みです。AI本人は文章を書いているだけで、手は動かしていません。<b>このアプリでは</b>マイエージェント途中の「SQL実行 (SELECT)」「グラフ描画」の表示が、依頼を受けたアプリが道具を動かしている瞬間です。AIはデータベースに直接触れないため、<b>読むだけ</b>（<code>SELECT</code>専用）の約束をアプリ側で確実に守れます（安全機構は4層。詳細は3-8を参照）。</td></tr>
             <tr><td>AIエージェント</td>
                 <td>「考える→道具を使う→結果を見てまた考える」を自律的に繰り返す仕組みの呼び名です。1回の受け答えで終わらず、目的に向かって段取りを自分で組み立てる点が特徴です。<b>このアプリでは</b>1つの質問の中でSQL実行→グラフ→レポートと往復するのがこれにあたります。暴走を防ぐため往復は<b>10回</b>で一区切りになり、「続けて」と送ると再開できます（詳細は3-2を参照）。</td></tr>
             <tr><td>オーケストレーション</td>
                 <td>複数の処理を指揮して、順番や受け渡しを段取りすることです。オーケストラの指揮者（各奏者に出番を指示する役）からの転用語です。<b>このアプリでは</b>上記の往復（AIへの依頼・道具の実行・結果の受け渡し）の交通整理役がこれにあたります。第2部の全体図（管理者にのみ表示されます）では「AIオーケストレーション」の箱として描かれています。</td></tr>
             <tr><td>text-to-SQL（テキスト・トゥ・エスキューエル）</td>
-                <td>日本語などの普通の文章からSQLを自動生成する技術の総称です。例えば「地域ごとの売上合計は？」という質問を<code>SELECT 地域, SUM(金額) FROM 注文 GROUP BY 地域</code>のようなSQLに翻訳します。<b>このアプリでは</b>チャットで集計を頼んだときにAIがSQLを組み立てる部分がこの技術です。最大のリスクは翻訳を誤ること（もっともらしいが違う集計が返り得るため）なので、実行したSQLを回答に必ず表示し、検算で人が確かめられるようにしています（検算は3-16を参照）。</td></tr>
+                <td>日本語などの普通の文章からSQLを自動生成する技術の総称です。例えば「地域ごとの売上合計は？」という質問を<code>SELECT 地域, SUM(金額) FROM 注文 GROUP BY 地域</code>のようなSQLに翻訳します。<b>このアプリでは</b>マイエージェントで集計を頼んだときにAIがSQLを組み立てる部分がこの技術です。最大のリスクは翻訳を誤ること（もっともらしいが違う集計が返り得るため）なので、実行したSQLを回答に必ず表示し、検算で人が確かめられるようにしています（検算は3-16を参照）。</td></tr>
             <tr><td>API（エーピーアイ）</td>
                 <td>プログラム同士が会話するための「窓口」の総称です（Application Programming Interface）。人が画面のボタンを押す代わりに、プログラムが決まった形式で依頼を送り、返事を受け取ります。<b>このアプリでは</b>ChatGPT-API（社外のAIモデル）とLightRAGサーバ（社内の文書検索）をこの窓口経由で呼び出しています。説明書で「外部API」とあれば、窓口越しに借りている社外サービスの意味です。</td></tr>
             <tr><td>APIキー</td>
@@ -2879,7 +3073,7 @@ window.CHAT_INIT = {
                     合計や件数を計算する句で、この2つがSQLの2大基本句です。
                     <b>このアプリでは</b>件数・合計・順位を求めるとき、AIに表を読ませて数えさせるより
                     SQLで計算させる方が確実です（AIが読むのは先頭40行だけで、SQLの計算には読み間違いが無いため）。
-                    第1部「使い方の注意（チャット）」の「大きな表を見せたとき」の注意はこの理屈によります。</td></tr>
+                    第1部「使い方の注意（マイエージェント）」の「大きな表を見せたとき」の注意はこの理屈によります。</td></tr>
             <tr><td>JOIN（ジョイン・結合）</td>
                 <td>2つのテーブルを共通の列で横につないで、1つの表のように扱う操作です。
                     ExcelのVLOOKUPで別シートから情報を引いてくる操作に近いものです。
@@ -2895,7 +3089,7 @@ window.CHAT_INIT = {
             <tr><td>クロス集計（ピボットテーブル）</td>
                 <td>行×列のかけ合わせで集計する表です（例: 行に製品・列に月で売上を並べる）。
                     Excelのピボットテーブルと同じ概念です。
-                    <b>このアプリでは</b>チャットの「クロス集計」ツールが作ります
+                    <b>このアプリでは</b>マイエージェントの「クロス集計」ツールが作ります
                     （SQLiteには表をこの形に展開する構文が無いため）。実数のほか
                     構成比でも出せ（行ごと・列ごと・全体の3モード）、
                     色の濃淡で値の大小を見せるヒートマップ表示も選べます。</td></tr>
@@ -2935,7 +3129,7 @@ window.CHAT_INIT = {
   <div class="card mt">
       <div class="card__title">4-4. ER図とデータ設計の用語</div>
       <div class="card__desc">
-        管理画面の「結合・ER図」や、チャットにAIが描くER図を「データの地図」として読めるようになるためのカードです。
+        管理画面の「結合・ER図」や、マイエージェントにAIが描くER図を「データの地図」として読めるようになるためのカードです。
         表と表の「つながり」にまつわる設計用語をまとめます。
       </div>
       <div class="tablewrap">
@@ -2947,14 +3141,14 @@ window.CHAT_INIT = {
                   データは複製されず、開くたびに元の表から計算し直されるので常に最新になります
                   （Excelでいえば、値を貼り付けたシートではなく、数式のまま置いてあるシートに近い考え方です）。
                   <b>このアプリでは</b>管理者がデータカタログの「ビュー」タブで作れます。作ったビューは
-                  テーブルと同じように扱われ、チャットからも使えます。正しい結合を1つ固定しておけるので、
+                  テーブルと同じように扱われ、マイエージェントからも使えます。正しい結合を1つ固定しておけるので、
                   AIが毎回結合を組み立て直して間違える余地がなくなります（詳細は3-16bを参照）。</td></tr>
           <tr><td>ER図（イーアールず）</td>
                 <td>表（エンティティ＝実体）と表同士の関係（リレーションシップ）を、箱と線で描いた「データの地図」です。
                     どの表とどの表をつなげて集計できるかが一目で分かります
                     （Excelのシート一覧だけでは、シート同士の対応関係までは分からないため）。
-                    <b>このアプリでは</b>チャットで「ER図を見せて」と頼むと、誰でもAIに表示してもらえます
-                    （チャット側は<b>読むだけ</b>で、線の追加や変更はできません。
+                    <b>このアプリでは</b>マイエージェントで「ER図を見せて」と頼むと、誰でもAIに表示してもらえます
+                    （マイエージェント側は<b>読むだけ</b>で、線の追加や変更はできません。
                     編集は管理者が管理画面の「結合・ER図」で行います）。
                     まずは箱＝表・線＝結合できる関係、と読んでください。</td></tr>
             <tr><td>関連（リレーション）</td>
@@ -3019,7 +3213,7 @@ window.CHAT_INIT = {
                 <td>主キーの重複＝二重計上、空の列＝欠損、親に無い外部キー＝突合漏れ、という
                     「データの健康診断」の観点です。どれも集計結果を直接ゆがめます
                     （重複は合計を膨らませ、欠損は件数を欠けさせ、突合漏れは結合時に行を落とすため）。
-                    <b>このアプリでは</b>チャットの「データ品質チェック」ツールが、
+                    <b>このアプリでは</b>マイエージェントの「データ品質チェック」ツールが、
                     行数・主キーの重複・空の列・親に存在しない外部キー・日付の範囲をこの観点で調べます。
                     ただし<b>警告が無い＝データが正しい、ではありません</b>
                     （形式のゆがみを見るだけで、値の中身が業務として正しいかまでは判定できないため）。</td></tr>
@@ -3028,7 +3222,7 @@ window.CHAT_INIT = {
       </div>
       <div class="small muted mt">
         補足: 見た目の凡例（下線＝主キー・破線の下線＝外部キー・線の両端の <code>1</code> と <code>*</code>＝多重度）は
-        「結合・ER図」画面にも表示されています。チャットにAIが描くER図も同じ記法・同じデータで描かれるため、
+        「結合・ER図」画面にも表示されています。マイエージェントにAIが描くER図も同じ記法・同じデータで描かれるため、
         画面で見える図とAIの理解（結合の定義）は必ず一致します。
       </div>
     </div>
@@ -3074,7 +3268,7 @@ window.CHAT_INIT = {
             </tr>
             <tr>
               <td>自然言語（しぜんげんご）</td>
-              <td>プログラム言語や検索用の特別な構文ではない、人間が普段使う言葉を指すIT用語です。日本語も英語も自然言語です。<b>このアプリでは</b>チャットの質問がまさに自然言語で、特別な書式や記号を覚えなくても普通の日本語で聞けば伝わります。画面の説明欄にある「自然言語で構いません」という注記も同じ意味です。AIは書かれた文をそのまま読んで理解するため、隣の席の人に説明するつもりで書くのが一番効きます。</td>
+              <td>プログラム言語や検索用の特別な構文ではない、人間が普段使う言葉を指すIT用語です。日本語も英語も自然言語です。<b>このアプリでは</b>マイエージェントの質問がまさに自然言語で、特別な書式や記号を覚えなくても普通の日本語で聞けば伝わります。画面の説明欄にある「自然言語で構いません」という注記も同じ意味です。AIは書かれた文をそのまま読んで理解するため、隣の席の人に説明するつもりで書くのが一番効きます。</td>
             </tr>
           </tbody>
         </table>
@@ -3164,7 +3358,7 @@ window.CHAT_INIT = {
                     併売（へいばい）は一緒に買われる組み合わせを探します（リフト1.0前後＝無関係、が基準）。
                     寄与度は全体の増減を区分ごとの貢献に分解するもので、増減の内訳はウォーターフォール図で描けます。
                     生存時間分析は壊れる・やめるまでの期間を、まだ起きていない件（打ち切り）を捨てずに測ります（捨てて平均すると必ず短く見積もるため。MTBFやWeibullはこの仲間です）。
-                    <b>このアプリでは</b>いずれもチャットから頼める分析ツールとして入っています。</td></tr>
+                    <b>このアプリでは</b>いずれもマイエージェントから頼める分析ツールとして入っています。</td></tr>
           </tbody>
         </table>
       </div>
@@ -3227,7 +3421,7 @@ window.CHAT_INIT = {
           </tr>
           <tr>
             <td>文字コードと文字化け</td>
-            <td>文字コードは、文字をコンピュータ内部の番号に対応づける表（UTF-8・Shift_JISなど）のことで、複数の方式があります。書いたときと違う表で読むと「譁�蟄�」のように化けますが、ファイル自体が壊れたわけではありません（対応表を取り違えているだけのため）。<b>このアプリでは</b>ダウンロード用のCSVを、Excelで開いても化けない <code>utf-8-sig</code> という方式で作ります。古いシステム向けにShift_JISが必要なときは、チャットで「Shift_JISで」と頼むと <code>cp932</code>（Shift_JISの一種）で作れます。取り込みでは主要な文字コードを自動で順に試すため、たいていはそのまま読めます。それでも化けたときは、元ファイルをメモ帳で開いて「名前を付けて保存」で文字コードをUTF-8にしてから、取り込み直してください（取り込みの操作は管理者が行います）。</td>
+            <td>文字コードは、文字をコンピュータ内部の番号に対応づける表（UTF-8・Shift_JISなど）のことで、複数の方式があります。書いたときと違う表で読むと「譁�蟄�」のように化けますが、ファイル自体が壊れたわけではありません（対応表を取り違えているだけのため）。<b>このアプリでは</b>ダウンロード用のCSVを、Excelで開いても化けない <code>utf-8-sig</code> という方式で作ります。古いシステム向けにShift_JISが必要なときは、マイエージェントで「Shift_JISで」と頼むと <code>cp932</code>（Shift_JISの一種）で作れます。取り込みでは主要な文字コードを自動で順に試すため、たいていはそのまま読めます。それでも化けたときは、元ファイルをメモ帳で開いて「名前を付けて保存」で文字コードをUTF-8にしてから、取り込み直してください（取り込みの操作は管理者が行います）。</td>
           </tr>
           <tr>
             <td>Markdown（マークダウン）</td>
@@ -3265,7 +3459,7 @@ window.CHAT_INIT = {
             <tr><td>PythonとFlask（フラスク）</td>
                 <td>Pythonはこのアプリを書いているプログラミング言語、FlaskはPythonでWebアプリを作るための土台（フレームワーク）です。どちらも道具の名前だと分かれば、第3部の文の主語が読めるようになります。
                     同類の道具として、画面の雛形に値を流し込むJinja2（ジンジャ）、機能単位の部品であるブループリントという名前も出てきます。
-                    <b>このアプリでは</b>Python+Flaskの1プロセスで画面とAPIの両方を返し、チャット／カタログ／取り込みなど11個のブループリントに分かれています（3-1参照）。</td></tr>
+                    <b>このアプリでは</b>Python+Flaskの1プロセスで画面とAPIの両方を返し、マイエージェント／カタログ／取り込みなど11個のブループリントに分かれています（3-1参照）。</td></tr>
             <tr><td>本番用サーバとリバースプロキシ</td>
                 <td>本番用サーバは、多数の同時アクセスを安定してさばくためのWebサーバで、waitress（ウェイトレス）やgunicorn（ガニコーン）が代表です（Flask付属の簡易サーバは開発向けのため）。このアプリの <code>python core.py</code> は内部でwaitressを使って待ち受けるので、本番でも同じコマンドのまま載せ替えは不要です。
                     リバースプロキシは利用者とアプリの間に置く中継サーバのことで、代表がnginx（エンジンエックス）です。
@@ -3435,7 +3629,7 @@ POST /api/chat/send     … フォールバック（sendStreaming が false を�
   └ _persist(chat) → chats.save_chat(...)
        /send   … _reply() の中で保存し、新規ぶんの render_log を JSON で返す
        /stream … generate() の finally で保存し、その後 SSE の &#x27;end&#x27; を送る</pre><div class="mt"><code>/api/chat/rewind</code> も同じ部品を使うが <code>_begin_turn</code> は通らず（自前で system と user を積む）、<b>常に非ストリーミング</b>で <code>_advance</code> を呼び、<code>_reply(chat, 0, replace=True)</code> で画面を全部描き直させる。</div></td></tr>
-      <tr><td>2. _begin_turn — 順序そのものが仕様</td><td><div class="mt">この関数は「何をするか」より「どの順でやるか」に意味がある。</div><div class="tablewrap"><table class="data"><thead><tr><th>順</th><th>処理</th><th>なぜその位置か</th></tr></thead><tbody><tr><td>1</td><td>text 空チェック / <code>llm.is_configured()</code></td><td>何も始まっていないうちに弾く</td></tr><tr><td>2</td><td><code>rag.set_current_user(g.user)</code></td><td><code>tools.dispatch</code> は利用者を引数に持たない。処理中スレッドの threading.local 経由で渡す</td></tr><tr><td>3</td><td><code>results.new_turn()</code></td><td>「新しい質問だ」と宣言し、前の質問の結果の使い回しを断つ（質問直前にリアルタイム取り込みが走るので、古い数字を返す事故を防ぐ）</td></tr><tr><td>4</td><td>画像の vision 判定</td><td>保存より前。ここで落ちても会話は汚れない</td></tr><tr><td>5</td><td><b>messages/render_log に質問を積んで <code>_persist</code></b></td><td>ルーターのLLM呼び出しやリアルタイム取り込みは数十秒かかることがある。保存が後ろだと、送信直後に別チャットへ切り替えて戻る（<code>/api/chat/open</code> は保存ファイルを読む）と質問が消えて見える</td></tr><tr><td>6</td><td><code>_auto_scope</code></td><td>質問文が要るのでユーザー発言の後</td></tr><tr><td>7</td><td>scope も KB も無ければ <code>_TurnError</code></td><td>この時点で質問は保存済み。コメントも「答えの無い質問が1件残る」と認めている</td></tr><tr><td>8</td><td><code>_realtime_refresh(scope)</code></td><td>例外は握って print だけ。読めなければ前回取り込んだ内容で答える、が決めごと</td></tr><tr><td>9</td><td>system プロンプトを <code>messages[0]</code> に差し替え</td><td>スコープが決まってからでないと組めない。ユーザー発言より後に作るが、置き場所は必ず index 0 なので並びは崩れない</td></tr></tbody></table></div><div class="mt"><code>_load_current()</code> は session の chat_id が無い／読めないとき、黙って <code>{&quot;id&quot;: None, &quot;messages&quot;: [], &quot;render_log&quot;: []}</code> を返す（＝新しい会話が始まる）。</div></td></tr>
+      <tr><td>2. _begin_turn — 順序そのものが仕様</td><td><div class="mt">この関数は「何をするか」より「どの順でやるか」に意味がある。</div><div class="tablewrap"><table class="data"><thead><tr><th>順</th><th>処理</th><th>なぜその位置か</th></tr></thead><tbody><tr><td>1</td><td>text 空チェック / <code>llm.is_configured()</code></td><td>何も始まっていないうちに弾く</td></tr><tr><td>2</td><td><code>rag.set_current_user(g.user)</code></td><td><code>tools.dispatch</code> は利用者を引数に持たない。処理中スレッドの threading.local 経由で渡す</td></tr><tr><td>3</td><td><code>results.new_turn()</code></td><td>「新しい質問だ」と宣言し、前の質問の結果の使い回しを断つ（質問直前にリアルタイム取り込みが走るので、古い数字を返す事故を防ぐ）</td></tr><tr><td>4</td><td>画像の vision 判定</td><td>保存より前。ここで落ちても会話は汚れない</td></tr><tr><td>5</td><td><b>messages/render_log に質問を積んで <code>_persist</code></b></td><td>ルーターのLLM呼び出しやリアルタイム取り込みは数十秒かかることがある。保存が後ろだと、送信直後に別マイエージェントへ切り替えて戻る（<code>/api/chat/open</code> は保存ファイルを読む）と質問が消えて見える</td></tr><tr><td>6</td><td><code>_auto_scope</code></td><td>質問文が要るのでユーザー発言の後</td></tr><tr><td>7</td><td>scope も KB も無ければ <code>_TurnError</code></td><td>この時点で質問は保存済み。コメントも「答えの無い質問が1件残る」と認めている</td></tr><tr><td>8</td><td><code>_realtime_refresh(scope)</code></td><td>例外は握って print だけ。読めなければ前回取り込んだ内容で答える、が決めごと</td></tr><tr><td>9</td><td>system プロンプトを <code>messages[0]</code> に差し替え</td><td>スコープが決まってからでないと組めない。ユーザー発言より後に作るが、置き場所は必ず index 0 なので並びは崩れない</td></tr></tbody></table></div><div class="mt"><code>_load_current()</code> は session の chat_id が無い／読めないとき、黙って <code>{&quot;id&quot;: None, &quot;messages&quot;: [], &quot;render_log&quot;: []}</code> を返す（＝新しい会話が始まる）。</div></td></tr>
       <tr><td>3. _auto_scope と表ルーター</td><td><div class="mt">利用者はサイドバーで表の ON/OFF しか触らない。「AIに何を見せるか」は質問ごとにここが決める。</div><pre class="mono small">scope = build_scope({全DBファイル名: []})     # 全DB・全表
 off   = rag.excluded_tables(g.user)           # prefs の tables_off（除外方式）
 scope から off を落とす（空になったDBごと消す）
@@ -3482,6 +3676,7 @@ for _ in range(config.MAX_AGENT_STEPS):          # 既定10
       <tr><td>8. ストリーミング（/api/chat/stream）と SSE</td><td><div class="mt"><code>_sse(event, data)</code> は <code>event: X\ndata: {json}\n\n</code> を作るだけ。イベントは5種類。</div><div class="tablewrap"><table class="data"><thead><tr><th>event</th><th>中身</th><th>出るところ</th></tr></thead><tbody><tr><td><code>delta</code></td><td><code>{text}</code></td><td><code>llm.chat_stream</code> が <code>(&#x27;text&#x27;, 差分)</code> を返すたび</td></tr><tr><td><code>text_end</code></td><td><code>{}</code></td><td>ひとまとまりの本文が終わった時点。<b>tool_calls がある場合も無い場合も出す</b></td></tr><tr><td><code>running</code></td><td><code>{name, label}</code></td><td>1つのツールを実行する直前（<code>TOOL_LABELS</code> の日本語名）</td></tr><tr><td><code>item</code></td><td><code>_web_log</code> した描画アイテム1つ</td><td>プレビュー（SQLカード）・ツールの描画物・検算カード・停止注記・エラー</td></tr><tr><td><code>end</code></td><td><code>{chat_id, title}</code></td><td><code>generate()</code> の finally、<code>_persist</code> の<b>後</b></td></tr></tbody></table></div><div class="mt">ループ本体は <code>_advance</code> と同型だが、実行が<b>1呼び出しずつ</b>になる（<code>running</code> を出してから <code>_execute(chat, [c], ...)</code>、直後に <code>_web_log(render_log, before)</code> で新規ぶんだけ item にする）。</div><div class="mt">エンドポイント側の段取りにも理由がある:</div><div class="mt">・<code>chat[&#x27;id&#x27;]</code> をここで確定して <code>session[&#x27;chat_id&#x27;]</code> に入れる。<b>応答を流し始めるとセッションに書けない</b>（Cookie が出せない）ので、後から入れても消える<br>・<code>turn_id = results.current_turn()</code> をリクエストスレッドで捕まえ、<code>generate()</code> の中で <code>rag.set_current_user(user)</code> と <code>results.set_turn(turn_id)</code> を<b>やり直す</b>。この2つは threading.local で、<code>stream_with_context</code> が引き継ぐのは Flask の g / session だけ<br>・<code>GeneratorExit</code>（画面を閉じた・更新した）は <code>aborted=True</code> にして再送出。finally で <code>_persist</code> はするが <code>end</code> は送らない（切断後に yield すると RuntimeError になるだけ）<br>・レスポンスヘッダに <code>X-Accel-Buffering: no</code>（nginx のバッファ抑止）</div><div class="mt">クライアント側（chat.js <code>sendStreaming</code>）は <code>EventSource</code> が POST を使えないので <code>fetch</code> + <code>ReadableStream</code> を自前でパースする。<code>false</code> を返す＝フォールバックするのは <b>fetch が投げたときと <code>!res.ok || !res.body</code> のときだけ</b>。途中で切れた場合は <code>true</code> を返すので <code>/api/chat/send</code> への再送は起きない。</div></td></tr>
       <tr><td>9. messages と render_log がなぜ2本あるか</td><td><div class="tablewrap"><table class="data"><thead><tr><th></th><th>messages</th><th>render_log</th></tr></thead><tbody><tr><td>用途</td><td>次のターンでAPIに送る会話</td><td>画面の描画・保存・監査</td></tr><tr><td>要素</td><td><code>{role: system/user/assistant/tool, content, tool_calls?, tool_call_id?}</code></td><td><code>{role, kind, at, …kind別}</code></td></tr><tr><td>保存</td><td>system は除いて保存</td><td>全部保存（bytes は base64 に符号化）</td></tr><tr><td>情報量</td><td>ツール結果は先頭40行（<code>SAMPLE_ROWS_FOR_LLM</code>）のサマリJSON</td><td>表は全行、グラフの元データ、ファイルの実体</td></tr></tbody></table></div><div class="mt">分けている理由は3つあり、どれも一方だけでは成立しない。</div><div class="mt">・<b>粒度が逆</b>。LLMには全行を渡さない（トークン）が、画面には全行を出す。逆にSQLカードの <code>explanation</code> や検算カードは画面のためのもので、messages には別形式で入る。<br>・<b>バイト列</b>。Excel/CSV/画像は JSON に載らない。<code>_encode_item</code> が <code>CHAT_EMBED_FILE_MAX_BYTES</code>(2MB) までは base64、超えるものは <code>_no_data: True</code> にして本体を捨てる。messages 側にファイル名しか入らないのはこのため。<br>・<b>system を保存しない</b>。カタログが育ったら過去の会話も新しい定義で続けたいので、<code>save_chat</code> が system を落とし、開くたびに <code>build_system_prompt</code> で作り直す。</div><div class="mt">副産物として render_log は<b>監査ログ</b>になっている。<code>usage.collect</code> は render_log の <code>kind</code> を数えて sql/chart/table/file/report の件数を出し、<code>_asked</code> は user/text の <code>at</code> と次の応答の <code>at</code> の差で「その質問に何秒待たされたか」を出す。<code>verify.collect_sqls</code> は render_log の SQL と messages の tool_calls 引数の両方から実行SQLを集め、会話単位で重複を除く。</div><div class="mt">2本をつなぐ唯一の目盛りが<b>ユーザー発言の通し番号</b>。<code>_count_turns</code> は render_log の <code>role==&#x27;user&#x27; and kind==&#x27;text&#x27;</code> を数え、<code>_web_log</code> がそれを <code>turn</code> として各吹き出しに振る。<code>_split_at_turn</code> は同じ番号で messages 側（<code>role==&#x27;user&#x27;</code> の n 個目）と render_log 側を切る。</div></td></tr>
       <tr><td>10. 保存・_web_log・巻き戻し</td><td><div class="mt"><b><code>_persist(chat)</code></b></div><div class="mt">・render_log が空で id も無ければ何もしない（新しい会話は話すまでファイルを作らない）。既にある会話は空でも保存する（巻き戻しで全部消したとき、古いやり取りが復活しないように）<br>・<code>db_names</code> = render_log の SQL から <code>db.dbs_named_in</code> で集めたDB名の累積<br>・<code>table_names</code> = 各DBのプロファイルの表名を <code>(?&lt;!\w)表名(?!\w)</code> で SQL に当てて拾った <code>&quot;DBファイル名.表名&quot;</code> の累積。これが次の質問で表ルーターのピン留めになる</div><div class="mt"><b><code>_web_log(render_log, start)</code></b> は保存形式 → ブラウザ形式。3つ副作用がある。</div><div class="mt">・user/text に <code>turn</code> を振る（<code>start</code> より前を数えてから続きを振る）<br>・<code>item[&#x27;data&#x27;]</code>（bytes）を持つアイテムは <code>_fs_put</code> で<b>新しいダウンロードトークンを発行</b>して <code>url</code> に差し替える。呼ぶたび別トークンになり、置き場はプロセス内メモリ200件・所有者一致でしか読めない<br>・<code>kind==&#x27;sql&#x27;</code> に <code>TOOL_LABELS</code> の日本語ラベルを付ける</div><div class="mt"><b><code>/api/chat/rewind</code></b></div><div class="mt">・<code>turn</code> 必須、<code>text</code> は任意。<code>_split_at_turn</code> が messages と render_log を同じ位置で切る（どちらかで見つからなければ ValueError → 400）<br>・<code>text</code> が空なら切るだけ（<code>restored</code> に元の文面を返して入力欄に戻す）<br>・<code>text</code> があれば <code>_auto_scope</code> → <code>_realtime_refresh</code> → system を入れ直し → user を積んで <code>_advance</code>。送信と同じ規則で「scope も KB も無ければ 400」<br>・応答は必ず <code>replace=True</code>（画面を全部描き直す）</div></td></tr>
+      <tr><td>11. マイロボット（AIなしの再現）</td><td><div class="mt">利用者ごとの <code>data/users/&lt;safe_key&gt;/robots.json</code>（<code>{robots: [...]}</code>、1人あたりの上限・実行の最低間隔・手順数の上限は <code>data/robot_settings.yaml</code>（管理者メニュー → マイロボット。無ければ env <code>ROBOT_MAX_PER_USER</code>=5 / <code>ROBOT_MIN_INTERVAL_HOURS</code>=12 / <code>ROBOT_MAX_STEPS</code>=20）。重複は <code>_robot_fingerprint</code>（道具名と引数の並び。result_id は「何番目の手順の何番目の結果か」に置き換え、explanation は見ない）で判定し 409）。ロボット = {id, name, from_chat, from_title, questions[], steps[], holes[], tables[], created_at, updated_at, last_run, last_status, last_message}。step = {name, arguments(dict), produced(その呼び出しが返した result_id)}。hole = {key: &#x27;hN&#x27;, label, kind: &#x27;text&#x27;|&#x27;number&#x27;, sample}。</div><div class="mt"><b>抜き出し（<code>_robot_steps_from_chat</code>）</b>: messages を歩き、assistant の tool_calls と、それに対応する tool の content を突き合わせる。content が JSON で <code>error</code> を持つもの（失敗・_Guard の差し戻し）と、<code>_ROBOT_SKIP_TOOLS</code>（describe_table / propose_glossary_term / propose_example）は入れない。content が JSON でない道具は成功扱い。</div><div class="mt"><b>穴（<code>_robot_candidates</code> / <code>_robot_apply_holes</code>）</b>: 引数 <code>sql</code> は文字列リテラル（<code>&#x27;...&#x27;</code> の中身）と、リテラルの外にある数値。それ以外の引数は文字列・数値の値そのもの（result_id と explanation / purpose は除く）。候補の id は <code>手順:引数:開始:終了</code> で、保存時に同じ抜き出しをやり直して突き合わせ、同じ引数の中では後ろから <code>&#123;&#123;hN&#125;&#125;</code> に置き換える（前から置き換えると位置がずれる）。</div><div class="mt"><b>実行（<code>_robot_run</code>）</b>: <code>rag.set_current_user</code> → <code>results.new_turn()</code> → scope は全表（<code>build_scope({db: []})</code>。絞る意味は AI の焦点であって権限ではない）→ 新しい会話に user を積んで <code>_persist</code> → <code>_realtime_refresh</code> → 手順ごとに <code>_robot_fill</code>（穴を埋める。SQL 内の文字列は <code>&#x27;</code> を二重に、number は数値のみ許可、前の手順の result_id は idmap で付け替え）→ assistant(tool_calls) を積み <code>_call_previews</code> + <code>_execute</code>（＝送信と同じ経路。admin は <code>_is_admin()</code>、SQL ガードも同じ）→ tool の content に <code>error</code> があればそこで止める。最後に assistant の本文を1つ積んで <code>_persist</code>。会話は普通の会話として残るので、続きを AI に頼める。</div><div class="mt"><b>ルート</b>（すべて login_required・本人のフォルダしか見ない）: GET <code>/robots</code>（画面。<code>bp_robots</code>、ナビはマイエージェントの直下） / GET <code>/api/robots</code> / POST <code>/api/robots/extract</code>{chat_id, upto} / <code>save</code>{chat_id, upto, name, turns[], holes[{id,label}]} / <code>run</code>{id, values{hN: 値}} → {chat_id, items(_web_log 全件), run_ok, message} / <code>update</code>{id, name} / <code>delete</code>{id}。save は「外した質問の result_id を使う手順」を 400 で断る。run は <code>_robot_missing_tables</code>（robot.tables がプロファイルに無い）を 400 で断る。表の削除の下見（<code>cleanup.table_impact</code>）は <code>_robots_using</code> で全利用者の robots.json を走査して &quot;robots&quot; 群に出す（消さない）。</div></td></tr>
       <tr><td>11. LLM呼び出し層（llm.chat / chat_stream / _create）</td><td><div class="mt"><code>chat()</code> と <code>chat_stream()</code> は同じ kwargs を組む: <code>model</code>（既定 <code>config.OPENAI_MODEL</code>）、<code>messages</code>、<code>tools</code>、<code>tool_choice=&#x27;auto&#x27;</code>、<code>temperature=config.OPENAI_TEMPERATURE</code>（既定0）、任意で <code>top_p</code> / <code>max_tokens</code>。<code>chat_stream</code> は <code>stream=True</code> を足す。</div><div class="mt">両者とも <code>_create(**kwargs)</code> を通る。<code>_create</code> は2種類の再試行を持つ。</div><div class="mt">・<b>引数の作法学習</b>: 400 のエラー文を <code>_fix_for</code> で読み、<code>reasoning_effort</code> を <code>none</code> にする／落とす、<code>temperature</code>・<code>top_p</code> を落とす、<code>max_tokens</code> → <code>max_completion_tokens</code> に置き換える、を試して <code>_QUIRKS[model]</code> に覚える。1回の呼び出しで最大 <code>_MAX_FIX = 4</code> 回。400 は推論前に弾かれるので費用はかからない。覚えた内容はプロセスの寿命だけ<br>・<b>レート制限(429)</b>: <code>retry-after</code> ヘッダ → エラー文の <code>try again in X</code>（+0.5秒） → <code>2^n</code> 秒 の順で待ち時間を決め、<code>LLM_RATE_LIMIT_MAX_WAIT</code>(20秒) で頭打ち。<code>LLM_RATE_LIMIT_RETRIES</code>(3) 回で諦めて <code>RateLimited</code> を投げる</div><div class="mt"><code>chat()</code> は <code>msg.finish_reason = resp.choices[0].finish_reason</code> を<b>SDKのオブジェクトに後付け</b>する（<code>_note_if_cut</code> が <code>&#x27;length&#x27;</code> を見るため）。属性を拒まれても本体の動作は変えない。</div><div class="mt"><code>chat_stream()</code> は <code>StreamedMessage</code> を組み立てる。tool_calls は複数チャンクに分かれて届くので <code>delta.tool_calls[].index</code> で束ね、<code>name</code> も <code>arguments</code> も<b>文字列連結</b>する。最後に <code>(&#x27;done&#x27;, out)</code> を1回だけ yield する。</div><div class="mt">呼び出し側の <code>_friendly_llm_error</code> が例外文を言い換える（<code>error parsing tool call</code> / <code>out of memory</code> / <code>timeout</code> の3種を特別扱いし、それ以外は先頭160文字だけ添える）。</div></td></tr>
       <tr><td>12. 本日入った変更が経路のどこに触るか</td><td><div class="mt">・<b>SQLの日本語解説</b>: <code>tools.build_tools</code> が <code>name in SQL_TOOLS</code> のツール宣言に <code>_with_explanation</code> で <code>explanation</code> 引数を注入する（<b>required には足さない</b> — 解説を書き損ねただけで質問が止まるのを避けるため）。<code>_call_previews</code> が <code>args.get(&#x27;explanation&#x27;)</code> を <code>kind:&#x27;sql&#x27;</code> アイテムに載せ、chat.js が SQL の下に「このSQLがしていること」として出す。ユーザー定義ツールの場合だけは AI の解説ではなく<b>登録時の description</b> を使う。<br>・<code>drop_table</code> の <code>sqlite_master</code> 判定・まとまりメモの点検 / drift_warnings / dirty 管理は、この経路（質問処理）には直接入ってこない。効くとすれば <code>build_system_prompt</code> が載せるカタログ本文の中身が変わる点だけ。</div></td></tr>
       <tr><td>主なデータ構造</td><td>・scope = [{path: str, alias: str, name: &#x27;DBファイル名.db&#x27;, tables: [表名], meta: {...meta.yaml...}}]（build_scope が生成。tables は選択後の表だけ）<br>・messages = [{role: &#x27;system&#x27;|&#x27;user&#x27;|&#x27;assistant&#x27;|&#x27;tool&#x27;, content: str|[part], tool_calls?: [{id, type:&#x27;function&#x27;, function:{name, arguments}}], tool_call_id?: str}]<br>・render_log アイテム = {role: &#x27;user&#x27;|&#x27;assistant&#x27;, kind: ..., at: ISO秒, ...kind別}。kind は text / sql / table / chart / chart_dual / report / report_doc / file / error / mail_draft / glossary_term / example_proposal / er / table_link / sources<br>・kind:&#x27;sql&#x27; = {tool, sql, purpose, explanation, question, tables: [{db, table}]}（tables は tables_in_sql が最大6件。画面ではカタログへのリンクになる）<br>・calls = [{id, name, arguments}]（_extract_calls。arguments は未パースのJSON文字列のまま _Guard のキーに使う）<br>・tools.dispatch の戻り = {ok: bool, llm_content: str(JSON), render: dict|None, verify_alerts?: [alert]}<br>・verify alert = {key: &#x27;verify||owner||name||指紋||データ版&#x27;, name, left_label, left, right_label, right, diff, pct, tolerance_pct, drill}<br>・results のエントリ = {scope: scope_key, columns, rows, truncated, sql, norm_sql, turn, label}（result_id で他ツールへ引き渡す）<br>・SSE 1件 = &#x27;event: &lt;delta|text_end|running|item|end&gt;\ndata: &lt;JSON&gt;\n\n&#x27;<br>・保存形式（chats/&lt;ID&gt;.json） = {id, title, created_at, updated_at, db_names, table_names, tables, messages(systemを除く), render_log(_encode_item済み)}</td></tr>
@@ -3492,7 +3687,7 @@ for _ in range(config.MAX_AGENT_STEPS):          # 既定10
       <tr><td class="mono small">01</td><td>_begin_turn は _auto_scope より前に質問を保存する。そのため「いま調べられるものがありません」の _TurnError だけは<b>質問が保存済みの状態で</b>返る。さらにブラウザは /stream が 400 を返すと sendStreaming が false を返して /send にフォールバックし、そこで _begin_turn がもう一度走るので、<b>同じ質問が会話に2回積まれて2回保存される</b>。</td></tr>
       <tr><td class="mono small">02</td><td>_append_final_answer は「回答を書け」という user メッセージを LLM には送るが messages には append しない（返ってきた assistant だけ積む）。これが無いと messages 側の user 個数と render_log 側の user/text 個数がずれ、_split_at_turn（巻き戻し）が別の位置で切ってしまう。</td></tr>
       <tr><td class="mono small">03</td><td>_Guard は失敗だけでなく<b>成功した呼び出しも覚える</b>。正しい結果が返っていても2回目は実行せず「もう答えを書け」と差し戻す。実測で「同じ文書検索を10回・103秒、毎回正解を得ていたのに無回答」が起きたための措置。</td></tr>
-      <tr><td class="mono small">04</td><td>空の最終回答は messages.pop() で履歴から取り除く。取り除かないと空の assistant 発言が残り、次の質問でも真似されて<b>そのチャットがずっと無言になる</b>。</td></tr>
+      <tr><td class="mono small">04</td><td>空の最終回答は messages.pop() で履歴から取り除く。取り除かないと空の assistant 発言が残り、次の質問でも真似されて<b>そのマイエージェントがずっと無言になる</b>。</td></tr>
       <tr><td class="mono small">05</td><td>_stream_advance の <code>if msg is None: return</code> は、chat_stream が (&#x27;done&#x27;, …) を返さなかった場合の逃げ道。停止注記もエラーも出さずに黙って終わる（finally の _persist と &#x27;end&#x27; だけ走る）。</td></tr>
       <tr><td class="mono small">06</td><td>_web_log は純関数ではない。bytes を持つアイテムを渡すたび _fs_put で<b>新しいダウンロードトークンを発行する</b>。同じファイルを再描画すると別URLになり、古いトークンは200件のLRUから押し出されて404になりうる。</td></tr>
       <tr><td class="mono small">07</td><td>threading.local に置いているのは rag のカレントユーザーと results のターンIDの2つだけ。stream_with_context が引き継ぐのは Flask の g / session なので、generate() の冒頭で set_current_user / set_turn を<b>やり直さないと</b>同じSQLを2回実行してしまう。</td></tr>
@@ -3517,8 +3712,8 @@ for _ in range(config.MAX_AGENT_STEPS):          # 既定10
     <div class="card__title" id="impl-prompt">5-2. システムプロンプトの組み立て</div>
     <div class="card__desc">質問1回ごとに、選択スコープのデータカタログをテキストへ直列化し、振る舞い規則・ツール一覧・SQLルールと合わせて1本の system メッセージへ組み上げる部分。中核は <code>build_system_prompt</code>（llm 相当）と、その中で呼ばれる <code>catalog.prompt_for_scope</code> → <code>db_text_cached</code> → <code>db_text</code> → <code>table_text</code> の連鎖。カタログが選択中モデルの読める量を超えたときは、上流（<code>_auto_scope</code> の表ルーター）で表を絞り、それでも溢れたら <code>prompt_for_scope</code> が「表の1行要約だけ・列名なし」の要約モードへ落とし、詳細は <code>describe_table</code> ツールで取りに行かせる。文字数→トークンの換算は実測係数（日本語 0.55／JSON 0.31 トークン/字）による概算で、モデル差は文脈量テーブル＋管理者上書き＋呼び出し引数の学習（<code>_QUIRKS</code>）で吸収する。</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:210px">項目</th><th>内容</th></tr></thead><tbody>
-      <tr><td>全体像 — いつ・どこで組まれ、どこに置かれるか</td><td><div class="mt">system プロンプトは会話に1本だけ持ち、<b>毎ターン丸ごと作り直して <code>chat[&quot;messages&quot;][0]</code> を差し替える</b>。組み立てる場所は2か所だけ。</div><div class="tablewrap"><table class="data"><thead><tr><th>呼び出し元</th><th>契機</th></tr></thead><tbody><tr><td><code>_begin_turn</code>（<code>/api/chat/send</code> と <code>/api/chat/stream</code> の共通前処理）</td><td>通常の質問</td></tr><tr><td>巻き戻し・書き直しのエンドポイント</td><td>途中のターンをやり直すとき</td></tr></tbody></table></div><div class="mt">どちらも同じ引数で呼ぶ：</div><pre class="mono small">llm.build_system_prompt(scope, admin=_is_admin(), model=models.current(g.user))</pre><div class="mt">順序が重要な点が2つある。</div><div class="mt">・<b>ユーザー発言を保存してからスコープを決める。</b> <code>_begin_turn</code> は <code>chat[&quot;messages&quot;].append(user_message(...))</code> と <code>_persist(chat)</code> を先に済ませてから <code>_auto_scope</code> を呼ぶ。表ルーターのLLM呼び出しがローカルLLMだと数十秒かかり、その間に別チャットへ切り替えて戻ると質問が消えて見えるため（コメントに明記）。<br>・<b>system は後から index 0 に差し込む。</b> すでに先頭が system でなければ <code>insert(0, ...)</code> してから上書きするので、発言の並び順は崩れない。</div><div class="mt">ツール定義（<code>tools.build_tools(scope, admin=...)</code>）は system と違い、<code>_advance</code> / <code>_stream_advance</code> の<b>エージェントループの毎ステップで作り直される</b>。system は1ターンに1回。</div><div class="mt">このほか、カタログ直列化そのものは AI下書き系でも使われる（<code>draft_view</code> / <code>draft_tool</code> が <code>catalog.prompt_for_scope(...)</code> を limit 無しで呼び、専用の system 文と組み合わせる）。こちらは <code>build_system_prompt</code> を通らない。</div></td></tr>
-      <tr><td>build_system_prompt の構成要素と順序</td><td><div class="mt">戻り値は1本のf文字列。ブロックの並びは固定で、次のとおり。</div><div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>ブロック</th><th>出所・条件</th></tr></thead><tbody><tr><td>1</td><td><code>intro</code>（1〜2行）</td><td><code>rag_targets()</code> が空でなければ「社内の業務アシスタント…ナレッジベースも検索できます」、空なら「SQLiteデータベースの分析アシスタント」</td></tr><tr><td>2</td><td><code># 振る舞い</code></td><td>固定文。実データ厳守・不確かなら <code>describe_table</code>・業務用語優先・カタログ育成の提案（用語/例文）・<code>verification_warnings</code> の扱い</td></tr><tr><td>3</td><td><code># 可視化の方針（チャットにグラフを描く）</code></td><td>固定文。目的別の <code>plot_*</code> 選択、<code>result_id</code> の使い回し</td></tr><tr><td>4</td><td><code># SQLで書けないこと（必ず専用ツールを使う）</code></td><td>固定文。STDDEV/MEDIAN/CORR/PIVOT が無いので <code>pivot_table</code> / <code>analyze_stats</code> へ誘導</td></tr><tr><td>5</td><td><code># ファイル出力</code></td><td>固定文。<code>export_excel</code> / <code>export_csv</code> / <code>export_text</code>、表が無くても <code>rows</code> で出せること</td></tr><tr><td>6</td><td><code># 利用可能なツール</code> + <code>tool_list</code></td><td><code>tools.build_tools(scope, admin)</code> の結果を <code>- name(引数名, ...) : description</code> に整形。末尾に、ユーザー定義ツールがあれば「※ 上記のうち次はこの環境専用…」の1行</td></tr><tr><td>7</td><td><code>kb_note</code></td><td>ナレッジベースが1件以上のときだけ。<code># 社内文書（ナレッジベース）</code> 節＋KB名/説明の一覧＋出典番号の作法</td></tr><tr><td>8</td><td><code>stale_note</code></td><td><code>jobs.problems_by_table()</code> に該当があるときだけ。<code># 状態に問題があるデータ（重要）</code></td></tr><tr><td>9</td><td><code># SQLルール</code></td><td>固定文＋<code>naming</code> を1行差し込む</td></tr><tr><td>10</td><td><code># 選択中のデータカタログ</code></td><td><code>catalog.prompt_for_scope(scope, limit=inline_cap)</code> の戻り値まるごと</td></tr><tr><td>11</td><td><code>現在時刻: &lt;ISO8601 秒精度&gt;</code></td><td><code>datetime.now().isoformat(timespec=&quot;seconds&quot;)</code></td></tr></tbody></table></div><div class="mt"><b>inline_cap の決定</b>（関数の冒頭）</div><pre class="mono small">inline_cap = None
+      <tr><td>全体像 — いつ・どこで組まれ、どこに置かれるか</td><td><div class="mt">system プロンプトは会話に1本だけ持ち、<b>毎ターン丸ごと作り直して <code>chat[&quot;messages&quot;][0]</code> を差し替える</b>。組み立てる場所は2か所だけ。</div><div class="tablewrap"><table class="data"><thead><tr><th>呼び出し元</th><th>契機</th></tr></thead><tbody><tr><td><code>_begin_turn</code>（<code>/api/chat/send</code> と <code>/api/chat/stream</code> の共通前処理）</td><td>通常の質問</td></tr><tr><td>巻き戻し・書き直しのエンドポイント</td><td>途中のターンをやり直すとき</td></tr></tbody></table></div><div class="mt">どちらも同じ引数で呼ぶ：</div><pre class="mono small">llm.build_system_prompt(scope, admin=_is_admin(), model=models.current(g.user))</pre><div class="mt">順序が重要な点が2つある。</div><div class="mt">・<b>ユーザー発言を保存してからスコープを決める。</b> <code>_begin_turn</code> は <code>chat[&quot;messages&quot;].append(user_message(...))</code> と <code>_persist(chat)</code> を先に済ませてから <code>_auto_scope</code> を呼ぶ。表ルーターのLLM呼び出しがローカルLLMだと数十秒かかり、その間に別マイエージェントへ切り替えて戻ると質問が消えて見えるため（コメントに明記）。<br>・<b>system は後から index 0 に差し込む。</b> すでに先頭が system でなければ <code>insert(0, ...)</code> してから上書きするので、発言の並び順は崩れない。</div><div class="mt">ツール定義（<code>tools.build_tools(scope, admin=...)</code>）は system と違い、<code>_advance</code> / <code>_stream_advance</code> の<b>エージェントループの毎ステップで作り直される</b>。system は1ターンに1回。</div><div class="mt">このほか、カタログ直列化そのものは AI下書き系でも使われる（<code>draft_view</code> / <code>draft_tool</code> が <code>catalog.prompt_for_scope(...)</code> を limit 無しで呼び、専用の system 文と組み合わせる）。こちらは <code>build_system_prompt</code> を通らない。</div></td></tr>
+      <tr><td>build_system_prompt の構成要素と順序</td><td><div class="mt">戻り値は1本のf文字列。ブロックの並びは固定で、次のとおり。</div><div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>ブロック</th><th>出所・条件</th></tr></thead><tbody><tr><td>1</td><td><code>intro</code>（1〜2行）</td><td><code>rag_targets()</code> が空でなければ「社内の業務アシスタント…ナレッジベースも検索できます」、空なら「SQLiteデータベースの分析アシスタント」</td></tr><tr><td>2</td><td><code># 振る舞い</code></td><td>固定文。実データ厳守・不確かなら <code>describe_table</code>・業務用語優先・カタログ育成の提案（用語/例文）・<code>verification_warnings</code> の扱い</td></tr><tr><td>3</td><td><code># 可視化の方針（マイエージェントにグラフを描く）</code></td><td>固定文。目的別の <code>plot_*</code> 選択、<code>result_id</code> の使い回し</td></tr><tr><td>4</td><td><code># SQLで書けないこと（必ず専用ツールを使う）</code></td><td>固定文。STDDEV/MEDIAN/CORR/PIVOT が無いので <code>pivot_table</code> / <code>analyze_stats</code> へ誘導</td></tr><tr><td>5</td><td><code># ファイル出力</code></td><td>固定文。<code>export_excel</code> / <code>export_csv</code> / <code>export_text</code>、表が無くても <code>rows</code> で出せること</td></tr><tr><td>6</td><td><code># 利用可能なツール</code> + <code>tool_list</code></td><td><code>tools.build_tools(scope, admin)</code> の結果を <code>- name(引数名, ...) : description</code> に整形。末尾に、ユーザー定義ツールがあれば「※ 上記のうち次はこの環境専用…」の1行</td></tr><tr><td>7</td><td><code>kb_note</code></td><td>ナレッジベースが1件以上のときだけ。<code># 社内文書（ナレッジベース）</code> 節＋KB名/説明の一覧＋出典番号の作法</td></tr><tr><td>8</td><td><code>stale_note</code></td><td><code>jobs.problems_by_table()</code> に該当があるときだけ。<code># 状態に問題があるデータ（重要）</code></td></tr><tr><td>9</td><td><code># SQLルール</code></td><td>固定文＋<code>naming</code> を1行差し込む</td></tr><tr><td>10</td><td><code># 選択中のデータカタログ</code></td><td><code>catalog.prompt_for_scope(scope, limit=inline_cap)</code> の戻り値まるごと</td></tr><tr><td>11</td><td><code>現在時刻: &lt;ISO8601 秒精度&gt;</code></td><td><code>datetime.now().isoformat(timespec=&quot;seconds&quot;)</code></td></tr></tbody></table></div><div class="mt"><b>inline_cap の決定</b>（関数の冒頭）</div><pre class="mono small">inline_cap = None
 if model:
     import models as models_mod   # 循環import回避のため関数内import
     inline_cap = models_mod.inline_limit_for(model)</pre><div class="mt"><code>model</code> を渡さない呼び出しでは <code>None</code> のまま <code>prompt_for_scope</code> に入り、そちらの既定（<code>catalog.inline_limit()</code> = 400,000字）が使われる。</div><div class="mt"><b><code>naming</code> の4分岐</b>（<code>aliases = [s[&quot;alias&quot;] for s in scope]</code>）</div><div class="mt">・2件以上 … 「複数のDBが対象です（…）。テーブル名は必ず『エイリアス.テーブル名』で修飾すること」<br>・1件 … 「テーブル名はそのまま書く（前に何かを付けて修飾しない）」。<b>DB名をAIに教えない</b>のが明示的な設計判断で、画面にDBという概念を出していないため、回答やSQLにDB名が出ると利用者に意味が通じなくなる<br>・0件かつKBあり … 「いま対象にできるデータがありません…ナレッジベースの検索で答えられる範囲で」<br>・0件かつKBなし … 「対象にできるDBがありません。『データ取り込み』でDBを作るよう案内すること」</div><div class="mt"><b><code>stale_note</code> の作り方</b></div><div class="mt"><code>jobs.problems_by_table()</code> は <code>{(db_file, table): [problem,...]}</code>。<code>in_scope = {s[&quot;name&quot;] for s in scope}</code>（＝DBファイル名の集合）に db_file が入っているものだけを拾い、<code>- {alias}.{table}: {message}（{since} 以降）</code> の行にする。文面は「古い」と断定せず、<code>degraded</code>（数値列が文字で保存された）の可能性も併記させる — データは新しいのに集計の方が信用できない場合があるため。</div><div class="mt"><b>tool_list と explanation 引数</b></div><div class="mt"><code>build_tools</code> は <code>SQL_TOOLS</code>（<code>run_sql_query</code> / <code>pivot_table</code> / <code>analyze_stats</code> / 各 <code>plot_*</code> / <code>compare_periods</code> 系 / <code>hypothesis_test</code> 系）に <code>_with_explanation</code> を通し、<code>explanation</code>（日本語解説3〜5行）プロパティを注入する。<code>required</code> には<b>足さない</b>（解説を書き損ねただけで質問全体が止まるのを避けるため）。system プロンプト側にはこの引数の説明文は書かれず、<code>tool_list</code> の行に引数名として <code>explanation</code> が並ぶだけ。書き方の指示は <code>_EXPLANATION_PARAM[&quot;description&quot;]</code>（＝tools 配列側）にある。</div></td></tr>
@@ -3646,7 +3841,7 @@ for s_ in use:                       # use = narrow_scope(sql, scope)
     else: allowed = None; break      # 表を持たないDBが1つでもあれば制限しない
 ...
 conn.set_authorizer(_make_authorizer(allowed))</pre><div class="mt"><code>_authorizer</code> は <code>_ALLOWED_ACTIONS</code>（SELECT / READ / FUNCTION / RECURSIVE）以外を DENY し、SQLITE_READ のとき arg1（表名）が allowed に無ければ DENY（<code>sqlite_</code> 始まりは除外）。</div><div class="mt">全部外すと <code>_auto_scope</code> は空 scope を返し、KBも無ければ <code>_TurnError</code>「いま調べられるものがありません。」。KBがあれば scope=[] のまま進み、system prompt の naming が「いま対象にできるデータがありません。数値の集計はできないので、ナレッジベースの検索で答えられる範囲で答えること。」に切り替わる。</div></td></tr>
-      <tr><td>絞ったときにプロンプトへ入る注記</td><td><div class="mt">注記は2種類ある。両方とも「絞ったこと」ではなく「見えていない情報がある」ことをAIに伝えるためのもの。</div><div class="mt"><b>(1) 表を絞ったときの注記</b>（<code>catalog.db_text</code>）。<code>limited = tables is not None and len(shown) &lt; len(profile[&quot;tables&quot;])</code> のとき、<code>## 使えるデータ</code> の直後に入る:</div><div class="mt">&gt; ※ 利用者がいま対象にしているのは、下に挙げる表だけです。ここに無いデータは存在しないものとして答えてください。他の表があるかのような案内・前置き・質問返しはしないこと。対象外の話を求められたら、サイドバーの SQLite3 でその表にチェックを入れるよう一言で伝えてください。</div><div class="mt">理由はコメントどおり: 絞っていることを明示しないと、AIは知識として知っている他データの話を始め、最後に「使えません」と言う（利用者からは「できないのに答える」に見える）。</div><div class="mt"><code>limited</code> のときは注記だけでなく<b>周辺情報も表示中の表に限定</b>される。素通しにすると載せていない表の名前が例文などから漏れ、AIが「あるはず」と判断して読みに行ってしまうため。</div><div class="tablewrap"><table class="data"><thead><tr><th>対象</th><th>フィルタ</th></tr></thead><tbody><tr><td>relationships</td><td><code>_mentions_only_shown(from + &quot; &quot; + to)</code> … 触れている表が1つ以上あり、全部が表示中</td></tr><tr><td>業務用語</td><td>SQL式は <code>_mentions_only_shown(sql)</code>、説明文は <code>_no_hidden_tables(description)</code>（表名が出てこなければ通す）</td></tr><tr><td>例文</td><td><code>_mentions_only_shown(ex[&quot;sql&quot;])</code></td></tr><tr><td>まとまりメモ</td><td>表示中の表から作った <code>by_group</code> のぶんだけ</td></tr><tr><td>兄弟まとまりの注記</td><td><code>_sibling_groups(by_group)</code> … 表示中の表だけから導くので、選択外のまとまり名は漏れない</td></tr></tbody></table></div><div class="mt">表名の照合は <code>(?&lt;![\w.])名前(?![\w])</code>。日本語の表名があるので <code>\w</code>（UNICODE）でなければ「品質__x」が「高品質__x」に当たる。</div><div class="mt"><b>(2) 要約モードの注記</b>（<code>catalog.prompt_for_scope</code>）。全文が limit を超えたときに compact 版へ落とし、末尾に付く:</div><div class="mt">&gt; 【重要】対象のDBが多いため、上には各テーブルの説明までしか載せていません。<b>列名は1つも載っていません。</b> … 上に見当たらないという理由で「その列は無い」「そのテーブルは無い」と判断してはいけない … ユーザーに「その情報は無い」と答えてよいのは、関係しそうなテーブルを describe_table で実際に確認した後だけです。</div><div class="mt"><b>画面側の注記</b>は別物で <code>models._scope_note(total, limit)</code>。<code>models.status()</code> の <code>scope.note</code> として返り、チャット画面の警告バーに出る。all モードのときだけ「要約モードになります…SCOPE_MODE を見直してください」、それ以外は「使えるデータは変わりません。カタログが大きいので、質問ごとに関係するデータだけへ自動で絞り、詳細を保って渡します」。安心を先に、数字（カタログ全体 約N字 ＞ このモデルが読める量 約M字）は根拠として後ろ、という並びにしてある。</div><div class="mt">なお、ルーターが実際に絞ったことをチャットログに出す仕掛けは無い。残るのは失敗時の <code>[router] …</code> の標準出力だけ。</div></td></tr>
+      <tr><td>絞ったときにプロンプトへ入る注記</td><td><div class="mt">注記は2種類ある。両方とも「絞ったこと」ではなく「見えていない情報がある」ことをAIに伝えるためのもの。</div><div class="mt"><b>(1) 表を絞ったときの注記</b>（<code>catalog.db_text</code>）。<code>limited = tables is not None and len(shown) &lt; len(profile[&quot;tables&quot;])</code> のとき、<code>## 使えるデータ</code> の直後に入る:</div><div class="mt">&gt; ※ 利用者がいま対象にしているのは、下に挙げる表だけです。ここに無いデータは存在しないものとして答えてください。他の表があるかのような案内・前置き・質問返しはしないこと。対象外の話を求められたら、サイドバーの SQLite3 でその表にチェックを入れるよう一言で伝えてください。</div><div class="mt">理由はコメントどおり: 絞っていることを明示しないと、AIは知識として知っている他データの話を始め、最後に「使えません」と言う（利用者からは「できないのに答える」に見える）。</div><div class="mt"><code>limited</code> のときは注記だけでなく<b>周辺情報も表示中の表に限定</b>される。素通しにすると載せていない表の名前が例文などから漏れ、AIが「あるはず」と判断して読みに行ってしまうため。</div><div class="tablewrap"><table class="data"><thead><tr><th>対象</th><th>フィルタ</th></tr></thead><tbody><tr><td>relationships</td><td><code>_mentions_only_shown(from + &quot; &quot; + to)</code> … 触れている表が1つ以上あり、全部が表示中</td></tr><tr><td>業務用語</td><td>SQL式は <code>_mentions_only_shown(sql)</code>、説明文は <code>_no_hidden_tables(description)</code>（表名が出てこなければ通す）</td></tr><tr><td>例文</td><td><code>_mentions_only_shown(ex[&quot;sql&quot;])</code></td></tr><tr><td>まとまりメモ</td><td>表示中の表から作った <code>by_group</code> のぶんだけ</td></tr><tr><td>兄弟まとまりの注記</td><td><code>_sibling_groups(by_group)</code> … 表示中の表だけから導くので、選択外のまとまり名は漏れない</td></tr></tbody></table></div><div class="mt">表名の照合は <code>(?&lt;![\w.])名前(?![\w])</code>。日本語の表名があるので <code>\w</code>（UNICODE）でなければ「品質__x」が「高品質__x」に当たる。</div><div class="mt"><b>(2) 要約モードの注記</b>（<code>catalog.prompt_for_scope</code>）。全文が limit を超えたときに compact 版へ落とし、末尾に付く:</div><div class="mt">&gt; 【重要】対象のDBが多いため、上には各テーブルの説明までしか載せていません。<b>列名は1つも載っていません。</b> … 上に見当たらないという理由で「その列は無い」「そのテーブルは無い」と判断してはいけない … ユーザーに「その情報は無い」と答えてよいのは、関係しそうなテーブルを describe_table で実際に確認した後だけです。</div><div class="mt"><b>画面側の注記</b>は別物で <code>models._scope_note(total, limit)</code>。<code>models.status()</code> の <code>scope.note</code> として返り、マイエージェント画面の警告バーに出る。all モードのときだけ「要約モードになります…SCOPE_MODE を見直してください」、それ以外は「使えるデータは変わりません。カタログが大きいので、質問ごとに関係するデータだけへ自動で絞り、詳細を保って渡します」。安心を先に、数字（カタログ全体 約N字 ＞ このモデルが読める量 約M字）は根拠として後ろ、という並びにしてある。</div><div class="mt">なお、ルーターが実際に絞ったことをマイエージェントログに出す仕掛けは無い。残るのは失敗時の <code>[router] …</code> の標準出力だけ。</div></td></tr>
       <tr><td>新しく取り込まれた表 / 改名 / 削除</td><td><div class="mt"><b>新規取り込み</b>: <code>profile_db</code> のキャッシュキーは <code>{v:2, mtime, size}</code> なので、DBファイルが変われば次の <code>profile_db</code> で自動的に作り直され、新しい表は即座に <code>build_scope</code> の <code>available</code> に入る。<code>tables_off</code> は除外方式なので、<b>新しい表は全利用者で既定ON</b>。取り込み側は <code>catalog.forget(path)</code> でプロファイルキャッシュと <code>_TEXT_CACHE</code> を捨てる。</div><div class="mt"><code>db_text_cached</code> のキーにDB・meta・プロファイルキャッシュの mtime_ns が入っているので、カタログ本文も自動で作り直される。</div><div class="mt"><b>ビュー</b>: <code>profile_db</code> は <code>type IN (&#x27;table&#x27;,&#x27;view&#x27;)</code> で拾うので、ビューは表と完全に同じ扱い（サイドバーのチェック対象・ルーターの候補・authorizer の allowed）。名前を「まとまり__名前」にすればまとまりにも入る。</div><div class="mt"><b>改名</b> <code>cleanup.rename_table</code>: 実表・カタログ・定期取り込みに加えて、<code>USER_META_DIR/*/prefs.yaml</code> を全走査して <code>tables_off</code> の中の旧名を新名に付け替える（全利用者ぶん）。失敗したら実表とカタログを巻き戻す。戻り値の <code>prefs</code> が書き換えた利用者数。</div><div class="mt"><b>削除</b> <code>POST /api/import/drop-table</code>（<code>admin_required</code>）→ <code>importer.drop_table</code> → <code>cleanup.clean_table</code>。<code>drop_table</code> は <code>sqlite_master</code> を <code>name = ? COLLATE NOCASE</code> で引いて <code>type</code> を見てから <code>DROP VIEW</code> / <code>DROP TABLE</code> を撃ち分け、無ければ 404。BINARY で引くと「見つからない→黙って何もしない」になり、呼び出し元は掃除だけ進めて表は残るのに知識だけ消える、という事故を防いでいる。返すのは実物の綴りで、掃除にはそれを使う。<code>clean_table</code> はカタログ・定期取り込み・（最後の1表なら）まとまりメモまで片づけるが、<b><code>tables_off</code> には触らない</b>。</div></td></tr>
       <tr><td>主なデータ構造</td><td>・scope = [{path: str, alias: str, name: str(DBファイル名), tables: [表名, ...], meta: dict}] … tools/llm がそのまま受け取る形式。build_scope が組み立て、_auto_scope が tables を書き換える<br>・picked（route_tables の戻り） = {DBファイル名: [表名, ...]} または None。内部では {DBファイル名: set(表名)} で持ち、最後に sorted して返す<br>・known（route_tables 内の名前解決表） = {&quot;alias.table&quot; または &quot;table&quot;（すべて lower）: (DBファイル名, 表名)}。曖昧な素の表名は ambiguous に入れて削除し、そのあと alias.table だけ入れ直す<br>・profile_db(path) = {file, key:{v,mtime,size}, generated_at, tables: {表名: {type: &#x27;table&#x27;|&#x27;view&#x27;, columns, fks, row_count, sample_columns, sample_rows, col_stats}}}<br>・prefs.yaml（USER_META_DIR/&lt;利用者&gt;/prefs.yaml） = {model, rag_off, rag_settings, tables_off}。KEYS に無いキーは読み書きとも捨てられる<br>・tables_off = [表名, ...] … 「外した表」の名前だけ（DB名は付かない）<br>・chat[&quot;table_names&quot;] = [&quot;DBファイル名.表名&quot;, ...] … この会話でSQLが触った表。ルーターの選から漏れても残すための控え<br>・meta[&quot;relationships&quot;] = [{from: &#x27;table.col&#x27; | &#x27;alias.table.(c1, c2)&#x27;, to: 同左, cardinality?}]（parse_endpoint_cols が解く）</td></tr>
       <tr><td>定数・しきい値</td><td>・SCOPE_MODE（config.py・env）: auto | router | all。既定 auto。この3つ以外の値は auto に丸められる（config.py の直後の if で強制）<br>・INLINE_LIMIT_MIN = 4_000 / INLINE_LIMIT_MAX = 400_000（core.py の models 相当部）。prompt_inline_limit() は常に INLINE_LIMIT_MAX を返す（管理画面から変えられない安全弁）<br>・CATALOG_CONTEXT_RATIO = 0.5 … モデル文脈のうちカタログに使ってよい割合。残り半分をツール定義・履歴・回答に残す<br>・TOKENS_PER_CHAR_TEXT = 0.55（日本語本文）／ TOKENS_PER_CHAR_JSON = 0.31（ツール定義JSON）。inline_limit_for の割り算に使うのは前者<br>・MODEL_CONTEXT_WINDOWS（config.py）＋ MODEL_CONTEXT_DEFAULT = 128000（env）。当てるのは部分一致で、長い名前から先に見る。管理者の context_overrides が最優先<br>・route_tables の早期リターンしきい値: 表の総数 total &lt;= 8 なら絞らない（全部渡した方が確実、という判断）<br>・route_tables のLLM呼び出し: model=config.OPENAI_MODEL（既定 &quot;gpt-5.6-sol&quot;）、temperature=0、max_tokens=300<br>・route_tables に渡す会話履歴: history[-3:]（呼び出し側は render_log の role=user・kind=text を全部渡す）<br>・expand_tables_by_relations: 1ホップのみ・from→to の向きのみ<br>・MAX_ATTACHED = 10（1SQLで ATTACH できるDB数。narrow_scope / widen_scope の打ち止め）<br>・PROMPT_INLINE_LIMIT_CHARS = 80000（env）… 現在は読むだけで使っていない。実効上限は inline_limit_for が決める</td></tr>
@@ -3661,7 +3856,7 @@ conn.set_authorizer(_make_authorizer(allowed))</pre><div class="mt"><code>_autho
       <tr><td class="mono small">06</td><td>ビューは profile_db が sqlite_master の type IN (&#x27;table&#x27;,&#x27;view&#x27;) で拾うため、表とまったく同じ粒度でルーターの候補・サイドバーのチェック対象になる。しかし SQLite の authorizer はビュー経由の読み取りを『実体テーブルへの SQLITE_READ』として通知する（arg1=実体テーブル名、第5引数=ビュー名）。allowed にビューだけ入っていて実体テーブルが入っていないと <code>access to base.a is prohibited</code> で落ちる（実測確認済み）。ルーターがビューだけを選んだ場合や、利用者がビューを残して元表を外した場合に起きる。expand_tables_by_relations はカタログの関連しか見ないので、ここは補完されない。</td></tr>
       <tr><td class="mono small">07</td><td>絞られたことをAIに伝える文面は db_text の limited 注記1本しかなく、内容は『※ 利用者がいま対象にしているのは、下に挙げる表だけです…サイドバーの SQLite3 でその表にチェックを入れるよう一言で伝えてください』。ルーターが機械的に絞ったときも同じ文が出るので、AIは利用者のせいにして『サイドバーでチェックを』と案内する。利用者は何も外していないのに、である。</td></tr>
       <tr><td class="mono small">08</td><td>同じ理由で describe_table_text の拒否文も『いまの対象に入っていません。サイドバーの SQLite3 でチェックを入れると使えます。』で固定。ルーター起因の絞り込みでも同じ文言が返る。</td></tr>
-      <tr><td class="mono small">09</td><td>チャット画面の警告バナー（models.status の scope.note）は catalog_total_chars() ＝ tables=None の全カタログで判定する。_auto_scope が実際に使うのは tables_off 適用後の inline_length(scope)。よって「表を大量に外したのでルーターは走らないのに、バナーだけは『自動で絞ります』と出続ける」ことが起きる。</td></tr>
+      <tr><td class="mono small">09</td><td>マイエージェント画面の警告バナー（models.status の scope.note）は catalog_total_chars() ＝ tables=None の全カタログで判定する。_auto_scope が実際に使うのは tables_off 適用後の inline_length(scope)。よって「表を大量に外したのでルーターは走らないのに、バナーだけは『自動で絞ります』と出続ける」ことが起きる。</td></tr>
       <tr><td class="mono small">10</td><td>表を削除しても tables_off は掃除されない。cleanup.clean_table はカタログ・定期取り込み・まとまりメモは片づけるが prefs.yaml には触らない（改名 rename_table は USER_META_DIR/*/prefs.yaml を全走査して付け替える。非対称）。残骸が消えるのは、その利用者が次にサイドバーのチェックを触ったときだけ（tables_prefs_save が実在する表名だけ残す）。結果、同じ名前で取り込み直すと、以前外していた利用者には最初から外れた状態で現れる。</td></tr>
       <tr><td class="mono small">11</td><td>ルーターのLLMは models.current(g.user)（利用者が選んだモデル）ではなく config.OPENAI_MODEL 固定で呼ばれる。一方、収まるかどうかの判定 inline_limit_for は利用者のモデルで行う。判定するモデルと振り分けるモデルが別物。</td></tr>
       <tr><td class="mono small">12</td><td>SCOPE_MODE の docstring と config の説明には router モードが書かれているが、_auto_scope に <code>== &quot;router&quot;</code> の分岐は無い。all でも auto-fits でもない全部が routing に落ちるので、結果として router は正しく動く（暗黙分岐）。</td></tr>
@@ -3730,7 +3925,7 @@ picked = []
 (1) alias. の形で名指しされているDB
 (2) 修飾なしの表名が一致するDB（(1) と混在したSQLでも取りこぼさない）
 return picked[:MAX_ATTACHED] if picked else scope</pre><div class="mt">「選択中のDBを全部つなぐ必要はない」ため。docstringに経緯があり、11個以上選ぶと2表だけの問い合わせも実行できなくなっていた。<b>どちらでも判断できないときは全部を返す</b> — 勝手に減らして <code>no such table</code> にするより、元の分かりやすいエラー（<code>connect_scope</code> の「1つのSQLで扱えるDBは10個までです…『DB名.テーブル名』の形で書けば…」）の方がよい、という判断。</div><div class="mt">呼び出し順は <b>widen（呼び出し側）→ narrow（run_select 内）</b>。widen が足した <code>tables: None</code> の要素は、SQLがその alias を名指ししているからこそ足されたので narrow でも必ず残る → <code>allowed</code> が None になる。</div></td></tr>
-      <tr><td>SQLから名前を当てる正規表現群と Unicode 対応</td><td><div class="mt">「このSQLはどのDB／どの表を触っているか」を当てる処理が、目的別に4つある。<b>すべて <code>\w</code>（Python3ではUnicode既定）に依存している</b>。</div><div class="tablewrap"><table class="data"><thead><tr><th>関数</th><th>正規表現</th><th>用途</th></tr></thead><tbody><tr><td><code>dbs_named_in(sql)</code></td><td><code>(?&lt;![\w.&quot;])</code> + alias + <code>\s*\.</code></td><td>全DBファイルを走査。SQLが名指ししているDBファイル名</td></tr><tr><td><code>widen_scope</code> / <code>narrow_scope</code>(1)</td><td>同上</td><td>繋ぐDBの決定</td></tr><tr><td><code>narrow_scope</code>(2) / <code>dbs_in_sql</code>(2)</td><td><code>(?&lt;![\w.&quot;])</code> + 表名 + <code>(?![\w&quot;])</code></td><td>修飾なしの表名からDBを当てる</td></tr><tr><td><code>dbs_in_sql(sql, scope)</code></td><td>上2つを <code>re.search().start()</code> で位置つき</td><td>例文の保存先DBを決める。alias が1つでも当たればその順、無ければ表名で最後の手段</td></tr><tr><td><code>tables_in_sql(sql, scope, limit=6)</code></td><td><code>sql.replace(&#x27;&quot;&#x27;,&#x27;&#x27;)</code> してから <code>(?&lt;![\w.])</code>…<code>(?![\w])</code></td><td>チャットのSQLプレビューからカタログの該当表へのリンク（最大6件）</td></tr></tbody></table></div><div class="mt"><b>なぜ <code>\w</code> でなければならないか（実測で確認）</b></div><div class="mt">・<code>SELECT * FROM 売上受注明細</code> に対して表名 <code>受注</code> を探す:<br>・<code>(?&lt;![\w.&quot;])受注(?![\w&quot;])</code>（Unicode <code>\w</code>）→ <b>当たらない</b>（<code>売</code>も<code>明</code>も語構成文字なので境界にならない）。正しい。<br>・<code>(?&lt;![A-Za-z0-9_.&quot;])受注(?![A-Za-z0-9_&quot;])</code>（ASCII限定）→ <b>当たってしまう</b>。存在しない参照を検出したことになる。<br>・同じ理由で <code>品質__defects</code> の中の <code>defects</code> にも当たらない（<code>_</code> が <code>\w</code>）。表名＝接頭辞付きの1本（<code>まとまり__名前</code>）という命名規約と噛み合っている。</div><div class="mt"><b>関数ごとに規則が違う点</b>（重要）</div><div class="mt">・<code>narrow_scope</code> / <code>dbs_in_sql</code> の lookbehind は <code>(?&lt;![\w.&quot;])</code> で <code>&quot;</code> を含むため、<b><code>&quot;品質__defects&quot;</code> と引用符付きで書かれた表名には当たらない</b>（実測）。<br>・<code>tables_in_sql</code> は先に <code>sql.replace(&#x27;&quot;&#x27;,&#x27;&#x27;)</code> で引用符を落としてから照合するので当たる。<br>・カタログ側の別実装（用語検証の参照表抽出）は <code>(?&lt;![\w.&quot;])&quot;?</code> + 名前 + <code>&quot;?(?![\w])</code> と、引用符を任意で許す3つ目の書き方をしている。<br>・一方で健全性チェックが組み立てるSQLは <code>_q(alias, table)</code> = <code>alias.&quot;表名&quot;</code> と必ず引用符を付ける。単一DB（<code>narrow_scope</code> が <code>len(scope) &lt;= 1</code> で即 return）だから問題になっていない。</div><div class="mt"><code>_ALIAS_BAD = re.compile(r&quot;[^\w]&quot;, re.UNICODE)</code> も同じ前提。SQLiteは非ASCIIの識別子をクオート無しで扱えるので、<code>売上.db</code> は <code>売上.受注</code> と書ける。</div></td></tr>
+      <tr><td>SQLから名前を当てる正規表現群と Unicode 対応</td><td><div class="mt">「このSQLはどのDB／どの表を触っているか」を当てる処理が、目的別に4つある。<b>すべて <code>\w</code>（Python3ではUnicode既定）に依存している</b>。</div><div class="tablewrap"><table class="data"><thead><tr><th>関数</th><th>正規表現</th><th>用途</th></tr></thead><tbody><tr><td><code>dbs_named_in(sql)</code></td><td><code>(?&lt;![\w.&quot;])</code> + alias + <code>\s*\.</code></td><td>全DBファイルを走査。SQLが名指ししているDBファイル名</td></tr><tr><td><code>widen_scope</code> / <code>narrow_scope</code>(1)</td><td>同上</td><td>繋ぐDBの決定</td></tr><tr><td><code>narrow_scope</code>(2) / <code>dbs_in_sql</code>(2)</td><td><code>(?&lt;![\w.&quot;])</code> + 表名 + <code>(?![\w&quot;])</code></td><td>修飾なしの表名からDBを当てる</td></tr><tr><td><code>dbs_in_sql(sql, scope)</code></td><td>上2つを <code>re.search().start()</code> で位置つき</td><td>例文の保存先DBを決める。alias が1つでも当たればその順、無ければ表名で最後の手段</td></tr><tr><td><code>tables_in_sql(sql, scope, limit=6)</code></td><td><code>sql.replace(&#x27;&quot;&#x27;,&#x27;&#x27;)</code> してから <code>(?&lt;![\w.])</code>…<code>(?![\w])</code></td><td>マイエージェントのSQLプレビューからカタログの該当表へのリンク（最大6件）</td></tr></tbody></table></div><div class="mt"><b>なぜ <code>\w</code> でなければならないか（実測で確認）</b></div><div class="mt">・<code>SELECT * FROM 売上受注明細</code> に対して表名 <code>受注</code> を探す:<br>・<code>(?&lt;![\w.&quot;])受注(?![\w&quot;])</code>（Unicode <code>\w</code>）→ <b>当たらない</b>（<code>売</code>も<code>明</code>も語構成文字なので境界にならない）。正しい。<br>・<code>(?&lt;![A-Za-z0-9_.&quot;])受注(?![A-Za-z0-9_&quot;])</code>（ASCII限定）→ <b>当たってしまう</b>。存在しない参照を検出したことになる。<br>・同じ理由で <code>品質__defects</code> の中の <code>defects</code> にも当たらない（<code>_</code> が <code>\w</code>）。表名＝接頭辞付きの1本（<code>まとまり__名前</code>）という命名規約と噛み合っている。</div><div class="mt"><b>関数ごとに規則が違う点</b>（重要）</div><div class="mt">・<code>narrow_scope</code> / <code>dbs_in_sql</code> の lookbehind は <code>(?&lt;![\w.&quot;])</code> で <code>&quot;</code> を含むため、<b><code>&quot;品質__defects&quot;</code> と引用符付きで書かれた表名には当たらない</b>（実測）。<br>・<code>tables_in_sql</code> は先に <code>sql.replace(&#x27;&quot;&#x27;,&#x27;&#x27;)</code> で引用符を落としてから照合するので当たる。<br>・カタログ側の別実装（用語検証の参照表抽出）は <code>(?&lt;![\w.&quot;])&quot;?</code> + 名前 + <code>&quot;?(?![\w])</code> と、引用符を任意で許す3つ目の書き方をしている。<br>・一方で健全性チェックが組み立てるSQLは <code>_q(alias, table)</code> = <code>alias.&quot;表名&quot;</code> と必ず引用符を付ける。単一DB（<code>narrow_scope</code> が <code>len(scope) &lt;= 1</code> で即 return）だから問題になっていない。</div><div class="mt"><code>_ALIAS_BAD = re.compile(r&quot;[^\w]&quot;, re.UNICODE)</code> も同じ前提。SQLiteは非ASCIIの識別子をクオート無しで扱えるので、<code>売上.db</code> は <code>売上.受注</code> と書ける。</div></td></tr>
       <tr><td>explain_error — エラー文の言い換え</td><td><div class="mt"><code>run_select</code> は <code>conn.execute</code> の <code>sqlite3.Error</code> を捕まえ、<code>raise sqlite3.OperationalError(explain_error(e)) from e</code> で投げ直す。目的は「何が悪いか」だけでなく「代わりに何を使うか」までLLMに返すこと。</div><pre class="mono small">explain_error(e):
   msg = str(e)
   1) r&quot;no such function:\s*([A-Za-z_0-9]+)&quot; にヒット
@@ -3820,7 +4015,7 @@ return _attach_verification(_run_custom(tool, args, scope), sqls, scope)</pre><d
       <tr><td class="mono small">05</td><td>_string_list_params はツールのトップレベル properties しか見ない。export_excel の sheets.items.chart.value_columns のような入れ子の「文字列の配列」は _coerce_lists の対象外で、文字列が1つ来ても直らない。</td></tr>
       <tr><td class="mono small">06</td><td>_INLINE_COLUMNS が付いたツールでは columns が「文字列の配列」型になるので _coerce_lists の対象に入る。pivot_table だけは自前の columns（列に展開する1列名＝文字列）を持つため _allow_result_id が上書きせず、結果として _LIST_PARAMS にも入らない。この2つは連動している — pivot_table の columns を配列宣言に変えると pandas 側で unhashable type: &#x27;list&#x27; になる。</td></tr>
       <tr><td class="mono small">07</td><td>カタログ画面の組み込みツール一覧（builtin=[_builtin_view(t) for t in tools.BUILTIN_TOOLS]）は build_tools を通していない生のリスト。「AIがこのツールをどう理解しているか」を見せるのが目的と書かれているが、実際には explanation 引数も、管理者フィルタも、ナレッジベース名を埋め込んだ動的な description も反映されない。help.html 側（tools_now）は builtin_overrides と ADMIN_TOOLS を反映するので、2つの画面で見えるものが違う。</td></tr>
-      <tr><td class="mono small">08</td><td>results の _store はプロセス内グローバルで、利用者もチャットも見ない。get() の照合は scope_key（DBファイルパスの並び）だけ。DBが1つの統合構成では全利用者・全チャットで scope_key が同一なので、result_id（8桁hex）を知っていれば他人の結果を引ける。MAX_ENTRIES = 40 も全利用者で共有なので、同時利用が増えると「会話1本で使う量には十分」という前提が崩れて古い result_id が早く消える。</td></tr>
+      <tr><td class="mono small">08</td><td>results の _store はプロセス内グローバルで、利用者もマイエージェントも見ない。get() の照合は scope_key（DBファイルパスの並び）だけ。DBが1つの統合構成では全利用者・全マイエージェントで scope_key が同一なので、result_id（8桁hex）を知っていれば他人の結果を引ける。MAX_ENTRIES = 40 も全利用者で共有なので、同時利用が増えると「会話1本で使う量には十分」という前提が崩れて古い result_id が早く消える。</td></tr>
       <tr><td class="mono small">09</td><td>_gather_sqls はハンドラを呼ぶ前に走る。だからそのツール自身が新しく預ける result_id は当然拾えないし、result_id 経由でSQLを引くときも「実行前の _store」を見る。ユーザー定義ツールだけは例外的にハンドラ呼び出しの直前に sqls.append(render_sql(tool)) で足しており、そのSQLには :name のバインド変数が残ったまま verify に渡る（alerts_for は表名を正規表現で拾うだけで実行しないので害はない）。</td></tr>
       <tr><td class="mono small">10</td><td>_run_custom と fetch は results.put の前に db.widen_scope で scope を広げる。預けたキーは広げた後のもの。DBが複数あってSQLが別DBを名指ししている場合、次のツールが広げる前の scope で同じ result_id を引くと scope_key が一致せず「データが見つかりません」になる。DBが1つの現構成では widen_scope が実質no-opなので表面化しない。</td></tr>
       <tr><td class="mono small">11</td><td>verify_alerts は「戻り値は3キー」という文書化された契約の外にある第4のキーで、_execute だけが読む。ここが res を破壊的に書き換えるので、dispatch の戻り値を再利用する別の経路を足すときは3キー前提で書くと落とす。</td></tr>
@@ -4026,7 +4221,7 @@ mode != &quot;append&quot;  → realtime = True, interval_minutes = 0</pre><div 
   interval &lt;= 0            → None（手動のみ）
   last_run が無い          → start_at があればその時刻、無ければ now（＝すぐ対象）
   last_run がある          → last_run + interval、start_at があれば max(それ, start_at)
-is_due(job, now): enabled かつ next_run_at is not None かつ next_run_at &lt;= now</pre><div class="mt">次回は「前回の<b>実行開始</b>時刻 + 間隔」で決まる。だから手で余計に走らせると予定がずれる。</div><div class="mt"><b>manual_run_blocked</b></div><div class="mt"><code>interval_minutes &gt; 0</code> かつ <code>mode == &quot;append&quot;</code> のときだけ理由文字列を返す。理由は 2 つ:</div><div class="mt">・次回予定が後ろにずれる<br>・保存回数を 1 回ぶん余計に使い、その回だけ間隔の違うデータが混ざる</div><div class="mt">これが効くのは <code>POST /api/jobs/run</code>（400）と <code>/api/import/run</code>（<code>_locked_tables()</code> 経由で 400）と画面のボタン無効化。job_save の強制により append ジョブは必ず interval &gt; 0 なので、<b>実質すべての追記ジョブが手動実行禁止</b>。</div><div class="mt"><b>run_job / _run_job_locked</b></div><div class="mt"><code>run_job</code> は <code>_jobs_lock</code> を取って <code>_run_job_locked</code> を呼ぶだけ。<b>例外は投げず</b>、<code>{&quot;ok&quot;, &quot;rows&quot;, &quot;message&quot;, &quot;degraded&quot;}</code>（append なら <code>removed</code> / <code>kept</code> も）を返す。1 本こけても他を止めないため。</div><div class="mt">・<code>importer.is_allowed(path)</code> を確認（移動・削除・許可フォルダ設定の変更を検出）<br>・<code>read_table(sheet, header_row, delimiter)</code><br>・列の照合。<code>job[&quot;columns&quot;]</code>（登録時のスナップショット）の <code>元の列名</code> がファイル側に無ければ失敗。<b>1列も合わないとき</b>は「区切り文字・見出し行・シートが変わった」という別メッセージにする（列名の変更ではないから）。<br>・<code>len(df) == 0</code> なら失敗させて止める。見出しだけのファイルで全件入れ替えするとテーブルが空になって「成功」で終わるため、前回の内容を残す。<br>・<code>import_dataframe(..., timestamp_value=started.isoformat())</code><br>・append かつ <code>keep_runs</code> があれば <code>prune_runs</code> → <code>run_count</code>。メッセージに <code>保持 N/M回（古い X行を削除）</code> を足す。<br>・結果をジョブ定義に書き戻す（<code>last_run</code>=開始時刻, <code>last_status</code>, <code>last_message</code>, <code>last_rows</code>, <code>last_degraded</code>）。成功時のみ <code>source_stamp</code> を更新。<br>・<code>history.add_import_record(...)</code> に 1 件残す。</div><div class="mt"><b>problems()（設定どおりに更新できていないジョブ）</b></div><div class="mt">有効なジョブだけを見て、先に当たった 1 種類だけを返す（continue で打ち切る）。</div><div class="tablewrap"><table class="data"><thead><tr><th>kind</th><th>条件</th></tr></thead><tbody><tr><td><code>failed</code></td><td><code>last_status == &quot;error&quot;</code></td></tr><tr><td><code>degraded</code></td><td><code>last_degraded</code> が空でない</td></tr><tr><td><code>overdue</code></td><td><code>interval &gt; 0</code> かつ <code>last_run</code> があり、<code>now - last_run &gt; interval * 2</code></td></tr></tbody></table></div><div class="mt">この 1 か所の判定を、チャットのサイドバーの⚠、AI の回答への注記、管理者へのメール（<code>mailer.alert_import_problems</code>）の 3 つが共有する。<code>problems_by_table()</code> は <code>{(db_file, table): [...]}</code> に畳んだ形。</div></td></tr>
+is_due(job, now): enabled かつ next_run_at is not None かつ next_run_at &lt;= now</pre><div class="mt">次回は「前回の<b>実行開始</b>時刻 + 間隔」で決まる。だから手で余計に走らせると予定がずれる。</div><div class="mt"><b>manual_run_blocked</b></div><div class="mt"><code>interval_minutes &gt; 0</code> かつ <code>mode == &quot;append&quot;</code> のときだけ理由文字列を返す。理由は 2 つ:</div><div class="mt">・次回予定が後ろにずれる<br>・保存回数を 1 回ぶん余計に使い、その回だけ間隔の違うデータが混ざる</div><div class="mt">これが効くのは <code>POST /api/jobs/run</code>（400）と <code>/api/import/run</code>（<code>_locked_tables()</code> 経由で 400）と画面のボタン無効化。job_save の強制により append ジョブは必ず interval &gt; 0 なので、<b>実質すべての追記ジョブが手動実行禁止</b>。</div><div class="mt"><b>run_job / _run_job_locked</b></div><div class="mt"><code>run_job</code> は <code>_jobs_lock</code> を取って <code>_run_job_locked</code> を呼ぶだけ。<b>例外は投げず</b>、<code>{&quot;ok&quot;, &quot;rows&quot;, &quot;message&quot;, &quot;degraded&quot;}</code>（append なら <code>removed</code> / <code>kept</code> も）を返す。1 本こけても他を止めないため。</div><div class="mt">・<code>importer.is_allowed(path)</code> を確認（移動・削除・許可フォルダ設定の変更を検出）<br>・<code>read_table(sheet, header_row, delimiter)</code><br>・列の照合。<code>job[&quot;columns&quot;]</code>（登録時のスナップショット）の <code>元の列名</code> がファイル側に無ければ失敗。<b>1列も合わないとき</b>は「区切り文字・見出し行・シートが変わった」という別メッセージにする（列名の変更ではないから）。<br>・<code>len(df) == 0</code> なら失敗させて止める。見出しだけのファイルで全件入れ替えするとテーブルが空になって「成功」で終わるため、前回の内容を残す。<br>・<code>import_dataframe(..., timestamp_value=started.isoformat())</code><br>・append かつ <code>keep_runs</code> があれば <code>prune_runs</code> → <code>run_count</code>。メッセージに <code>保持 N/M回（古い X行を削除）</code> を足す。<br>・結果をジョブ定義に書き戻す（<code>last_run</code>=開始時刻, <code>last_status</code>, <code>last_message</code>, <code>last_rows</code>, <code>last_degraded</code>）。成功時のみ <code>source_stamp</code> を更新。<br>・<code>history.add_import_record(...)</code> に 1 件残す。</div><div class="mt"><b>problems()（設定どおりに更新できていないジョブ）</b></div><div class="mt">有効なジョブだけを見て、先に当たった 1 種類だけを返す（continue で打ち切る）。</div><div class="tablewrap"><table class="data"><thead><tr><th>kind</th><th>条件</th></tr></thead><tbody><tr><td><code>failed</code></td><td><code>last_status == &quot;error&quot;</code></td></tr><tr><td><code>degraded</code></td><td><code>last_degraded</code> が空でない</td></tr><tr><td><code>overdue</code></td><td><code>interval &gt; 0</code> かつ <code>last_run</code> があり、<code>now - last_run &gt; interval * 2</code></td></tr></tbody></table></div><div class="mt">この 1 か所の判定を、マイエージェントのサイドバーの⚠、AI の回答への注記、管理者へのメール（<code>mailer.alert_import_problems</code>）の 3 つが共有する。<code>problems_by_table()</code> は <code>{(db_file, table): [...]}</code> に畳んだ形。</div></td></tr>
       <tr><td>リアルタイム更新（refresh_realtime）</td><td><div class="mt"><code>_begin_turn</code>（/send と /stream の共通前処理）から、スコープ確定後・システムプロンプト構築前に <code>_realtime_refresh(scope)</code> が呼ばれる。<b>質問のたびに走る。</b></div><div class="mt"><code>realtime_jobs()</code> = <code>realtime</code> が真 かつ <code>enabled</code> かつ mode が append でないジョブ。</div><div class="mt">各ジョブについて:</div><div class="mt">・<code>job[&quot;db_file&quot;]</code> が scope の DB 名に無ければスキップ（<b>テーブル単位では絞らない</b>。DB が 1 つの本構成では実質すべての realtime ジョブが毎回対象）。<br>・<code>_source_stamp(job)</code> = <code>f&quot;{st.st_mtime_ns}:{st.st_size}&quot;</code>。中身を読まずに版を判定する。<br>・stamp が空（ファイルが見当たらない）→ 取り込まず、前回の内容のまま答える。<code>_note_realtime_failure</code> でジョブに <code>last_status=&quot;error&quot;</code> を書き、履歴に <code>kind=&quot;realtime&quot;</code> の失敗を 1 件残す。<code>last_run</code> と <code>source_stamp</code> は触らない（実行していないので「最後に動いた時刻」は変わらないし、ファイルが戻ったとき版が違えば取り込み直せるようにするため）。同じ理由で既に記録済みなら何も書かない（質問のたびに呼ばれるので、状態が変わったときだけ書く）。<br>・stamp が <code>job[&quot;source_stamp&quot;]</code> と同じ → 何もしない。ただし直前が <code>error</code> だった場合（ファイルが消えて、同じ内容のまま戻ってきた場合）は <code>last_status=&quot;ok&quot;</code> に戻して⚠を下ろす。下ろさないと次にファイルが変わるまで警告が出続ける。<br>・変わっていれば <code>run_job(job, kind=&quot;realtime&quot;)</code>。版の記録は run_job 側（成功時のみ）なので、失敗したら次の質問で再挑戦する。</div><div class="mt"><code>_realtime_refresh</code> は例外を握って <code>print</code> するだけで質問は止めない（読めなければ前回取り込んだ内容で答える、が決めごと）。</div></td></tr>
       <tr><td>スケジューラと CLI</td><td><div class="mt"><b>アプリ内スケジューラ（元 scheduler.py）</b></div><div class="mt"><code>create_app()</code> から <code>scheduler.start()</code>。<code>config.IMPORT_SCHEDULER</code> が false なら起動しない。二重起動の防止はフラグではなくスレッド名 <code>aiagent-import-scheduler</code> の生存確認（<code>is_running()</code>）で行う。</div><div class="mt"><code>_loop</code>:</div><pre class="mono small">while not _stop.is_set():
     try: tick(); _state[&quot;last_error&quot;] = None
@@ -4046,11 +4241,11 @@ return row[0]      # 実物の綴りを返す</pre><div class="mt">・ビュー�
         _merge(found, own, hit)
         if apply: catalog.save_meta(f, meta)</pre><div class="mt"><code>apply=False</code> が下見（<code>table_impact</code>）、<code>True</code> が本番（<code>clean_table</code>）。</div><div class="mt"><b>clean_table</b></div><div class="mt">・<code>_cleanup_walk(alias, table, apply=True)</code> で全 DB のメタを掃除<br>・<code>drop_jobs</code>（既定 True）なら、その (db_file, table) を狙う定期取り込みを <code>jobs.delete_job</code> で消す。残すと消したテーブルが次の実行で復活する。<br>・<code>catalog.forget(path)</code>（プロファイルキャッシュのファイルとテキストキャッシュを捨てる）<br>・<b>まとまりの最後の表が消えたら、まとまりのメモも片づける。</b> <code>table</code> に <code>__</code> があれば接頭辞を取り、<code>profile_db</code> で <code>pref + &quot;__&quot;</code> で始まる表が 1 つも無ければ <code>meta[&quot;groups&quot;][pref]</code> を pop して保存し、<code>done[&quot;groups&quot;]</code> に記録。残すと「無いデータの前提」だけが AI に渡り続ける。</div><div class="mt"><b>table_impact（下見・何も書き換えない）</b></div><div class="mt"><code>_cleanup_walk(apply=False)</code> に加えて:</div><div class="mt">・<code>jobs</code> … 巻き添えになる定期取り込み（<code>_job_text</code> が <code>名前（表 / 間隔・停止中）</code> を作る）<br>・<code>orphan_terms</code> … <code>_orphan_terms(path, table)</code>。「SQL に表名が書かれていないが、その表の列だけで成立していて、他のどの表でも成立しない」全体用語を列挙する。自動削除は表名の有無で判定するので <code>minutes &gt;= 60</code> のような式はどの表を消しても残る。残った式は検証も整合性の警告も効かなくなるので、削除の確認画面で人に見せて判断を委ねる。<b>数えるだけで消さない。</b></div><div class="mt"><code>summarize(impact)</code> が <code>LABELS</code> の順に <code>[{key, label, items}]</code> に整形する（空は落とす）。</div><div class="mt">入口: <code>GET /api/import/impact</code>（下見）、<code>POST /api/import/drop-table</code>（実行、<code>drop_jobs</code> を body で指定可）。</div></td></tr>
       <tr><td>改名（rename_table / rename_group）</td><td><div class="mt"><b>_rename_in_text</b></div><pre class="mono small">re.sub(r&quot;(?&lt;!\w)&quot; + re.escape(old) + r&quot;(?!\w)&quot;, new, text)</pre><div class="mt">境界を Unicode の語構成文字（<code>\w</code>）で見る。英数字だけの境界では「品質__x」が「高品質__x」の一部に当たる事故が起きる。SQL にも散文にも同じものを使う。</div><div class="mt"><b>rename_table(path, old, new)</b></div><div class="mt">検査（すべて <code>ValueError</code> → API は 400）:</div><div class="mt">・<code>new = safe_name(new, table=True)</code><br>・<code>old</code> が <code>profile_db(path)[&quot;tables&quot;]</code> にあること（views も含む）<br>・<code>&quot;__&quot; in new.strip(&quot;_&quot;)</code>（まとまり必須）<br>・<code>new != old</code>、<code>new</code> が既存でないこと</div><div class="mt">手順:</div><div class="mt">・<code>.meta.yaml</code> の全文を <code>meta_backup</code> に控える<br>・<code>ALTER TABLE old RENAME TO new</code>（<code>sqlite3.connect(timeout=30)</code>）<br>・<b>カタログは YAML 全文への境界つき置換で一括更新</b>。表名は十分に固有なので、説明・SQL・関連の端点・ER 配置キー・ユーザー定義ツールの SQL のどこに現れても同じ置き換えでよい。置換後の文字列を <code>yaml.safe_load</code> し、<code>catalog.save_meta</code> に通して形を正規化して保存する。<br>・<b>まとまり（接頭辞キー）は名前の一部ではないので別扱い。</b> 旧接頭辞 ≠ 新接頭辞 で、旧まとまりに他の表が残っていなければ <code>groups[old_g]</code> を pop し、新キーが未使用なら <code>groups[new_g]</code> に引き継ぐ（<code>moved_memo</code> に旧キーを記録）。削除時と同じ考え方。<br>・定期取り込み: <code>jobs._read()</code> を直接いじり、<code>db_file</code> と <code>table</code> が一致するジョブの <code>table</code> を差し替え、<code>name</code> にも <code>_rename_in_text</code> を掛けて <code>jobs._write()</code>。<br>・利用者ごとの選択: <code>config.USER_META_DIR/*/prefs.yaml</code> を glob し、<code>tables_off</code> リストの中の <code>old</code> を <code>new</code> に置き換えて書き戻す（<code>prefs</code> モジュールを通さず直接書く）。<br>・3〜6 のどこかで例外が出たら <b>実表を元の名前に戻し、<code>.meta.yaml</code> を控えから書き戻し</b>、<code>catalog.forget</code> して再送出。<br>・最後に <code>catalog.forget(path)</code>。</div><div class="mt">戻り値 <code>{old, new, jobs, prefs, memo_moved}</code>。</div><div class="mt"><b>rename_group(path, old_key, new_key)</b></div><div class="mt">・<code>&quot;__&quot; in new_key</code>（<b>生の入力に対して</b>）を先に弾く。safe_name が <code>__</code> を潰すので、後に回すと検査が効かない。<br>・<code>new_key = safe_name(new_key)</code>（table=False）<br>・対象は <code>t.split(&quot;__&quot;, 1)[0] == old_key and &quot;__&quot; in t</code> の全表<br>・<b>先に全部の衝突を確かめてから</b>始める（途中で止まると半端になる）<br>・あとは 1 表ずつ <code>rename_table(path, t, new_key + &quot;__&quot; + rest)</code> を回す</div><div class="mt">入口: <code>POST /api/catalog/rename-table</code> / <code>POST /api/catalog/rename-group</code>。どちらも <code>admin_required</code>。</div></td></tr>
-      <tr><td>ビュー（実体を持たない、名前を付けた SELECT）</td><td><div class="mt">表と同じ規約「まとまり__名前」で作るので、登録すると表一覧・ER 図・チャットの表選択にそのまま出る。カタログ側は名前で引くだけなので追加実装が要らない。</div><div class="mt"><b>検査と作成</b></div><div class="mt">・<code>_view_check_sql(sql)</code> … 末尾の <code>;</code> を落とし、<code>db.validate_select</code> を通す（複数文禁止、<code>SELECT</code> / <code>WITH</code> 始まり、書き込み・DDL キーワード禁止）。<br>・<code>_view_run(path, sql, limit)</code> … 実データで動かして <code>{columns, rows, total}</code> を返す。<code>total</code> は <code>SELECT COUNT(*) FROM (&lt;sql&gt;)</code>、失敗しても本体は見せる。<br>・<code>create_view(db_path, name, sql, replace=False)</code> … <code>data/</code> の外は拒否。<code>sqlite_master</code> で同名を引き、<b>表なら拒否</b>（取り違え防止）、ビューで <code>replace=False</code> なら拒否、ビューで replace なら <code>DROP VIEW IF EXISTS</code> してから <code>CREATE VIEW ... AS &lt;sql&gt;</code>。</div><div class="mt"><b>API</b></div><div class="tablewrap"><table class="data"><thead><tr><th>ルート</th><th>内容</th></tr></thead><tbody><tr><td><code>POST /api/catalog/view/preview</code></td><td>保存せず実データで動かす</td></tr><tr><td><code>POST /api/catalog/view/draft</code></td><td>日本語の目的から AI に下書きさせる。実データに当てて失敗したらエラーを添えて <b>1 回だけ</b> 書き直させる（<code>for _attempt in range(2)</code>）。AI が「作らない方がよい」と返したら <code>ok:false</code> + <code>reason</code> を 200 で返す</td></tr><tr><td><code>POST /api/catalog/view</code></td><td>新規・作り直し・改名。説明も同時に保存</td></tr><tr><td><code>POST /api/catalog/view/delete</code></td><td>削除 + 後片付け</td></tr></tbody></table></div><div class="mt"><code>view_save</code> の順序:</div><div class="mt">・<code>name = safe_name(name, table=True)</code>、<code>&quot;__&quot;</code> 必須<br>・<code>_view_check_sql</code><br>・<code>profile_db</code> で同名が「ビュー以外の実体」なら拒否<br>・<b>改名は旧名が本当にビューのときだけ許す</b>（<code>old not in {v[&quot;name&quot;] for v in list_views(path)}</code> なら 400）<br>・<code>_view_run(limit=1)</code> で <b>保存前に必ず動かす</b><br>・<code>create_view(replace = (name == old or bool(existing)))</code><br>・改名なら <code>drop_table(path, old)</code> で旧ビューを落とす<br>・カタログの <code>tables</code> エントリを <code>old</code> から <code>name</code> へ移し替え（説明・列の説明を引き継ぐ）、<code>description</code> を保存、<code>catalog.forget</code></div><div class="mt"><code>view_delete</code> は <code>drop_table</code> → <code>cleanup.clean_table(path, name, drop_jobs=False)</code>。ビューに定期取り込みは付かないので、ジョブは触らない。</div><div class="mt"><code>_views_payload(path)</code> が画面に渡す一覧。<code>view_body</code> は保存済みの <code>CREATE VIEW ... AS</code> の後ろを <code>re.search(r&quot;\bAS\b\s*(.+)$&quot;, sql, re.S|re.I)</code> で切り出す。</div></td></tr>
+      <tr><td>ビュー（実体を持たない、名前を付けた SELECT）</td><td><div class="mt">表と同じ規約「まとまり__名前」で作るので、登録すると表一覧・ER 図・マイエージェントの表選択にそのまま出る。カタログ側は名前で引くだけなので追加実装が要らない。</div><div class="mt"><b>検査と作成</b></div><div class="mt">・<code>_view_check_sql(sql)</code> … 末尾の <code>;</code> を落とし、<code>db.validate_select</code> を通す（複数文禁止、<code>SELECT</code> / <code>WITH</code> 始まり、書き込み・DDL キーワード禁止）。<br>・<code>_view_run(path, sql, limit)</code> … 実データで動かして <code>{columns, rows, total}</code> を返す。<code>total</code> は <code>SELECT COUNT(*) FROM (&lt;sql&gt;)</code>、失敗しても本体は見せる。<br>・<code>create_view(db_path, name, sql, replace=False)</code> … <code>data/</code> の外は拒否。<code>sqlite_master</code> で同名を引き、<b>表なら拒否</b>（取り違え防止）、ビューで <code>replace=False</code> なら拒否、ビューで replace なら <code>DROP VIEW IF EXISTS</code> してから <code>CREATE VIEW ... AS &lt;sql&gt;</code>。</div><div class="mt"><b>API</b></div><div class="tablewrap"><table class="data"><thead><tr><th>ルート</th><th>内容</th></tr></thead><tbody><tr><td><code>POST /api/catalog/view/preview</code></td><td>保存せず実データで動かす</td></tr><tr><td><code>POST /api/catalog/view/draft</code></td><td>日本語の目的から AI に下書きさせる。実データに当てて失敗したらエラーを添えて <b>1 回だけ</b> 書き直させる（<code>for _attempt in range(2)</code>）。AI が「作らない方がよい」と返したら <code>ok:false</code> + <code>reason</code> を 200 で返す</td></tr><tr><td><code>POST /api/catalog/view</code></td><td>新規・作り直し・改名。説明も同時に保存</td></tr><tr><td><code>POST /api/catalog/view/delete</code></td><td>削除 + 後片付け</td></tr></tbody></table></div><div class="mt"><code>view_save</code> の順序:</div><div class="mt">・<code>name = safe_name(name, table=True)</code>、<code>&quot;__&quot;</code> 必須<br>・<code>_view_check_sql</code><br>・<code>profile_db</code> で同名が「ビュー以外の実体」なら拒否<br>・<b>改名は旧名が本当にビューのときだけ許す</b>（<code>old not in {v[&quot;name&quot;] for v in list_views(path)}</code> なら 400）<br>・<code>_view_run(limit=1)</code> で <b>保存前に必ず動かす</b><br>・<code>create_view(replace = (name == old or bool(existing)))</code><br>・改名なら <code>drop_table(path, old)</code> で旧ビューを落とす<br>・カタログの <code>tables</code> エントリを <code>old</code> から <code>name</code> へ移し替え（説明・列の説明を引き継ぐ）、<code>description</code> を保存、<code>catalog.forget</code></div><div class="mt"><code>view_delete</code> は <code>drop_table</code> → <code>cleanup.clean_table(path, name, drop_jobs=False)</code>。ビューに定期取り込みは付かないので、ジョブは触らない。</div><div class="mt"><code>_views_payload(path)</code> が画面に渡す一覧。<code>view_body</code> は保存済みの <code>CREATE VIEW ... AS</code> の後ろを <code>re.search(r&quot;\bAS\b\s*(.+)$&quot;, sql, re.S|re.I)</code> で切り出す。</div></td></tr>
       <tr><td>更新履歴（history）</td><td><div class="mt"><code>data/import_history.jsonl</code>（1行1件の JSON）。YAML ではなく追記型なのは、実行のたびに全件を書き直したくないため。手動も定期も同じ形で残し、<code>kind</code> で区別する。</div><div class="mt"><code>IMPORT_RECORD_KINDS = {&quot;manual&quot;: &quot;手動&quot;, &quot;auto&quot;: &quot;定期&quot;, &quot;job&quot;: &quot;定期（手動実行）&quot;, &quot;realtime&quot;: &quot;リアルタイム&quot;}</code></div><div class="mt"><code>add_import_record</code> は <code>_history_lock</code> の下で 1 行追記し、行数カウンタ <code>_count</code> を進めて <code>_trim_if_needed</code>。カウンタはプロセス内変数で、初回は <code>_line_count</code> で数え直す。上限 <code>config.IMPORT_HISTORY_MAX</code> の 1.1 倍を超えてから、新しい方だけを残してまとめて間引く（毎回書き直すと重い）。<b>記録に失敗しても取り込み自体は止めない</b>（print して続行）。</div><div class="mt">読み出し: <code>for_table(db_file, table, limit)</code>、<code>recent_import_records(limit)</code>、<code>counts()</code>、<code>latest_by_source()</code>（AI ツールの「取り込み状況」列が使う）。<code>_newest_first</code> は「先に並びを逆にしてから安定ソート」する。<code>at</code> が秒までしか無いので、同じ秒の中は「後に書いた方が新しい」で決めるため。</div></td></tr>
-      <tr><td>HTTP API 一覧（すべて admin_required）</td><td><div class="tablewrap"><table class="data"><thead><tr><th>メソッド・パス</th><th>関数</th><th>内容</th></tr></thead><tbody><tr><td>GET <code>/import</code></td><td><code>import_index</code></td><td>取り込み画面。<code>dir_status</code> / <code>existing_tables</code> / <code>_group_choices</code> / <code>_manage_view</code> を渡す</td></tr><tr><td>GET/POST <code>/api/import/dirs</code></td><td><code>dirs_list</code> / <code>dirs_edit</code></td><td>取り込み元フォルダの一覧・追加・削除</td></tr><tr><td>POST <code>/api/import/browse</code></td><td><code>_w_browse</code></td><td>フォルダを1階層開く（許可フォルダの外は開かない）</td></tr><tr><td>POST <code>/api/import/upload</code></td><td><code>upload</code></td><td>アップロード受け取り（メモリ、token 返却）</td></tr><tr><td>POST <code>/api/import/preview</code></td><td><code>_w_preview</code></td><td>先頭 2000 行を読んで列プラン・サンプル行・推奨表名を返す</td></tr><tr><td>POST <code>/api/import/run</code></td><td><code>run</code></td><td>1回きりの取り込み（append は 400。<code>_locked_tables</code> も見る）</td></tr><tr><td>GET <code>/api/import/manage</code></td><td><code>manage_view</code></td><td>「DBの管理」タブの中身</td></tr><tr><td>GET <code>/api/import/table</code></td><td><code>table_detail</code></td><td>開いたテーブルのサンプル行と更新履歴</td></tr><tr><td>GET <code>/api/import/impact</code></td><td><code>impact</code></td><td>削除の下見</td></tr><tr><td>POST <code>/api/import/drop-table</code></td><td><code>_w_drop_table</code></td><td>削除＋後片付け</td></tr><tr><td>POST <code>/api/jobs/save</code></td><td><code>job_save</code></td><td>ジョブ登録。replace なら直後に 1 回実行</td></tr><tr><td>POST <code>/api/jobs/run</code></td><td><code>job_run</code></td><td>「▶ 今すぐ更新」。<code>manual_run_blocked</code> を見る</td></tr><tr><td>POST <code>/api/jobs/update</code></td><td><code>job_update</code></td><td>enabled / interval / realtime の変更（<code>check_start=False</code>）</td></tr><tr><td>POST <code>/api/jobs/delete</code></td><td><code>job_delete</code></td><td>ジョブ削除</td></tr><tr><td>POST <code>/api/catalog/rename-table</code></td><td><code>api_rename_table</code></td><td>表の改名（まとまりの移動も同じ口）</td></tr><tr><td>POST <code>/api/catalog/rename-group</code></td><td><code>api_rename_group</code></td><td>まとまりキーの一括改名</td></tr><tr><td>POST <code>/api/catalog/view*</code></td><td><code>view_preview</code> / <code>view_draft</code> / <code>view_save</code> / <code>view_delete</code></td><td>ビュー</td></tr></tbody></table></div><div class="mt">取り込みが成功したら呼び出し側が <code>catalog.profile_db(db_path, force=True)</code> でプロファイルを取り直す（<code>/api/import/run</code>、<code>job_save</code> の初回、<code>job_run</code>）。</div></td></tr>
-      <tr><td>主なデータ構造</td><td>・job = {id: 12桁hex, name, source(絶対パス), sheet|None, header_row(int,0始まり), delimiter|None, db_file, table, mode(&#x27;replace&#x27;|&#x27;append&#x27;), timestamp_column|None, keep_runs|None, start_at(&#x27;YYYY-MM-DDTHH:MM&#x27;), interval_minutes(int), realtime(bool), enabled(bool), columns[], created_at, last_run, last_status(&#x27;ok&#x27;|&#x27;error&#x27;), last_message, last_rows, last_degraded[], source_stamp(&#x27;&lt;mtime_ns&gt;:&lt;size&gt;&#x27;)}<br>・columns（列プラン）= [{&quot;元の列名&quot;: 元ファイルの見出し, &quot;列名&quot;: safe_name後, &quot;型&quot;: &quot;TEXT&quot;|&quot;INTEGER&quot;|&quot;REAL&quot;}] ※prepare_frame が「型」をその場で TEXT に書き換えることがある<br>・write_cols（import_dataframe 内部）= [{&quot;列名&quot;, &quot;型&quot;}] … columns から作り、取得日時列を末尾に足したもの。CREATE TABLE と INSERT の列順はこれ<br>・inspect_file の戻り = {file, sheet, sheets[], header_row(0始まり), verdict, issues[], shape{列数,読んだ行数,見出し行}, columns[], encoding?, delimiter?}<br>・issue = {level: &quot;高&quot;|&quot;中&quot;|&quot;低&quot;, text: 何が起きているか, fix: 直し方}<br>・import_dataframe の戻り = (書き込んだ行数:int, TEXTに降格した列名:list[str])<br>・run_job の戻り = {ok: bool, rows: int, message: str, degraded: [列名], removed?: int, kept?: int}<br>・problems() の要素 = {id, name, db_file, table, kind: &quot;failed&quot;|&quot;degraded&quot;|&quot;overdue&quot;, since(last_run), message}<br>・履歴レコード = {at, db_file, table, ok, kind, mode, rows, removed, kept, keep, source, sheet, job_id, job_name, user, message, seconds}<br>・_scrub_meta の hit / clean_table・table_impact の戻り = {relationships[], glossary[], examples[], checks[], tables[], er_layout[], jobs[], groups[], orphan_terms[]}（各要素は {db, text}。ただし jobs は table_impact のとき {id, name, text}）<br>・table_info の戻り = {name, columns[], column_count, rows, timestamp_column, runs(distinct数), latest, oldest, error?}<br>・_manage_view の戻り = {dbs: [{name, size, mtime, tables: [{...table_info, jobs: [_job_row]}]}], orphans: [_job_row], locked: {db_file: {table: 理由}}, sched: scheduler_status()}<br>・scope（realtime のフィルタに使う）= [{path, alias, name(=DBファイル名), tables?}]<br>・アップロード預かり物 = {data: bytes, filename, mime, owner} を token をキーに OrderedDict で保持</td></tr>
-      <tr><td>定数・しきい値</td><td>・MAX_SCAN_ROWS = 200（core.py 冒頭 filecheck セクション）… 形を見るために読む最大行数<br>・HEADER_SEARCH_ROWS = 12 … 見出し行を探す範囲。これより下に見出しがある表は当てられない<br>・MERGE_CHECK_MAX_MB = 20 … これを超えるExcelは結合セルを調べず None（＝「調べていない」）を返す<br>・_TOTAL_WORDS = (&quot;合計&quot;,&quot;総計&quot;,&quot;小計&quot;,&quot;計&quot;,&quot;累計&quot;,&quot;total&quot;,&quot;subtotal&quot;,&quot;sum&quot;) … 行頭2セルにあると合計行とみなす<br>・CSV_ENCODINGS = [&quot;utf-8-sig&quot;, &quot;cp932&quot;, &quot;utf-8&quot;, &quot;shift_jis&quot;, &quot;euc_jp&quot;] … 上から順に試す<br>・config.IMPORT_EXTENSIONS = (&quot;.csv&quot;, &quot;.tsv&quot;, &quot;.txt&quot;, &quot;.xlsx&quot;, &quot;.xlsm&quot;)（config.py・env では変えられない定数）<br>・config.IMPORT_MAX_FILE_MB = 100（env IMPORT_MAX_FILE_MB）<br>・config.IMPORT_MAX_ROWS = 1_000_000（env IMPORT_MAX_ROWS）… import_dataframe が超過を拒否<br>・config.IMPORT_PREVIEW_ROWS = 30 … 画面に見せる行数。ただしプレビューが読むのは nrows=2000（/api/import/preview のハードコード）<br>・config.IMPORT_SCAN_DEPTH = 0（env）… 0 は「無制限」という意味のある値。未指定は None で区別する<br>・config.IMPORT_MAX_FILES = 2000（env）… list_all_files の打ち切り<br>・config.IMPORT_SAMPLE_ROWS = 20（env）… sample_rows の既定<br>・config.IMPORT_TIMESTAMP_COLUMN = &quot;取得日時&quot;（env）… ジョブに設定が無いときの既定列名<br>・config.IMPORT_SCHEDULER = true / IMPORT_SCHEDULER_TICK_SEC = 60（env）… ただし実際の待ちは max(5, tick) 秒<br>・config.IMPORT_HISTORY_MAX = 5000（env）… 1.1倍を超えてから間引く<br>・config.IMPORT_ALLOW_UPLOAD = false（env、既定 false）/ IMPORT_DIRS_EDITABLE = true（env）<br>・jobs.MAX_KEEP_RUNS = 800 … 保存回数の上限。決めておかないと日次で回すだけで表が際限なく膨らむ<br>・jobs.DEFAULT_KEEP_RUNS = None … 既定値をあえて置かない（業務ごとに違うので必ず自分で決めさせる）<br>・jobs.START_GRACE_MINUTES = 2 … 開始日時が「過去」かの判定の許容。送信のタイムラグ対策<br>・jobs.INTERVALS = {手動のみ:0, 15分ごと:15, 1時間ごと:60, 3時間ごと:180, 6時間ごと:360, 1日ごと:1440, 1週間ごと:10080}<br>・importer.DELIMITERS = {自動判定:None, カンマ:&quot;,&quot;, タブ:&quot;\t&quot;, パイプ:&quot;|&quot;, セミコロン:&quot;;&quot;, 空白（連続もまとめる）:&quot;\\s+&quot;}<br>・safe_name の切り詰め = 64文字（return s[:64]）<br>・INTEGER 判定の上限 = abs(値) &lt; 2**63（infer_type）<br>・sqlite3.connect(..., timeout=30) … import_dataframe / prune_runs / rename_table の書き込み接続<br>・scheduler の tick_count &gt; 1 から通知（起動直後の1周目は「変化」とみなさない）<br>・AIツール側: _MAX_ROWS=300（一覧件数）、_MAX_PREVIEW_ROWS=20、_MAX_CHECK=20（1件ずつ開くので形の判定はここまで）<br>・VIEW_PREVIEW_ROWS = 20 / view_draft の再試行は 1 回だけ（for _attempt in range(2)）<br>・_fs（アップロード預かり）_MAX_ITEMS = 200、LRU で古いものから破棄</td></tr>
+      <tr><td>HTTP API 一覧（すべて admin_required）</td><td><div class="tablewrap"><table class="data"><thead><tr><th>メソッド・パス</th><th>関数</th><th>内容</th></tr></thead><tbody><tr><td>GET <code>/import</code></td><td><code>import_index</code></td><td>取り込み画面。<code>dir_status</code> / <code>existing_tables</code> / <code>_group_choices</code> / <code>_manage_view</code> を渡す</td></tr><tr><td>GET/POST <code>/api/import/dirs</code></td><td><code>dirs_list</code> / <code>dirs_edit</code></td><td>取り込み元フォルダの一覧・追加・削除</td></tr><tr><td>POST <code>/api/import/browse</code></td><td><code>_w_browse</code></td><td>フォルダを1階層開く（許可フォルダの外は開かない）</td></tr><tr><td>POST <code>/api/import/upload</code></td><td><code>upload</code></td><td>アップロード受け取り（メモリ、token 返却）</td></tr><tr><td>POST <code>/api/import/preview</code></td><td><code>_w_preview</code></td><td>先頭 2000 行を読んで列プラン・サンプル行・推奨表名を返す</td></tr><tr><td>POST <code>/api/import/run</code></td><td><code>run</code></td><td>1回きりの取り込み（append は 400。<code>_locked_tables</code> も見る）</td></tr><tr><td>GET <code>/api/import/manage</code></td><td><code>manage_view</code></td><td>「DBの管理」タブの中身</td></tr><tr><td>GET <code>/api/import/table</code></td><td><code>table_detail</code></td><td>開いたテーブルのサンプル行と更新履歴</td></tr><tr><td>GET <code>/api/import/impact</code></td><td><code>impact</code></td><td>削除の下見</td></tr><tr><td>POST <code>/api/import/drop-table</code></td><td><code>_w_drop_table</code></td><td>削除＋後片付け</td></tr><tr><td>POST <code>/api/jobs/save</code></td><td><code>job_save</code></td><td>ジョブ登録。replace なら直後に 1 回実行</td></tr><tr><td>POST <code>/api/jobs/run</code></td><td><code>job_run</code></td><td>「▶ 今すぐ更新」。<code>manual_run_blocked</code> を見る</td></tr><tr><td>POST <code>/api/jobs/update</code></td><td><code>job_update</code></td><td>enabled / interval / realtime の変更（<code>check_start=False</code>）</td></tr><tr><td>POST <code>/api/jobs/delete</code></td><td><code>job_delete</code></td><td>ジョブ削除</td></tr><tr><td>GET <code>/output</code></td><td><code>output_index</code></td><td>「出力」タブ（出力先フォルダの設定画面。<code>output.html</code>）</td></tr><tr><td>GET/POST <code>/api/output-dir</code></td><td><code>output_dir_get</code> / <code>output_dir_set</code></td><td>出力先フォルダの状態と保存（<code>data/output_dir.yaml</code>、env の <code>OUTPUT_DIR</code> が初期値。<code>check_output_dir</code> が絶対パス・アプリ外・書けるか（試し書き）を見る）。書く先は <code>save_to_user_folder</code> の「出力先/利用者名/ファイル名」に固定で、同名は _2, _3。道具側は <code>dispatch</code> の <code>_attach_folder_save</code> が <code>save_to_folder: true</code> を一括処理し、render に <code>saved_to</code>／<code>save_error</code> を足す。会話のファイルカードは <code>POST /api/file/save-to-folder</code>{token}（login_required）</td></tr><tr><td>GET <code>/api/scrapers</code></td><td><code>scrapers_list</code></td><td><code>config.SCRAPER_DIR</code> 直下の .py（<code>_</code> 始まりは除く）と既定のタイムアウト・最小間隔</td></tr><tr><td>POST <code>/api/scrapers/test</code></td><td><code>scrapers_test</code></td><td><code>importer.run_scraper</code> で1回実行。出来たファイルは <code>_fs_put(..., trusted=True)</code> でメモリに預け、名前・サイズ・シート名・預かり札を返す。一時フォルダは実行直後に削除</td></tr><tr><td>POST <code>/api/catalog/rename-table</code></td><td><code>api_rename_table</code></td><td>表の改名（まとまりの移動も同じ口）</td></tr><tr><td>POST <code>/api/catalog/rename-group</code></td><td><code>api_rename_group</code></td><td>まとまりキーの一括改名</td></tr><tr><td>POST <code>/api/catalog/view*</code></td><td><code>view_preview</code> / <code>view_export</code> / <code>view_draft</code> / <code>view_save</code> / <code>view_delete</code></td><td>ビュー（export は定義SQLの結果を全件 xlsx にして <code>_fs_put</code> の札で渡す。保存前のSQLでも動く）</td></tr></tbody></table></div><div class="mt">取り込みが成功したら呼び出し側が <code>catalog.profile_db(db_path, force=True)</code> でプロファイルを取り直す（<code>/api/import/run</code>、<code>job_save</code> の初回、<code>job_run</code>）。</div></td></tr>
+      <tr><td>主なデータ構造</td><td>・job = {id: 12桁hex, name, source(絶対パス), sheet|None, header_row(int,0始まり), delimiter|None, db_file, table, mode(&#x27;replace&#x27;|&#x27;append&#x27;), timestamp_column|None, keep_runs|None, start_at(&#x27;YYYY-MM-DDTHH:MM&#x27;), interval_minutes(int), realtime(bool), enabled(bool), columns[], created_at, last_run, last_status(&#x27;ok&#x27;|&#x27;error&#x27;), last_message, last_rows, last_degraded[], source_stamp(&#x27;&lt;mtime_ns&gt;:&lt;size&gt;&#x27;)}。スクレイピングの設定はさらに source_kind=&#x27;scraper&#x27;（source はスクリプトのファイル名）, scrape_file（使う出来上がりファイル名）, scrape_timeout_sec, scrape_interval_minutes を持つ。run_job はスクレイピングを <code>_jobs_lock</code> の外で実行し（<code>_scraping</code> で同じ設定の同時実行を1本に）、refresh_realtime は stamp の代わりに last_run＋最小間隔で判定する<br>・columns（列プラン）= [{&quot;元の列名&quot;: 元ファイルの見出し, &quot;列名&quot;: safe_name後, &quot;型&quot;: &quot;TEXT&quot;|&quot;INTEGER&quot;|&quot;REAL&quot;}] ※prepare_frame が「型」をその場で TEXT に書き換えることがある<br>・write_cols（import_dataframe 内部）= [{&quot;列名&quot;, &quot;型&quot;}] … columns から作り、取得日時列を末尾に足したもの。CREATE TABLE と INSERT の列順はこれ<br>・inspect_file の戻り = {file, sheet, sheets[], header_row(0始まり), verdict, issues[], shape{列数,読んだ行数,見出し行}, columns[], encoding?, delimiter?}<br>・issue = {level: &quot;高&quot;|&quot;中&quot;|&quot;低&quot;, text: 何が起きているか, fix: 直し方}<br>・import_dataframe の戻り = (書き込んだ行数:int, TEXTに降格した列名:list[str])<br>・run_job の戻り = {ok: bool, rows: int, message: str, degraded: [列名], removed?: int, kept?: int}<br>・problems() の要素 = {id, name, db_file, table, kind: &quot;failed&quot;|&quot;degraded&quot;|&quot;overdue&quot;, since(last_run), message}<br>・履歴レコード = {at, db_file, table, ok, kind, mode, rows, removed, kept, keep, source, sheet, job_id, job_name, user, message, seconds}<br>・_scrub_meta の hit / clean_table・table_impact の戻り = {relationships[], glossary[], examples[], checks[], tables[], er_layout[], jobs[], groups[], orphan_terms[]}（各要素は {db, text}。ただし jobs は table_impact のとき {id, name, text}）<br>・table_info の戻り = {name, columns[], column_count, rows, timestamp_column, runs(distinct数), latest, oldest, error?}<br>・_manage_view の戻り = {dbs: [{name, size, mtime, tables: [{...table_info, jobs: [_job_row]}]}], orphans: [_job_row], locked: {db_file: {table: 理由}}, sched: scheduler_status()}<br>・scope（realtime のフィルタに使う）= [{path, alias, name(=DBファイル名), tables?}]<br>・アップロード預かり物 = {data: bytes, filename, mime, owner} を token をキーに OrderedDict で保持</td></tr>
+      <tr><td>定数・しきい値</td><td>・MAX_SCAN_ROWS = 200（core.py 冒頭 filecheck セクション）… 形を見るために読む最大行数<br>・HEADER_SEARCH_ROWS = 12 … 見出し行を探す範囲。これより下に見出しがある表は当てられない<br>・MERGE_CHECK_MAX_MB = 20 … これを超えるExcelは結合セルを調べず None（＝「調べていない」）を返す<br>・_TOTAL_WORDS = (&quot;合計&quot;,&quot;総計&quot;,&quot;小計&quot;,&quot;計&quot;,&quot;累計&quot;,&quot;total&quot;,&quot;subtotal&quot;,&quot;sum&quot;) … 行頭2セルにあると合計行とみなす<br>・CSV_ENCODINGS = [&quot;utf-8-sig&quot;, &quot;cp932&quot;, &quot;utf-8&quot;, &quot;shift_jis&quot;, &quot;euc_jp&quot;] … 上から順に試す<br>・config.IMPORT_EXTENSIONS = (&quot;.csv&quot;, &quot;.tsv&quot;, &quot;.txt&quot;, &quot;.xlsx&quot;, &quot;.xlsm&quot;)（config.py・env では変えられない定数）<br>・config.IMPORT_MAX_FILE_MB = 100（env IMPORT_MAX_FILE_MB）<br>・config.IMPORT_MAX_ROWS = 1_000_000（env IMPORT_MAX_ROWS）… import_dataframe が超過を拒否<br>・config.IMPORT_PREVIEW_ROWS = 30 … 画面に見せる行数。ただしプレビューが読むのは nrows=2000（/api/import/preview のハードコード）<br>・config.IMPORT_SCAN_DEPTH = 0（env）… 0 は「無制限」という意味のある値。未指定は None で区別する<br>・config.IMPORT_MAX_FILES = 2000（env）… list_all_files の打ち切り<br>・config.IMPORT_SAMPLE_ROWS = 20（env）… sample_rows の既定<br>・config.IMPORT_TIMESTAMP_COLUMN = &quot;取得日時&quot;（env）… ジョブに設定が無いときの既定列名<br>・config.IMPORT_SCHEDULER = true / IMPORT_SCHEDULER_TICK_SEC = 60（env）… ただし実際の待ちは max(5, tick) 秒<br>・config.IMPORT_HISTORY_MAX = 5000（env）… 1.1倍を超えてから間引く<br>・config.IMPORT_ALLOW_UPLOAD = false（env、既定 false）/ IMPORT_DIRS_EDITABLE = true（env）<br>・jobs.MAX_KEEP_RUNS = 800 … 保存回数の上限。決めておかないと日次で回すだけで表が際限なく膨らむ<br>・保存回数（keep_runs）に既定値は無い … 業務ごとに違うので必ず自分で決めさせる（validate_job が空を断る）<br>・jobs.START_GRACE_MINUTES = 2 … 開始日時が「過去」かの判定の許容。送信のタイムラグ対策<br>・jobs.INTERVALS = {手動のみ:0, 15分ごと:15, 1時間ごと:60, 3時間ごと:180, 6時間ごと:360, 1日ごと:1440, 1週間ごと:10080}<br>・importer.DELIMITERS = {自動判定:None, カンマ:&quot;,&quot;, タブ:&quot;\t&quot;, パイプ:&quot;|&quot;, セミコロン:&quot;;&quot;, 空白（連続もまとめる）:&quot;\\s+&quot;}<br>・safe_name の切り詰め = 64文字（return s[:64]）<br>・INTEGER 判定の上限 = abs(値) &lt; 2**63（infer_type）<br>・sqlite3.connect(..., timeout=30) … import_dataframe / prune_runs / rename_table の書き込み接続<br>・scheduler の tick_count &gt; 1 から通知（起動直後の1周目は「変化」とみなさない）<br>・AIツール側: _MAX_ROWS=300（一覧件数）、_MAX_PREVIEW_ROWS=20、_MAX_CHECK=20（1件ずつ開くので形の判定はここまで）<br>・VIEW_PREVIEW_ROWS = 20 / view_draft の再試行は 1 回だけ（for _attempt in range(2)）<br>・_fs（アップロード預かり）_MAX_ITEMS = 200、LRU で古いものから破棄</td></tr>
     </tbody></table></div>
     <div class="card__title mt">落とし穴（36件）</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:60px">#</th><th>内容</th></tr></thead><tbody>
@@ -4113,11 +4308,11 @@ return row[0]      # 実物の綴りを返す</pre><div class="mt">・ビュー�
       <tr><td>_rag_describe — 接続エラーの切り分け</td><td><div class="mt"><code>requests</code> の例外文字列をそのまま出すと読めないうえ、綴り違い・FW・プロトコル取り違えがどれも同じ見た目になる。管理画面で環境を登録するのはこの機能の主要操作なので、ここで「何を直せばよいか」まで日本語にする。</div><div class="mt"><b>判定順が重要</b>。<code>SSLError</code> / <code>ProxyError</code> / <code>ConnectTimeout</code> はいずれも <code>ConnectionError</code> のサブクラスなので、先に見ないと握り潰される。</div><div class="tablewrap"><table class="data"><thead><tr><th>判定</th><th>出す文面の主旨</th></tr></thead><tbody><tr><td><code>SSLError</code></td><td>http/https の取り違え、社内CA証明書が信頼済みか</td></tr><tr><td><code>ProxyError</code></td><td><code>HTTP_PROXY</code> / <code>NO_PROXY</code> の設定</td></tr><tr><td><code>Timeout</code></td><td>ネットワーク経路とファイアウォール</td></tr><tr><td><code>ConnectionError</code> かつ本文に <code>NameResolutionError</code> / <code>getaddrinfo failed</code> / <code>Name or service not known</code> / <code>nodename nor servname</code> を含む</td><td>ホスト名を解決できない。URLの綴りと社内DNS</td></tr><tr><td>上記以外の <code>ConnectionError</code></td><td>接続拒否。ポート番号とサーバ起動状態</td></tr><tr><td>それ以外</td><td><code>接続に失敗しました: URL（例外クラス名）</code></td></tr></tbody></table></div><div class="mt">エラー本文の整形は2段。<code>_rag_error_message(resp, limit=300)</code> は LightRAG の失敗応答 <code>{&quot;status&quot;,&quot;message&quot;,&quot;data&quot;,&quot;metadata&quot;}</code> から <code>message</code> → <code>detail</code> → <code>error</code> の順に文字列を拾い、無ければ <code>_rag_safe_body</code>。<code>_rag_safe_body(resp, limit=300)</code> は本文の改行を空白に潰して300文字で切り、超過分は <code>…</code> を足す。生JSONをそのまま画面に出すと環境の数だけ同じ塊が並んで読めなくなるため。</div></td></tr>
       <tr><td>登録簿（管理者側）と接続テスト</td><td><div class="mt"><code>data/knowledge_bases.json</code>（<code>config.KNOWLEDGE_BASES_FILE</code>）に JSON の配列で持つ。<code>_kb_write</code> は <code>.json.tmp</code> に書いて <code>os.replace</code> で差し替え、そのあと <code>os.chmod(0o600)</code> を試みる（APIキーが平文で入るため。失敗は握り潰す＝Windows等で落ちない）。読み書きは <code>_kb_lock</code>（<code>threading.Lock</code>）で直列化。</div><div class="mt">・<code>kb_add</code> … <code>base_url</code> は <code>_kb_normalize_url</code> で末尾スラッシュ除去＋スキーム無しなら <code>http://</code> を付与。<b>URL重複と名前重複の両方を弾く</b>。名前を一意にするのは、名前がそのまま AI に見せるツールの選択肢（enum）になるから — 重なると AI も人もどちらを指しているか決められない。id は <code>uuid4().hex[:12]</code>。<br>・<code>kb_update</code> … <b>空文字の <code>api_key</code> は「変更なし」</b>。画面はキーを伏せて表示するので未入力＝据え置きが自然、という判断。<br>・<code>kb_list</code> / <code>kb_get</code> は既定で <code>_kb_redact</code>（<code>api_key</code> を落として <code>has_api_key: bool</code> を足す）。実値は <code>GET /api/knowledge/&lt;id&gt;/key</code>（admin_required）を押したときだけ返す — 一覧に埋め込むと管理画面を開くたびにキーがHTMLとして流れ、キャッシュやソース表示に残るため。<br>・<code>kb_test</code> … <code>health()</code> を呼び、<code>{ok, status, detail}</code> を返す。<code>detail</code> は <code>status / core_version / api_version / pipeline_busy</code> だけに絞る。</div><div class="mt">Webエンドポイント（すべて <code>admin_required</code>、<code>bp_knowledge</code>）: <code>GET /knowledge</code>, <code>POST /api/knowledge</code>, <code>POST /api/knowledge/&lt;id&gt;</code>, <code>POST /api/knowledge/&lt;id&gt;/delete</code>, <code>POST /api/knowledge/&lt;id&gt;/test</code>, <code>GET /api/knowledge/&lt;id&gt;/key</code>。</div><div class="mt">接続テストだけ <b>失敗しても 200 に <code>ok:false</code> を載せて返す</b>（<code>RegistryError</code> は 404）。つながらないのは「この画面で確かめたい結果」であってAPIの失敗ではなく、500 にすると画面側がネットワーク不調と区別できず原因の文面も出せないため。</div></td></tr>
       <tr><td>利用者ごとの選択（rag_excluded_ids）</td><td><div class="mt">prefs（<code>data/users/&lt;ユーザー&gt;/prefs.yaml</code>、キーは <code>KEYS = (&quot;model&quot;, &quot;rag_off&quot;, &quot;rag_settings&quot;, &quot;tables_off&quot;)</code>）に <b>「外したもの」を保存する</b>。</div><div class="mt">選択リスト方式（選んだものを保存）にすると、管理者が新しいKBを足したとき既存の利用者全員にそれが見えないままになる。除外方式なら新しいものは既定で検索対象に入る。まったく同じ理由で表の選択も <code>excluded_tables</code> / <code>tables_off</code> が除外方式になっている。</div><pre class="mono small">rag_targets(user) = [e for e in kb_enabled() if e[&quot;id&quot;] not in set(rag_excluded_ids(user))]
-rag_available(user) = bool(rag_targets(user))</pre><div class="mt"><code>kb_enabled()</code> は <code>enabled</code> が真のものだけ（管理者が無効にした環境はチャット側の一覧にそもそも出ない。逆に利用者が外しただけの環境は他人の検索対象には残る）。</div><div class="mt"><b>利用者をどう渡しているか</b>: <code>dispatch</code> は引数に利用者を持たない（35個のツールすべての形が変わるため）。代わりに <code>_rag_local = threading.local()</code> に置き、<code>rag.set_current_user(user)</code> で入れる。<code>rag_user_settings</code> / <code>rag_excluded_ids</code> / <code>excluded_tables</code> は <code>user or _current_user()</code> で引く。呼んでいるのは3か所。</div><div class="tablewrap"><table class="data"><thead><tr><th>場所</th><th>理由</th></tr></thead><tbody><tr><td><code>_begin_turn</code>（<code>/api/chat/send</code> と <code>/api/chat/stream</code> の共通前処理）</td><td>リクエストを処理しているスレッドに入れる</td></tr><tr><td><code>/api/chat/stream</code> の <code>generate()</code> の冒頭</td><td>応答を流す処理が別スレッドで回る構成でも引けるように（<code>_begin_turn</code> で入れたものはそのスレッドには無い）</td></tr><tr><td><code>/api/chat/rewind</code>（発言の書き直し）</td><td>書き直しも1回のターン。送信と同じ下ごしらえをする（ここが抜けていて、前の質問で同じスレッドを使った別の利用者の設定で検索していた）</td></tr></tbody></table></div><div class="mt"><code>rag_retrieve_all</code> が <code>environments</code> と <code>settings</code> を <b>引数で受け取る</b>のはこれと表裏。ワーカースレッドにはスレッドローカルが伝播しないので、fan-out する前に呼び出し元が解決しておく必要がある。</div><div class="mt">チャット開始の門番: <code>_begin_turn</code> と <code>/api/chat/rewind</code> はどちらも <code>if not scope and not rag.rag_available(g.user)</code> で止める。DBが1つも無くてもKBがあれば文書には答えられ、両方無いときだけ止める。rewind 側にも同じ条件を置いてあるのは、ここだけ厳しいと「書き直しだけ通らない」になるため。</div></td></tr>
+rag_available(user) = bool(rag_targets(user))</pre><div class="mt"><code>kb_enabled()</code> は <code>enabled</code> が真のものだけ（管理者が無効にした環境はマイエージェント側の一覧にそもそも出ない。逆に利用者が外しただけの環境は他人の検索対象には残る）。</div><div class="mt"><b>利用者をどう渡しているか</b>: <code>dispatch</code> は引数に利用者を持たない（35個のツールすべての形が変わるため）。代わりに <code>_rag_local = threading.local()</code> に置き、<code>rag.set_current_user(user)</code> で入れる。<code>rag_user_settings</code> / <code>rag_excluded_ids</code> / <code>excluded_tables</code> は <code>user or _current_user()</code> で引く。呼んでいるのは3か所。</div><div class="tablewrap"><table class="data"><thead><tr><th>場所</th><th>理由</th></tr></thead><tbody><tr><td><code>_begin_turn</code>（<code>/api/chat/send</code> と <code>/api/chat/stream</code> の共通前処理）</td><td>リクエストを処理しているスレッドに入れる</td></tr><tr><td><code>/api/chat/stream</code> の <code>generate()</code> の冒頭</td><td>応答を流す処理が別スレッドで回る構成でも引けるように（<code>_begin_turn</code> で入れたものはそのスレッドには無い）</td></tr><tr><td><code>/api/chat/rewind</code>（発言の書き直し）</td><td>書き直しも1回のターン。送信と同じ下ごしらえをする（ここが抜けていて、前の質問で同じスレッドを使った別の利用者の設定で検索していた）</td></tr></tbody></table></div><div class="mt"><code>rag_retrieve_all</code> が <code>environments</code> と <code>settings</code> を <b>引数で受け取る</b>のはこれと表裏。ワーカースレッドにはスレッドローカルが伝播しないので、fan-out する前に呼び出し元が解決しておく必要がある。</div><div class="mt">マイエージェント開始の門番: <code>_begin_turn</code> と <code>/api/chat/rewind</code> はどちらも <code>if not scope and not rag.rag_available(g.user)</code> で止める。DBが1つも無くてもKBがあれば文書には答えられ、両方無いときだけ止める。rewind 側にも同じ条件を置いてあるのは、ここだけ厳しいと「書き直しだけ通らない」になるため。</div></td></tr>
       <tr><td>検索設定（RAG_SPECS）</td><td><div class="mt"><code>RAG_SPECS</code> が唯一の正本で、画面のフォーム定義・入力検証・初期値・保存がすべてこの1つのタプルから作られる。項目を増やすときはここに1行足すだけでよい。</div><div class="tablewrap"><table class="data"><thead><tr><th>キー</th><th>種類</th><th>範囲</th><th>既定（config）</th></tr></thead><tbody><tr><td><code>retrieve_mode</code></td><td>choice</td><td><code>_RAG_MODES</code> の5つ</td><td><code>RAG_RETRIEVE_MODE</code>=<code>mix</code></td></tr><tr><td><code>chunk_top_k</code></td><td>int</td><td>1〜100</td><td><code>RAG_CHUNK_TOP_K</code>=10</td></tr><tr><td><code>top_k</code></td><td>int</td><td>1〜200</td><td><code>RAG_TOP_K</code>=40</td></tr><tr><td><code>max_context_chars</code></td><td>int</td><td>1000〜20000</td><td><code>RAG_MAX_CONTEXT_CHARS</code>=12000</td></tr></tbody></table></div><div class="mt">上限は LightRAG 側の制約（<code>MAX_QUERY_TOP_K=1000</code>）より <b>わざと狭く</b>取ってある。実用外の値を入れられると、検索が返らないだけで理由が分からなくなるため。</div><div class="mt">・<code>_rag_default(key)</code> は <b>config を毎回引き直す遅延評価</b>。値を二重に持たないためで、管理者が env の既定を変えれば「初期値に戻す」の戻り先も一緒に変わる。<br>・<code>rag_merge_settings(stored)</code> … <code>rag_defaults()</code> に保存値を重ねる。<code>RAG_SPEC_BY_KEY</code> に無いキーは無視（項目を削除したあとも古い保存値がファイルに残るため）、<code>_rag_coerce</code> が <code>ValueError</code> を投げた値も無視して初期値のまま。<b>壊れた保存値で質問が止まることはない</b>。<br>・<code>rag_validate_settings(payload)</code> … 画面から来た値。payload に入っているキーだけを検証し、1つでも不正なら <code>ValueError</code>（400）。<br>・<code>rag_form_fields()</code> … <code>{key, label, kind, help, min, max, choices:[{value,label}]}</code> を返す。<code>chat.js</code> の <code>renderKbFields</code> が kind を見て <code>&lt;select&gt;</code> か <code>&lt;input type=number&gt;</code> を出し分ける。</div><div class="mt">保存時（<code>POST /api/knowledge/prefs</code>）に <b>初期値と同じ項目は保存しない</b>（<code>{k: v for k, v in cleaned.items() if v != base.get(k)}</code>）。明示的に設定を変えていない利用者は、管理者が env の既定を変えたとき新しい既定に自動で追随する。</div><div class="mt"><code>off</code>（除外id）の保存側は <code>rag.kb_list()</code>（無効なものも含む全件）に実在する id だけ残す。消えた環境の id を持ち続けても意味がなく、同じ id が再利用されることもないため。</div></td></tr>
       <tr><td>rag_retrieve_all — 並列実行と部分失敗</td><td><pre class="mono small">workers = max(1, min(config.RAG_FANOUT_WORKERS, len(environments)))
 with ThreadPoolExecutor(max_workers=workers) as pool:
-    return list(pool.map(_one, environments))</pre><div class="mt">・<code>environments</code> が空なら即 <code>[]</code>。<br>・<code>pool.map</code> なので <b>戻り値の順序は environments の順（＝登録簿の並び）を保つ</b>。この順序がそのまま <code>rag_merge_context</code> の第2周以降のラウンドロビン順になる。<br>・<code>list(...)</code> を <code>with</code> の中で評価しているので、ここで全KBの完了を待つ。1KBあたりのタイムアウトは <code>config.RAG_RETRIEVE_TIMEOUT</code>（既定180秒）。KB数がワーカー数を超えると最悪 <code>ceil(n/8) × 180秒</code> ぶんチャットが待つ。</div><div class="mt"><code>_one(env)</code> の中は <b>二段の except で「1つ落ちても残りで続行」を保証する</b>。</div><pre class="mono small">try:    body = client.retrieve(question, mode=..., chunk_top_k=..., top_k=...)
+    return list(pool.map(_one, environments))</pre><div class="mt">・<code>environments</code> が空なら即 <code>[]</code>。<br>・<code>pool.map</code> なので <b>戻り値の順序は environments の順（＝登録簿の並び）を保つ</b>。この順序がそのまま <code>rag_merge_context</code> の第2周以降のラウンドロビン順になる。<br>・<code>list(...)</code> を <code>with</code> の中で評価しているので、ここで全KBの完了を待つ。1KBあたりのタイムアウトは <code>config.RAG_RETRIEVE_TIMEOUT</code>（既定180秒）。KB数がワーカー数を超えると最悪 <code>ceil(n/8) × 180秒</code> ぶんマイエージェントが待つ。</div><div class="mt"><code>_one(env)</code> の中は <b>二段の except で「1つ落ちても残りで続行」を保証する</b>。</div><pre class="mono small">try:    body = client.retrieve(question, mode=..., chunk_top_k=..., top_k=...)
 except RagError as exc:   print(...); return {..., &quot;chunks&quot;: [], &quot;error&quot;: str(exc)}
 except Exception as exc:  print(...); return {..., &quot;chunks&quot;: [], &quot;error&quot;: f&quot;検索でエラー: {exc}&quot;}</pre><div class="mt">想定外の例外まで拾うのは、1台の不調で他のKBの結果まで巻き添えにしないため。失敗は例外として上に投げず、<b>結果レコードの <code>error</code> フィールドに畳んで返す</b>（呼び出し側が「成功したKBだけで続ける」と「全滅なら諦める」を素直に書けるようにするため）。失敗は <code>print(&quot;[rag] 検索失敗 kb=...&quot;)</code> でサーバログにも出す。</div><div class="mt">呼び出し側（<code>_search_knowledge_base</code>）での部分失敗の扱い:</div><pre class="mono small">failures = [{&quot;knowledge_base&quot;: r[&quot;name&quot;], &quot;error&quot;: r[&quot;error&quot;]} for r in results if r.get(&quot;error&quot;)]
 if failures and len(failures) == len(results):
@@ -4138,7 +4333,7 @@ if not envs: return []
 schema = json.loads(json.dumps(KNOWLEDGE_TOOLS[0]))   # 原本を壊さない深いコピー
 fn[&quot;description&quot;] += &quot;\n\n登録されているナレッジベース:\n&quot; + &quot;\n&quot;.join(f&quot;- {name}: {desc}&quot;)
 fn[&quot;parameters&quot;][&quot;properties&quot;][&quot;knowledge_bases&quot;][&quot;items&quot;][&quot;enum&quot;] = names</pre><div class="mt">・<b>KBは運用中に増減するので、選択肢を起動時には決められない</b>。だから <code>_DYNAMIC_TOOLS</code> に入れて毎回組み立て直す。<code>BUILTIN_TOOLS</code> に固定の宣言も残してあるのは、<code>_missing_required</code> と <code>_coerce_lists</code> がそこから表を作るから（宣言を1つに保つより、必須引数検査を無料で効かせる方を採った）。<br>・<code>json.loads(json.dumps(...))</code> で深いコピーを取るのは、<code>description</code> への <code>+=</code> と <code>enum</code> の代入がモジュールグローバルの <code>KNOWLEDGE_TOOLS</code> を破壊しないため（浅いコピーだと <code>properties</code> が共有され、2回目以降の呼び出しで description が積み上がる）。<br>・<b>見せるのは、その利用者がサイドバーで選んでいるものだけ</b>（<code>rag_targets()</code> であって <code>kb_enabled()</code> ではない）。外したものまで並べると、AIはあると思って呼び、そのたびに <code>_search_knowledge_base</code> の未知名チェックに断られて往復を1回損する。<br>・説明文は管理画面で管理者が書いた <code>description</code> がそのまま入る。AIがツール／KBを選ぶ材料は名前と説明しかないので、<b>ここが検索の当たり外れをいちばん左右する</b>。</div><div class="mt"><code>build_tools</code> 側では、動的に組み立てた宣言に対しても <code>.meta.yaml</code> の <code>builtin_tools:</code> による無効化（<code>enabled: False</code>）と説明の上書きが効く。</div></td></tr>
-      <tr><td>画面（サイドバーと管理画面）</td><td><div class="mt"><b>チャットのサイドバー</b>（<code>#kbSection</code>、ラベルは「LightRAG」）。初期値は <code>chat.html</code> に渡る <code>knowledge_prefs_payload()</code> → <code>window.CHAT_INIT.knowledge</code>。</div><pre class="mono small">{ bases: [{id, name, description, on}], settings, defaults, fields }</pre><div class="mt"><code>bases</code> は <code>kb_enabled()</code> から作り、<code>on = id not in rag_excluded_ids(g.user)</code>。</div><div class="mt">・KBが0件なら <code>renderKnowledge</code> が節ごと <code>display:none</code>（この状態ではAIにツール自体を渡していない）。<br>・<b>チェックは押した時点で保存する</b>。「保存」を押させると、押し忘れたまま質問して「なぜあの文書が出ないのか」になるため。送るのは <code>off</code>＝チェックの外れているものの id。<br>・見出しのバッジは <code>4 / 22</code> の形。全部選んでいるときも分母を出す（数字だけだと選択数なのか総数なのか読めない）。<br>・「検索設定」だけは <code>#kbSave</code> ボタンで明示保存、<code>#kbReset</code> は <code>settings: kb.defaults</code> を送る（＝サーバ側で「初期値と同じ項目は保存しない」に当たり、<code>rag_settings</code> が空になる）。</div><div class="mt"><b>管理画面</b> <code>/knowledge</code>（admin_required）は <code>bases=kb_list()</code>（キー伏せ）、<code>defaults=rag_defaults()</code>、<code>fields=rag_form_fields()</code> を渡す。ヘルプ画面（<code>/help</code>）は <code>bases=kb_list() if g.user.is_admin else []</code> — 一般利用者にはKBの一覧を出さない。</div></td></tr>
+      <tr><td>画面（サイドバーと管理画面）</td><td><div class="mt"><b>マイエージェントのサイドバー</b>（<code>#kbSection</code>、ラベルは「LightRAG」）。初期値は <code>chat.html</code> に渡る <code>knowledge_prefs_payload()</code> → <code>window.CHAT_INIT.knowledge</code>。</div><pre class="mono small">{ bases: [{id, name, description, on}], settings, defaults, fields }</pre><div class="mt"><code>bases</code> は <code>kb_enabled()</code> から作り、<code>on = id not in rag_excluded_ids(g.user)</code>。</div><div class="mt">・KBが0件なら <code>renderKnowledge</code> が節ごと <code>display:none</code>（この状態ではAIにツール自体を渡していない）。<br>・<b>チェックは押した時点で保存する</b>。「保存」を押させると、押し忘れたまま質問して「なぜあの文書が出ないのか」になるため。送るのは <code>off</code>＝チェックの外れているものの id。<br>・見出しのバッジは <code>4 / 22</code> の形。全部選んでいるときも分母を出す（数字だけだと選択数なのか総数なのか読めない）。<br>・「検索設定」だけは <code>#kbSave</code> ボタンで明示保存、<code>#kbReset</code> は <code>settings: kb.defaults</code> を送る（＝サーバ側で「初期値と同じ項目は保存しない」に当たり、<code>rag_settings</code> が空になる）。</div><div class="mt"><b>管理画面</b> <code>/knowledge</code>（admin_required）は <code>bases=kb_list()</code>（キー伏せ）、<code>defaults=rag_defaults()</code>、<code>fields=rag_form_fields()</code> を渡す。ヘルプ画面（<code>/help</code>）は <code>bases=kb_list() if g.user.is_admin else []</code> — 一般利用者にはKBの一覧を出さない。</div></td></tr>
       <tr><td>主なデータ構造</td><td>・登録簿の1件 = {id: 12桁hex, name, base_url, api_key, description, enabled: bool, created_at: ISO8601(UTC)}  ← data/knowledge_bases.json の配列要素<br>・伏せた写し（_kb_redact） = 上記から api_key を除き has_api_key: bool を足したもの<br>・rag_targets() = [登録簿の1件（api_key入り）, ...]  ※ kb_enabled() から rag_off を引いたもの<br>・settings（rag_user_settings） = {retrieve_mode: str, chunk_top_k: int, top_k: int, max_context_chars: int}<br>・RAG_SPECS の1行 = (key, label, kind(&quot;int&quot;|&quot;choice&quot;), help, lo, hi, choices)  choices = ((値, 表示名), ...)<br>・rag_form_fields() の1要素 = {key, label, kind, help, min, max, choices: [{value, label}]}<br>・retrieve() の payload = {query, mode, chunk_top_k, include_chunk_content: True, (top_k)}<br>・rag_retrieve_all() の1要素 = {id, name, chunks: [chunk], error: str|None}  ※ environments と同じ順<br>・chunk（_rag_normalize_chunks 後） = {content: 非空str, file_path: str, score: 任意|None}<br>・source = {index: 1始まりの連番, knowledge_base: KB名, kb_id, file_path, score, excerpt: content[:200]}<br>・context = &quot;[出典N] KB名 / file_path\n本文\n&quot; を &quot;\n&quot; で連結した文字列<br>・failures = [{knowledge_base: KB名, error: エラー文言}]<br>・render アイテム = {role:&quot;assistant&quot;, kind:&quot;sources&quot;, query, sources, failures, searched: [成功したKB名]}<br>・prefs.yaml = {model, rag_off: [kb_id], rag_settings: {初期値と違う項目だけ}, tables_off: [表名]}<br>・サイドバー払い出し = {bases: [{id, name, description, on: bool}], settings, defaults, fields}</td></tr>
       <tr><td>定数・しきい値</td><td>・config.RAG_RETRIEVE_TIMEOUT = 180秒（env <code>RAG_RETRIEVE_TIMEOUT</code>）… 1KBへの検索タイムアウト。文書の取り込み中はLightRAG側が抽出処理で埋まり応答が遅くなるため、わざと長く取ってある<br>・config.RAG_FANOUT_WORKERS = 8（env <code>RAG_FANOUT_WORKERS</code>）… 同時に投げるKB数。実際は max(1, min(8, KB数))<br>・config.RAG_RETRIEVE_MODE = &quot;mix&quot;（env）… retrieve_mode の初期値<br>・config.RAG_CHUNK_TOP_K = 10（env）… chunk_top_k の初期値<br>・config.RAG_TOP_K = 40（env）… top_k の初期値。naive モードでは使われない<br>・config.RAG_MAX_CONTEXT_CHARS = 12000（env）… 統合後にAIへ渡す上限。1つの質問でナレッジ検索を何度も呼ぶことがあり、そのたびに積み上がるので控えめにしてある<br>・RAG_SPECS の許容範囲: chunk_top_k 1〜100 / top_k 1〜200 / max_context_chars 1000〜20000。LightRAG の MAX_QUERY_TOP_K=1000 より意図的に狭い<br>・AIによる chunk_top_k 上書きの天井 = min(AI指定, 利用者設定×2, 100)、下限 1<br>・health() と _verify_credentials() の HTTP タイムアウト = 15秒（ハードコード。RagClient の timeout は使わない）<br>・_rag_error_message / _rag_safe_body の本文切り出し = 300文字（超過は「…」）<br>・source の excerpt = content[:200]<br>・config.KNOWLEDGE_BASES_FILE = data/knowledge_bases.json（env で変更可）、書き込み後に chmod 0o600 を試行<br>・prefs.KEYS = (&quot;model&quot;, &quot;rag_off&quot;, &quot;rag_settings&quot;, &quot;tables_off&quot;)。これ以外のキーは読み書きしない<br>・認証ヘッダ名 = X-API-Key（LightRAG）。エンドポイントは POST /query/data, GET /health, GET /documents/pipeline_status<br>・_DYNAMIC_TOOLS = {&quot;search_knowledge_base&quot;}</td></tr>
     </tbody></table></div>
@@ -4219,7 +4414,7 @@ def _fs_put(data, filename, mime, owner) -&gt; str:
       <tr><td class="mono small">24</td><td>R² は学習に使ったデータで測ると必ず良く出る。30行以上のとき seed=0 で7:3に分けたホールドアウトを別表で出し、そちらの数字で「予測に使えるか」を語らせる。</td></tr>
       <tr><td class="mono small">25</td><td>clustering の k=&quot;auto&quot; は max(scored) を採るため、シルエット係数が同点なら分割数の大きい方が勝つ（タプルの2番目で比較されるため）。空クラスタが出た候補は最初から除外される。</td></tr>
       <tr><td class="mono small">26</td><td>abc_analysis の要約表の見出しは値の列名から動的に作る。「金額」と決め打つと停止時間や工数を渡したときに単位の違う見出しのままExcel・PowerPointへ出て行くため。</td></tr>
-      <tr><td class="mono small">27</td><td>ファイルはディスクに書かない。_files は200件のFIFOなので、古いチャットを大量に開くと先に発行したURLが失効する。</td></tr>
+      <tr><td class="mono small">27</td><td>ファイルはディスクに書かない。_files は200件のFIFOなので、古いマイエージェントを大量に開くと先に発行したURLが失効する。</td></tr>
       <tr><td class="mono small">28</td><td>会話に保存されるファイルは2MiBまで。それを超えると中身を捨てるので、履歴からは再ダウンロードできない。メール添付も render_log の data を直接読むため同じ制限を受ける。</td></tr>
       <tr><td class="mono small">29</td><td>/api/file/&lt;token&gt; は login_required に加えて owner 一致を確かめる。トークンを推測されても他人のファイルは渡らないが、逆に言えば同一トークンでも別ユーザーからは404になる。</td></tr>
       <tr><td class="mono small">30</td><td>jsonable が NaN と ±inf を None に変換しているのは、そのまま json.dumps すると &quot;NaN&quot; という不正なJSONになりブラウザ側で読めなくなるため（Excel の空セルは pandas で NaN になる）。</td></tr>
@@ -4231,7 +4426,7 @@ def _fs_put(data, filename, mime, owner) -&gt; str:
 
   <div class="card mt">
     <div class="card__title" id="impl-auth">5-10. 認証・権限・保存レイアウト</div>
-    <div class="card__desc">ログインは auth.py 1ファイルに閉じてあり、<code>authenticate()</code> が「常設管理者 → 常設一般ユーザー（BUILTIN_USERS）→ プロバイダ（local / http）」の順に判定する。認証結果は <code>User</code> データクラスの4項目だけを Flask のセッション Cookie に写し、毎リクエストの <code>load_user_into_context</code>（<code>app.before_request</code>）で <code>g.user</code> に復元する。権限は <code>login_required</code> / <code>admin_required</code> の2段だけで、両者とも <code>request.path.startswith(&quot;/api/&quot;)</code> を見て JSON(401/403) と 画面(リダイレクト/403テンプレ) を切り替える。ユーザーごとの状態（チャット履歴・prefs）は <code>data/users/&lt;User.safe_key&gt;/</code> にファイルで置き、カタログ・ナレッジベース登録簿・モデル設定・メール設定・各種履歴は全員共通で <code>data/</code> 直下に置く。</div>
+    <div class="card__desc">ログインは auth.py 1ファイルに閉じてあり、<code>authenticate()</code> が「常設管理者 → 常設一般ユーザー（BUILTIN_USERS）→ プロバイダ（local / http）」の順に判定する。認証結果は <code>User</code> データクラスの4項目だけを Flask のセッション Cookie に写し、毎リクエストの <code>load_user_into_context</code>（<code>app.before_request</code>）で <code>g.user</code> に復元する。権限は <code>login_required</code> / <code>admin_required</code> の2段だけで、両者とも <code>request.path.startswith(&quot;/api/&quot;)</code> を見て JSON(401/403) と 画面(リダイレクト/403テンプレ) を切り替える。ユーザーごとの状態（会話の履歴・prefs）は <code>data/users/&lt;User.safe_key&gt;/</code> にファイルで置き、カタログ・ナレッジベース登録簿・モデル設定・メール設定・各種履歴は全員共通で <code>data/</code> 直下に置く。</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:210px">項目</th><th>内容</th></tr></thead><tbody>
       <tr><td>ファイルの分かれ方と、なぜ auth.py だけ別なのか</td><td><div class="mt">ソースは <code>core.py</code>（約37,000行・アプリ本体）/ <code>config.py</code>（env から読む設定）/ <code>auth.py</code>（ログイン）の3本。</div><div class="mt"><code>auth.py</code> は「LDAP連携APIに差し替えるときに触るファイルを1本に閉じる」ことを目的に分離されている。そのため<b>ログイン関係の設定は env にも config.py にも一切無く、すべて auth.py の冒頭定数</b>にある（<code>AUTH_PROVIDER</code> / <code>AUTH_USERS_FILE</code> / <code>AUTH_ADMIN_GROUP</code> / <code>ADMIN_USER</code> / <code>ADMIN_PASS</code> / <code>BUILTIN_USERS</code> / <code>AUTH_API_*</code>）。config.py の「--- 認証 ---」節にもその旨だけが書いてあり、置いてあるのは <code>USER_META_DIR</code>（＝<code>DATA_DIR / &quot;users&quot;</code>）だけ。</div><div class="mt">core.py 側は <code>auth.User</code> / <code>auth.authenticate</code> / <code>auth.get_provider</code> / <code>auth.AuthError</code> / <code>auth.admin_enabled</code> / <code>auth.load_users_file</code> / <code>auth.save_users_file</code> / <code>auth.hash_password</code> / <code>auth.AUTH_ADMIN_GROUP</code> しか触らない。</div><div class="mt">なお core.py は冒頭で、統合前のモジュール名（<code>db</code> <code>catalog</code> <code>chats</code> <code>prefs</code> <code>models</code> <code>rag</code> <code>tools</code> <code>llm</code> …）を全部 <code>_sys.modules</code> に自分自身として登録している。したがって core.py 内の <code>import prefs</code> / <code>import rag</code> は<b>すべて自分自身を指す</b>。<code>auth</code> と <code>config</code> だけが本物の別ファイル。</div></td></tr>
       <tr><td>authenticate() — 3段の判定順と、その順序の理由</td><td><div class="mt"><code>auth.authenticate(username, password)</code> が画面から呼ばれる唯一の入口。処理は次の順で、途中で確定したらプロバイダには渡さない。</div><div class="mt">・<code>_try_builtin_admin(username, password)</code><br>・<code>admin_enabled()</code>（＝<code>ADMIN_USER</code> と <code>ADMIN_PASS</code> の両方が真）が偽なら即 None。<b><code>ADMIN_PASS</code> を空文字にするとこのアカウントごと無効</b>になる（空パスワードで入れてしまう事故を防ぐため）。<br>・ID は <code>strip().lower()</code> と <code>ADMIN_USER.lower()</code> の比較（大文字小文字を無視）。<br>・パスワードは <code>hmac.compare_digest(str(password).encode(&quot;utf-8&quot;), str(ADMIN_PASS).encode(&quot;utf-8&quot;))</code>。<b>bytes に落としてから比べているのは、<code>compare_digest</code> が非ASCIIの str を受け付けず TypeError になるため</b>（日本語パスワードを設定した瞬間に落ちる）。<br>・成功時は <code>User(username=ADMIN_USER, display_name=&quot;管理者&quot;, groups=[AUTH_ADMIN_GROUP], is_admin=True)</code>。<br>・常設管理者と同じIDだったが 1 で失敗した場合、<b>ここで None を返してプロバイダには渡さない</b>。LDAP側に同名の <code>admin</code> が居ても取り違えないため。<br>・<code>BUILTIN_USERS</code> のどれかとIDが一致したら <code>_try_builtin_user</code> の結果で確定（一致・不一致どちらでもプロバイダへは行かない）。<code>_try_builtin_user</code> は <b>IDとパスワードが同じ文字列</b>なら成功（<code>hmac.compare_digest</code> で比較）。返るのは <code>User(username=&lt;リストの綴り&gt;, display_name=&quot;&quot;, groups=[], is_admin=False)</code>。<br>・どれにも当たらなければ <code>get_provider().authenticate(username, password)</code>。</div><div class="mt">この「先に常設アカウントを見る」構造が、LDAPが落ちていても設定画面に入れる非常口になっている。逆に LDAP へ完全移行したら <code>BUILTIN_USERS = []</code> にし、<code>ADMIN_PASS</code> を強いものへ変えるのが前提。</div></td></tr>
@@ -4246,9 +4441,9 @@ def _fs_put(data, filename, mime, owner) -&gt; str:
 admin_required:
   user is None      → 上と同じ（401 or ログイン画面へ）
   not user.is_admin → &quot;/api/&quot; 始まり ? jsonify({&quot;error&quot;:&quot;この操作は管理者のみです。&quot;}),403
-                                     : render_template_string(_TPL_403), 403</pre><div class="mt"><code>_TPL_403</code> は「元 templates/403.html」を core.py 内の文字列として持っているもので、<code>base.html</code> を継承し <code>user.display_name or user.username</code> を出す（<code>user</code> は <code>inject_globals</code> が全テンプレートへ注入）。<code>render_template_string</code> は helpers 節より前で個別に import されている。</div><div class="mt"><b>実際の分布（全84ルート）</b></div><div class="tablewrap"><table class="data"><thead><tr><th>Blueprint</th><th>admin_required</th><th>login_required</th><th>無防備</th></tr></thead><tbody><tr><td>bp_auth</td><td>0</td><td>0</td><td>2（/login, /logout）</td></tr><tr><td>bp_chat</td><td>1（/api/mail/test）</td><td>14</td><td>0</td></tr><tr><td>bp_catalog</td><td>28</td><td>1（/api/catalog/table-info）</td><td>0</td></tr><tr><td>bp_import</td><td>15</td><td>0</td><td>0</td></tr><tr><td>bp_mail</td><td>3</td><td>0</td><td>0</td></tr><tr><td>bp_models</td><td>3</td><td>0</td><td>0</td></tr><tr><td>bp_knowledge</td><td>6</td><td>1（/api/knowledge/prefs）</td><td>0</td></tr><tr><td>bp_usage</td><td>4</td><td>0</td><td>0</td></tr><tr><td>bp_help</td><td>0</td><td>1</td><td>0</td></tr><tr><td>bp_table</td><td>0</td><td>3</td><td>0</td></tr><tr><td>bp_api</td><td>0</td><td>1（/api/file/&lt;token&gt;）</td><td>1（/vendor/plotly.min.js）</td></tr></tbody></table></div><div class="mt">設計の線引き:</div><div class="mt">・<b>カタログ・取り込み・モデル設定・メール設定・ナレッジベース登録・利用状況は「閲覧も含めて」管理者のみ</b>。理由は <code>admin_required</code> の docstring に明記されている（AIの回答の土台・DBの中身・送信先が変わるため）。画面側でメニューを隠すだけでは URL 直打ちで抜けられる。<br>・例外は <code>/api/catalog/table-info</code>（ER図のテーブル詳細）。チャットの読み取り専用ER図からも使い、返す内容は <code>describe_table</code> でAIに渡している範囲と同じなのでログイン済みなら見せる、と docstring で明示している。<br>・<code>/api/knowledge/prefs</code> と <code>/api/tables/prefs</code> は「自分の除外設定」なので login_required。<br>・<code>base.html</code> は非管理者に対して<b>管理メニューのセクションごと（チャットのリンクも含めて）非表示</b>にする。理由はコメントにあるとおり「行き先が1つだけのメニューは出さない」で、守りは <code>admin_required</code> 側にある。</div></td></tr>
-      <tr><td>AI経路での権限（画面と同じ線を引く）</td><td><div class="mt">チャットは <code>_is_admin()</code>（＝<code>bool(getattr(g.get(&quot;user&quot;), &quot;is_admin&quot;, False))</code>）を <code>llm.build_system_prompt</code> / <code>tools.build_tools</code> / <code>tools.dispatch</code> に渡している。</div><div class="mt">・<code>build_tools(entries, admin=False)</code> は <code>name in ADMIN_TOOLS and not admin</code> のツールを<b>そもそも宣言に載せない</b>（AIは存在を知らないので呼ばれない）。<br>・<code>dispatch(..., admin=False)</code> は名指しで呼ばれても <code>&#x27;&lt;名前&gt;&#x27; は管理者だけが使えます。</code> を返す。コメントどおり<b>守りを2箇所で持つ</b>。<br>・<code>ADMIN_TOOLS</code> は各モジュールの申告を合わせたもので、実体は <code>explore_import_files</code>（取り込み元フォルダの調査＝<code>ADMIN_TOOLS_files</code>）と <code>analyze_usage</code>（他人の質問・失敗まで見える＝<code>ADMIN_TOOLS_usage</code>）の2つ。<code>search_knowledge_base</code> は <code>ADMIN_TOOLS_knowledge = set()</code> で全員に渡す。<br>・ヘルプ画面のツール一覧も <code>if name in tools.ADMIN_TOOLS and not g.user.is_admin: continue</code> で同じ線を引き、<code>bases=rag.kb_list() if g.user.is_admin else []</code> としている。</div></td></tr>
-      <tr><td>_may_contribute_catalog（チャットからのカタログ書き込み）</td><td><pre class="mono small">def _may_contribute_catalog() -&gt; bool:
+                                     : render_template_string(_TPL_403), 403</pre><div class="mt"><code>_TPL_403</code> は「元 templates/403.html」を core.py 内の文字列として持っているもので、<code>base.html</code> を継承し <code>user.display_name or user.username</code> を出す（<code>user</code> は <code>inject_globals</code> が全テンプレートへ注入）。<code>render_template_string</code> は helpers 節より前で個別に import されている。</div><div class="mt"><b>実際の分布（全84ルート）</b></div><div class="tablewrap"><table class="data"><thead><tr><th>Blueprint</th><th>admin_required</th><th>login_required</th><th>無防備</th></tr></thead><tbody><tr><td>bp_auth</td><td>0</td><td>0</td><td>2（/login, /logout）</td></tr><tr><td>bp_chat</td><td>1（/api/mail/test）</td><td>14</td><td>0</td></tr><tr><td>bp_catalog</td><td>28</td><td>1（/api/catalog/table-info）</td><td>0</td></tr><tr><td>bp_import</td><td>15</td><td>0</td><td>0</td></tr><tr><td>bp_mail</td><td>3</td><td>0</td><td>0</td></tr><tr><td>bp_models</td><td>3</td><td>0</td><td>0</td></tr><tr><td>bp_knowledge</td><td>6</td><td>1（/api/knowledge/prefs）</td><td>0</td></tr><tr><td>bp_usage</td><td>4</td><td>0</td><td>0</td></tr><tr><td>bp_help</td><td>0</td><td>1</td><td>0</td></tr><tr><td>bp_table</td><td>0</td><td>3</td><td>0</td></tr><tr><td>bp_api</td><td>0</td><td>1（/api/file/&lt;token&gt;）</td><td>1（/vendor/plotly.min.js）</td></tr></tbody></table></div><div class="mt">設計の線引き:</div><div class="mt">・<b>カタログ・取り込み・モデル設定・メール設定・ナレッジベース登録・利用状況は「閲覧も含めて」管理者のみ</b>。理由は <code>admin_required</code> の docstring に明記されている（AIの回答の土台・DBの中身・送信先が変わるため）。画面側でメニューを隠すだけでは URL 直打ちで抜けられる。<br>・例外は <code>/api/catalog/table-info</code>（ER図のテーブル詳細）。マイエージェントの読み取り専用ER図からも使い、返す内容は <code>describe_table</code> でAIに渡している範囲と同じなのでログイン済みなら見せる、と docstring で明示している。<br>・<code>/api/knowledge/prefs</code> と <code>/api/tables/prefs</code> は「自分の除外設定」なので login_required。<br>・<code>base.html</code> は非管理者に対して<b>管理メニューのセクションごと（マイエージェントのリンクも含めて）非表示</b>にする。理由はコメントにあるとおり「行き先が1つだけのメニューは出さない」で、守りは <code>admin_required</code> 側にある。</div></td></tr>
+      <tr><td>AI経路での権限（画面と同じ線を引く）</td><td><div class="mt">マイエージェントは <code>_is_admin()</code>（＝<code>bool(getattr(g.get(&quot;user&quot;), &quot;is_admin&quot;, False))</code>）を <code>llm.build_system_prompt</code> / <code>tools.build_tools</code> / <code>tools.dispatch</code> に渡している。</div><div class="mt">・<code>build_tools(entries, admin=False)</code> は <code>name in ADMIN_TOOLS and not admin</code> のツールを<b>そもそも宣言に載せない</b>（AIは存在を知らないので呼ばれない）。<br>・<code>dispatch(..., admin=False)</code> は名指しで呼ばれても <code>&#x27;&lt;名前&gt;&#x27; は管理者だけが使えます。</code> を返す。コメントどおり<b>守りを2箇所で持つ</b>。<br>・<code>ADMIN_TOOLS</code> は各モジュールの申告を合わせたもので、実体は <code>explore_import_files</code>（取り込み元フォルダの調査＝<code>ADMIN_TOOLS_files</code>）と <code>analyze_usage</code>（他人の質問・失敗まで見える＝<code>ADMIN_TOOLS_usage</code>）の2つ。<code>search_knowledge_base</code> は <code>ADMIN_TOOLS_knowledge = set()</code> で全員に渡す。<br>・ヘルプ画面のツール一覧も <code>if name in tools.ADMIN_TOOLS and not g.user.is_admin: continue</code> で同じ線を引き、<code>bases=rag.kb_list() if g.user.is_admin else []</code> としている。</div></td></tr>
+      <tr><td>_may_contribute_catalog（マイエージェントからのカタログ書き込み）</td><td><pre class="mono small">def _may_contribute_catalog() -&gt; bool:
     return config.CATALOG_OPEN_CONTRIB or _is_admin()</pre><div class="mt"><code>config.CATALOG_OPEN_CONTRIB</code> は env <code>CATALOG_OPEN_CONTRIB</code>（既定 <b>false</b>）。</div><div class="mt">効くのは <code>POST /api/chat/glossary-save</code> と <code>POST /api/chat/save-example</code> の2本だけ。どちらも <code>login_required</code> の直後に <code>if not _may_contribute_catalog(): return jsonify({&quot;error&quot;: _CATALOG_CONTRIB_DENIED}), 403</code>。</div><div class="mt">既定を管理者のみにした理由は config.py と両関数の docstring に揃えて書かれている：カタログは全利用者のシステムプロンプトに毎回そのまま載り、用語の定義は「必ずその定義に従う」、用語のSQL式は「そのまま使う」とAIに指示しているので、ここを開けると<b>権限の低い利用者が管理者を含む全員の回答を左右できる</b>（書けるのは読み取り専用のSELECTだけだが、答えの中身は歪められる）。</div><div class="mt">どちらの設定でも、書き込みは <code>catalog_history.add_catalog_change(..., user=g.user.username, source=&quot;chat&quot;)</code> で必ず記録される。</div></td></tr>
       <tr><td>data/ 配下の保存レイアウト</td><td><div class="mt">パスはすべて <code>config.py</code> で決まり、env で個別に差し替えられる。<code>config.DATA_DIR</code>（既定 <code>&lt;プロジェクト&gt;/data</code>）は import 時に <code>mkdir(parents=True, exist_ok=True)</code> される。</div><div class="mt"><b>全員共通（data/ 直下）</b></div><div class="tablewrap"><table class="data"><thead><tr><th>パス</th><th>定数</th><th>中身</th><th>書けるのは</th><th>chmod</th></tr></thead><tbody><tr><td><code>統合.db</code></td><td>—</td><td>唯一のSQLite。<code>db.list_db_files()</code> は <code>DATA_DIR/*.db</code> を名前順で列挙</td><td>取り込み（管理者）</td><td>—</td></tr><tr><td><code>統合.db.meta.yaml</code></td><td><code>catalog.meta_path()</code></td><td>データカタログ（表/列の説明・用語集・例文・検算・関連・ビュー・ユーザー定義ツール・まとまりメモ）</td><td>管理者</td><td>—</td></tr><tr><td><code>.profile_cache/&lt;DB名&gt;.profile.json</code></td><td><code>PROFILE_CACHE_DIR</code></td><td>自動プロファイルの控え</td><td>自動生成</td><td>—</td></tr><tr><td><code>knowledge_bases.json</code></td><td><code>KNOWLEDGE_BASES_FILE</code></td><td>LightRAG接続先の登録簿（<b>APIキーを平文で持つ</b>）</td><td>管理者</td><td><b>0600 を試行</b></td></tr><tr><td><code>model_settings.yaml</code></td><td><code>MODEL_SETTINGS_FILE</code></td><td>候補モデル・既定・vision判定・文脈量上書き・<b>APIキー</b>・chat_url・models_url</td><td>管理者</td><td>しない</td></tr><tr><td><code>mail_settings.yaml</code></td><td><code>SMTP_SETTINGS_FILE</code></td><td>ホスト/ポート/タイムアウト・差出人・宛先許可リスト・通知先など（<b>秘密は入れない約束</b>。SMTP認証情報は env のみ）</td><td>管理者</td><td>しない</td></tr><tr><td><code>import_jobs.yaml</code></td><td><code>IMPORT_JOBS_FILE</code></td><td>定期取り込みジョブ</td><td>管理者</td><td>しない</td></tr><tr><td><code>import_dirs.yaml</code></td><td><code>IMPORT_DIRS_FILE</code></td><td>画面から足した取り込み元フォルダ（env の <code>IMPORT_DIRS</code> は画面から消せない土台）</td><td>管理者</td><td>しない</td></tr><tr><td><code>import_history.jsonl</code></td><td><code>IMPORT_HISTORY_FILE</code></td><td>取り込み1回=1行。上限 <code>IMPORT_HISTORY_MAX</code>(5000)</td><td>追記</td><td>—</td></tr><tr><td><code>catalog_history.jsonl</code></td><td><code>CATALOG_HISTORY_FILE</code></td><td>用語集・例文の変更1件=1行。上限 <code>CATALOG_HISTORY_MAX</code>(2000)</td><td>追記</td><td>—</td></tr></tbody></table></div><div class="mt"><b>利用者ごと（<code>config.USER_META_DIR</code> ＝ <code>data/users/</code>）</b></div><pre class="mono small">data/users/&lt;User.safe_key&gt;/
   prefs.yaml                 model / rag_off / rag_settings / tables_off の4キーのみ
@@ -4257,7 +4452,7 @@ admin_required:
       <tr><td>User.safe_key と、ユーザーごとのファイル入出力</td><td><pre class="mono small">@property
 def safe_key(self) -&gt; str:
     return &quot;&quot;.join(c if (c.isalnum() or c in &quot;-_.@&quot;) else &quot;_&quot; for c in self.username)[:64]</pre><div class="mt"><code>str.isalnum()</code> は Unicode 準拠なので<b>日本語のユーザー名はそのまま残る</b>（<code>山田太郎</code> → <code>山田太郎</code>）。長さは64文字で切る。</div><div class="mt">・<code>chats.chats_dir(user)</code> = <code>USER_META_DIR / (user.safe_key or str(user)) / &quot;chats&quot;</code><br>・<code>prefs._prefs_path(user)</code> = <code>USER_META_DIR / _key(user) / &quot;prefs.yaml&quot;</code>（<code>_key</code> は safe_key と同じ決め方）</div><div class="mt">会話ファイル名は <code>chats._safe_id(chat_id)</code> で <code>[^0-9a-zA-Z_-]</code> を落として64文字に切るので、<code>..</code> や <code>/</code> は混ざらない。<code>new_id()</code> は <code>%Y%m%d-%H%M%S-</code> + uuid4の6桁で、ファイル名だけで新しい順に並ぶ。</div><div class="mt"><b>掃除は「一覧を読むついで」に行う</b>（常駐の掃除役を置かない）。<code>list_chats</code> → <code>_drop_expired</code>（<code>CHAT_HISTORY_DAYS</code>=90日、<code>updated_at</code> 起点。0で無期限）、<code>_upsert_index</code> → <code>CHAT_HISTORY_LIMIT</code>=100本を超えた古いものを実体ごと削除。<code>index.json</code> が壊れた/消えた場合は <code>_rebuild_index</code> が <code>chats/*.json</code> から作り直す。</div><div class="mt">生成ファイル（Excel等）は <code>render_log</code> に base64 で埋め込むが、<code>CHAT_EMBED_FILE_MAX_BYTES</code>(2MB) を超えるものは本体を捨てて <code>_no_data: True</code> だけ残す。</div><div class="mt"><code>prefs</code> は <code>KEYS = (&quot;model&quot;, &quot;rag_off&quot;, &quot;rag_settings&quot;, &quot;tables_off&quot;)</code> に無いキーを読み書きとも捨てる。<code>_save</code> は <code>_prefs_lock</code>（<code>threading.Lock</code>）で直列化。</div><div class="mt"><b>除外方式の理由</b>（<code>rag_excluded_ids</code> / <code>excluded_tables</code> の docstring）: 「選んだもの」ではなく「外したもの」を保存する。選択リスト方式だと、管理者が新しいナレッジベースや表を足したとき既存の利用者全員に見えないままになるため。</div></td></tr>
-      <tr><td>検算（verify）とアラート</td><td><div class="mt"><b>検算ルール</b> は <code>data/&lt;DB&gt;.db.meta.yaml</code> の <code>checks:</code> に置く（＝管理者だけが編集できる場所）。<code>normalize()</code> が壊れた項目を落として揃え、<code>tolerance_pct</code> の既定は <code>DEFAULT_TOLERANCE_PCT = 0.5</code>（%）。左右のSQLは1行1列のスカラを返す約束で、<code>_scalar</code> は NULL を 0.0 として扱う。</div><div class="mt">実行の流れ:</div><div class="mt">・<code>tools.dispatch</code> が成功したら <code>_attach_verification(res, sqls, scope)</code> が <code>verify.alerts_for(sqls, scope)</code> を呼ぶ。ここで例外が出ても回答は止めない（<code>print</code> して素通り）。<br>・<code>alerts_for</code> は、実行されたSQLが触れた <code>(alias, table)</code> 集合と交わる検算だけを走らせ、<b>不一致だけ</b>返す（一致・実行不能は何も言わない。毎回「問題ありません」と言われると読まれなくなるため）。<br>・<code>run_check</code> の結果は <code>_verify_cache[(_fingerprint(check), _data_version(check, scope))]</code> にキャッシュ。<code>_data_version</code> は関係するDBファイルの <code>st_mtime_ns</code>。<b>データが変わった後の最初の1回しか実際には実行されない</b>。<code>_CACHE_MAX = 300</code> を超えたら丸ごと clear。<br>・不一致で <code>drilldown</code> があれば <code>DRILL_ROWS = 8</code> 行だけ内訳を取る。<br>・チャット側は <code>_fresh_alerts(chat, alerts)</code> で、<code>render_log</code> に既にある <code>verify_key</code> を除く。<code>key</code> は <code>verify||owner||name||md5(指紋)[:8]||version</code> という形で、<b><code>hash()</code> を使わない</b>（プロセスごとに変わって再起動のたびに同じ警告が出直すため）。<br>・残った警告は <code>_merge_alerts</code> でツール結果JSONの <code>verification_warnings</code> に混ぜてLLMへ渡し、同時に <code>verify.render_item(a)</code> を画面カードとして積む。</div><div class="mt"><b>取り込み失敗のメール通知</b>（<code>mailer.alert_import_problems</code>）は <code>SmtpSettings.alert_to</code> が空か <code>alert_enabled=False</code> なら送らない。<code>ALERT_KINDS = (&quot;failed&quot;, &quot;degraded&quot;, &quot;overdue&quot;)</code> のうち <code>alert_kinds</code> に選ばれた種類だけを見て、<b>「健全→失敗」「失敗→復旧」の変わり目でのみ1通</b>送る（15分間隔なら1日96通になるのを避けるため）。スケジューラの <code>tick()</code> から呼ばれ、<code>_state[&quot;tick_count&quot;] &gt; 1</code> の周回からしか送らない（起動直後の1周目は「変化」ではない）。</div><div class="mt"><b>起動時の警告</b> <code>_warn_if_no_admin()</code> は <code>create_app()</code> の中で1回だけ走る。<code>auth.admin_enabled()</code> が真なら何もしない。偽で local プロバイダなら <code>auth_users.yaml</code> に <code>AUTH_ADMIN_GROUP</code> を持つユーザーが居るかを見て、居なければ標準出力に「管理者が1人も居ません」と出す。http プロバイダなら（グループを返さない前提で）無条件に警告する。気づけるのが「設定を直したいとき」になってしまうので起動時に言う、という判断が docstring に書いてある。同じく <code>_ensure_default_db()</code> が <code>.db</code> ゼロなら <code>data/データ.db</code> を作る。</div></td></tr>
+      <tr><td>検算（verify）とアラート</td><td><div class="mt"><b>検算ルール</b> は <code>data/&lt;DB&gt;.db.meta.yaml</code> の <code>checks:</code> に置く（＝管理者だけが編集できる場所）。<code>normalize()</code> が壊れた項目を落として揃え、<code>tolerance_pct</code> の既定は <code>DEFAULT_TOLERANCE_PCT = 0.5</code>（%）。左右のSQLは1行1列のスカラを返す約束で、<code>_scalar</code> は NULL を 0.0 として扱う。</div><div class="mt">実行の流れ:</div><div class="mt">・<code>tools.dispatch</code> が成功したら <code>_attach_verification(res, sqls, scope)</code> が <code>verify.alerts_for(sqls, scope)</code> を呼ぶ。ここで例外が出ても回答は止めない（<code>print</code> して素通り）。<br>・<code>alerts_for</code> は、実行されたSQLが触れた <code>(alias, table)</code> 集合と交わる検算だけを走らせ、<b>不一致だけ</b>返す（一致・実行不能は何も言わない。毎回「問題ありません」と言われると読まれなくなるため）。<br>・<code>run_check</code> の結果は <code>_verify_cache[(_fingerprint(check), _data_version(check, scope))]</code> にキャッシュ。<code>_data_version</code> は関係するDBファイルの <code>st_mtime_ns</code>。<b>データが変わった後の最初の1回しか実際には実行されない</b>。<code>_CACHE_MAX = 300</code> を超えたら丸ごと clear。<br>・不一致で <code>drilldown</code> があれば <code>DRILL_ROWS = 8</code> 行だけ内訳を取る。<br>・マイエージェント側は <code>_fresh_alerts(chat, alerts)</code> で、<code>render_log</code> に既にある <code>verify_key</code> を除く。<code>key</code> は <code>verify||owner||name||md5(指紋)[:8]||version</code> という形で、<b><code>hash()</code> を使わない</b>（プロセスごとに変わって再起動のたびに同じ警告が出直すため）。<br>・残った警告は <code>_merge_alerts</code> でツール結果JSONの <code>verification_warnings</code> に混ぜてLLMへ渡し、同時に <code>verify.render_item(a)</code> を画面カードとして積む。</div><div class="mt"><b>取り込み失敗のメール通知</b>（<code>mailer.alert_import_problems</code>）は <code>SmtpSettings.alert_to</code> が空か <code>alert_enabled=False</code> なら送らない。<code>ALERT_KINDS = (&quot;failed&quot;, &quot;degraded&quot;, &quot;overdue&quot;)</code> のうち <code>alert_kinds</code> に選ばれた種類だけを見て、<b>「健全→失敗」「失敗→復旧」の変わり目でのみ1通</b>送る（15分間隔なら1日96通になるのを避けるため）。スケジューラの <code>tick()</code> から呼ばれ、<code>_state[&quot;tick_count&quot;] &gt; 1</code> の周回からしか送らない（起動直後の1周目は「変化」ではない）。</div><div class="mt"><b>起動時の警告</b> <code>_warn_if_no_admin()</code> は <code>create_app()</code> の中で1回だけ走る。<code>auth.admin_enabled()</code> が真なら何もしない。偽で local プロバイダなら <code>auth_users.yaml</code> に <code>AUTH_ADMIN_GROUP</code> を持つユーザーが居るかを見て、居なければ標準出力に「管理者が1人も居ません」と出す。http プロバイダなら（グループを返さない前提で）無条件に警告する。気づけるのが「設定を直したいとき」になってしまうので起動時に言う、という判断が docstring に書いてある。同じく <code>_ensure_default_db()</code> が <code>.db</code> ゼロなら <code>data/データ.db</code> を作る。</div></td></tr>
       <tr><td>同時実行（waitress のスレッドと threading.local）</td><td><div class="mt">起動は <code>python core.py</code>（引数なし）で <code>create_app()</code> → <code>waitress.serve(app, host=HOST, port=PORT, threads=THREADS)</code>。<code>HOST=&quot;0.0.0.0&quot;</code> / <code>PORT=8000</code> / <code>THREADS=8</code> / <code>DEBUG=False</code> は<b>末尾のコード内定数で、env も環境変数も読まない</b>（<code>PORT</code> を他のソフトが環境変数で持っていると別ポートで起動する事故があるため、と明記）。waitress が無ければ Flask 開発サーバ（<code>threaded=True, use_reloader=False</code>）に落ちる。</div><div class="mt"><b>ワーカー（プロセス）は必ず1</b>。理由は <code>scheduler.start()</code> が立てる定期取り込みスレッドがワーカーの数だけ立ち、同じジョブを多重実行してしまうから。同時アクセス数はスレッド数で稼ぐ。<code>scheduler</code> は <code>_THREAD_NAME = &quot;aiagent-import-scheduler&quot;</code> の生存をスレッド名で確認して二重起動を防ぎ、<code>_stop</code>（<code>threading.Event</code>）で <code>wait</code> するので終了の合図で即抜ける。このスレッドには <b>リクエスト文脈が無いので <code>g</code> / <code>request</code> を使わない</b>（状態は <code>_state</code> に置いて画面が読む）。</div><div class="mt"><b><code>threading.local</code> は2つだけ</b>。どちらも「リクエストを処理しているスレッドに置いて、web 側が質問のたびに入れ直す」方式。</div><div class="tablewrap"><table class="data"><thead><tr><th>変数</th><th>置くもの</th><th>入れる場所</th><th>読む場所</th></tr></thead><tbody><tr><td><code>_rag_local</code>（元 rag/retriever.py）</td><td>いまの利用者</td><td><code>_begin_turn</code> の <code>rag.set_current_user(g.user)</code>、SSEの <code>generate()</code> 冒頭</td><td><code>rag_user_settings</code> / <code>rag_excluded_ids</code> / <code>excluded_tables</code> / <code>rag_targets</code> の引数省略時</td></tr><tr><td><code>_turn_local</code>（元 tools/results.py）</td><td>いまの質問の識別子</td><td><code>_begin_turn</code> の <code>results.new_turn()</code>、SSEの <code>generate()</code> で <code>results.set_turn(turn_id)</code></td><td><code>results.put</code> / <code>find_by_sql</code></td></tr></tbody></table></div><div class="mt"><code>_rag_local</code> が要るのは「<code>dispatch</code> が引数に利用者を持たない（35個のツールすべての形が変わるため）」から、<code>_turn_local</code> が要るのは「同じ質問の中でだけSQLの結果を使い回す」ため（質問をまたぐと、間にリアルタイム取り込みが走って古い数字を返しかねない）。</div><div class="mt">SSE (<code>POST /api/chat/stream</code>) は <code>stream_with_context</code> で流すが、<b><code>generate()</code> の冒頭で <code>rag.set_current_user(user)</code> と <code>results.set_turn(turn_id)</code> をやり直している</b>。Flask の <code>g</code> / <code>session</code> は ContextVar ベースの文脈に乗るので流し込み先のスレッドでも見えるが、<code>threading.local</code> は乗らないため。また <code>session[&quot;chat_id&quot;]</code> は<b>応答を流し始める前に</b>確定させる（流し始めた後に書いても Cookie に載らず、次の質問が別の会話として始まってしまう）。</div><div class="mt"><b>プロセス内共有の入れ物とロック</b></div><div class="tablewrap"><table class="data"><thead><tr><th>入れ物</th><th>ロック</th><th>上限</th></tr></thead><tbody><tr><td><code>_files</code>（生成ファイル、元 web/filestore.py）</td><td><code>_fs_lock</code></td><td><code>_MAX_ITEMS = 200</code></td></tr><tr><td><code>_store</code>（SELECT結果、元 tools/results.py）</td><td><b>無し</b></td><td><code>MAX_ENTRIES = 40</code> / <code>MAX_CELLS = 400_000</code></td></tr><tr><td><code>_meta_cache</code>（カタログYAML）</td><td>無し（mtime_ns+size で判定）</td><td>無し</td></tr><tr><td><code>_verify_cache</code></td><td>無し</td><td><code>_CACHE_MAX = 300</code></td></tr><tr><td><code>_models_cache</code></td><td><code>_models_lock</code>（無効化時のみ）</td><td><code>_CACHE_SEC = 300</code></td></tr><tr><td><code>_sent_log</code>（メール送信記録）</td><td><code>_mailer_lock</code></td><td><code>_MAX_LOG = 200</code></td></tr><tr><td><code>_prefs_lock</code> / <code>_kb_lock</code> / <code>_history_lock</code> / <code>_catalog_history_lock</code></td><td>各ファイル書き込みを直列化</td><td>—</td></tr></tbody></table></div><div class="mt">SQLite は接続を都度作って都度閉じる（<code>connect_ro</code> / <code>connect_scope</code>）ので、<code>check_same_thread</code> の既定のままでスレッドをまたがない。</div></td></tr>
       <tr><td>生成ファイルの持ち主チェック</td><td><div class="mt">ツールが作るバイト列は <code>_fs_put(data, filename, mime, owner=g.user.username)</code> でプロセス内 <code>OrderedDict</code> に預け、トークン（<code>secrets.token_urlsafe(16)</code>）だけを画面に渡す。ディスクには書かない。</div><div class="mt"><code>_fs_get(token, owner)</code> は <code>item[&quot;owner&quot;] != owner</code> なら None を返す。<code>GET /api/file/&lt;token&gt;</code> は <code>login_required</code> の上で <code>_fs_get(token, g.user.username)</code> を通し、外れれば <code>abort(404)</code>（403ではなく404で存在も隠す）。画像アップロード・取り込みアップロード・利用状況Excelもすべて同じ仕組みを通る。</div><div class="mt"><b>持ち主の識別子は <code>safe_key</code> ではなく生の <code>username</code></b>。</div></td></tr>
       <tr><td>ユーザー管理CLI（python core.py users …）</td><td><div class="mt"><code>users_cli</code> は <code>argparse</code> で <code>list</code> / <code>add</code> / <code>passwd</code> / <code>remove</code> を持つ。</div><div class="mt">・<code>add &lt;名前&gt; [--display-name] [--groups a,b] [--admin] [--password]</code>。<code>--admin</code> は <code>AUTH_ADMIN_GROUP</code> を groups に足す。同名（大文字小文字無視）が居れば <code>sys.exit</code>。<br>・パスワードは既定で <code>getpass</code> の2回入力。<code>--password</code> を使うと「コマンドラインで渡したパスワードは履歴に残ります。」と stderr に警告する。<br>・<code>remove</code> は「※ 個人カタログ（data/users/配下）は残ります。不要なら手動で削除してください。」と明示的に案内する（<b>退職者のデータは自動では消えない</b>）。</div><div class="mt">CLIは <code>if __name__ == &quot;__main__&quot;</code> の中で <code>sys.argv[1]</code> を見て分岐し、<code>users</code> / <code>refresh</code> / <code>selftest</code> 以外は使い方を出して終了する。CLI経路ではサーバもスケジューラも起動しない。直起動時は <code>_sys.modules.setdefault(&quot;core&quot;, _sys.modules[__name__])</code> で <code>__main__</code> と <code>core</code> を同じ実体に向け、後から <code>import core</code> が走ってスケジューラが二重に立つのを防いでいる。</div></td></tr>
@@ -4271,13 +4466,13 @@ def safe_key(self) -&gt; str:
       <tr><td class="mono small">03</td><td>/login の next 検査は nxt.startswith(&quot;/&quot;) だけなので、//evil.example.com のようなプロトコル相対URLを通してしまう（オープンリダイレクト）。login_required が付ける next は request.path なので通常は問題にならないが、URLは外から作れる。</td></tr>
       <tr><td class="mono small">04</td><td>CSRF対策が一切ない（トークンもOrigin検査も無い）。守りは SESSION_COOKIE_SAMESITE=&quot;Lax&quot; だけで、POST /logout も含めて全POSTが同じ状況。SESSION_COOKIE_SECURE も設定していないので、HTTPS 前段を置く場合はそこで補うことになる。</td></tr>
       <tr><td class="mono small">05</td><td>safe_key はパス区切りを潰すが &quot;.&quot; は許可文字に入っている。username が &quot;..&quot; のプロバイダを繋ぐと data/users/../chats/ すなわち data/chats/ に書きに行ける。BUILTIN/常設adminは定数なので安全、auth_users.yaml は管理者が書くので実害は薄いが、HTTP認証APIの応答を素通しする経路では成立しうる。</td></tr>
-      <tr><td class="mono small">06</td><td>HttpApiAuthProvider は応答から username を読むのに AUTH_API_USER_FIELD（＝リクエスト側のキー名）を使い回す。認証APIがそのキーを返さないと、フォールバックで「利用者が打った文字列」がそのまま username になる。すると Yamada と yamada で data/users/ のフォルダが2つに割れ、チャット履歴とモデル選択が別物になる。local プロバイダは YAML の綴りを返すのでこの問題が無い（照合は lower で行い、返す値は正本を使う、という対比になっている）。</td></tr>
+      <tr><td class="mono small">06</td><td>HttpApiAuthProvider は応答から username を読むのに AUTH_API_USER_FIELD（＝リクエスト側のキー名）を使い回す。認証APIがそのキーを返さないと、フォールバックで「利用者が打った文字列」がそのまま username になる。すると Yamada と yamada で data/users/ のフォルダが2つに割れ、会話の履歴とモデル選択が別物になる。local プロバイダは YAML の綴りを返すのでこの問題が無い（照合は lower で行い、返す値は正本を使う、という対比になっている）。</td></tr>
       <tr><td class="mono small">07</td><td>auth_users.yaml は配布物に存在しない。したがって既定構成では LocalAuthProvider は常に None を返し、実際に通るのは常設 admin と BUILTIN_USERS の4人だけ。それでも「ユーザーが1人も居ません」の案内（setup_needed）は ADMIN_PASS が設定されていると出ないので、画面からは local プロバイダが空であることに気づけない。</td></tr>
       <tr><td class="mono small">08</td><td>AuthProvider.hint（LocalAuthProvider は「社内LDAP導入までの暫定アカウントです。」）は login.html に渡されておらず、どこにも表示されない死んだ属性。</td></tr>
-      <tr><td class="mono small">09</td><td>base.html は非管理者に対して管理メニューのセクションをまるごと隠すが、その中には「チャット」のリンクも入っている。一般利用者のサイドバー上部は「ヘルプ」だけになる。仕様であってバグではない（コメントに「行き先が1つだけのメニューは出さない」とある）が、初見では権限バグに見える。</td></tr>
+      <tr><td class="mono small">09</td><td>base.html は非管理者に対して管理メニューのセクションをまるごと隠すが、その中には「マイエージェント」のリンクも入っている。一般利用者のサイドバー上部は「ヘルプ」だけになる。仕様であってバグではない（コメントに「行き先が1つだけのメニューは出さない」とある）が、初見では権限バグに見える。</td></tr>
       <tr><td class="mono small">10</td><td>results の _store（result_id → SELECT結果）はプロセス内で全ユーザー共有で、get() が確かめるのは scope（DBファイルのパス集合）だけ。このアプリはDBが1つなので scope は誰でも同じ文字列になり、実質「result_id を知っていれば誰でも読める」。ID は LLM にしか渡らないので現実の露出は小さいが、ユーザー境界ではない。さらに _store には一切ロックが無く、waitress の8スレッドから put/_evict/find_by_sql が同時に走ると「dictionary changed size during iteration」を踏み得る（_files には _fs_lock がある）。</td></tr>
       <tr><td class="mono small">11</td><td>knowledge_bases.json は APIキーを平文で持つため os.chmod 0600 を試すが、同じくキーを平文で持つ model_settings.yaml（_write_admin）は chmod していない。加えて Windows では chmod は事実上効かないので、どちらも「data/ を直接読める人には無防備」。auth.py の docstring が「OSレベルのアクセス制御ではない」と断っているのはこの点。</td></tr>
-      <tr><td class="mono small">12</td><td>rag_targets / rag_user_settings / excluded_tables を引数なしで呼ぶ経路が4つある（knowledge_tool_schemas / build_system_prompt のKB一覧 / ナレッジ検索ツールの実処理2箇所）。ここは threading.local の _rag_local を読む。set_current_user を通るのは _begin_turn と SSE の generate() だけなので、モデル設定画面の llm.budget → build_tools のようにチャット以外から build_tools が呼ばれると、そのスレッドに残っていた「前の人」の除外設定が使われる。表示上の見積もりにしか効かないが、スレッド使い回しに由来する取り違えなので原因が追いにくい。</td></tr>
+      <tr><td class="mono small">12</td><td>rag_targets / rag_user_settings / excluded_tables を引数なしで呼ぶ経路が4つある（knowledge_tool_schemas / build_system_prompt のKB一覧 / ナレッジ検索ツールの実処理2箇所）。ここは threading.local の _rag_local を読む。set_current_user を通るのは _begin_turn と SSE の generate() だけなので、モデル設定画面の llm.budget → build_tools のようにマイエージェント以外から build_tools が呼ばれると、そのスレッドに残っていた「前の人」の除外設定が使われる。表示上の見積もりにしか効かないが、スレッド使い回しに由来する取り違えなので原因が追いにくい。</td></tr>
       <tr><td class="mono small">13</td><td>SSE の /api/chat/stream は generate() の中で rag.set_current_user と results.set_turn をやり直す。g と session は ContextVar ベースの Flask 文脈なのでスレッドをまたいでも見えるが、threading.local は見えないため。この2行を消すと「同じ質問なのに前の人の設定で検索する」「同じSQLを2回実行する」が起きる。</td></tr>
       <tr><td class="mono small">14</td><td>session[&quot;chat_id&quot;] は応答を流し始める前に必ず書く必要がある。stream() が chat[&quot;id&quot;] をその場で確定させてセッションに入れているのはこのため。流し始めた後に session を書いても Set-Cookie に載らず、次の質問が別の会話として始まる。</td></tr>
       <tr><td class="mono small">15</td><td>/api/import/upload は importer.check_upload で IMPORT_MAX_FILE_MB（既定100MB）を見るが、その前に Flask の MAX_CONTENT_LENGTH（64MB）が効く。64〜100MB のファイルは日本語のエラーではなく素の 413 で弾かれる。</td></tr>
@@ -4285,7 +4480,7 @@ def safe_key(self) -&gt; str:
       <tr><td class="mono small">17</td><td>config.py は load_dotenv(&quot;./env&quot;) → load_dotenv(BASE_DIR/&quot;env&quot;) の順で読む。python-dotenv の既定は override=False なので、先に読んだ ./env（＝カレントディレクトリ）が勝ち、さらに本物の環境変数が両方に勝つ。別ディレクトリから起動すると意図しない env が効く。ただし認証設定は env に無いので、この影響は認証には及ばない。</td></tr>
       <tr><td class="mono small">18</td><td>起動用の HOST / PORT / THREADS / DEBUG は core.py 末尾のコード内定数で、env も環境変数も読まない（PORT を他ソフトが環境変数で持っていた事故への対処と明記されている）。「env に PORT を書いたのに変わらない」は仕様。</td></tr>
       <tr><td class="mono small">19</td><td>ワーカー（プロセス）は必ず1にすること。scheduler.start() の定期取り込みスレッドがワーカーごとに立ち、同じジョブを多重実行する。gunicorn を使うなら -w 1、同時接続はスレッド数で増やす。</td></tr>
-      <tr><td class="mono small">20</td><td>python core.py users remove はログイン情報を消すだけで、data/users/&lt;safe_key&gt;/ 配下のチャット履歴と prefs は残る（CLI 自身が最後にそう案内する）。退職者対応では手で消す必要がある。</td></tr>
+      <tr><td class="mono small">20</td><td>python core.py users remove はログイン情報を消すだけで、data/users/&lt;safe_key&gt;/ 配下の会話の履歴と prefs は残る（CLI 自身が最後にそう案内する）。退職者対応では手で消す必要がある。</td></tr>
     </tbody></table></div>
   </div>
 {% endraw %}
@@ -4302,20 +4497,14 @@ def safe_key(self) -&gt; str:
 # --- import.html ---
 "import.html": r"""{% extends "base.html" %}
 {% from "_icons.html" import icon %}
-{% block title %}データカタログ（取り込み） — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（取り込み） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content content--wide">
-  {# データカタログの一機能。同じタブバーを出して、行き来が同じ画面の中に見えるようにする。
-     他のタブはカタログ画面へ。 #}
-  <div class="tabs tabs--bar">
-    <a class="tab" href="{{ url_for('catalog.index') }}#tab=tables">テーブル</a>
-    <a class="tab" href="{{ url_for('catalog.index') }}#tab=er">結合・ER図</a>
-    <a class="tab" href="{{ url_for('catalog.index') }}#tab=glossary">用語集・例文</a>
-    <a class="tab" href="{{ url_for('catalog.index') }}#tab=tools">ツール</a>
-    <button class="tab is-active">取り込み</button>
-  </div>
+  {# 管理者メニューの一画面。同じタブ帯を出して、行き来が同じ画面の中に見えるようにする #}
+  <div class="tabs tabs--bar">{{ admintabs('import') }}</div>
 
   <!-- ================= 取り込み ================= -->
   <div id="pane-file">
@@ -4352,6 +4541,8 @@ def safe_key(self) -&gt; str:
         <div class="card__title" style="margin:0">取り込むファイル</div>
         <div class="spacer"></div>
         <button class="btn btn--sm" id="pickServer">サーバのフォルダから選ぶ</button>
+        <button class="btn btn--sm" id="pickScraper"
+                title="scrapers/ に置いたスクリプトを実行し、取得できたファイルを取り込み元にします">スクレイピングで取得する</button>
         {% if allow_upload %}
           <button class="btn btn--sm" id="pickLocal">自分のPCから選ぶ</button>
           <input type="file" id="localFile" class="hidden"
@@ -4404,9 +4595,28 @@ def safe_key(self) -&gt; str:
   </div>
 </div>
 
+<!-- スクレイピングのスクリプトを選んで試すダイアログ -->
+<div class="modal hidden" id="scraperModal">
+  <div class="modal__box">
+    <div class="modal__head">
+      <b>スクレイピングで取得する</b>
+      <div class="spacer"></div>
+      <button class="btn btn--sm btn--ghost" id="scraperClose" title="閉じる" aria-label="閉じる">{{ icon('x', 'icon--sm') }}</button>
+    </div>
+    <div class="modal__body" id="scraperList"></div>
+    <div class="modal__foot small muted">
+      <code>{{ scraper_dir }}</code> 直下の .py が出ます。スクリプトは <code>fetch(out_dir)</code> を定義し、
+      out_dir に Excel／CSV を書きます。「試す」で1回実行し、出来たファイルとシートを確認してから選びます。
+      取得したファイルはサーバに残しません（表に入れたら消します）。
+    </div>
+  </div>
+</div>
+
 <script>
 window.IMP = {
-  allowUpload: {{ allow_upload|tojson }},
+  scrapeTimeout: {{ scrape_timeout|tojson }},
+  scrapeInterval: {{ scrape_interval|tojson }},
+  scrapeLimits: {{ scrape_limits|tojson }},
   dbFiles: {{ db_files|tojson }},
   existing: {{ existing|tojson }},
   groups: {{ groups|tojson }},
@@ -4414,8 +4624,112 @@ window.IMP = {
   intervals: {{ intervals|tojson }},
   modes: {{ modes|tojson }},
   defaultTs: {{ default_ts|tojson }},
-  maxKeep: {{ max_keep|tojson }},
-  defaultKeep: {{ default_keep|tojson }}
+  maxKeep: {{ max_keep|tojson }}
+};
+</script>
+{% endblock %}
+""",
+
+# --- output.html ---
+"output.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（出力） — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content content--wide">
+  {# 管理者メニューの一画面。同じタブ帯を出して、行き来が同じ画面の中に見えるようにする #}
+  <div class="tabs tabs--bar">{{ admintabs('output') }}</div>
+
+  {# 出力先フォルダ。利用者が「フォルダに出力して」と頼んだファイルを
+     出力先/<利用者名>/ に置く。無ければ利用者名のフォルダを作る #}
+  <div class="card">
+    <div class="row" style="align-items:center">
+      <div class="card__title" style="margin:0">出力先フォルダ</div>
+      <span class="badge {{ 'badge--ok' if output.ok else ('badge--err' if output.path else '') }}" id="outBadge"
+            style="margin-left:10px">{{ '使えます' if output.ok else ('問題あり' if output.path else '未設定') }}</span>
+    </div>
+    <div class="card__desc">
+      利用者がマイエージェントで「フォルダに出力して」と頼んだファイル（Excel／CSV／テキスト／PowerPoint／Word）を、
+      ここに決めたフォルダの中の<b>利用者名のフォルダ</b>に置きます（無ければ作ります）。
+      会話に出たファイルの「フォルダに保存」ボタンも同じ場所に書きます。未設定ならダウンロードだけになります。
+    </div>
+    <div id="outStatus" class="small mb"
+         data-ok="{{ 'true' if output.ok else 'false' }}">{{ output.message }}{% if output.source %}（{{ output.source }}の設定）{% endif %}</div>
+    <div class="row">
+      <input type="text" id="outDir" class="grow" value="{{ output.path }}"
+             placeholder="出力先フォルダのパス（例: /mnt/out や \\\\server\\share\\出力）">
+      <button class="btn btn--sm btn--primary" id="outSave">保存</button>
+      <button class="btn btn--sm" id="outClear" title="出力先を外します（ダウンロードだけになります）">使わない</button>
+    </div>
+    <div class="small muted mt">
+      保存すると書けるかを確かめてから <code>data/output_dir.yaml</code> に残します（<code>env</code> の <code>OUTPUT_DIR</code> が初期値）。
+      アプリを動かしているアカウントが、そのフォルダに書ける必要があります。
+      アプリ自身のフォルダやデータのフォルダは指定できません。
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">置かれ方</div>
+    <div class="card__desc">
+      <code>出力先フォルダ／利用者名／ファイル名</code> の形で固定です。利用者名のフォルダは初めて出力したときに作られ、
+      以後はそのまま使います。パスは利用者もAIも指定できません。<br>
+      ファイル名の日時（付ける／付けない）と、同じ名前があるときの扱い（番号を付けて残す／置き換える）は<b>利用者が決めます</b>:
+      マイエージェントでは言葉で（「日時なしで」「置き換えて」）、マイロボットでは登録時とカードの「フォルダ出力」の欄で。
+      何も言わなければ「日時を付ける・番号を付けて残す」です。マイロボットで「実行結果をフォルダにも置く」をオンにしたものは、
+      実行のたびにその決めごとでここへ出ます。
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>window.OUTPUT_INIT = { ok: {{ output.ok|tojson }} };</script>
+{% endblock %}
+""",
+
+# --- robots.html ---
+"robots.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}マイロボット — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content">
+  <details class="card" id="howto">
+    <summary class="card__title" style="cursor:pointer">マイロボットとは</summary>
+    <div class="card__desc" style="margin-top:8px">
+      マイエージェントとのやり取りの中でAIが実際に使った道具（SQLの実行・グラフ・Excel作成・メール下書き…）の
+      並びに名前を付けて保存したものです。「実行」を押すと同じ手順を<b>AIなしでそのまま</b>実行するので、
+      数字は毎回同じ・待ち時間なし・LLMの費用なし。結果はマイエージェントの<b>新しい会話</b>に出ます
+      （そのあと「これをグラフにして」と続けられます）。
+      <ol style="margin:8px 0 0 18px;padding:0;line-height:1.9">
+        <li>マイエージェントで、いつもの流れを一度やる（集計 → グラフ → Excel など）</li>
+        <li>自分の発言にマウスを乗せて「<b>ロボットにする</b>」→ 含める質問にチェック → 名前 → 保存</li>
+        <li>この画面で「実行」。穴（実行のたびに入れ替える値）があれば、そのとき聞かれます</li>
+      </ol>
+      <div class="mt small muted">
+        自分だけのものです（他の人には見えません）。1人 {{ settings.max_per_user }} 件まで
+        {%- if interval_label %}、同じロボットは前回うまくいった実行から {{ interval_label }}たつまで実行できません{% endif %}
+        （管理者が決めています）。同じ名前・同じ内容のものは二重に登録できません。
+        全員で使いたい流れは、管理者が「例文」や「ユーザー定義ツール」として登録してください。
+      </div>
+    </div>
+  </details>
+
+  <div id="robotCards" class="mt"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.ROBOTS_INIT = {
+  robots: {{ robots|tojson }},
+  intervals: {{ intervals|tojson }},
+  minIntervalHours: {{ settings.min_interval_hours|tojson }},
+  schedulerOn: {{ scheduler_on|tojson }},
+  agentUrl: {{ url_for('chat.index')|tojson }}
 };
 </script>
 {% endblock %}
@@ -4423,11 +4737,13 @@ window.IMP = {
 
 # --- knowledge.html ---
 "knowledge.html": r"""{% extends "base.html" %}
-{% block title %}ナレッジベース — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（ナレッジベース） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content">
+  <div class="tabs tabs--bar">{{ admintabs('knowledge') }}</div>
   <div id="banner"></div>
 
   <details class="card" id="howto">
@@ -4441,7 +4757,7 @@ window.IMP = {
         <li><b>説明</b>に「何が入っているか・どんなときに使うか」を書く</li>
       </ol>
       <div class="mt">
-        追加した瞬間から、チャットのAIがそのナレッジベースを検索できるようになります。
+        追加した瞬間から、マイエージェントのAIがそのナレッジベースを検索できるようになります。
         <b>説明はAIがそのまま読みます</b>。AIがどのナレッジベースを調べるか決める材料は
         名前と説明しかないので、ここの書き方で検索の当たり外れが変わります。
       </div>
@@ -4460,7 +4776,7 @@ http://10.20.30.40:9621</pre>
     <div class="card__title">登録されているナレッジベース</div>
     <div class="card__desc">
       「検索対象にする」を外すと、その環境は全利用者の検索から外れます
-      （チャット画面の一覧にも出なくなります）。
+      （マイエージェント画面の一覧にも出なくなります）。
       APIキーは伏せ字で表示され、「表示」を押したときだけ実値を取りに行きます。
     </div>
     <div id="kbList"></div>
@@ -4495,7 +4811,7 @@ http://10.20.30.40:9621</pre>
   <div class="card">
     <div class="card__title">検索の効き方の初期値</div>
     <div class="card__desc">
-      利用者はチャット画面のサイドバーから個別に変えられます。ここに出ているのは
+      利用者はマイエージェント画面のサイドバーから個別に変えられます。ここに出ているのは
       <b>まだ自分で変えていない人が使う値</b>で、<code>env</code>（{{ 'RAG_RETRIEVE_MODE / RAG_CHUNK_TOP_K / RAG_TOP_K / RAG_MAX_CONTEXT_CHARS' }}）
       で決まります。env を変えれば、設定を触っていない利用者はその新しい値に追随します。
     </div>
@@ -4532,6 +4848,9 @@ window.KB_INIT = {
       {{ icon('spark') }}
       <h1>{{ app_title }}</h1>
     </div>
+    {% if app_tagline %}
+      <div class="small muted" style="text-align:center;margin:-6px 0 14px;letter-spacing:.04em">{{ app_tagline }}</div>
+    {% endif %}
 
     {% if fatal %}
       <div class="alert alert--err">{{ fatal }}</div>
@@ -4567,11 +4886,13 @@ window.KB_INIT = {
 
 # --- mail.html ---
 "mail.html": r"""{% extends "base.html" %}
-{% block title %}メール設定 — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（メール設定） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content">
+  <div class="tabs tabs--bar">{{ admintabs('mail') }}</div>
   <div id="banner"></div>
 
   <div class="card">
@@ -4733,18 +5054,20 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
 
 # --- models.html ---
 "models.html": r"""{% extends "base.html" %}
-{% block title %}モデル設定 — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（モデル設定） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content">
+  <div class="tabs tabs--bar">{{ admintabs('models') }}</div>
   <div id="banner"></div>
 
   <details class="card" id="howto">
     <summary class="card__title" style="cursor:pointer">この画面の使い方</summary>
     <div class="card__desc" style="margin-top:8px">
       APIが返すモデルは100件を超えることもあり、その中には旧世代のものや
-      チャットに使えないものが混ざっています。そのまま利用者に見せると選び間違えるので、
+      マイエージェントに使えないものが混ざっています。そのまま利用者に見せると選び間違えるので、
       <b>ここで「使ってよいモデル」を決めます</b>。
       <ol style="margin:8px 0 0 18px;padding:0;line-height:1.9">
         <li>「一覧から選ぶ」で、使わせたいモデルにチェックを入れる</li>
@@ -4752,7 +5075,7 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
         <li>下の「設定を保存」を押す</li>
       </ol>
       <div class="mt">
-        保存すると、チャット画面のプルダウンは<b>ここで選んだモデルだけ</b>になります。
+        保存すると、マイエージェント画面のプルダウンは<b>ここで選んだモデルだけ</b>になります。
         候補から外したモデルを選んでいた利用者は、次の質問から既定のモデルに変わります。
       </div>
     </div>
@@ -4761,7 +5084,7 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
   <div class="card">
     <div class="card__title">選択できるモデル</div>
     <div class="card__desc">
-      ここに登録したモデルだけが、チャット画面のプルダウンに出ます。
+      ここに登録したモデルだけが、マイエージェント画面のプルダウンに出ます。
       候補から外すと、既にそのモデルを選んでいた利用者も既定のモデルに戻ります。
     </div>
     <div id="modelList"></div>
@@ -4797,7 +5120,7 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
       <b>空欄にして保存すると env の値に戻ります。</b>
     </div>
     <div class="mb" style="max-width:640px">
-      <label class="field">チャット（AI呼び出し）のURL</label>
+      <label class="field">AI呼び出し（chat completions）のURL</label>
       <input type="text" id="chatUrl" placeholder="例: https://api.openai.com/v1/chat/completions">
       <div class="small muted mt" id="chatUrlNote"></div>
     </div>
@@ -4886,6 +5209,265 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
 {% endblock %}
 """,
 
+# --- memory.html ---
+"memory.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}覚え書き — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content">
+  <details class="card" id="howto">
+    <summary class="card__title" style="cursor:pointer">覚え書きとは</summary>
+    <div class="card__desc" style="margin-top:8px">
+      ChatGPT のメモリと同じ発想です。マイエージェントで質問して答えが返るたびに、AIがもう一度だけ働き、
+      やり取りの中から<b>次回以降の質問でも使える前提・好み・期間</b>（「うちの部署は関西工場」「Excel で欲しい」
+      「特に言わなければ先月分」）をこの本文に書き足します。データの中身や1回きりの指示は覚えません。
+      <div class="mt">
+        本文はそのまま次の質問からAIに渡り、使ったときは回答の末尾に「（覚え書き「…」を使いました）」と出ます。
+        ここで自由に直せます（1行に1つ、「- 」で始める箇条書きがおすすめ）。会話で「忘れて」と言えば、その回答のあとに消えます。
+        「覚えない」にすると新しく覚えるのをやめ、いまの本文もAIに渡しません。他の利用者には見えませんが、管理者は管理者メニューで内容を見られます。
+      </div>
+    </div>
+  </details>
+
+  <div class="card memedit">
+    <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+      <div class="card__title" style="margin:0">AIが覚えていること</div>
+      <span class="badge" id="memState"></span>
+      <div class="spacer"></div>
+      <button class="btn btn--sm btn--ghost" id="memToggle">覚えない</button>
+    </div>
+    <div class="alert alert--warn small mt hidden" id="memOffNote">
+      管理者がこの機能を止めています。いま書いても、AIには渡りません（止めているあいだに覚えることもありません）。</div>
+    <div class="alert alert--err small mt hidden" id="memBroken">
+      保存ファイル（memory.yaml）が読めませんでした。下の欄は空で表示しています。
+      ここで保存すると、新しい本文で置き換わります（読めなかった中身は戻りません）。</div>
+    <textarea id="memText" spellcheck="false" placeholder="まだありません。マイエージェントで質問すると、答えのあとにここに書き足されます。&#10;自分で書いてもかまいません（例: - うちの部署は関西工場）"></textarea>
+    <div class="row mt" style="align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn btn--primary btn--sm" id="memSave">保存</button>
+      <button class="btn btn--sm btn--danger" id="memClear">全部消す</button>
+      <span class="small muted" id="memCount"></span>
+      <div class="spacer"></div>
+      <span class="small muted" id="memNote"></span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.MEMORY_INIT = {{ memory|tojson }};
+</script>
+{% endblock %}
+""",
+
+# --- memory_admin.html ---
+"memory_admin.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（覚え書き） — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content content--wide">
+  <div class="tabs tabs--bar">{{ admintabs('memory') }}</div>
+
+  <div class="card">
+    <div class="card__title">覚え書きの決めごと</div>
+    <div class="card__desc">
+      利用者の覚え書き（AIが会話から覚える、その人についての前提・好み・期間。1人につき1つの本文）の決めごとです。
+      全利用者に同じ値が効き、保存するとすぐ反映されます。
+    </div>
+    <div class="row mb" style="align-items:flex-end;gap:20px;flex-wrap:wrap">
+      <div>
+        <label class="field">機能</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="msEnabled"> <span class="small">覚え書きを使う（外すと、メニューから消え、AIにも渡しません）</span>
+        </label>
+      </div>
+      <div>
+        <label class="field">書き直しに使うモデル</label>
+        <select id="msModel" style="min-width:240px">
+          <option value="">回答と同じモデル</option>
+          {% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+        </select>
+        <div class="small muted" style="margin-top:4px">回答のたびに1回呼びます。安いモデルにすると費用を抑えられます（候補は「モデル設定」で使えるモデル）。</div>
+      </div>
+      <div>
+        <label class="field">本文の上限（文字）</label>
+        <div class="row" style="align-items:center;gap:6px">
+          <input type="number" id="msMax" min="{{ ranges.max_chars[0] }}" max="{{ ranges.max_chars[1] }}" step="100" style="width:120px">
+          <span class="small muted">（{{ ranges.max_chars[0] }}〜{{ ranges.max_chars[1] }}。超えた分は切ります。できるだけ行の切れ目で）</span>
+        </div>
+      </div>
+    </div>
+    <div class="small muted mb">
+      初期値は {{ '使う' if defaults.enabled else '使わない' }}・{{ defaults.model or '回答と同じモデル' }}・{{ defaults.max_chars }} 文字
+      （環境変数 MEMORY_ENABLED / MEMORY_MODEL / MEMORY_MAX_CHARS でも変えられます）。
+    </div>
+    <div class="row" style="align-items:center;gap:10px">
+      <button class="btn btn--primary btn--sm" id="msSave">保存</button>
+      <span class="small muted" id="msNote">{% if note.updated_at %}{{ note.updated_at|replace('T', ' ') }} に {{ note.updated_by }} が保存{% else %}まだ保存していません（初期値のまま）{% endif %}</span>
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">全利用者の覚え書き</div>
+    <div class="card__desc">利用者ごとの本文をそのまま表示します（閲覧のみ。直せるのは本人だけです）。利用者にも「管理者は見られる」と案内してあります。</div>
+    {% if overview %}
+    {% for o in overview %}
+    <details class="acc">
+      <summary>
+        <strong>{{ o.user }}</strong>
+        <span class="badge" style="margin-left:8px">{{ '覚えている' if o.on else '停止中' }}</span>
+        {% if o.broken %}<span class="badge badge--warn" style="margin-left:4px">ファイルが読めません</span>{% endif %}
+        <span class="small muted" style="margin-left:8px">{{ o.chars }} 文字・最終更新 {{ o.updated_at|replace('T', ' ') if o.updated_at else '—' }}</span>
+      </summary>
+      <div class="acc__body">
+        {% if o.text %}<pre class="mono" style="white-space:pre-wrap;word-break:break-all;font-size:13px">{{ o.text }}</pre>{% else %}<div class="small muted">本文はありません。</div>{% endif %}
+      </div>
+    </details>
+    {% endfor %}
+    {% else %}
+    <div class="small muted">まだ誰の覚え書きもありません。</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
+</script>
+{% endblock %}
+""",
+
+# --- robot_settings.html ---
+"robot_settings.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（マイロボット） — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content content--wide">
+  <div class="tabs tabs--bar">{{ admintabs('robots') }}</div>
+
+  <div class="card">
+    <div class="card__title">マイロボットの決めごと</div>
+    <div class="card__desc">
+      利用者が保存するマイロボット（気に入った処理の流れを、AIなしで繰り返すもの）の上限と、実行の間隔を決めます。
+      全利用者に同じ値が効きます（管理者も同じ）。保存するとすぐ反映されます。
+    </div>
+    <div class="row mb" style="align-items:flex-end;gap:20px;flex-wrap:wrap">
+      <div>
+        <label class="field">1人あたりの登録上限数</label>
+        <div class="row" style="align-items:center;gap:6px">
+          <input type="number" id="rsMax" min="{{ ranges.max_per_user[0] }}" max="{{ ranges.max_per_user[1] }}" step="1" style="width:110px">
+          <span class="small muted">件（{{ ranges.max_per_user[0] }}〜{{ ranges.max_per_user[1] }}）</span>
+        </div>
+      </div>
+      <div>
+        <label class="field">同じロボットの実行の最低間隔</label>
+        <div class="row" style="align-items:center;gap:6px">
+          <input type="number" id="rsInterval" min="{{ ranges.min_interval_hours[0] }}" max="{{ ranges.min_interval_hours[1] }}" step="0.5" style="width:110px">
+          <span class="small muted">時間（0 で制限なし・最大 {{ ranges.min_interval_hours[1] }}）</span>
+        </div>
+      </div>
+      <div>
+        <label class="field">1つのロボットの手順数の上限</label>
+        <div class="row" style="align-items:center;gap:6px">
+          <input type="number" id="rsSteps" min="{{ ranges.max_steps[0] }}" max="{{ ranges.max_steps[1] }}" step="1" style="width:110px">
+          <span class="small muted">手順（{{ ranges.max_steps[0] }}〜{{ ranges.max_steps[1] }}）</span>
+        </div>
+      </div>
+    </div>
+    <div class="small muted mb">
+      間隔は「前回うまくいった実行」から数えます（失敗した実行はすぐやり直せます）。
+      上限に達した利用者は、使わないロボットを削除してから登録します。
+      同じ名前・同じ内容のロボットは、決めごとに関係なく二重には登録できません。
+      初期値は {{ defaults.max_per_user }} 件・{{ '%g'|format(defaults.min_interval_hours) }} 時間・{{ defaults.max_steps }} 手順
+      （環境変数 ROBOT_MAX_PER_USER / ROBOT_MIN_INTERVAL_HOURS / ROBOT_MAX_STEPS でも変えられます）。
+    </div>
+    <div class="row" style="align-items:center;gap:10px">
+      <button class="btn btn--primary btn--sm" id="rsSave">保存</button>
+      <span class="small muted" id="rsNote">{% if note.updated_at %}{{ note.updated_at|replace('T', ' ') }} に {{ note.updated_by }} が保存{% else %}まだ保存していません（初期値のまま）{% endif %}</span>
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">いまの登録状況（全利用者）</div>
+    <div class="card__desc">利用者ごとのマイロボット。名前を開くと、手順の中身（SQLなど）・穴・定期実行・メール・前回の実行まで見られます。</div>
+    {% if overview %}
+    {% for o in overview %}
+    <details class="acc">
+      <summary>
+        <strong>{{ o.user }}</strong>{% if o.display_name and o.display_name != o.user %}<span class="small muted" style="margin-left:6px">{{ o.display_name }}</span>{% endif %}
+        <span class="badge" style="margin-left:8px">{{ o.count }} 件</span>
+        {% if o.scheduled %}<span class="badge" style="margin-left:4px">定期 {{ o.scheduled }} 件</span>{% endif %}
+        <span class="small muted" style="margin-left:8px">最後の実行: {{ o.last_run|replace('T', ' ') if o.last_run else 'まだ実行していません' }}</span>
+      </summary>
+      <div class="acc__body">
+        {% for r in o.robots %}
+        <details class="acc robotdetail" style="margin-top:6px">
+          <summary>
+            <strong>{{ r.name }}</strong>
+            <span class="small muted" style="margin-left:8px">{{ r.n_steps }}手順・{{ r.tools|join(' → ') }}</span>
+            {% if r.schedule.interval_minutes %}<span class="badge" style="margin-left:6px">{{ r.schedule.interval_label }}{% if r.schedule.enabled is sameas false %}（止めています）{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at[5:16]|replace('T', ' ') }}{% endif %}</span>{% endif %}
+            {% if r.mail_auto %}<span class="badge" style="margin-left:4px">メール自動送信</span>{% endif %}
+            {% if r.last_status == 'error' %}<span class="badge badge--warn" style="margin-left:4px">前回失敗</span>{% endif %}
+            {% if (r.schedule.interval_minutes and r.schedule.enabled is not sameas false) or r.mail_auto %}
+            <button class="btn btn--sm btn--danger sbsec__act" data-stop-user="{{ o.user }}" data-stop-id="{{ r.id }}" data-stop-name="{{ r.name }}"
+                    title="この利用者のロボットの定期実行と、メールの自動送信を止めます（手順は消しません。本人はあとで再開できます）">止める</button>
+            {% endif %}
+          </summary>
+          <div class="acc__body small">
+            <dl class="robotdetail">
+              <dt>手順</dt>
+              <dd>{% for sd in r.steps_detail %}<div><span class="badge">手順{{ sd.i }}</span> <b>{{ sd.label }}</b></div><pre class="mono">{{ sd.text }}</pre>{% if sd.explanation %}<div class="muted" style="margin:-4px 0 8px">{{ sd.explanation }}</div>{% endif %}{% endfor %}</dd>
+              <dt>元の質問</dt><dd>{{ r.questions|join(' ／ ') or '—' }}</dd>
+              <dt>穴</dt><dd>{% if r.holes %}{% for h in r.holes %}{{ h.label }}（登録時の値: {{ h.sample }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}</dd>
+              <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
+              <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
+              <dt>定期実行</dt><dd>{% if r.schedule.interval_minutes %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
+              <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}</dd>
+              <dt>作成・更新・前回の実行</dt><dd>{{ r.created_at|replace('T', ' ') }} ／ {{ r.updated_at|replace('T', ' ') }} ／ {% if r.last_run %}{{ r.last_run|replace('T', ' ') }}（{{ '成功' if r.last_status == 'ok' else ('実行中' if r.last_status == 'running' else '失敗') }}）{{ r.last_message }}{% else %}まだ実行していません{% endif %}</dd>
+            </dl>
+          </div>
+        </details>
+        {% endfor %}
+      </div>
+    </details>
+    {% endfor %}
+    {% else %}
+    <div class="small muted">まだ誰も登録していません。</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.ROBOT_SETTINGS_INIT = { settings: {{ settings|tojson }} };
+</script>
+<script>
+/* 「止める」: 他の利用者の定期実行と自動送信を止める（管理者だけ）。押したら画面を読み直す */
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[data-stop-id]').forEach(b => b.addEventListener('click', async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    if (!confirm(`「${b.dataset.stopName}」（${b.dataset.stopUser}）の定期実行とメールの自動送信を止めますか？`)) return;
+    b.disabled = true;
+    try {
+      await api('/api/catalog/robots/stop', { user: b.dataset.stopUser, id: b.dataset.stopId });
+      toast('止めました。'); location.reload();
+    } catch (e) { b.disabled = false; toast(e.message, 'err', 9000); }
+  }));
+});
+</script>
+{% endblock %}
+""",
+
 # --- table.html ---
 "table.html": r"""{% extends "base.html" %}
 {% block title %}{{ table }} — {{ app_title }}{% endblock %}
@@ -4956,14 +5538,17 @@ window.TABLE_INIT = {
 
 # --- usage.html ---
 "usage.html": r"""{% extends "base.html" %}
-{% block title %}利用状況 — {{ app_title }}{% endblock %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（利用状況） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content content--wide">
+  <div class="tabs tabs--bar">{{ admintabs('usage') }}</div>
 
-  {# 条件は1本の帯にまとめる。タブを切り替えても条件はそのまま持ち回る #}
-  <div class="tabs tabs--bar">
+  {# 集計の切り口と条件は1本の帯にまとめる。タブを切り替えても条件はそのまま持ち回る
+     （上の管理者メニューの帯とは別。JSは data-view のあるタブだけを見る） #}
+  <div class="tabs tabs--bar tabs--sub">
     {% for v in views if not v.merged %}
     <button class="tab {{ 'is-active' if loop.first }}" data-view="{{ v.key }}">{{ v.label }}</button>
     {% endfor %}
@@ -4992,7 +5577,7 @@ window.TABLE_INIT = {
     <div id="uBody"></div>
   </div>
 
-  {# チャット履歴。左に一覧、右に中身 #}
+  {# 会話の履歴。左に一覧、右に中身 #}
   <div class="tabpane" id="pane-chats">
     <div id="uQNotes"></div>
     <div class="row mb" style="align-items:center">
@@ -5247,12 +5832,10 @@ details.sbsec > summary .sbsec__act { flex: none; }
 .navlink.is-active .icon { color: var(--accent); }
 
 /* ふつうの画面は中身の高さだけ伸びて、ページ全体がスクロールする。
-   チャットだけは画面に固定して、ログの中だけをスクロールさせたいので
+   マイエージェントだけは画面に固定して、ログの中だけをスクロールさせたいので
    body に .is-chat を付けて切り替える（下の .is-chat .main を参照）。 */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 /* flexの既定で縮められると中身がはみ出して読めなくなるので、縮小を止める */
-.content { flex: none; }
-
 .is-chat .main { height: 100vh; overflow: hidden; }
 
 /* 表だけを見る画面（テーブル全体のビューア）。読むのは中身だけなので、
@@ -5278,7 +5861,7 @@ details.sbsec > summary .sbsec__act { flex: none; }
 .is-table table.data thead th:first-child { z-index: 3; background: var(--surface-2); }
 .is-table table.data tbody tr:hover td:first-child { background: var(--surface-2); }
 /* 見出しも操作部も無い画面では、そもそも header ごと出していない（base.html）。
-   以前ここでチャットだけ display:none にしていたが、同じことをする画面が
+   以前ここでマイエージェントだけ display:none にしていたが、同じことをする画面が
    増えたのでテンプレート側にまとめた。 */
 .topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -5298,7 +5881,7 @@ details.sbsec > summary .sbsec__act { flex: none; }
     white-space: nowrap;
 }
 .topbar .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
-.content { padding: 24px 28px 72px; max-width: 1400px; width: 100%; }
+.content { flex: none; padding: 24px 28px 72px; max-width: 1400px; width: 100%; }
 .content--wide { max-width: none; }
 
 /* --- 部品 ------------------------------------------------------------------ */
@@ -5545,7 +6128,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .tab:hover { color: var(--text); }
 .tab.is-active { color: var(--text); border-bottom-color: var(--accent); }
-/* 定期取り込みが設定どおりに動いていないDB・テーブルに付ける印（チャットのサイドバー） */
+/* 定期取り込みが設定どおりに動いていないDB・テーブルに付ける印（マイエージェントのサイドバー） */
 .warnmark { color: var(--warn, #c77700); display: inline-flex; align-items: center; margin-left: 4px; }
 .warnmark .icon { width: 14px; height: 14px; }
 
@@ -5564,6 +6147,14 @@ a.tab { text-decoration: none; display: inline-block; line-height: normal; }
 }
 .tabpane { display: none; }
 .tabpane.is-active { display: block; }
+/* 管理者メニューの帯: データカタログのタブと、それ以外の画面のタブの間の区切り */
+.tabs__sep { width: 1px; background: var(--border); margin: 8px 6px; align-self: stretch; }
+/* 帯の下にもう1段（利用状況の集計の切り口）。上の帯と続きに見えるよう、間を詰める */
+.tabs--sub { margin-top: -8px; }
+/* ビューの「使ったデータ」: 表ごとに1行、その下に読んだ列を並べる */
+.usedrow { margin-top: 6px; }
+.usedrow .icon { width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; }
+.usedcols { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 2px 0 0 20px; font-size: 12.5px; }
 
 details.acc { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px; background: var(--surface); }
 details.acc > summary {
@@ -5591,14 +6182,14 @@ details.acc--group > summary { font-size: 14px; padding: 11px 13px; }
 details.acc--group > .acc__body { padding: 0 10px 10px; }
 details.acc--group > .acc__body > details.acc { background: var(--surface); }
 
-/* チャットから飛んできたテーブル。どれを開いたのかが一目で分かるように光らせる */
+/* マイエージェントから飛んできたテーブル。どれを開いたのかが一目で分かるように光らせる */
 details.acc.is-target {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-weak);
     transition: box-shadow .4s, border-color .4s;
 }
 
-/* --- チャット --------------------------------------------------------------- */
+/* --- マイエージェント --------------------------------------------------------------- */
 
 /* 上のヘッダを除いた残り全部。ヘッダの高さが変わってもここは追従する */
 .chat { display: flex; flex-direction: column; flex: 1; min-height: 0;
@@ -5692,7 +6283,7 @@ details.acc.is-target {
 .toolblock__foot { padding: 6px 11px; border-top: 1px solid var(--border);
                    display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 
-/* 触れているテーブルから、カタログの該当テーブルへ飛ぶリンク（チャット画面） */
+/* 触れているテーブルから、カタログの該当テーブルへ飛ぶリンク（マイエージェント画面） */
 .catlinks { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
             font-size: 12px; }
 .catlinks a { font-family: var(--mono); font-size: 11.5px; }
@@ -5723,7 +6314,7 @@ details.acc.is-target {
 .filecard .name { font-weight: 500; }
 
 /* --- 画像のドロップ先 ------------------------------------------------------------
-   ふだんは出さず、ファイルをドラッグしてきたときだけチャット全体を覆う。
+   ふだんは出さず、ファイルをドラッグしてきたときだけマイエージェント全体を覆う。
    落とす場所を探させないよう、狙いは「画面のどこでもよい」にしている。 */
 
 .dropzone {
@@ -5772,7 +6363,8 @@ details.acc.is-target {
     background: var(--surface); border: 1px solid var(--border-2);
     border-radius: 999px; padding: 2px; box-shadow: var(--shadow);
 }
-/* 触れるまで隠す。キーボード操作でも出るように :focus-within を入れる */
+/* 触れるまで隠す（常時表示にすると短い吹き出しの文字に被って読みづらい）。
+   キーボード操作でも出るように :focus-within を入れる */
 .msg:hover .turn__tools, .turn:focus-within .turn__tools { opacity: 1; }
 .turn__btn {
     border: 0; background: none; cursor: pointer; padding: 3px 8px;
@@ -5907,13 +6499,18 @@ details.acc.is-target {
 .dbpick__head:hover { background: var(--surface-2); }
 .dbpick__name { font-weight: 600; font-size: 12.5px; flex: 1; min-width: 0;
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dbpick__tables { padding: 2px 10px 9px 30px; display: none; }
+.dbpick__tables { padding: 2px 10px 9px 22px; display: none; }
 .dbpick.is-open .dbpick__tables { display: block; }
 /* テーブル名は「押すと中身が開く」リンク。ふだんは一覧として静かに見せ、
    マウスを乗せたときだけ下線を出す（サイドバーが青いリンクだらけにならないように） */
 .dbpick__table {
     display: flex; gap: 7px; align-items: center; font-size: 12px; padding: 2px 0;
 }
+/* 表／ビューの種類のアイコン。名前より一段薄く、行の高さを変えない */
+.dbpick__kind { display: inline-flex; flex: 0 0 auto; color: var(--muted); }
+.dbpick__kind .icon--sm { width: 13px; height: 13px; }
+.ertable__name { display: flex; align-items: center; gap: 4px; }
+.ertable__name .icon--sm { width: 13px; height: 13px; opacity: .8; }
 .dbpick__tname {
     color: var(--muted); text-decoration: none; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -5923,7 +6520,10 @@ details.acc.is-target {
 .tblpick, .grppick { flex: none; margin: 0; cursor: pointer; }
 .dbpick__table:has(.tblpick:not(:checked)) .dbpick__tname { opacity: .45; }
 /* 一覧はチェックの分だけ左を詰める（インデントが二重にならないように） */
-.dbpick__tables { padding-left: 22px; }
+/* --- 覚え書き（専用の画面。本文は1つのテキスト） ------------------------------------- */
+.memedit textarea { width: 100%; min-height: 340px; margin-top: 10px; font-size: 14px; line-height: 1.75;
+                    font-family: inherit; resize: vertical; }
+.memedit.is-off textarea { opacity: .55; }
 
 /* --- 社内文書の検索先 ---------------------------------------------------------
    外したものは薄く見せる。消さずに残すのは、また戻せることを示すため。 */
@@ -5948,12 +6548,25 @@ details.acc.is-target {
                  color: var(--muted); padding: 0 3px; font-size: 13px; }
 .histitem:hover .histitem__del { opacity: 1; }
 .histitem__del:hover { color: var(--err); }
+/* マイロボット: 登録ダイアログの質問ごとの囲いと、一覧のカード */
+.robotturn { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+             margin-bottom: 8px; }
+.robotcard + .robotcard { margin-top: 10px; }
+/* 登録ダイアログ・詳細: 手順の中身（SQLなど）は折り返して全部読める */
+.robotstep { margin-top: 6px; }
+.robotstep__sum { white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.5;
+                  margin: 2px 0 0 6px; padding: 4px 8px; background: var(--surface-2); border-radius: var(--radius-sm); }
+.robotdetail pre { white-space: pre-wrap; word-break: break-all; font-size: 12.5px; margin: 4px 0 8px;
+                   padding: 6px 8px; background: var(--surface-2); border-radius: var(--radius-sm); }
+.robotdetail dt { font-weight: 600; margin-top: 8px; }
+.robotdetail dd { margin: 2px 0 0 0; }
+.schedgrid { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; align-items: center; }
 
 /* --- ER図キャンバス --------------------------------------------------------- */
 
 .er { position: relative; border: 1px solid var(--border); border-radius: var(--radius);
       background: var(--surface); overflow: hidden; height: 620px; }
-/* チャットのモーダル内での高さ。インラインstyleにすると .er--full の100vhが
+/* マイエージェントのモーダル内での高さ。インラインstyleにすると .er--full の100vhが
    上書きできず「全画面なのに下が欠ける」ことになるため、必ずクラスで与える */
 .er--chat { height: 72vh; }
 .er--full { position: fixed; inset: 0; z-index: 200; height: 100vh; border-radius: 0; }
@@ -6025,6 +6638,7 @@ details.acc.is-target {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow-lg); padding: 12px;
     max-height: calc(100% - 20px); overflow: auto;
+    display: flex; flex-direction: column;
 }
 /* テーブルの中身（列・サンプル行）を出すときは広げる。キャンバスからはみ出さない幅に */
 .er__panel--wide { width: min(560px, calc(100% - 20px)); }
@@ -6039,7 +6653,6 @@ details.acc.is-target {
 .er__grip--tl { left: -5px; top: -5px; width: 14px; height: 14px; cursor: nwse-resize; }
 .er__panel--max .er__grip { display: none; }
 /* 中身がパネルの高さを超えたら本文だけスクロール（見出しは残す） */
-.er__panel { display: flex; flex-direction: column; }
 .er__panel__body { overflow: auto; min-height: 0; }
 .er__legend {
     position: absolute; left: 10px; bottom: 10px; z-index: 5; font-size: 11px;
@@ -6056,6 +6669,9 @@ details.acc.is-target {
     border-radius: var(--radius); box-shadow: var(--shadow-lg);
     width: 100%; max-width: 720px; max-height: 80vh; display: flex; flex-direction: column;
 }
+/* 広い版（マイロボットの登録）。手順のSQLを折り返して読めるように */
+.modal__box--wide { max-width: 980px; max-height: 88vh; font-size: 14px; }
+.modal__box--wide .modal__body { padding: 10px 14px; }
 .modal__head { display: flex; align-items: center; gap: 10px;
                padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .modal__crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
@@ -6596,6 +7212,116 @@ function dataTable(columns, rows, opts = {}) {
      world  … ノードが持つ論理座標（.meta.yaml の er_layout と同じ）
      screen … 画面のピクセル。world に translate(tx,ty) scale(k) をかけたもの */
 
+// --- 整列アルゴリズム（純粋関数。ER図の「整列」ボタンが使う） ---
+/**
+ * 関連にそって表を並べ直す。戻り値は {id: {x, y}}（渡した nodes の分だけ。左上が 0,0）。
+ *   nodes  … [{id, table}]（表示中の表）
+ *   edges  … [{from:[alias, table, col], to:[alias, table, col]}]
+ *   sizeOf … id → {w, h}（画面の実寸）
+ * 決め方:
+ *   1. 関連でつながる表ごとの「かたまり」に分ける
+ *   2. かたまりの中では、関連の to 側（参照される親・マスタ）を右の列へ。列は
+ *      from → to の道のりの長さで決める（循環していても止まる）
+ *   3. 同じ列の中は、隣の列でつながる相手の位置の平均に近い順に並べ、線の交差を減らす
+ *   4. かたまりは大きい順に縦に積み、1表だけのもの（つながりのない表）は最後に格子で並べる
+ */
+function erArrangeLayout(nodes, edges, sizeOf) {
+    const GAP_X = 90, GAP_Y = 36, GAP_BLOCK = 80, GRID_COLS = 4;
+    const out = {};
+    if (!nodes.length) return out;
+    const ids = new Set(nodes.map(n => n.id));
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const name = id => String((byId.get(id) || {}).table || id);
+    const byName = (a, b) => name(a).localeCompare(name(b), 'ja');
+    // 隣接（向きなし）と、向き（from → to）
+    const adj = new Map(nodes.map(n => [n.id, new Set()]));
+    const outs = new Map(nodes.map(n => [n.id, new Set()]));
+    (edges || []).forEach(e => {
+        const f = `${e.from[0]}.${e.from[1]}`, t = `${e.to[0]}.${e.to[1]}`;
+        if (!ids.has(f) || !ids.has(t) || f === t) return;
+        adj.get(f).add(t); adj.get(t).add(f); outs.get(f).add(t);
+    });
+    // かたまり
+    const seen = new Set(), comps = [];
+    nodes.forEach(n => {
+        if (seen.has(n.id)) return;
+        const comp = [], stack = [n.id];
+        seen.add(n.id);
+        while (stack.length) {
+            const id = stack.pop();
+            comp.push(id);
+            adj.get(id).forEach(m => { if (!seen.has(m)) { seen.add(m); stack.push(m); } });
+        }
+        comps.push(comp);
+    });
+    const linked = comps.filter(c => c.length > 1)
+        .sort((a, b) => b.length - a.length || byName(a[0], b[0]));
+    const alone = comps.filter(c => c.length === 1).map(c => c[0]).sort(byName);
+    let y0 = 0;
+    linked.forEach(comp => {
+        const set = new Set(comp);
+        // 列 = from → to の最長の道のり（循環があっても表の数で打ち切る）
+        const level = new Map(comp.map(id => [id, 0]));
+        for (let round = 0; round < comp.length; round++) {
+            let changed = false;
+            comp.forEach(f => outs.get(f).forEach(t => {
+                const next = level.get(f) + 1;
+                if (set.has(t) && level.get(t) < next && next < comp.length) {
+                    level.set(t, next); changed = true;
+                }
+            }));
+            if (!changed) break;
+        }
+        const ncol = Math.max(...level.values()) + 1;
+        const cols = Array.from({ length: ncol }, () => []);
+        comp.forEach(id => cols[level.get(id)].push(id));
+        cols.forEach(c => c.sort(byName));
+        // 隣の列の相手の位置の平均で並べ替え（左→右、右→左を1回ずつ）
+        const pos = new Map();
+        cols.forEach(c => c.forEach((id, k) => pos.set(id, k)));
+        const sweep = (i, ref) => {
+            const key = id => {
+                const ns = [...adj.get(id)].filter(m => level.get(m) === ref).map(m => pos.get(m));
+                return ns.length ? ns.reduce((s, v) => s + v, 0) / ns.length : Number.POSITIVE_INFINITY;
+            };
+            cols[i].sort((a, b) => (key(a) - key(b)) || byName(a, b));
+            cols[i].forEach((id, k) => pos.set(id, k));
+        };
+        for (let i = 1; i < ncol; i++) sweep(i, i - 1);
+        for (let i = ncol - 2; i >= 0; i--) sweep(i, i + 1);
+        // 置く。列ごとに縦に積み、列の幅はいちばん広い表に合わせる。
+        // 1つのマスタに多くの表がぶら下がると1列が縦に長くなりすぎるので、
+        // MAX_ROWS を超えた列は隣に折り返して格子にする（並び順は保つ）
+        const MAX_ROWS = 4;
+        let x = 0, blockH = 0;
+        cols.forEach(col => {
+            for (let i = 0; i < col.length; i += MAX_ROWS) {
+                let y = y0, w = 0;
+                col.slice(i, i + MAX_ROWS).forEach(id => {
+                    const s = sizeOf(id);
+                    out[id] = { x, y };
+                    y += s.h + GAP_Y;
+                    w = Math.max(w, s.w);
+                });
+                blockH = Math.max(blockH, y - y0 - GAP_Y);
+                x += w + GAP_X;
+            }
+        });
+        y0 += blockH + GAP_BLOCK;
+    });
+    // つながりのない表は格子で
+    let x = 0, y = y0, rowH = 0;
+    alone.forEach((id, i) => {
+        if (i && i % GRID_COLS === 0) { x = 0; y += rowH + GAP_Y; rowH = 0; }
+        const s = sizeOf(id);
+        out[id] = { x, y };
+        x += s.w + GAP_X;
+        rowH = Math.max(rowH, s.h);
+    });
+    return out;
+}
+// --- /整列アルゴリズム ---
+
 const ER = (() => {
     let data = { nodes: [], edges: [], alias: '' };
     let view = { tx: 40, ty: 40, k: 1 };
@@ -6609,7 +7335,7 @@ const ER = (() => {
     const HIST_MAX = 50;
     let savedLayout = '';         // 最後に保存（または読み込み）した配置。💾 の活性判定に使う
     let root, viewport, world, svg, panel;
-    // 読み取り専用（チャットからの表示）。編集の入口だけを閉じ、
+    // 読み取り専用（マイエージェントからの表示）。編集の入口だけを閉じ、
     // 移動・パン・ズーム・全画面はそのまま使えるようにする。
     let ro = false;
     let docWired = false;         // documentへのキーハンドラは1回だけ張る
@@ -6635,7 +7361,9 @@ const ER = (() => {
             'data-id': n.id, style: `left:${n.x}px; top:${n.y}px`,
         },
             el('div', { class: 'ertable__head' },
-                el('div', {}, n.table),
+                // 名前の前に種類のアイコン（格子＝表、重なった紙＝ビュー）。サイドバーと同じ
+                el('div', { class: 'ertable__name', title: n.type === 'view' ? 'ビュー（保存したSELECT）' : 'テーブル' },
+                    icon(n.type === 'view' ? 'view' : 'table', 'icon--sm'), n.table),
                 el('div', { class: 'rows' },
                     n.rows === null || n.rows === undefined ? '行数不明' : `${n.rows.toLocaleString()}行`)));
         n.columns.forEach(c => {
@@ -7148,7 +7876,7 @@ const ER = (() => {
         selected = { type: 'table', id };
         drawEdges(); syncSelection();
         // 概要・列の説明・実値・サンプル行を取りに行く（描画用の図には入れていない）。
-        // 主キーの編集はカタログ画面だけ（読み取り専用のチャットでは出さない）。
+        // 主キーの編集はカタログ画面だけ（読み取り専用のマイエージェントでは出さない）。
         const rowsBadge = (n.rows !== null && n.rows !== undefined)
             ? el('span', { class: 'muted small', style: 'margin-right:6px' },
                  `${Number(n.rows).toLocaleString()}行`) : null;
@@ -7518,7 +8246,7 @@ const ER = (() => {
 
     function wireViewport() {
         // init は表の削除などで何度も呼ばれる。要素に印を付けて1回だけ張る
-        // （フラグ1本にすると、要素ごと作り直すチャット側で張られなくなる）
+        // （フラグ1本にすると、要素ごと作り直すマイエージェント側で張られなくなる）
         if (viewport.dataset.wired) return;
         viewport.dataset.wired = '1';
         viewport.addEventListener('pointerdown', ev => {
@@ -7566,6 +8294,33 @@ const ER = (() => {
         applyView();
     }
 
+    /** 表示中の表を関連にそって並べ直す。1手として積むので Ctrl+Z で戻せる。保存は 💾。 */
+    function arrange() {
+        const shown = shownNodes();
+        if (!shown.length) return;
+        const sizeOf = id => {
+            const b = world.querySelector(`.ertable[data-id="${CSS.escape(id)}"]`);
+            return { w: b?.offsetWidth || 232, h: b?.offsetHeight || 120 };
+        };
+        const target = erArrangeLayout(shown, data.edges || [], sizeOf);
+        // 表示中の表の左上を起点にする（まとまりで絞っているとき、他のまとまりの
+        // 表が置いてある場所へ被せないように、いまの場所の近くに並べ直す）
+        const minX = Math.min(...shown.map(n => n.x)), minY = Math.min(...shown.map(n => n.y));
+        const before = Object.fromEntries(shown.map(n => [n.id, { x: n.x, y: n.y }]));
+        const after = Object.fromEntries(shown.map(n =>
+            [n.id, { x: Math.round(minX + target[n.id].x), y: Math.round(minY + target[n.id].y) }]));
+        if (JSON.stringify(before) === JSON.stringify(after)) { toast('すでに整列しています。'); return; }
+        const apply = m => {
+            data.nodes.forEach(n => { if (m[n.id]) { n.x = m[n.id].x; n.y = m[n.id].y; } });
+            render(); syncHistoryUi(); setTimeout(fit, 20);
+        };
+        record({ label: '整列', undo: () => apply(before), redo: () => apply(after) });
+        apply(after);
+        toast(ro ? '並べ直しました。'
+                 : '並べ直しました。この配置で残すには保存（💾）を押してください。Ctrl+Z で戻せます。',
+              'ok', 6000);
+    }
+
     async function saveLayout() {
         if (ro) return;
         const snap = layoutSnapshot();
@@ -7585,7 +8340,7 @@ const ER = (() => {
         ro = !!(opts && opts.readonly);
         data = (opts && opts.data) || (typeof CAT !== 'undefined' ? CAT.er : null);
         if (!data) return;
-        // チャットでは開くたびに init し直すので、前回の状態を持ち越さない
+        // マイエージェントでは開くたびに init し直すので、前回の状態を持ち越さない
         view = { tx: 40, ty: 40, k: 1 };
         selected = null; past = []; future = []; groupFilter = null;
         // 元DBグループの絞り込み（カタログ画面のみ。表が多いときは最初の
@@ -7635,6 +8390,7 @@ const ER = (() => {
         });
         once('#erUndo', undo);
         once('#erRedo', redo);
+        once('#erArrange', arrange);
         once('#erFull', () => {
             root.classList.toggle('er--full');
             $('#erFull').textContent = root.classList.contains('er--full') ? '全画面を終了' : '全画面';
@@ -7649,7 +8405,7 @@ const ER = (() => {
                     return;
                 }
                 // Ctrl+Z / Ctrl+Y(Ctrl+Shift+Z) / Ctrl+S は、ER図が見えていて
-                // 入力欄にいないときだけ受ける（他のタブやチャットでは横取りしない）
+                // 入力欄にいないときだけ受ける（他のタブやマイエージェントでは横取りしない）
                 if (ro || !root || !(ev.ctrlKey || ev.metaKey)) return;
                 if (!root.getClientRects().length) return;                    // 別タブで隠れている
                 if (/INPUT|TEXTAREA|SELECT/.test(ev.target.tagName) || ev.target.isContentEditable) return;
@@ -7799,33 +8555,64 @@ function renderSched(s) {
 
 /** 定期取り込みの操作ボタン（頻度の変更・手動実行・停止・削除）。 */
 
+/** スクレイピングの設定ごとの数値（最小間隔・タイムアウト）を、その場で変える欄。 */
+
+function scrapeNumber(j, key, label, unit, title) {
+    const inp = el('input', {
+        type: 'number', value: String(j[key]), style: 'width:70px',
+        title,
+        // 保存しても管理欄は描き直さない。描き直すと、続けて入力中のもう一方の欄が消える
+        onchange: async ev => {
+            const before = j[key];
+            try {
+                await api('/api/jobs/update', { id: j.id, [key]: ev.target.value });
+                j[key] = ev.target.value;
+                toast(`「${j.name}」の${label}を ${ev.target.value}${unit} にしました。`);
+            } catch (e) {
+                ev.target.value = String(before);       // 断られた値は元に戻す
+                toast(e.message, 'err', 8000);
+            }
+        },
+    });
+    return el('label', { class: 'small muted', style: 'display:flex;align-items:center;gap:4px' },
+        `${label}`, inp, unit);
+}
+
 function jobControls(j) {
+    const scraper = j.source_kind === 'scraper';
     return [
         // リアルタイム更新の切替。追記のジョブは対象外（サーバ側でも弾かれる）
         j.mode_label === '追記' ? null : el('button', {
             class: 'btn btn--sm',
-            title: j.realtime
-                ? '質問のたびに元ファイルの更新を確認して取り込み直しています。押すとやめます。'
-                : '質問のたびに元ファイルの更新を確認し、変わっていれば取り込み直してから答えるようにします。'
-                  + 'ファイルが読めないときは前回取り込んだ内容で答えます。',
-            onclick: async () => {
-                await api('/api/jobs/update', { id: j.id, realtime: !j.realtime });
-                toast(j.realtime
+            title: scraper
+                ? (j.realtime
+                    ? '質問のたびに、前回の取得から最小間隔が経っていればスクリプトを実行し直しています。押すとやめます。'
+                    : '質問のたびに、前回の取得から最小間隔が経っていればスクリプトを実行し直して答えるようにします。')
+                : (j.realtime
+                    ? '質問のたびに元ファイルの更新を確認して取り込み直しています。押すとやめます。'
+                    : '質問のたびに元ファイルの更新を確認し、変わっていれば取り込み直してから答えるようにします。'
+                      + 'ファイルが読めないときは前回取り込んだ内容で答えます。'),
+            onclick: () => tryUpdate(j, { realtime: !j.realtime },
+                j.realtime
                     ? `「${j.name}」のリアルタイム更新を止めました。`
-                    : `「${j.name}」をリアルタイム更新にしました。質問のたびに元ファイルへ追随します。`);
-                MANAGE.refresh();
-            },
+                    : `「${j.name}」をリアルタイム更新にしました。質問のたびに元ファイルへ追随します。`),
         }, j.realtime ? 'リアルタイム中' : 'リアルタイムにする'),
         el('select', {
             style: 'width:130px',
             title: '更新の頻度',
-            onchange: async ev => {
-                await api('/api/jobs/update', { id: j.id, interval: ev.target.value });
-                toast(`「${j.name}」を ${ev.target.value} に変更しました。`);
-                MANAGE.refresh();
-            },
+            onchange: ev => tryUpdate(j, { interval: ev.target.value },
+                `「${j.name}」を ${ev.target.value} に変更しました。`),
         }, MANAGE.intervals.map(i => el('option',
             { ...(i === j.interval_label ? { selected: 'selected' } : {}) }, i))),
+        // スクレイピングだけ: 質問に応じた取り直しの最小間隔（全件入れ替えのみ）とタイムアウト
+        (scraper && j.mode_label !== '追記')
+            ? scrapeNumber(j, 'scrape_interval_minutes', '最小間隔', '分',
+                '質問を受けたとき、前回の取得からこの分数が経っていれば取り直します。0 なら質問のたびに。')
+            : null,
+        scraper
+            ? scrapeNumber(j, 'scrape_timeout_sec', 'タイムアウト', '秒',
+                'スクリプト1回の実行にこれ以上かかったら打ち切ります。')
+            : null,
         // 定期実行＋追記は手で走らせると間隔が崩れるので押せなくする
         j.manual_blocked
             ? el('button', { class: 'btn btn--sm', disabled: 'disabled',
@@ -7848,13 +8635,10 @@ function jobControls(j) {
                 ? '自動更新を再開します（次回予定の時刻から動きます）。'
                 : '自動更新を一時的に止めます。設定は残るので、いつでも再開できます。'
                   + '止めている間は「更新できていない」警告も出ません。',
-            onclick: async () => {
-                await api('/api/jobs/update', { id: j.id, enabled: j.enabled === false });
-                toast(j.enabled === false
+            onclick: () => tryUpdate(j, { enabled: j.enabled === false },
+                j.enabled === false
                     ? `「${j.name}」の自動更新を再開しました。`
-                    : `「${j.name}」の自動更新を止めました。「再開」でいつでも戻せます。`);
-                MANAGE.refresh();
-            },
+                    : `「${j.name}」の自動更新を止めました。「再開」でいつでも戻せます。`),
         }, j.enabled === false ? '再開' : '停止'),
         el('button', {
             class: 'btn btn--sm btn--danger',
@@ -7863,12 +8647,23 @@ function jobControls(j) {
             onclick: async () => {
                 if (!confirm(`定期取り込み「${j.name}」の設定を削除しますか？\n`
                     + '（テーブルと中のデータは残ります）')) return;
-                await api('/api/jobs/delete', { id: j.id });
-                toast('定期取り込みの設定を削除しました。');
+                try {
+                    await api('/api/jobs/delete', { id: j.id });
+                    toast('定期取り込みの設定を削除しました。');
+                } catch (e) { toast(e.message, 'err', 8000); }
                 MANAGE.refresh();
             },
         }, '設定を削除'),
     ];
+}
+
+/** 設定の変更を送る。断られたら理由を出して、表示を実際の値に戻す（描き直す）。 */
+async function tryUpdate(j, patch, okMessage) {
+    try {
+        await api('/api/jobs/update', { id: j.id, ...patch });
+        toast(okMessage);
+    } catch (e) { toast(e.message, 'err', 9000); }
+    MANAGE.refresh();
 }
 
 /** 1件ぶんの定期取り込みの中身（取り込み元と更新のしかた）。 */
@@ -7880,9 +8675,18 @@ function jobDetail(j, withName) {
             `${j.name}`,
             j.enabled === false ? el('span', { class: 'badge badge--warn' }, '停止中') : null));
     }
+    if (j.source_kind === 'scraper') {
+        box.append(
+            kv('取り込み元', `スクレイピング（${j.source}）`, true),
+            kv('取得ファイル', j.scrape_file || '（出来たファイルを使う）'),
+            kv('最小間隔', j.mode === 'append' ? '（追記は定期実行のみ）' : `${j.scrape_interval_minutes} 分`),
+            kv('タイムアウト', `${j.scrape_timeout_sec} 秒`));
+    } else {
+        box.append(
+            kv('ファイル名', j.source_label ? j.source_label.split(/[\\/]/).pop() : '―', true),
+            kv('フルパス', j.source));
+    }
     box.append(
-        kv('ファイル名', j.source_label ? j.source_label.split(/[\\/]/).pop() : '―', true),
-        kv('フルパス', j.source),
         kv('シート', j.sheet || '（Excel以外）'),
         kv('区切り文字', j.delimiter === null || j.delimiter === undefined
             ? '自動判定' : JSON.stringify(j.delimiter)),
@@ -8335,14 +9139,14 @@ function renderOrphans(list) {
 // ===== 元 chat.js（window.CHAT_INIT がある画面だけ動く） =====
 (() => {
 if (!window.CHAT_INIT) return;
-/* チャット画面。描画アイテム（text/sql/table/chart/file/error）を組み立てて流す。 */
+/* マイエージェント画面。描画アイテム（text/sql/table/chart/file/error）を組み立てて流す。 */
 
 let currentChatId = window.CHAT_INIT.chatId || null;
 let busy = false;
-// 表示中のビューの世代。チャットを切り替える（＝ログを描き直す）たびに進める。
+// 表示中のビューの世代。マイエージェントを切り替える（＝ログを描き直す）たびに進める。
 // 送信処理は開始時の世代を覚えておき、届いた回答は世代が一致するときだけ描く。
-// これが無いと、送信中に別のチャットへ切り替えたとき、後から届いた回答が
-// 関係ないチャットの画面に紛れ込む。
+// これが無いと、送信中に別のマイエージェントへ切り替えたとき、後から届いた回答が
+// 関係ないマイエージェントの画面に紛れ込む。
 let viewToken = 0;
 // 過去の会話を開き直したときに、作成済みファイルの保存が走らないようにする
 let replaying = false;
@@ -8493,6 +9297,38 @@ function wireScope() {
     syncTableUi();
 }
 
+/* --- 覚え書き（利用者について、会話から自動で覚える） ------------------------------
+   保存はサーバが回答のあとに別スレッドで行う（end のあと数秒で増える）。ここは見せる・消す・止める。 */
+
+let mem = window.CHAT_INIT.memory || { enabled: false, on: true, text: '', updated_at: '' };
+let memTimers = [];                 // 取り直しの予約。次の質問が来たら前の予約は捨てる（二重に知らせない）
+
+/* 回答のあと、サーバが覚え書きを書き直していれば一言知らせる。書き直しは別スレッドなので、
+   end の数秒あとに何回か見る。中身はメニューの「覚え書き」で見る。 */
+function scheduleMemoryRefresh() {
+    if (!mem.enabled || !mem.on) return;
+    memTimers.forEach(clearTimeout);
+    memTimers = [];
+    const check = async () => {
+        try {
+            const r = await api('/api/memory', undefined, 'GET');
+            if ((r.updated_at || '') === (mem.updated_at || '')) return false;
+            const grew = (r.text || '').length > (mem.text || '').length;
+            mem = { ...mem, ...r };
+            toast((grew ? '覚え書きを書き足しました' : '覚え書きを書き直しました')
+                  + '（メニューの「覚え書き」で見られます）。', 'ok', 7000);
+            return true;
+        } catch (_) { return true; }         // 取れないときは黙って諦める
+    };
+    memTimers.push(setTimeout(async () => {
+        if (await check()) return;
+        memTimers.push(setTimeout(async () => {
+            if (await check()) return;
+            memTimers.push(setTimeout(check, 15000));
+        }, 7000));
+    }, 3000));
+}
+
 /* --- 社内文書の検索先（利用者ごと） ---------------------------------------------
    チェックは押した時点で保存する。「保存」を押させると、押し忘れたまま質問して
    「なぜあの文書が出ないのか」になるため。
@@ -8636,13 +9472,126 @@ async function openChat(id) {
     // finally で必ず戻す。1件でも描画に失敗すると true のまま固定され、
     // 以降ずっと「再描画中」扱いになってファイルの自動保存が止まる
     try { r.items.forEach(addItem); } finally { replaying = false; }
-    // このチャットの質問を送信中なら「考えています…」を出し直す
+    // このマイエージェントの質問を送信中なら「考えています…」を出し直す
     // （開始時刻は busyStart から続き）。clearLog で表示ごと消えるため、
-    // これが無いと切替後は待ち秒数が見えない。よそのチャットの質問のときは
+    // これが無いと切替後は待ち秒数が見えない。よそのマイエージェントの質問のときは
     // 出さない（無関係な画面にカウントが出るのは紛らわしいだけのため）。
     if (busy && busyChatId === id) setBusy(true);
     refreshHistory();
     scrollDown(true);
+}
+
+/* --- マイロボット（登録） -----------------------------------------------------
+   気に入った処理の流れ（AIが呼んだ道具の列）に名前を付けて保存し、AIなしで再現する。
+   登録は各発言の「ロボットにする」から。一覧と実行はメニューの「マイロボット」画面
+   （robots.js。ダイアログの枠は window.ROBOT にある共通部品）。 */
+
+/** 登録。会話から手順の候補を取り出して見せ、名前と穴を決めて保存する。 */
+async function registerRobot(upto) {
+    if (!currentChatId) { toast('この会話はまだ保存されていません。', 'warn'); return; }
+    if (busy) { toast('回答を待っているあいだは登録できません。', 'warn'); return; }
+    // 押した時点の会話に固定する（応答待ちの間に別の会話を開いても、保存先がずれないように）
+    const chatId = currentChatId;
+    let r;
+    try {
+        r = await api('/api/robots/extract', { chat_id: chatId, upto });
+    } catch (e) { toast(e.message, 'err', 8000); return; }
+    if (!r.turns.length) {
+        toast('ここまでのやり取りには、保存できる手順（SQLの実行・グラフ・ファイル作成など）がありません。', 'warn', 8000);
+        return;
+    }
+    const turnOf = {};                               // 手順の番号 → 何回目の質問か
+    r.turns.forEach(t => t.steps.forEach(s => { turnOf[s.i] = t.turn; }));
+
+    const name = el('input', { type: 'text', style: 'width:100%',
+                               value: (r.title || '').slice(0, 40) || 'マイロボット' });
+    const turnChecks = {};
+    const turnList = el('div', {}, ...r.turns.map(t => {
+        const cb = el('input', { type: 'checkbox', checked: 'checked' });
+        turnChecks[t.turn] = cb;
+        cb.addEventListener('change', syncHoles);
+        return el('div', { class: 'robotturn' },
+            el('label', { style: 'display:flex;gap:8px;align-items:flex-start;cursor:pointer' },
+                cb, el('div', { class: 'grow' },
+                    el('div', { style: 'font-weight:600' }, t.question || '（質問なし）'),
+                    ...t.steps.map(s => el('div', { class: 'small robotstep' },
+                        el('div', { style: 'display:flex;gap:6px;align-items:center' },
+                            el('span', { class: 'badge' }, `手順${s.i + 1}`),
+                            el('span', {}, s.label)),
+                        el('div', { class: 'mono muted robotstep__sum' }, s.summary))))));
+    }));
+
+    const holeRows = r.candidates.map(c => {
+        const cb = el('input', { type: 'checkbox' });
+        const label = el('input', { type: 'text', placeholder: 'ラベル（例: 対象月）',
+                                    disabled: 'disabled', style: 'width:160px' });
+        cb.addEventListener('change', () => { label.disabled = !cb.checked; if (cb.checked) label.focus(); });
+        const tr = el('tr', {},
+            el('td', {}, cb),
+            el('td', { class: 'muted small' }, `手順${c.step + 1}`),
+            el('td', { class: 'mono small', style: 'max-width:460px;white-space:pre-wrap;word-break:break-all' },
+               c.value.length > 160 ? c.value.slice(0, 160) + '…' : c.value),
+            el('td', { class: 'small muted' }, c.kind === 'number' ? '数値' : '文字'),
+            el('td', {}, label));
+        return { c, cb, label, tr };
+    });
+    function syncHoles() {
+        holeRows.forEach(h => {
+            const on = turnChecks[turnOf[h.c.step]]?.checked !== false;
+            h.tr.classList.toggle('hidden', !on);
+            if (!on) { h.cb.checked = false; h.label.disabled = true; }
+        });
+    }
+    const holeBox = holeRows.length
+        ? el('div', { class: 'tablewrap', style: 'max-height:260px' },
+            el('table', { class: 'data' },
+                el('thead', {}, el('tr', {}, el('th', { style: 'width:36px' }, '穴'), el('th', { style: 'width:70px' }, '手順'),
+                                       el('th', {}, '値'), el('th', { style: 'width:50px' }, '種類'), el('th', {}, 'ラベル'))),
+                el('tbody', {}, ...holeRows.map(h => h.tr))))
+        : el('div', { class: 'small muted' }, '穴にできる値はありません。');
+
+    // フォルダ出力の決めごと（ファイルを作る手順があるときだけ）。共通部品で作る
+    const folder = r.has_file_steps ? window.ROBOT.folderOptions(r) : null;
+    // 定期実行（時刻になったらサーバが動かす）と、メールの自動送信（下書きを作る手順があるときだけ）
+    const sched = window.ROBOT.scheduleOptions({ schedule: {}, holes: [] }, window.CHAT_INIT.robotIntervals || {}, null, false,
+        { minIntervalHours: window.CHAT_INIT.robotMinIntervalHours, schedulerOn: window.CHAT_INIT.schedulerOn });
+    const mailCb = el('input', { type: 'checkbox' });
+    const body = el('div', {},
+        el('label', { class: 'field' }, '名前'), name,
+        el('div', { class: 'small muted', style: 'margin:10px 0 4px' },
+           '含める質問（チェックしたやり取りでAIが使った道具が、この順に手順になります）'),
+        turnList,
+        el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
+           '穴にする値（任意）: チェックした値は、実行のたびに入力を求めます。'),
+        holeBox,
+        folder ? el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
+                    'フォルダ出力（実行のたびに、出力先フォルダの自分の名前のフォルダへ置くか）'
+                    + (window.CHAT_INIT.folderOut ? '' : '　※いまは出力先フォルダが未設定です。管理者が設定すると効きます')) : null,
+        folder ? folder.node : null,
+        el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
+           '定期実行（任意）: 決めた時刻に自動で動かす。「手動のみ」なら、マイロボットの画面の「実行」を押したときだけ動きます'),
+        el('div', { class: 'robotturn' }, sched.node),
+        r.has_mail_steps ? el('div', { class: 'robotturn', style: 'margin-top:8px' },
+            el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, mailCb,
+               el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')),
+            el('div', { class: 'small muted', style: 'margin-top:4px' },
+               '宛先の許可・件数の上限・テスト送信モードは「メール設定」のとおりです。チェックしなければ、下書きが会話に出るだけで送りません。')) : null);
+    const save = el('button', { class: 'btn btn--primary', onclick: async () => {
+        const turns = Object.entries(turnChecks).filter(([, cb]) => cb.checked).map(([t]) => Number(t));
+        const holes = holeRows.filter(h => h.cb.checked).map(h => ({ id: h.c.id, label: h.label.value.trim() }));
+        save.disabled = true;
+        try {
+            const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, holes,
+                                                       schedule: sched.value(), mail_auto: mailCb.checked,
+                                                       ...(folder ? folder.value() : {}) });
+            toast(`マイロボット「${res.robot.name}」を保存しました（${res.robot.n_steps}手順）。`
+                + 'メニューの「マイロボット」から実行できます。', 'ok', 9000);
+            close();
+        } catch (e) { toast(e.message, 'err', 9000); save.disabled = false; }
+    } }, '保存する');
+    const close = window.ROBOT.modal('マイロボットにする', body, [save,
+        el('span', { class: 'small muted' }, 'AIの説明文は保存されません。道具の列だけを再現します。')], { wide: true });
+    name.focus(); name.select();
 }
 
 /* --- 描画 ------------------------------------------------------------------- */
@@ -8804,7 +9753,9 @@ function openErModal(item) {
         el('div', { class: 'modal__body', style: 'padding:10px' },
             el('div', { class: 'er er--chat', id: 'erRoot' },
                 el('div', { class: 'er__toolbar' },
-                    el('button', { class: 'btn btn--sm', id: 'erFull' }, '全画面')),
+                    el('button', { class: 'btn btn--sm', id: 'erFull' }, '全画面'),
+                    el('button', { class: 'btn btn--sm', id: 'erArrange',
+                                   title: '表を関連にそって並べ直します（この画面では保存されません）' }, '整列')),
                 el('div', { class: 'er__viewport', id: 'erViewport' },
                     svgEl,
                     el('div', { class: 'er__world', id: 'erWorld' })),
@@ -9023,12 +9974,38 @@ function addItem(item) {
             }, { responsive: true, displaylogo: false });
         }
     } else if (item.kind === 'file') {
+        // フォルダへの保存の状態。道具が保存済みならその場所、失敗なら理由。
+        // どちらでもなく出力先が使えるなら「フォルダに保存」ボタン（AIは呼ばない）
+        const savedLine = (p, replaced) => el('div', { class: 'small', style: 'margin-top:3px;display:flex;gap:4px;align-items:center' },
+            icon('folder', 'icon--sm'), 'フォルダに保存済み: ', el('span', { class: 'mono' }, p),
+            replaced ? el('span', { class: 'muted' }, '（前のファイルを置き換えました）') : null);
+        const status = item.saved_to ? savedLine(item.saved_to, item.replaced)
+            : (item.save_error ? el('div', { class: 'small', style: 'margin-top:3px;color:var(--err)' },
+                                     `フォルダへの保存は失敗: ${item.save_error}`) : null);
+        const saveBtn = (item.url && !item.saved_to && window.CHAT_INIT.folderOut)
+            ? el('button', {
+                class: 'btn btn--sm',
+                title: '出力先フォルダの中の、自分の名前のフォルダにこのファイルを置きます',
+                onclick: async ev => {
+                    ev.target.disabled = true;
+                    try {
+                        const r = await api('/api/file/save-to-folder', { token: item.url.split('/').pop() });
+                        item.saved_to = r.path;
+                        ev.target.replaceWith(el('span'));
+                        info.append(savedLine(r.path, r.replaced));
+                        toast(`フォルダに保存しました: ${r.path}`, 'ok', 8000);
+                    } catch (e) { toast(e.message, 'err', 9000); ev.target.disabled = false; }
+                },
+            }, 'フォルダに保存') : null;
+        const info = el('div', { class: 'grow' },
+            el('div', { class: 'name' }, item.filename),
+            el('div', { class: 'small muted' },
+                item.note || (item.sheets || []).map(s => `${s.name}: ${s.total}行`).join('/ ')),
+            status);
         const card = el('div', { class: 'filecard' },
             icon('file', 'icon--lg'),
-            el('div', { class: 'grow' },
-                el('div', { class: 'name' }, item.filename),
-                el('div', { class: 'small muted' },
-                    item.note || (item.sheets || []).map(s => `${s.name}: ${s.total}行`).join('/ '))),
+            info,
+            saveBtn,
             item.url ? el('a', { class: 'btn btn--primary btn--sm', href: item.url }, 'ダウンロード') : null);
         body.append(card);
         // 作られた直後だけ自動で保存を始める（履歴を開き直したときは出さない）
@@ -9083,7 +10060,13 @@ function userTurn(item) {
         el('button', {
             class: 'turn__btn', title: 'この発言を書き直して、聞き直します（以降のやり取りは新しい回答に置き換わります）',
             onclick: () => editTurn(wrap, item),
-        }, icon('tool', 'icon--sm'), el('span', { class: 'turn__btn__t' }, '書き直す')));
+        }, icon('tool', 'icon--sm'), el('span', { class: 'turn__btn__t' }, '書き直す')),
+        // ここまでの流れ（AIが使った道具の列）を保存して、AIなしで繰り返せるようにする
+        el('button', {
+            class: 'turn__btn', title: 'ここまでのやり取りでAIが使った道具の列に名前を付けて保存し、'
+                + 'AIなしで同じ処理を繰り返せるようにします',
+            onclick: () => registerRobot(item.turn),
+        }, icon('spark', 'icon--sm'), el('span', { class: 'turn__btn__t' }, 'ロボットにする')));
     wrap.append(text, tools);
     return wrap;
 }
@@ -9172,6 +10155,7 @@ async function rewindTo(item, text, wrap) {
         }
         currentChatId = r.chat_id || currentChatId;
         refreshHistory();
+        if (send) scheduleMemoryRefresh();        // 書き直して送ったときは、サーバが覚え書きを抜き出す
     } catch (e) {
         toast(e.message, 'err', 8000);
     }
@@ -9305,7 +10289,10 @@ function mailCard(item) {
     card.append(el('pre', { class: 'mailcard__body' }, p.body || ''));
 
     const foot = el('div', { class: 'mailcard__foot' });
-    if ((p.errors || []).length) {
+    if (item.sent_at) {
+        // マイロボットの「実行のたびに送る」で、もう送ってある
+        foot.append(el('span', { class: 'small' }, `${p.dry_run ? '確認しました（テスト送信モード・未送信）' : '送信済み'}（${String(item.sent_at).replace('T', ' ')}・マイロボットの自動送信）`));
+    } else if ((p.errors || []).length) {
         card.append(el('div', { class: 'alert alert--err' },
             el('div', {}, 'このままでは送信できません:'),
             el('ul', {}, p.errors.map(e => el('li', {}, e)))));
@@ -9397,11 +10384,11 @@ const elapsedText = (sec) =>
     sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s`;
 
 // 「考えています…」の開始時刻とラベル。表示要素の中に閉じ込めず外に持つのは、
-// チャット切替でログを描き直すと要素ごと消えるため。戻ってきたときに
+// マイエージェント切替でログを描き直すと要素ごと消えるため。戻ってきたときに
 // この値から表示を作り直せば、経過秒数は数え直しにならず続きから出る。
 let busyStart = null;
 let busyLabel = '';
-let busyChatId = null;   // いま回答を待っている質問が、どのチャットのものか
+let busyChatId = null;   // いま回答を待っている質問が、どのマイエージェントのものか
 
 function setBusy(on, label = '') {
     busy = on;
@@ -9455,7 +10442,7 @@ async function send(text) {
     addItem({ role: 'user', kind: 'text', content: text, turn: turnCount,
               images: images.length ? images : undefined });
     scrollDown(true);                       // 自分の発言のときは必ず下へ
-    busyChatId = currentChatId;             // この質問が属するチャット（新規なら null）
+    busyChatId = currentChatId;             // この質問が属するマイエージェント（新規なら null）
     setBusy(true, '考えています');
     const tokens = images.map(i => i.token);
     const ok = await sendStreaming(text, tokens);
@@ -9474,10 +10461,11 @@ async function sendAtOnce(text, imageTokens) {
             currentChatId = r.chat_id || currentChatId;
             scrollDown();
         } else if (r.chat_id && currentChatId === r.chat_id) {
-            // 途中で他のチャットを見て戻ってきた。完成形を読み直して揃える
+            // 途中で他のマイエージェントを見て戻ってきた。完成形を読み直して揃える
             openChat(r.chat_id);
         }
         refreshHistory();
+        scheduleMemoryRefresh();
     } catch (e) {
         if (viewToken === myView) {
             addItem({ role: 'assistant', kind: 'error', message: e.message });
@@ -9526,11 +10514,12 @@ async function sendStreaming(text, imageTokens) {
                 // 送信したときの画面のまま。ライブで全部描けているので何もしない
                 currentChatId = data.chat_id || currentChatId;
             } else if (missed && data.chat_id && currentChatId === data.chat_id) {
-                // 途中で他のチャットを見て戻ってきた。描き逃した分があるので、
+                // 途中で他のマイエージェントを見て戻ってきた。描き逃した分があるので、
                 // 保存済みの完成形（サーバは end を送る前に保存している）を読み直す
                 openChat(data.chat_id);
             }
             refreshHistory();
+            scheduleMemoryRefresh();
             return;
         }
         if (viewToken !== myView) {         // 別の画面を表示中。ここには描かない
@@ -9708,7 +10697,7 @@ function activateTab(pane) {
         pane === 'glossary' ? `#tab=glossary&sec=${glSec}` : `#tab=${pane}`);
 }
 
-/* チャットから「カタログで説明を書く」で来たとき、そのテーブルを開いて光らせる。
+/* マイエージェントから「カタログで説明を書く」で来たとき、そのテーブルを開いて光らせる。
    一覧の途中にあると、開いても自分で探すことになるので、位置まで運ぶ。 */
 function revealTable(name) {
     const acc = $(`#pane-tables details.acc[data-table="${CSS.escape(name)}"]:not(.t-manage)`);
@@ -11041,7 +12030,7 @@ function wireExamples() {
 
 /* --- 検算（一致するはずの2つの数字） --------------------------------------------
    登録しておくと、AIが関係するテーブルに触れるたびに自動で突き合わせ、
-   食い違っていればチャットに警告が出る（verify.py）。ここはその管理画面。 */
+   食い違っていればマイエージェントに警告が出る（verify.py）。ここはその管理画面。 */
 
 let ckItems = [], ckSelId = null;
 
@@ -11949,6 +12938,44 @@ function wireMisc() {
 
 let viewEditing = null;      // 編集中のビュー名（新規なら null）
 
+/* --- ビューの名前: まとまり（プルダウン）＋ 名前 -------------------------------------
+   取り込み画面と同じ形。まとまりは既存の表・ビューの接頭辞から拾い、「＋ 新しいまとまりを作る」で足せる。 */
+function viewGroups() {
+    const names = (CAT.tables || []).map(t => t.name).concat((CAT.views || []).map(v => v.name));
+    return [...new Set(names.map(n => n.split('__')[0]).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+function fillViewGroups(selected) {
+    const sel = $('#viewGroup');
+    if (!sel) return;
+    const groups = viewGroups();
+    sel.replaceChildren(
+        el('option', { value: '' }, 'まとまりを選ぶ'),
+        ...groups.map(g2 => el('option', { value: g2, ...(g2 === selected ? { selected: 'selected' } : {}) }, g2)),
+        el('option', { value: '__new__', ...(selected && !groups.includes(selected) ? { selected: 'selected' } : {}) }, '＋ 新しいまとまりを作る'));
+    $('#viewGroupNew').classList.toggle('hidden', sel.value !== '__new__');
+    if (selected && !groups.includes(selected)) $('#viewGroupNew').value = selected;
+}
+
+/** 「まとまり__名前」を欄に分けて入れる。空なら全部空にする。 */
+function setViewName(full) {
+    const i = (full || '').indexOf('__');
+    const group = i > 0 ? full.slice(0, i) : '';
+    const body = i > 0 ? full.slice(i + 2) : (full || '');
+    fillViewGroups(group);
+    if (!group) $('#viewGroupNew').value = '';
+    $('#viewNameBody').value = body;
+}
+
+/** 欄から「まとまり__名前」を組み立てる。足りなければ ''。 */
+function readViewName() {
+    const sel = $('#viewGroup');
+    const group = sel.value === '__new__' ? $('#viewGroupNew').value.trim() : sel.value;
+    const body = $('#viewNameBody').value.trim();
+    return group && body ? `${group}__${body}` : '';
+}
+let viewExplainText = '';    // いま出ている解説（保存時に一緒に送る。SQLを直したら空に戻る）
+
 function renderViews() {
     const box = $('#viewList');
     if (!box) return;
@@ -11977,8 +13004,18 @@ function renderViews() {
                     + '　列の説明や用語は「テーブル」タブから付けられます'),
                 el('div', { class: 'toolblock mb' },
                     el('pre', { class: 'mono', style: 'white-space:pre-wrap' }, v.sql || '')),
+                // 登録後も、解説と使ったデータは畳まずに全部見せる
+                v.explanation
+                    ? el('div', { class: 'alert alert--info mb' },
+                        el('div', { class: 'mb' }, el('b', {}, 'このSQLがしていること')),
+                        el('div', { style: 'white-space:pre-wrap' }, v.explanation))
+                    : el('div', { class: 'small muted mb' },
+                        'このSQLの解説はまだありません（「編集」→「AIに解説を書かせる」→ 保存 で付けられます）。'),
+                usedDataBox(v.used, 'alert alert--info mb'),
                 el('div', { class: 'row' },
                     el('button', { class: 'btn btn--sm', onclick: ev => previewView(v, out, ev.target) }, 'プレビュー'),
+                    el('button', { class: 'btn btn--sm', title: 'このビューの中身を全件 Excel にしてダウンロードします',
+                                   onclick: ev => exportView(v.sql, v.name, ev.target) }, 'Excel'),
                     el('button', { class: 'btn btn--sm', onclick: () => editView(v) }, '編集'),
                     el('div', { class: 'spacer' }),
                     el('button', { class: 'btn btn--sm btn--danger', onclick: () => deleteView(v) }, '削除')),
@@ -12012,13 +13049,61 @@ async function previewView(v, out, btn) {
     btn.disabled = false;
 }
 
+/** SQLを実データで動かして全件を Excel にする。戻りの先頭の行はプレビューにも使える。 */
+async function exportView(sql, name, btn) {
+    if (!String(sql || '').trim()) { toast('SQLを書いてください。', 'warn'); return null; }
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '作成中…';
+    try {
+        const r = await api('/api/catalog/view/export', { db: CAT.db, sql, name: name || '' });
+        toast(`${r.filename} を作りました（${Number(r.rows).toLocaleString()}行${r.truncated ? '・上限で切り詰め' : ''}）。`, 'ok', 8000);
+        location.href = r.url;
+        return r;
+    } catch (e) {
+        toast(e.message, 'err', 10000);
+        return null;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = old;
+    }
+}
+
 function renderViewExplain(text) {
+    viewExplainText = text || '';
     const box = $('#viewExplain');
     if (!box) return;
     if (!text) { box.replaceChildren(); return; }
     box.replaceChildren(el('div', { class: 'alert alert--info mt' },
         el('div', { class: 'mb' }, el('b', {}, 'このSQLがしていること')),
         el('div', { style: 'white-space:pre-wrap' }, text)));
+}
+
+/** 「使ったデータ」の欄。表ごとに、読んだ列を説明つきで並べる（ビュー経由で読む元の表も出る）。 */
+function usedDataBox(used, cls) {
+    if (!used || !used.length) return null;
+    return el('div', { class: cls || 'alert alert--info mt' },
+        el('div', { class: 'mb' }, el('b', {}, '使ったデータ'),
+           el('span', { class: 'small muted', style: 'margin-left:8px' },
+              'このSQLが読む表と列（ビューを使っていれば、その元の表も）')),
+        ...used.map(t => el('div', { class: 'usedrow' },
+            el('div', {},
+                icon(t.type === 'view' ? 'view' : 'table'),
+                el('b', { class: 'mono' }, t.name),
+                t.type === 'view' ? el('span', { class: 'badge', style: 'margin-left:6px' }, 'ビュー') : null,
+                t.description ? el('span', { class: 'small muted', style: 'margin-left:8px' }, t.description) : null),
+            el('div', { class: 'usedcols' },
+                ...(t.columns.length
+                    ? t.columns.map(c => el('span', { title: c.description || '' },
+                        el('span', { class: 'mono' }, c.name),
+                        c.description ? el('span', { class: 'muted' }, `（${c.description}）`) : null))
+                    : [el('span', { class: 'muted' }, '（表全体。件数を数えるなど、特定の列は読みません）')])))));
+}
+
+function renderViewUsed(used) {
+    const box = $('#viewUsed');
+    if (!box) return;
+    box.replaceChildren(usedDataBox(used) || '');
 }
 
 
@@ -12032,11 +13117,12 @@ function editView(v) {
     viewEditing = v.name;
     openViewEditor(`ビューを編集（${v.name}）`);
     $('#viewNote').replaceChildren();
-    renderViewExplain('');
+    renderViewExplain(v.explanation || '');     // 保存してある解説はそのまま出す（SQLを直したら消える）
+    renderViewUsed(v.used || []);
     $('#viewPurpose').value = '';
     $('#viewSqlWrap').classList.remove('hidden');
     $('#viewSql').value = v.sql || '';
-    $('#viewName').value = v.name;
+    setViewName(v.name);
     $('#viewDesc').value = v.description || '';
     $('#viewPreview').replaceChildren();
 }
@@ -12065,12 +13151,18 @@ function wireViews() {
         openViewEditor('ビューを作る');
         $('#viewPurpose').value = '';
         $('#viewSql').value = '';
-        $('#viewName').value = '';
+        setViewName('');
         $('#viewDesc').value = '';
         $('#viewPreview').replaceChildren();
         $('#viewNote').replaceChildren();
         renderViewExplain('');
+        renderViewUsed([]);
         $('#viewSqlWrap').classList.add('hidden');
+    });
+
+    $('#viewGroup').addEventListener('change', () => {
+        $('#viewGroupNew').classList.toggle('hidden', $('#viewGroup').value !== '__new__');
+        if ($('#viewGroup').value === '__new__') $('#viewGroupNew').focus();
     });
 
     $('#viewManual').addEventListener('click', () => {
@@ -12079,8 +13171,40 @@ function wireViews() {
         $('#viewSql').focus();
     });
 
-    // 人がSQLを直したら、AIの解説は当てはまらなくなるので下ろす
-    $('#viewSql').addEventListener('input', () => renderViewExplain(''));
+    // 人がSQLを直したら、AIの解説も使ったデータも当てはまらなくなるので下ろす
+    $('#viewSql').addEventListener('input', () => { renderViewExplain(''); renderViewUsed([]); });
+    // AIが使えないときは「解説を書かせる」を出さない（押しても未設定のエラーになるだけ）
+    if (!CAT.llmReady) $('#viewExplainBtn').classList.add('hidden');
+
+    // いま書いてあるSQLを実データで動かして全件を Excel に。先頭の行は下にも出す
+    // （SQLを自分で書いたときの「確かめ」を兼ねる）
+    $('#viewExport').addEventListener('click', async ev => {
+        const r = await exportView($('#viewSql').value, readViewName(), ev.target);
+        if (r) {
+            $('#viewPreview').replaceChildren(viewPreviewBox({ columns: r.columns, rows: r.preview, total: r.rows }));
+            renderViewUsed(r.used);
+        }
+    });
+
+    // いま書いてあるSQLの解説をAIに書かせる（自分で書いたSQL・直したSQLに解説を付ける）
+    $('#viewExplainBtn').addEventListener('click', async ev => {
+        const sql = $('#viewSql').value.trim();
+        if (!sql) { toast('SQLを書いてください。', 'warn'); return; }
+        ev.target.disabled = true;
+        const old = ev.target.textContent;
+        ev.target.textContent = 'AIが考えています...';
+        try {
+            const r = await api('/api/catalog/view/explain', { db: CAT.db, sql });
+            renderViewExplain(r.explanation || '');
+            renderViewUsed(r.used || []);
+            if (!r.explanation) toast('解説を書けませんでした。', 'warn');
+        } catch (e) {
+            toast(e.message, 'err', 12000);
+        } finally {
+            ev.target.disabled = false;
+            ev.target.textContent = old;
+        }
+    });
 
     $('#viewDraft').addEventListener('click', async ev => {
         const purpose = $('#viewPurpose').value.trim();
@@ -12091,6 +13215,7 @@ function wireViews() {
         // 前回の理由・解説・結果は先に下ろす（考えている間、古い内容が残らないように）
         $('#viewNote').replaceChildren();
         renderViewExplain('');
+        renderViewUsed([]);
         $('#viewPreview').replaceChildren();
         try {
             const r = await api('/api/catalog/view/draft', { db: CAT.db, purpose });
@@ -12109,9 +13234,18 @@ function wireViews() {
             $('#viewNote').replaceChildren();
             $('#viewSqlWrap').classList.remove('hidden');
             $('#viewSql').value = r.sql || '';
-            if (!$('#viewName').value) $('#viewName').value = r.name || '';
+            // まとまりと名前は、まだ空の欄だけ埋める（選んでおいたまとまりや、打った名前は消さない）
+            {
+                const i = (r.name || '').indexOf('__');
+                const g2 = i > 0 ? r.name.slice(0, i) : '';
+                const body2 = i > 0 ? r.name.slice(i + 2) : (r.name || '');
+                const sel = $('#viewGroup');
+                if (!sel.value && !$('#viewGroupNew').value.trim() && g2) fillViewGroups(g2);
+                if (!$('#viewNameBody').value.trim() && body2) $('#viewNameBody').value = body2;
+            }
             if (!$('#viewDesc').value) $('#viewDesc').value = r.description || '';
             renderViewExplain(r.explanation);
+            renderViewUsed(r.used);
             $('#viewPreview').replaceChildren(viewPreviewBox(r));
             toast('下書きができました。中身を確かめて保存してください。');
         } catch (e) {
@@ -12123,30 +13257,17 @@ function wireViews() {
         }
     });
 
-    $('#viewRun').addEventListener('click', async ev => {
-        const sql = $('#viewSql').value.trim();
-        if (!sql) { toast('SQLを書いてください。', 'warn'); return; }
-        ev.target.disabled = true;
-        try {
-            const r = await api('/api/catalog/view/preview', { db: CAT.db, sql });
-            $('#viewPreview').replaceChildren(viewPreviewBox(r));
-        } catch (e) {
-            $('#viewPreview').replaceChildren(
-                el('div', { class: 'alert alert--err small' }, e.message));
-        }
-        ev.target.disabled = false;
-    });
-
     $('#viewSave').addEventListener('click', async ev => {
-        const name = $('#viewName').value.trim();
+        const name = readViewName();
         const sql = $('#viewSql').value.trim();
-        if (!name) { toast('名前を入れてください。', 'warn'); return; }
+        if (!name) { toast('まとまりと名前を入れてください。', 'warn'); return; }
         if (!sql) { toast('SQLを書いてください。', 'warn'); return; }
         ev.target.disabled = true;
         try {
             const payload = {
                 db: CAT.db, name, sql,
                 description: $('#viewDesc').value.trim(),
+                explanation: viewExplainText,        // 登録後も読めるように、解説も一緒に残す
                 old_name: viewEditing || '',
             };
             let r;
@@ -12164,7 +13285,7 @@ function wireViews() {
             renderViews();
             $('#viewEditor').classList.add('hidden');
             viewEditing = null;
-            toast('保存しました。テーブル一覧やチャットからも使えます。');
+            toast('保存しました。テーブル一覧やマイエージェントからも使えます。');
         } catch (e) { toast(e.message, 'err', 12000); }
         ev.target.disabled = false;
     });
@@ -12353,7 +13474,7 @@ async function loadReport() {
         : [el('div', { class: 'empty' }, 'この条件では、集計できる記録がありません。')]);
 }
 
-/* --- チャット履歴 ------------------------------------------------------------
+/* --- 会話の履歴 ------------------------------------------------------------
    一覧は「誰の・いつ・何を聞いたか」だけ。本文は選んだ1本だけ読みに行く。 */
 
 /* 1行 = 1つの質問と、その回答。純粋な表で、行を押して開くものは無い。
@@ -12532,7 +13653,7 @@ async function loadChats() {
 /* --- タブ・条件・Excel ------------------------------------------------------- */
 
 function showTab(key) {
-    $$('.tab').forEach(t => t.classList.toggle('is-active', t.dataset.view === key));
+    $$('.tab[data-view]').forEach(t => t.classList.toggle('is-active', t.dataset.view === key));
     const isChats = key === 'chats';
     $('#pane-report').classList.toggle('is-active', !isChats);
     $('#pane-chats').classList.toggle('is-active', isChats);
@@ -12560,7 +13681,7 @@ async function exportExcel() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    $$('.tab').forEach(t => t.addEventListener('click', () => showTab(t.dataset.view)));
+    $$('.tab[data-view]').forEach(t => t.addEventListener('click', () => showTab(t.dataset.view)));
     $('#uRange').addEventListener('change', () =>
         $('#pane-chats').classList.contains('is-active') ? loadChats() : loadReport());
     $('#uUser').addEventListener('change', () =>
@@ -12579,13 +13700,17 @@ if (!window.IMP) return;
 
 let plan = [];          // 列の設定
 let previewInfo = null;
-// いま選ばれている取り込み元。サーバのファイル（path）か、アップロード（upload）のどちらか。
-let source = null;      // {kind:'server'|'upload', path?, upload?, name}
+// いま選ばれている取り込み元。サーバのファイル（path）・アップロード（upload）・
+// スクレイピングの出来上がり（scraper + 預かり札 upload）のどれか。
+let source = null;      // {kind:'server'|'upload'|'scraper', path?, upload?, scraper?, file?, name}
 
 function readOptions() {
     return {
         path: source?.kind === 'server' ? source.path : '',
-        upload: source?.kind === 'upload' ? source.upload : null,
+        // スクレイピングの出来上がりはアップロードと同じ預かり場所から読む
+        upload: (source?.kind === 'upload' || source?.kind === 'scraper') ? source.upload : null,
+        scraper: source?.kind === 'scraper' ? source.scraper : null,
+        scrape_file: source?.kind === 'scraper' ? source.file : null,
         sheet: $('#sheetWrap').classList.contains('hidden') ? null : $('#sheet').value,
         header_row: Math.max(0, parseInt($('#headerRow').value || '1', 10) - 1),
         delimiter: $('#delimiter').value,
@@ -12675,6 +13800,99 @@ async function openBrowser(path) {
 
 function closeBrowser() { $('#browser').classList.add('hidden'); }
 
+/* --- スクレイピングのスクリプトを選んで試すダイアログ ------------------------------
+   scrapers/ 直下の .py を一覧し、「試す」で1回実行する。出来たファイルは
+   アップロードと同じ預かり場所（メモリ）に置かれ、その預かり札でプレビューする。
+   ファイル（Excelならシートも）を選ぶと、あとはサーバのファイルと同じ流れ。 */
+
+let scraperRunning = 0;          // 「試す」を実行中の数。閉じたり作り直したりしない
+
+async function openScrapers() {
+    $('#scraperModal').classList.remove('hidden');
+    if (scraperRunning > 0) return;      // 実行中の一覧をそのまま見せる（作り直すと結果が消える）
+    const list = $('#scraperList');
+    list.replaceChildren(el('div', { class: 'fsrow' }, el('span', { class: 'spinner' }), '読み込み中...'));
+    let r;
+    try {
+        r = await api('/api/scrapers', undefined, 'GET');
+    } catch (e) {
+        list.replaceChildren(el('div', { class: 'alert alert--err' }, e.message));
+        return;
+    }
+    if (!r.ok) {
+        list.replaceChildren(el('div', { class: 'alert alert--warn' },
+            `フォルダ ${r.dir} がありません。作成して .py を置いてください。`));
+        return;
+    }
+    if (!r.scrapers.length) {
+        list.replaceChildren(el('div', { class: 'small muted', style: 'padding:12px' },
+            `${r.dir} に .py がありません。`));
+        return;
+    }
+    list.replaceChildren(...r.scrapers.map(s => scraperRow(s, r.timeout_sec)));
+}
+
+function scraperRow(s, timeoutSec) {
+    const result = el('div', { style: 'padding:0 0 4px 28px' });
+    const btn = el('button', {
+        class: 'btn btn--sm',
+        title: `スクリプトを1回実行します（最大 ${Math.round(timeoutSec / 60)} 分）`,
+        onclick: async () => {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> 実行中';
+            result.replaceChildren(el('div', { class: 'small muted' },
+                `実行しています（最大 ${Math.round(timeoutSec / 60)} 分待ちます）...`));
+            scraperRunning++;
+            try {
+                const r = await api('/api/scrapers/test', { name: s.name, timeout_sec: timeoutSec });
+                result.replaceChildren(
+                    el('div', { class: 'small muted' },
+                        `${r.seconds} 秒で ${r.files.length} ファイルできました。取り込むファイルを選んでください。`),
+                    ...r.files.map(f => el('div', {
+                        class: 'fsrow',
+                        onclick: () => { chooseScraped(s.name, f); closeScrapers(); },
+                    },
+                        icon('file', 'icon--sm'), el('span', { class: 'name' }, f.name),
+                        el('span', { class: 'meta' },
+                            `${(f.size / 1024).toFixed(0)} KB`
+                            + (f.sheets.length ? ` ・ シート: ${f.sheets.join('、')}` : '')))));
+            } catch (e) {
+                // 失敗の理由（スクリプトの出力の末尾つき）をそのまま見せる。
+                // ここで読めないと、何を直せばよいか分からない
+                result.replaceChildren(el('pre', { class: 'alert alert--err small mono',
+                    style: 'white-space:pre-wrap;margin:4px 0' }, e.message));
+            } finally {
+                scraperRunning--;
+            }
+            btn.disabled = false;
+            btn.textContent = '試す';
+        },
+    }, '試す');
+    return el('div', {},
+        el('div', { class: 'fsrow', style: 'cursor:default' },
+            icon('file', 'icon--sm'), el('span', { class: 'name' }, s.name),
+            el('span', { class: 'meta' }, `${(s.size / 1024).toFixed(0)} KB ・ ${s.mtime}`),
+            btn),
+        result);
+}
+
+function closeScrapers() {
+    if (scraperRunning > 0) {
+        // 閉じても実行は続くが結果の出し先が消えるので、待ってもらう（相手サイトへ二度行かないため）
+        toast('スクリプトの実行が終わるまでお待ちください。', 'warn');
+        return;
+    }
+    $('#scraperModal').classList.add('hidden');
+}
+
+function chooseScraped(script, f) {
+    source = { kind: 'scraper', scraper: script, upload: f.upload, file: f.name, name: f.name };
+    showChosen('', f.name,
+        `スクレイピング ${script} の出来上がり（${(f.size / 1024).toFixed(0)} KB）`
+        + (f.sheets.length ? ` ・ シート: ${f.sheets.join('、')}` : ''));
+    loadPreview();
+}
+
 /* --- 選択の確定 ----------------------------------------------------------------- */
 
 function showChosen(icon, label, note) {
@@ -12684,6 +13902,11 @@ function showChosen(icon, label, note) {
             el('div', { style: 'font-weight:700' }, label),
             note ? el('div', { class: 'small muted' }, note) : null)));
     $('#readOpts').classList.remove('hidden');
+    // 前のファイルのシート名を引きずらない（別の Excel に切り替えたとき、
+    // 無いシート名を送り続けてプレビューが失敗し続けるのを防ぐ）
+    $('#sheet').replaceChildren();
+    $('#sheetWrap').classList.add('hidden');
+    $('#sepWrap').classList.remove('hidden');
 }
 
 function chooseServerFile(path, name) {
@@ -12723,15 +13946,23 @@ async function loadPreview() {
         plan = r.plan.map(p => ({
             source: p['元の列名'], name: p['列名'], type: p['型'], include: true,
         }));
-        // Excel ならシート欄を出す
+        // Excel ならシート欄を出す。選択肢は中身が変わったときだけ入れ替える
+        // （同じ数の別のシート名でも入れ替わるように、件数ではなく名前で比べる）
         const has = (r.sheets || []).length > 0;
         $('#sheetWrap').classList.toggle('hidden', !has);
         $('#sepWrap').classList.toggle('hidden', has);
-        if (has && $('#sheet').options.length !== r.sheets.length) {
+        const now = [...$('#sheet').options].map(o => o.value);
+        if (has && now.join('') !== r.sheets.join('')) {
             $('#sheet').replaceChildren(...r.sheets.map(s => el('option', {}, s)));
         }
         renderPreview(r);
     } catch (e) {
+        if (source?.kind === 'scraper' && previewInfo) {
+            // 試した出来上がりの預かりが切れた等。入力途中の設定を消さず、案内だけ出す
+            toast(e.message + ' もう一度「スクレイピングで取得する」から試してください。', 'err', 10000);
+            renderPreview(previewInfo);
+            return;
+        }
         area.replaceChildren(el('div', { class: 'alert alert--err' }, e.message));
     }
 }
@@ -12815,7 +14046,19 @@ function renderPreview(r) {
                             // 追記でしか出さない欄なので「手動のみ」は候補から外す
                             .filter(i => i !== '手動のみ')
                             .map(i => el('option',
-                                { ...(i === '1日ごと' ? { selected: 'selected' } : {}) }, i))))),
+                                { ...(i === '1日ごと' ? { selected: 'selected' } : {}) }, i)))),
+                // スクレイピングだけの欄。1回にどれだけ待つか／質問に応じた取り直しの最小間隔
+                el('div', { id: 'scrapeIntervalWrap', class: 'hidden', style: 'width:150px' },
+                    el('label', { class: 'field' }, '最小間隔（分）'),
+                    el('input', { type: 'number', id: 'scrapeInterval', value: String(IMP.scrapeInterval),
+                        min: '0', max: String(IMP.scrapeLimits.interval_max),
+                        title: '質問を受けたとき、前回の取得からこの分数が経っていれば取り直します。'
+                             + '0 なら質問のたびに取りに行きます。' })),
+                el('div', { id: 'scrapeTimeoutWrap', class: 'hidden', style: 'width:150px' },
+                    el('label', { class: 'field' }, 'タイムアウト（秒）'),
+                    el('input', { type: 'number', id: 'scrapeTimeout', value: String(IMP.scrapeTimeout),
+                        min: String(IMP.scrapeLimits.timeout_min), max: String(IMP.scrapeLimits.timeout_max),
+                        title: 'スクリプト1回の実行にこれ以上かかったら打ち切ります。' }))),
             el('div', { id: 'jobNote', class: 'small muted mt' }),
             el('div', { class: 'row mt' },
                 el('button', { class: 'btn btn--primary', id: 'goBtn' }, '登録して取り込む'),
@@ -12949,11 +14192,15 @@ function syncTableName() {
 function syncMode() {
     const append = $('#mode').value === 'append';
     const upload = source?.kind === 'upload';
+    const scraper = source?.kind === 'scraper';
     ['#keepWrap', '#appendNote'].forEach(s => $(s)?.classList.toggle('hidden', !append));
     $('#jobIntervalWrap')?.classList.toggle('hidden', !append || upload);
     $('#jobStartWrap')?.classList.toggle('hidden', !append || upload);
     // アップロードは登録できない（サーバに残らず読み直せない）ので、名前も聞かない
     $('#jobNameWrap')?.classList.toggle('hidden', upload);
+    // スクレイピングだけの欄。最小間隔は「質問に応じた取り直し」＝全件入れ替えのときだけ
+    $('#scrapeTimeoutWrap')?.classList.toggle('hidden', !scraper);
+    $('#scrapeIntervalWrap')?.classList.toggle('hidden', !scraper || append);
 
     const go = $('#goBtn');
     if (go) {
@@ -12966,7 +14213,20 @@ function syncMode() {
     const note = $('#jobNote');
     if (note) {
         let text;
-        if (upload && append) {
+        if (scraper && append) {
+            text = `決めた間隔で自動的に ${source.scraper} を実行し、出来たファイルを1回ぶんずつ溜めます。`
+                + '開始日時を入れると、その時刻を過ぎるまで動きません（空なら登録後すぐ対象）。'
+                + '取得したファイルはサーバに残しません。'
+                + '手動で1回だけ取り込むことはできません'
+                + '（1回ぶん余計に増えて、保存回数の数え方が崩れるため）。';
+        } else if (scraper) {
+            text = '登録した時点で、いま試した出来上がりを取り込みます。以降は、マイエージェントで質問を'
+                + `受けるたびに、前回の取得から最小間隔が経っていれば ${source.scraper} を実行し直して`
+                + '表を入れ替えてから答えます（経っていなければ前回の内容で答えます）。'
+                + '取得したファイルはサーバに残しません。'
+                + '実行に失敗したときは、最後に取り込んだ内容で答えます'
+                + '（そのときはカタログに警告が出ます）。';
+        } else if (upload && append) {
             text = 'アップロードしたファイルは追記に使えません。'
                 + 'サーバに残らないため定期実行に登録できず、手で1回だけ追記すると'
                 + '保存回数の数え方が崩れるためです。'
@@ -12981,7 +14241,7 @@ function syncMode() {
                 + '手動で1回だけ取り込むことはできません'
                 + '（1回ぶん余計に増えて、保存回数の数え方が崩れるため）。';
         } else {
-            text = '登録した時点で1回取り込みます。以降は、チャットで質問を受けるたびに'
+            text = '登録した時点で1回取り込みます。以降は、マイエージェントで質問を受けるたびに'
                 + '元ファイルの更新を確認し、変わっていればその場で取り込み直してから答えます。'
                 + '定期実行の設定は要りません。'
                 + 'ファイルが読めないときは、最後に取り込んだ内容で答えます'
@@ -13009,6 +14269,19 @@ function formProblems(forJob = false) {
         // input の min だけでは手入力を防げないので、送る前にもう一度見る
         if (raw && raw < localNow(-2)) {
             out.push(`開始日時に過去の時刻は指定できません（指定: ${raw.replace('T', ' ')}）。`);
+        }
+    }
+    if (source?.kind === 'scraper') {
+        const lim = IMP.scrapeLimits;
+        const t = parseInt(($('#scrapeTimeout')?.value || '').trim(), 10);
+        if (!Number.isInteger(t) || t < lim.timeout_min || t > lim.timeout_max) {
+            out.push(`タイムアウト（秒）は ${lim.timeout_min}〜${lim.timeout_max} で指定してください。`);
+        }
+        if ($('#mode').value !== 'append') {
+            const m = parseInt(($('#scrapeInterval')?.value || '').trim(), 10);
+            if (!Number.isInteger(m) || m < 0 || m > lim.interval_max) {
+                out.push(`最小間隔（分）は 0〜${lim.interval_max} で指定してください。`);
+            }
         }
     }
     return out;
@@ -13064,6 +14337,12 @@ function importPayload() {
         timestamp_column: $('#tsCol')?.value || null,
         keep_runs: $('#mode').value === 'append' ? $('#keepRuns')?.value : null,
         columns: plan,
+        ...(source?.kind === 'scraper' ? {
+            scrape_timeout_sec: $('#scrapeTimeout')?.value,
+            // 最小間隔は全件入れ替えのときだけ（追記では欄が隠れているので、隠れた値は送らない）
+            ...($('#mode').value !== 'append'
+                ? { scrape_interval_minutes: $('#scrapeInterval')?.value } : {}),
+        } : {}),
     };
 }
 
@@ -13115,7 +14394,9 @@ async function saveJob() {
                 + 'データカタログの各テーブルの「管理」で確認できます。', 'ok', 8000);
         } else if (r.first_run?.ok) {
             toast(`登録しました。${(r.first_run.rows || 0).toLocaleString()}行を取り込みました。`
-                + '以降は質問のたびに元ファイルへ追随します。', 'ok', 8000);
+                + (source?.kind === 'scraper'
+                    ? '以降は質問のたびに（最小間隔が経っていれば）取得し直します。'
+                    : '以降は質問のたびに元ファイルへ追随します。'), 'ok', 8000);
         } else {
             // 登録自体は済んでいる。取り込みだけ失敗したことを取り違えないよう分けて出す
             toast('登録しましたが、最初の取り込みに失敗しました: '
@@ -13152,8 +14433,13 @@ document.addEventListener('DOMContentLoaded', () => {
     $('#browser')?.addEventListener('click', ev => {
         if (ev.target.id === 'browser') closeBrowser();   // 背景をクリックで閉じる
     });
+    $('#pickScraper')?.addEventListener('click', openScrapers);
+    $('#scraperClose')?.addEventListener('click', closeScrapers);
+    $('#scraperModal')?.addEventListener('click', ev => {
+        if (ev.target.id === 'scraperModal') closeScrapers();
+    });
     document.addEventListener('keydown', ev => {
-        if (ev.key === 'Escape') closeBrowser();
+        if (ev.key === 'Escape') { closeBrowser(); closeScrapers(); }
     });
     $('#pickLocal')?.addEventListener('click', () => $('#localFile')?.click());
     $('#localFile')?.addEventListener('change', ev => {
@@ -13166,6 +14452,543 @@ document.addEventListener('DOMContentLoaded', () => {
 
     lockedTables = (IMP.manage || {}).locked || {};
     if ($('#tableName')) syncDest();
+});
+})();
+
+// ===== マイロボット共通（ダイアログの枠と穴の入力。マイエージェント画面とマイロボット画面の両方で使う） =====
+(() => {
+/** 汎用のダイアログ枠。閉じる関数を返す。
+ *  opts.closable=false … 背景クリック・×では閉じない（実行中の表示など）
+ *  opts.onClose        … どの経路で閉じても1回だけ呼ぶ */
+function modal(title, bodyNode, footNodes, opts) {
+    const o = opts || {};
+    const back = el('div', { class: 'modal' });
+    const boxClass = o.wide ? 'modal__box modal__box--wide' : 'modal__box';
+    let closed = false;
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        back.remove();
+        if (o.onClose) o.onClose();
+    };
+    if (o.closable !== false) back.addEventListener('click', ev => { if (ev.target === back) close(); });
+    back.append(el('div', { class: boxClass },
+        el('div', { class: 'modal__head' }, el('b', {}, title), el('div', { class: 'spacer' }),
+            o.closable === false ? null
+                : el('button', { class: 'btn btn--sm btn--ghost', title: '閉じる', onclick: close },
+                     icon('x', 'icon--sm'))),
+        el('div', { class: 'modal__body' }, bodyNode),
+        el('div', { class: 'modal__foot row', style: 'gap:8px;align-items:center' }, ...(footNodes || []))));
+    document.body.append(back);
+    return close;
+}
+
+/** 穴の値を聞く。実行なら {h1: 値, ...}、閉じたら null を返す。 */
+function askHoles(r) {
+    return new Promise(resolve => {
+        const inputs = {};
+        let done = false;
+        const finish = v => { if (!done) { done = true; resolve(v); } };
+        const body = el('div', {},
+            el('div', { class: 'small muted', style: 'margin-bottom:8px' },
+               '実行のたびに入れ替える値です。登録したときの値が最初から入っています。'),
+            ...r.holes.map(h => el('div', { style: 'margin-bottom:10px' },
+                el('label', { class: 'field' }, h.label,
+                   el('span', { class: 'muted small' }, h.kind === 'number' ? '（数値）' : '')),
+                inputs[h.key] = el('input', { type: 'text', value: h.sample || '',
+                                              style: 'width:100%' }))));
+        const go = el('button', { class: 'btn btn--primary', onclick: () => {
+            const v = {};
+            for (const h of r.holes) v[h.key] = inputs[h.key].value.trim();
+            finish(v);
+            close();
+        } }, '実行する');
+        // 背景クリック・×で閉じたときは null（枠側がどの経路でも onClose を1回呼ぶ）
+        const close = modal(`マイロボット「${r.name}」`, body,
+            [go, el('span', { class: 'small muted' }, `${r.n_steps}手順を実行します`)],
+            { onClose: () => finish(null) });
+        const first = Object.values(inputs)[0];
+        if (first) { first.focus(); first.select(); }
+        body.addEventListener('keydown', ev => { if (ev.key === 'Enter') go.click(); });
+    });
+}
+
+/** フォルダ出力の決めごとの欄。{node, value()} を返す。onChange を渡すと変更のたびに呼ぶ。
+ *  r は {folder_out, folder_stamp, folder_overwrite} を持つ。 */
+function folderOptions(r, onChange) {
+    const on = el('input', { type: 'checkbox', ...(r.folder_out ? { checked: 'checked' } : {}) });
+    const stamp = el('select', {},
+        el('option', { value: '1', ...(r.folder_stamp !== false ? { selected: 'selected' } : {}) }, '日時を付ける（例: 一覧_20260912_1005.xlsx）'),
+        el('option', { value: '0', ...(r.folder_stamp === false ? { selected: 'selected' } : {}) }, '付けない（例: 一覧.xlsx）'));
+    const ow = el('select', {},
+        el('option', { value: '0', ...(!r.folder_overwrite ? { selected: 'selected' } : {}) }, '番号を付けて残す（_2, _3）'),
+        el('option', { value: '1', ...(r.folder_overwrite ? { selected: 'selected' } : {}) }, '置き換える（前のファイルは消える）'));
+    const detail = el('div', { class: 'row', style: 'gap:10px;flex-wrap:wrap;margin-top:4px' },
+        el('label', { class: 'small', style: 'display:flex;align-items:center;gap:4px' },
+           el('span', { style: 'white-space:nowrap' }, '名前:'), stamp),
+        el('label', { class: 'small', style: 'display:flex;align-items:center;gap:4px' },
+           el('span', { style: 'white-space:nowrap' }, '同じ名前があるとき:'), ow));
+    const sync = () => { detail.classList.toggle('hidden', !on.checked); if (onChange) onChange(); };
+    on.addEventListener('change', sync);
+    stamp.addEventListener('change', () => { if (onChange) onChange(); });
+    ow.addEventListener('change', () => { if (onChange) onChange(); });
+    detail.classList.toggle('hidden', !on.checked);
+    const node = el('div', { class: 'robotturn' },
+        el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, on,
+           el('span', {}, '実行結果をフォルダにも置く')),
+        detail);
+    const value = () => ({ folder_out: on.checked, folder_stamp: stamp.value === '1', folder_overwrite: ow.value === '1' });
+    return { node, value };
+}
+
+/** 定期実行の欄。{node, value()} を返す。onChange を渡すと変更のたびに呼ぶ。
+ *  intervals は {表示名: 分}（定期取り込みと同じ一覧）。r.schedule と r.holes を見る。
+ *  withValues=true なら、穴の値（定期実行のたびに使う値）と「止める」も出す（カード用）。 */
+function scheduleOptions(r, intervals, onChange, withValues, extra) {
+    const x = extra || {};
+    const floorMin = Number(x.minIntervalHours || 0) * 60;
+    const sch = r.schedule || {};
+    const cur = Number(sch.interval_minutes || 0);
+    const sel = el('select', {}, ...Object.entries(intervals || {}).map(([label, minutes]) => {
+        const m = Number(minutes);
+        const tooShort = m > 0 && floorMin > 0 && m < floorMin && m !== cur;
+        return el('option', { value: String(m), ...(cur === m ? { selected: 'selected' } : {}),
+                              ...(tooShort ? { disabled: 'disabled' } : {}) },
+                  label + (tooShort ? '（管理者の最低間隔より短い）' : ''));
+    }));
+    const start = el('input', { type: 'datetime-local', value: (sch.start_at || '').slice(0, 16) });
+    const on = el('input', { type: 'checkbox', ...(sch.enabled === false ? {} : { checked: 'checked' }) });
+    const holeInputs = {};
+    const rows = [
+        el('span', { class: 'small' }, '間隔'), el('div', {}, sel),
+        el('span', { class: 'small' }, '開始日時'), el('div', {}, start,
+            el('span', { class: 'small muted', style: 'margin-left:6px' }, 'この時刻から、間隔ごとに動きます（空なら登録した時刻から）')),
+    ];
+    if (withValues) {
+        rows.push(el('span', { class: 'small' }, '動かす'), el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' },
+            on, el('span', { class: 'small' }, '止めるとチェックを外す（設定は残ります）')));
+        (r.holes || []).forEach(h => {
+            const inp = el('input', { type: 'text', value: (sch.values || {})[h.key] ?? h.sample ?? '', style: 'max-width:260px' });
+            holeInputs[h.key] = inp;
+            rows.push(el('span', { class: 'small' }, `穴「${h.label}」`), el('div', {}, inp,
+                el('span', { class: 'small muted', style: 'margin-left:6px' }, '定期実行のたびに使う値')));
+        });
+    }
+    const grid = el('div', { class: 'schedgrid mt' }, ...rows);
+    const note = el('div', { class: 'small muted mt' },
+        'アプリのサーバが動いていれば、この画面を閉じていても・自分のPCを消していても、時刻になったら動きます。'
+        + '結果はマイエージェントの会話に残り、フォルダ出力やメールの自動送信を選んでいればそれも行われます。');
+    const warn = x.schedulerOn === false
+        ? el('div', { class: 'alert alert--warn small mt' },
+             'いまアプリの定期実行（スケジューラ）が止まっています。設定は保存できますが、時刻になっても動きません。管理者に確認してください。')
+        : null;
+    const choosable = [...sel.options].some(o => !o.disabled && o.value !== '0');
+    const blocked = (sch.floor_blocked)
+        ? el('div', { class: 'alert alert--warn small mt' },
+             choosable ? '管理者が決めた最低間隔より短いので、いまは動きません。間隔を選び直してください。'
+                       : `いまの最低間隔（${x.minIntervalHours} 時間）では、選べる間隔がありません。`
+                         + '定期実行を使うには、管理者に最低間隔を短くしてもらってください。')
+        : (!choosable && Number(x.minIntervalHours || 0) > 0
+            ? el('div', { class: 'alert alert--warn small mt' },
+                 `いまの最低間隔（${x.minIntervalHours} 時間）では、選べる間隔がありません（手動のみになります）。`)
+            : null);
+    const sync = () => { if (onChange) onChange(); };
+    [sel, start, on, ...Object.values(holeInputs)].forEach(i => i.addEventListener('change', sync));
+    const node = el('div', {}, grid, note, warn, blocked);
+    const value = () => {
+        const v = { interval_minutes: Number(sel.value || 0), start_at: start.value || '' };
+        if (withValues) {
+            v.enabled = on.checked;
+            v.values = Object.fromEntries(Object.entries(holeInputs).map(([k, i]) => [k, i.value]));
+        }
+        return v;
+    };
+    // 保存を断られたとき、いま保存されている値に戻す（断られた値が残ったままだと、次の変更も同じ理由で断られる）
+    const reset = () => {
+        const s2 = r.schedule || {};
+        sel.value = String(Number(s2.interval_minutes || 0));
+        start.value = (s2.start_at || '').slice(0, 16);
+        on.checked = s2.enabled !== false;
+        const sample = Object.fromEntries((r.holes || []).map(h => [h.key, h.sample ?? '']));
+        Object.entries(holeInputs).forEach(([k, i]) => { i.value = (s2.values || {})[k] ?? sample[k] ?? ''; });
+    };
+    return { node, value, reset };
+}
+
+/** 定期実行を一言で（カードの表示用）。 */
+function scheduleLabel(r) {
+    const sch = r.schedule || {};
+    if (!Number(sch.interval_minutes || 0)) return '定期実行: 手動のみ';
+    if (sch.enabled === false) return `定期実行: ${sch.interval_label}（止めています）`;
+    return `定期実行: ${sch.interval_label}` + (sch.next_at ? `・次回 ${sch.next_at.slice(5, 16).replace('T', ' ')}` : '');
+}
+
+/** 決めごとを一言で（カードの表示用）。 */
+function folderLabel(r) {
+    if (!r.folder_out) return 'フォルダ: 置かない';
+    return 'フォルダ: ' + (r.folder_stamp === false ? '日時なし' : '日時あり') + '・'
+        + (r.folder_overwrite ? '置き換える' : '番号を付けて残す');
+}
+
+window.ROBOT = { modal, askHoles, folderOptions, folderLabel, scheduleOptions, scheduleLabel };
+})();
+
+// ===== マイロボットの画面（window.ROBOTS_INIT がある画面だけ動く） =====
+(() => {
+if (!window.ROBOTS_INIT) return;
+/* 保存した処理の流れの一覧。実行すると結果の会話が「いま開いている会話」になるので、
+   終わったらマイエージェントの画面へ移る（結果はそこに並ぶ）。 */
+let robots = window.ROBOTS_INIT.robots || [];
+let running = false;          // 実行中はもう1つ走らせない（同じ手順が二重に走る）
+
+function render() {
+    const box = $('#robotCards');
+    box.replaceChildren();
+    if (!robots.length) {
+        box.append(el('div', { class: 'card' },
+            el('div', { class: 'card__title' }, 'まだありません'),
+            el('div', { class: 'card__desc' },
+               'マイエージェントで、いつもの流れ（集計 → グラフ → Excel など）を一度やってから、'
+               + '自分の発言にマウスを乗せて「ロボットにする」を押すと、ここに並びます。'),
+            el('a', { class: 'btn btn--primary', href: window.ROBOTS_INIT.agentUrl }, 'マイエージェントへ')));
+        return;
+    }
+    robots.forEach(r => box.append(card(r)));
+}
+
+/** カードの見出しの一言（設定を変えたら作り直す）。 */
+function cardMeta(r) {
+    const wait = !!(r.next_run && new Date(r.next_run) > new Date());
+    return `${r.n_steps}手順`
+        + ((r.holes || []).length ? `・穴 ${r.holes.map(h => h.label).join('、')}` : '')
+        + (r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')}` : '・まだ実行していません')
+        + (wait ? `・次に実行できるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
+        + (Number((r.schedule || {}).interval_minutes || 0) ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
+        + (r.mail_auto ? '・メール自動送信' : '')
+        + (r.from_title ? `・元の会話「${r.from_title}」` : '');
+}
+
+function card(r) {
+    // 決めごとの間隔で、まだ実行できない（サーバも同じ判断で断るが、押してから知るより先に見せる）
+    const wait = !!(r.next_run && new Date(r.next_run) > new Date());
+    const nextAt = wait ? r.next_run.slice(5, 16).replace('T', ' ') : '';
+    const meta = cardMeta(r);
+    return el('div', { class: 'card robotcard' },
+        el('div', { class: 'row', style: 'align-items:center;gap:10px' },
+            icon('spark'),
+            el('div', { class: 'grow', style: 'min-width:0' },
+                el('div', { class: 'card__title', style: 'margin:0' }, r.name),
+                el('div', { class: 'small muted', 'data-meta': r.id }, meta)),
+            el('button', { class: 'btn btn--primary', onclick: () => run(r),
+                           ...(wait ? { disabled: 'disabled' } : {}),
+                           title: wait ? `次に実行できるのは ${nextAt} 以降です（同じロボットの実行の間隔は管理者が決めています）`
+                                       : 'この手順をAIなしでそのまま実行し、結果をマイエージェントの新しい会話に出します' },
+               '実行'),
+            el('button', { class: 'btn btn--sm', title: '名前を変える', onclick: () => rename(r) }, '名前'),
+            el('button', { class: 'btn btn--sm btn--danger', title: '削除', onclick: () => remove(r) }, '削除')),
+        el('div', { class: 'small mt' }, el('span', { class: 'muted' }, '手順: '), r.tools.join(' → ')),
+        r.questions.length
+            ? el('div', { class: 'small muted' }, '元の質問: ' + r.questions.join(' ／ ')) : null,
+        r.has_file_steps ? folderRow(r) : null,
+        scheduleRow(r),
+        r.has_mail_steps ? mailRow(r) : null,
+        detailRow(r),
+        r.last_status === 'error'
+            ? el('div', { class: 'alert alert--err small mt' }, `前回の実行: ${r.last_message}`) : null);
+}
+
+/** 定期実行の設定（間隔・開始・止める・穴の値）。変えるとその場で保存。 */
+function scheduleRow(r) {
+    const summary = el('span', { class: 'small muted' }, window.ROBOT.scheduleLabel(r));
+    const opts = window.ROBOT.scheduleOptions(r, window.ROBOTS_INIT.intervals || {}, async () => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, schedule: opts.value() });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) {
+                Object.assign(r, fresh);
+                summary.textContent = window.ROBOT.scheduleLabel(r);
+                const meta = document.querySelector(`[data-meta="${r.id}"]`);
+                if (meta) meta.textContent = cardMeta(r);       // 見出しも新しい設定に合わせる
+            }
+            toast('定期実行の設定を保存しました。' + (r.schedule && r.schedule.next_at
+                ? ` 次回は ${r.schedule.next_at.slice(5, 16).replace('T', ' ')} です。` : ''));
+        } catch (e) { opts.reset(); toast(e.message, 'err', 9000); }
+    }, true, { minIntervalHours: window.ROBOTS_INIT.minIntervalHours, schedulerOn: window.ROBOTS_INIT.schedulerOn });
+    const sch = r.schedule || {};
+    return el('details', { class: 'acc', style: 'margin-top:8px' },
+        el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
+        el('div', { class: 'acc__body' }, opts.node,
+            sch.last_run ? el('div', { class: `small mt ${sch.last_status === 'error' ? 'alert alert--err' : 'muted'}` },
+                `前回の定期実行: ${sch.last_run.slice(5, 16).replace('T', ' ')} ${sch.last_message || ''}`) : null));
+}
+
+/** メールの自動送信（下書きを作る手順があるロボットだけ）。 */
+function mailRow(r) {
+    const cb = el('input', { type: 'checkbox', ...(r.mail_auto ? { checked: 'checked' } : {}) });
+    cb.addEventListener('change', async () => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, mail_auto: cb.checked });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) {
+                Object.assign(r, fresh);
+                const meta = document.querySelector(`[data-meta="${r.id}"]`);
+                if (meta) meta.textContent = cardMeta(r);
+            }
+            toast(cb.checked ? '実行のたびにメールを送ります（宛先の許可はメール設定のとおり）。' : 'メールは下書きのまま出します（送りません）。');
+        } catch (e) { cb.checked = !cb.checked; toast(e.message, 'err', 8000); }
+    });
+    return el('div', { class: 'small', style: 'margin-top:8px' },
+        el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, cb,
+           el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')));
+}
+
+/** 登録内容の詳細（手順の中身・穴・表・決めごと）。 */
+function detailRow(r) {
+    const sch = r.schedule || {};
+    const steps = (r.steps_detail || []).map(sd => el('div', {},
+        el('div', {}, el('span', { class: 'badge' }, `手順${sd.i}`), ' ', el('b', {}, sd.label)),
+        el('pre', { class: 'mono' }, sd.text || ''),
+        sd.explanation ? el('div', { class: 'small muted', style: 'margin:-4px 0 8px' }, sd.explanation) : null));
+    const dl = el('dl', { class: 'robotdetail small' },
+        el('dt', {}, '手順'), el('dd', {}, ...steps),
+        el('dt', {}, '穴（実行のたびに入れ替える値）'),
+        el('dd', {}, r.holes.length ? r.holes.map(h => `${h.label}（${h.kind === 'number' ? '数値' : '文字'}・登録時の値: ${h.sample}）`).join('、') : 'なし'),
+        el('dt', {}, '使う表'), el('dd', {}, (r.tables || []).join('、') || 'なし'),
+        el('dt', {}, 'フォルダ出力'), el('dd', {}, r.has_file_steps ? window.ROBOT.folderLabel(r).replace('フォルダ: ', '') : 'ファイルを作る手順はありません'),
+        el('dt', {}, '定期実行'), el('dd', {}, window.ROBOT.scheduleLabel(r).replace('定期実行: ', '')
+            + (Number(sch.interval_minutes || 0) && sch.start_at ? `（開始 ${sch.start_at.replace('T', ' ')}）` : '')),
+        el('dt', {}, 'メール'), el('dd', {}, r.has_mail_steps ? (r.mail_auto ? '実行のたびに自動で送る' : '下書きを出すだけ（送らない）') : 'メールの手順はありません'),
+        el('dt', {}, '元の会話'), el('dd', {}, r.from_title || '—'),
+        el('dt', {}, '作成・更新'), el('dd', {}, `${(r.created_at || '').replace('T', ' ')} ／ ${(r.updated_at || '').replace('T', ' ')}`),
+        el('dt', {}, '前回の実行'), el('dd', {}, r.last_run ? `${r.last_run.replace('T', ' ')}（${r.last_status === 'ok' ? '成功' : '失敗'}）${r.last_message || ''}` : 'まだ実行していません'));
+    return el('details', { class: 'acc', style: 'margin-top:8px' },
+        el('summary', { class: 'small', style: 'cursor:pointer' }, el('span', { class: 'muted' }, '詳細（手順の中身・穴・表・決めごと）')),
+        el('div', { class: 'acc__body' }, dl));
+}
+
+/** フォルダ出力の決めごと（ファイルを作る手順があるロボットだけ）。変えるとその場で保存。 */
+function folderRow(r) {
+    const summary = el('span', { class: 'small muted' }, window.ROBOT.folderLabel(r));
+    const opts = window.ROBOT.folderOptions(r, async () => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, ...opts.value() });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) { Object.assign(r, fresh); summary.textContent = window.ROBOT.folderLabel(r); }
+            toast('フォルダ出力の決めごとを保存しました。');
+        } catch (e) { toast(e.message, 'err', 8000); }
+    });
+    return el('details', { class: 'acc', style: 'margin-top:8px' },
+        el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
+        el('div', { class: 'acc__body' }, opts.node));
+}
+
+async function run(r) {
+    if (running) return;
+    const values = r.holes.length ? await window.ROBOT.askHoles(r) : {};
+    if (values === null) return;
+    running = true;
+    // 待ち（次に実行できる時刻まで）で止めてあるボタンは、失敗のあとも止めたままにする
+    const buttons = [...document.querySelectorAll('#robotCards button')].filter(b => !b.disabled);
+    buttons.forEach(b => { b.disabled = true; });
+    // 実行中の表示は閉じられない（閉じられると、走っている最中にもう一度押せてしまう）
+    const close = window.ROBOT.modal(`マイロボット「${r.name}」`,
+        el('div', { class: 'row', style: 'align-items:center;gap:8px;padding:8px 0' },
+            el('span', { class: 'spinner' }), `${r.n_steps}手順を実行しています…`),
+        [], { closable: false });
+    try {
+        await api('/api/robots/run', { id: r.id, values });
+        // 実行した会話が「いま開いている会話」になっている。結果はそこに並ぶ
+        window.location.href = window.ROBOTS_INIT.agentUrl;
+    } catch (e) {
+        close();
+        running = false;
+        buttons.forEach(b => { b.disabled = false; });
+        toast(e.message, 'err', 9000);
+        // 断られた理由（次に実行できる時刻など）が一覧に反映されるよう、取り直して描き直す
+        try {
+            const res = await api('/api/robots', undefined, 'GET');
+            robots = res.robots || robots;
+            render();
+        } catch (_) { /* 取り直せなくても、いまの表示のまま */ }
+    }
+}
+
+async function rename(r) {
+    const name = prompt('マイロボットの名前', r.name);
+    if (name === null) return;
+    try {
+        const res = await api('/api/robots/update', { id: r.id, name });
+        robots = res.robots; render();
+    } catch (e) { toast(e.message, 'err', 8000); }
+}
+
+async function remove(r) {
+    if (!confirm(`マイロボット「${r.name}」を削除しますか？`)) return;
+    try {
+        const res = await api('/api/robots/delete', { id: r.id });
+        robots = res.robots; render();
+        toast('削除しました。');
+    } catch (e) { toast(e.message, 'err', 8000); }
+}
+
+document.addEventListener('DOMContentLoaded', render);
+})();
+
+// ===== マイロボットの決めごと（window.ROBOT_SETTINGS_INIT がある画面だけ動く） =====
+(() => {
+if (!window.ROBOT_SETTINGS_INIT) return;
+/* 管理者が決める上限・間隔・手順数。範囲の外はサーバが断る（画面はその文言をそのまま出す）。 */
+function fill(s) {
+    $('#rsMax').value = s.max_per_user;
+    $('#rsInterval').value = s.min_interval_hours;
+    $('#rsSteps').value = s.max_steps;
+}
+document.addEventListener('DOMContentLoaded', () => {
+    fill(window.ROBOT_SETTINGS_INIT.settings || {});
+    $('#rsSave').addEventListener('click', async () => {
+        const btn = $('#rsSave');
+        btn.disabled = true;
+        try {
+            const r = await api('/api/catalog/robot-settings', {
+                max_per_user: $('#rsMax').value, min_interval_hours: $('#rsInterval').value,
+                max_steps: $('#rsSteps').value });
+            fill(r.settings || {});
+            if (r.updated_at) $('#rsNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
+            toast('保存しました。すぐ効きます。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
+});
+})();
+
+// ===== 覚え書きの決めごと（window.MEMORY_SETTINGS_INIT がある画面だけ動く。管理者） =====
+(() => {
+if (!window.MEMORY_SETTINGS_INIT) return;
+function fill(s) {
+    $('#msEnabled').checked = !!s.enabled;
+    $('#msModel').value = s.model || '';
+    if ($('#msModel').value !== (s.model || '')) {     // 一覧に無いモデルが保存されていたら、選べるように足す
+        $('#msModel').append(el('option', { value: s.model, selected: 'selected' }, s.model));
+    }
+    $('#msMax').value = s.max_chars;
+}
+document.addEventListener('DOMContentLoaded', () => {
+    fill(window.MEMORY_SETTINGS_INIT.settings || {});
+    $('#msSave').addEventListener('click', async () => {
+        const btn = $('#msSave'); btn.disabled = true;
+        try {
+            const r = await api('/api/catalog/memory-settings', {
+                enabled: $('#msEnabled').checked, model: $('#msModel').value, max_chars: $('#msMax').value });
+            fill(r.settings || {});
+            if (r.updated_at) $('#msNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
+            toast('保存しました。すぐ効きます（メニューの表示は次に画面を開いたときに変わります）。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
+});
+})();
+
+// ===== 覚え書きの画面（window.MEMORY_INIT がある画面だけ動く） =====
+(() => {
+if (!window.MEMORY_INIT) return;
+/* 本文は1つのテキスト。保存はボタンで（打っている途中でAIの書き足しが来ても、消さずに知らせる）。 */
+let m = window.MEMORY_INIT;
+let dirty = false;
+
+function show() {
+    const box = document.querySelector('.memedit');
+    const off = !m.enabled;                       // 管理者が機能ごと止めている
+    $('#memState').textContent = off ? '機能停止中' : (m.on ? '覚えています' : '停止中');
+    $('#memToggle').textContent = m.on ? '覚えない' : '覚える';
+    $('#memToggle').classList.toggle('hidden', off);   // 押しても何も変わらないので出さない
+    $('#memOffNote').classList.toggle('hidden', !off);
+    $('#memBroken').classList.toggle('hidden', !m.broken);
+    box.classList.toggle('is-off', off || !m.on);
+    const len = $('#memText').value.length;
+    $('#memCount').textContent = `${len} / ${m.max_chars} 文字`
+        + (len > m.max_chars ? '（上限を超えた分は保存時に切ります）' : '');
+    $('#memNote').textContent = m.updated_at ? `最終更新 ${m.updated_at.replace('T', ' ')}` : 'まだありません';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    $('#memText').value = m.text || '';
+    show();
+    $('#memText').addEventListener('input', () => { dirty = true; show(); });
+    $('#memSave').addEventListener('click', async () => {
+        const btn = $('#memSave'); btn.disabled = true;
+        const sent = $('#memText').value;
+        try {
+            m = { ...m, ...(await api('/api/memory/save', { text: sent })) };
+            $('#memText').value = m.text || ''; dirty = false; show();
+            const cut = sent.trim().length > (m.text || '').length;
+            toast(cut ? `保存しました（上限 ${m.max_chars} 文字を超えた分は切りました）。`
+                      : (m.enabled ? '保存しました。次の質問からAIに渡ります。'
+                                   : '保存しました（いまは機能が止まっているので、AIには渡りません）。'),
+                  cut ? 'warn' : 'ok', cut ? 9000 : 4000);
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
+    $('#memClear').addEventListener('click', async () => {
+        if (!confirm('覚え書きを全部消しますか？（元に戻せません）')) return;
+        try {
+            m = { ...m, ...(await api('/api/memory/clear')) };
+            $('#memText').value = ''; dirty = false; show();
+            toast('全部消しました。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+    });
+    $('#memToggle').addEventListener('click', async () => {
+        try {
+            m = { ...m, ...(await api('/api/memory/toggle', { on: !m.on })) };
+            show();
+            toast(m.on ? '覚えるのを再開しました。' : '覚えるのをやめました（いまの本文もAIに渡しません）。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+    });
+    // 別の画面で答えが返って本文が変わったら、打っている途中でなければ差し替える。
+    // 印（時刻）は秒までしか無いので、本文そのものを比べる
+    setInterval(async () => {
+        try {
+            const r = await api('/api/memory', undefined, 'GET');
+            if ((r.text || '') === (m.text || '')) { m = { ...m, ...r }; return; }
+            const grew = (r.text || '').startsWith((m.text || '').slice(0, 40)) && (r.text || '').length > (m.text || '').length;
+            m = { ...m, ...r };
+            const what = grew ? 'AIが覚え書きを書き足しました。' : 'AIが覚え書きを書き直しました。';
+            if (!dirty) { $('#memText').value = m.text || ''; show(); toast(what); }
+            else toast(what + 'いま打っている内容を保存すると上書きになります（画面を読み直すと新しい本文が見えます）。', 'warn', 9000);
+        } catch (_) { /* 取れないときは何もしない */ }
+    }, 20000);
+});
+})();
+
+// ===== 出力の画面（window.OUTPUT_INIT がある画面だけ動く） =====
+(() => {
+if (!window.OUTPUT_INIT) return;
+/* 出力先フォルダの設定。保存は書けるかをサーバが確かめてから。 */
+document.addEventListener('DOMContentLoaded', () => {
+    const save = $('#outSave');
+    if (!save) return;
+    const show = st => {
+        $('#outStatus').textContent = st.message + (st.source ? `（${st.source}の設定）` : '');
+        $('#outStatus').dataset.ok = st.ok ? 'true' : 'false';
+        const b = $('#outBadge');
+        b.textContent = st.ok ? '使えます' : (st.path ? '問題あり' : '未設定');
+        b.className = 'badge ' + (st.ok ? 'badge--ok' : (st.path ? 'badge--err' : ''));
+        $('#outDir').value = st.path || '';
+    };
+    const submit = async path => {
+        save.disabled = true;
+        try {
+            const st = await api('/api/output-dir', { path });
+            show(st);
+            toast(path ? `出力先フォルダを保存しました: ${st.path}` : '出力先フォルダを外しました。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        save.disabled = false;
+    };
+    save.addEventListener('click', () => submit($('#outDir').value.trim()));
+    $('#outDir').addEventListener('keydown', ev => { if (ev.key === 'Enter') submit($('#outDir').value.trim()); });
+    $('#outClear').addEventListener('click', () => {
+        if (!confirm('出力先フォルダを外しますか？（フォルダへの出力ができなくなります。ダウンロードは今までどおり）')) return;
+        submit('');
+    });
 });
 })();
 
@@ -13298,7 +15121,7 @@ function render() {
     box.replaceChildren(bases.length && live
         ? el('div', { class: 'alert alert--ok' },
             `${live} 件のナレッジベースを検索できます。`
-            + 'チャットのAIは、質問の内容に応じてこの中から調べ先を選びます。')
+            + 'マイエージェントのAIは、質問の内容に応じてこの中から調べ先を選びます。')
         : el('div', { class: 'alert alert--info' },
             '検索できるナレッジベースがありません。'
             + 'この状態では、AIに社内文書の検索ツールを渡しません'
@@ -13441,10 +15264,10 @@ function render() {
     ['#maxRecipients', '#dryRun'].forEach(x => { $(x).disabled = !editable(); });
     $('#dryNote').replaceChildren(s.dry_run
         ? el('div', { class: 'alert alert--info' },
-            'テスト送信モードです。チャットの「送信」を押しても外にはメールが出ず、'
+            'テスト送信モードです。マイエージェントの「送信」を押しても外にはメールが出ず、'
             + '組み立てた内容の確認だけを行います。動作を確かめてから外してください。')
         : el('div', { class: 'alert alert--warn' },
-            '本番送信モードです。チャットの「送信」を押すと実際にメールが送られます。'));
+            '本番送信モードです。マイエージェントの「送信」を押すと実際にメールが送られます。'));
 
     // 上部のまとめ
     const box = $('#banner');
@@ -13595,7 +15418,7 @@ document.addEventListener('DOMContentLoaded', () => {
 (() => {
 if (!window.MODELS) return;
 /* モデル設定（管理者のみ）。
-   チャットのプルダウンに出す候補・既定・画像判定キーワードを決める。 */
+   マイエージェントのプルダウンに出す候補・既定・画像判定キーワードを決める。 */
 
 let state = {};
 
@@ -13664,14 +15487,14 @@ function render() {
     if (!state.llm_ready) {
         box.append(el('div', { class: 'alert alert--warn' },
             'LLMが未設定です。env の OPENAI_* を設定するまで、'
-            + 'モデル一覧の取得とチャットは動きません。'));
+            + 'モデル一覧の取得とマイエージェントは動きません。'));
     }
-    // いまチャットに何が出ているかを、実態のまま出す。
+    // いまマイエージェントに何が出ているかを、実態のまま出す。
     // ここがずれていると「設定が効いていない」ように見える。
     const eff = state.effective || [];
     if (state.source === 'admin') {
         box.append(el('div', { class: 'alert alert--info' },
-            `この画面の設定が効いています。チャットのプルダウンには `
+            `この画面の設定が効いています。マイエージェントのプルダウンには `
             + `${eff.length} 件（${eff.join('、')}）が出ます。`));
     } else if (state.source === 'env') {
         box.append(el('div', { class: 'alert alert--info' },
@@ -13679,7 +15502,7 @@ function render() {
             + `（${eff.join('、')}）。ここで保存すると、以後はこの画面の内容が優先されます。`));
     } else {
         box.append(el('div', { class: 'alert alert--warn' },
-            '候補をまだ決めていません。いまチャットに出るのは、既定のモデルと'
+            '候補をまだ決めていません。いまマイエージェントに出るのは、既定のモデルと'
             + `すでに誰かが選んでいるモデルだけです（${eff.join('、') || '（未設定）'}）。`
             + '「一覧から選ぶ」で使わせたいモデルを決めてください。'));
     }
@@ -13732,7 +15555,7 @@ function openPicker() {
             el('button', { class: 'btn btn--sm btn--ghost', onclick: close }, icon('x', 'icon--sm'))),
         el('div', { style: 'padding:10px 14px 0' }, filter,
             el('div', { class: 'small muted mt' },
-                `APIが返した ${cat.length} 件です。チェックしたものだけがチャットに出ます。`)),
+                `APIが返した ${cat.length} 件です。チェックしたものだけがマイエージェントに出ます。`)),
         body,
         el('div', { class: 'modal__foot row', style: 'align-items:center' },
             el('span', { class: 'small muted grow' }, count),

@@ -78,6 +78,47 @@ IMPORT_SCHEDULER_TICK_SEC = int(os.getenv("IMPORT_SCHEDULER_TICK_SEC", "60") or 
 # 追記(append)時に付ける取得日時の列名
 IMPORT_TIMESTAMP_COLUMN = os.getenv("IMPORT_TIMESTAMP_COLUMN", "取得日時").strip() or "取得日時"
 
+# --- 出力先フォルダ（作ったファイルをサーバ上の決まった場所にも置く） ----------------
+# 利用者が「フォルダに出力して」と頼んだとき、ここに書いたフォルダの中の
+# 「利用者名」のフォルダへファイルを書く（無ければ作る）。画面から保存した値が優先。
+# 空なら機能は出ない（ダウンロードだけ）。
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "").strip()
+OUTPUT_DIR_FILE = Path(os.getenv("OUTPUT_DIR_FILE",
+                                 str(DATA_DIR / "output_dir.yaml"))).expanduser()
+
+# --- マイロボットの決めごと -------------------------------------------------------
+# 管理者メニュー → マイロボット で変えられる。ここは画面で保存する前の初期値。
+ROBOT_MAX_PER_USER = int(os.getenv("ROBOT_MAX_PER_USER", "5") or 5)             # 1人あたりの登録上限
+ROBOT_MIN_INTERVAL_HOURS = float(os.getenv("ROBOT_MIN_INTERVAL_HOURS", "12") or 12)  # 同じロボットの実行間隔（時間）
+ROBOT_MAX_STEPS = int(os.getenv("ROBOT_MAX_STEPS", "20") or 20)                  # 1つのロボットの手順数
+ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
+                                     str(DATA_DIR / "robot_settings.yaml"))).expanduser()
+
+# --- 覚え書き（利用者について、会話から自動で覚える） ---------------------------------
+# 回答のあとにもう1回AIを呼び、「次回以降の質問でも使える前提・好み・期間」を本文（1つのテキスト）に
+# 書き足して data/users/<利用者>/memory.yaml に残す。次の質問からシステムプロンプトに載る。
+# 利用者は「覚え書き」の画面で直す・止めることができる。
+# 管理者メニュー → 覚え書き で変えられる。ここは画面で保存する前の初期値。
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "2000") or 2000)   # 本文の文字数（1つのテキスト）
+# 書き直しに使うモデル。空なら回答と同じモデル。安いモデルにすると1質問あたりの追加費用を抑えられる
+MEMORY_MODEL = os.getenv("MEMORY_MODEL", "").strip() or None
+# 管理者メニュー → 覚え書き で保存した値（上の3つの初期値を上書きする）
+MEMORY_SETTINGS_FILE = Path(os.getenv("MEMORY_SETTINGS_FILE",
+                                      str(DATA_DIR / "memory_settings.yaml"))).expanduser()
+
+# --- Webスクレイピングで取り込む ---------------------------------------------
+# scrapers/ に置いた Python ファイル（fetch(out_dir) を定義したもの）を実行し、
+# 出来た Excel/CSV を表に入れる。取得したファイルは表に入れたら消す（サーバに残さない）。
+# 画面で選べるのはこのフォルダ直下の .py だけ（パスは打たせない）。
+SCRAPER_DIR = Path(os.getenv("SCRAPER_DIR", str(BASE_DIR / "scrapers"))).expanduser()
+# 1回の実行に許す時間（秒）の既定。登録した設定ごとに画面から変えられる。
+SCRAPER_TIMEOUT_SEC = int(os.getenv("SCRAPER_TIMEOUT_SEC", "300") or 300)
+# 全件入れ替えの設定で、チャットの質問に応じて取得し直すときの最小間隔（分）の既定。
+# 前回の実行からこの時間が経っていなければ、前回取り込んだ内容で答える。
+# 0 にすると質問のたびに取りに行く（相手サイトへの負荷と待ち時間に注意）。
+SCRAPER_MIN_INTERVAL_MIN = int(os.getenv("SCRAPER_MIN_INTERVAL_MIN", "30") or 30)
+
 # --- 更新履歴 ---------------------------------------------------------------
 # 「いつ・どこから・何行入ったか」の記録。ジョブ定義側は直前の1回しか持たないので、
 # さかのぼって追えるように別ファイルに追記していく（1行1件のJSON）。
@@ -385,7 +426,11 @@ CHAT_LOCK_WAIT_SEC = int(os.getenv("CHAT_LOCK_WAIT_SEC", "120") or 120)
 AUTO_DOWNLOAD = True
 
 # --- アプリ表示 -------------------------------------------------------------
-APP_TITLE = "DB分析アシスタント"
+# ナレッジ検索（LightRAG）・マイエージェント（AIとの対話）・マイロボット（保存した
+# 手順の自動実行）をひとつに束ねた名前。ログイン画面と各画面のタブ名に出る。
+APP_TITLE = os.getenv("APP_TITLE", "").strip() or "AIワークハブ"
+# ログイン画面で名前の下に出す一言（3つの柱）。env の APP_TAGLINE で差し替えられる
+APP_TAGLINE = os.getenv("APP_TAGLINE", "").strip() or "ナレッジ検索 × マイエージェント × マイロボット"
 
 # チャット入力欄のプレースホルダ
 # 画像を扱えるモデルのときは、貼り付け・ドロップの案内を chat.js が末尾に足す
