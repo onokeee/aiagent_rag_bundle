@@ -6373,6 +6373,13 @@ details.acc.is-target {
     overflow: hidden;
 }
 .src.is-open .src__text { -webkit-line-clamp: unset; overflow: visible; }
+/* 引用されなかった出典を開く・畳む。件数を出すので、押す前に量が分かる */
+.srcs__more {
+    background: none; border: 0; padding: 0; font: inherit; font-size: 12px;
+    color: var(--muted); cursor: pointer;
+    text-decoration: underline; text-underline-offset: 3px;
+}
+.srcs__more:hover { color: var(--accent); }
 
 .filecard {
     display: flex; align-items: center; gap: 12px; padding: 13px 15px;
@@ -9934,6 +9941,26 @@ function exampleCard(item) {
    ファイル名・本文の抜粋を並べる。AIの回答を人が検証できることが目的なので、
    折りたたんで隠さず、行の抜粋だけを畳んでおく（クリックで全文）。 */
 
+/** 回答の本文に出てきた出典番号。半角・全角どちらの括弧でも拾う。
+ *  括弧無しの「出典15」まで拾うと、「出典が15件」のような文まで数えてしまうので取らない。 */
+function citedNumbers(text) {
+    const out = new Set();
+    String(text || '').replace(/[\[［]\s*出典\s*(\d+)/g, (_, n) => { out.add(String(Number(n))); return ''; });
+    return out;
+}
+
+/** まだ答え合わせをしていない出典カードに、引用された番号を教えて開き直す。
+ *  出典番号は質問ごとに1から振り直されるので、古いカードに当てないよう
+ *  「pending のものだけ」を対象にする（済んだカードは二度と触らない）。 */
+function revealCitedSources(text) {
+    const nums = [...citedNumbers(text)].join(',');
+    document.querySelectorAll('.srcs[data-fold="pending"]').forEach(list => {
+        list.dataset.fold = 'done';
+        list.dataset.cited = nums;
+        if (list.syncFold) list.syncFold();
+    });
+}
+
 function sourcesCard(item) {
     const sources = item.sources || [];
     const head = el('div', { class: 'toolblock__head' },
@@ -9955,7 +9982,7 @@ function sourcesCard(item) {
                   + 'サイドバーの検索設定で「参考情報の文字数上限」を上げると読めます。'
                 : `該当する文章は見つかりませんでした（探した先: ${(item.searched || []).join('、') || 'なし'}）。`)));
     } else {
-        block.append(el('div', { class: 'srcs' }, sources.map(s => {
+        const rows = sources.map(s => {
             // サーバが送ってくるのは先頭だけ（全文ではない）。
             // 「全文」と書くと、ここに無い＝文書に無い、と読まれてしまう
             const cut = s.excerpt_cut;
@@ -9972,8 +9999,36 @@ function sourcesCard(item) {
                     cut ? el('span', { class: 'small muted' },
                             ` （先頭${s.excerpt_chars || 200}字）`) : null),
                 el('div', { class: 'src__text' }, (s.excerpt || '') + (cut ? '…' : '')));
+            row.dataset.no = String(s.index);
             return row;
-        })));
+        });
+        // 最初はどれが引用されるか分からないので、全部畳んでおく（pending）。
+        // 回答の本文が出そろった時点で revealCitedSources が引用番号を入れて開き直す。
+        const list = el('div', { class: 'srcs' }, rows);
+        list.dataset.fold = 'pending';
+        const more = el('button', { class: 'srcs__more' });
+        const sync = () => {
+            const cited = (list.dataset.cited || '').split(',').filter(Boolean);
+            const all = list.dataset.open === '1';
+            let hidden = 0;
+            rows.forEach(r => {
+                const on = all || cited.indexOf(r.dataset.no) >= 0;
+                r.hidden = !on;
+                if (!on) hidden++;
+            });
+            list.hidden = (hidden === rows.length);   // 1件も出ないなら枠ごと消す
+            more.hidden = !all && !hidden;
+            more.textContent = all ? '引用されなかった分を畳む'
+                : (list.dataset.fold === 'pending' ? `見つかった ${hidden} 件を見る`
+                                                   : `引用されなかった ${hidden} 件も見る`);
+        };
+        more.addEventListener('click', () => {
+            list.dataset.open = list.dataset.open === '1' ? '' : '1';
+            sync();
+        });
+        list.syncFold = sync;
+        sync();
+        block.append(list, el('div', { class: 'toolblock__foot' }, more));
     }
 
     // 一部のナレッジベースだけ落ちた場合。黙って減らすと「無かった」と誤解される
@@ -9994,6 +10049,7 @@ function addItem(item) {
     } else if (item.kind === 'text') {
         body.append(el('div', { html: `<p>${mdToHtml(item.content)}</p>` },
                       catalogLinks(item.tables)));
+        revealCitedSources(item.content);     // この本文が根拠にした出典だけを開く
     } else if (item.kind === 'sql') {
         const block = el('div', { class: 'toolblock' },
             el('div', { class: 'toolblock__head' },
@@ -10574,6 +10630,7 @@ async function sendStreaming(text, imageTokens) {
     const closeText = () => {
         if (node && !buf.trim()) node.remove();   // 中身が無ければ跡を残さない
         else if (node) node.classList.add('is-done');   // 点滅カーソルを消す
+        revealCitedSources(buf);                  // 書き終えてから答え合わせをする
         node = null; buf = '';
     };
 
