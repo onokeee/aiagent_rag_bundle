@@ -141,7 +141,7 @@ TEMPLATES = {
 {% for key, ep, label in [('import', 'imp.index', '取り込み'), ('output', 'imp.output', '出力'), ('sep', '', ''),
                           ('knowledge', 'knowledge.index', 'ナレッジベース'), ('models', 'models.index', 'モデル設定'),
                           ('mail', 'mail.index', 'メール設定'), ('robots', 'catalog.robot_settings', 'マイロボット'),
-                          ('memory', 'catalog.memory_admin', '覚え書き'),
+                          ('memory', 'catalog.memory_admin', 'パーソナライズ'),
                           ('usage', 'usage.index', '利用状況'), ('help', 'help.index', 'ヘルプ')] -%}
 {% if key == 'sep' %}<span class="tabs__sep" aria-hidden="true"></span>
 {% elif key == active %}<button class="tab is-active">{{ label }}</button>
@@ -181,12 +181,12 @@ TEMPLATES = {
       {% if memory_feature %}
       <a class="navlink {{ 'is-active' if nav == 'chat.memory' }}" href="{{ url_for('chat.memory') }}"
          data-desc="AIがあなたについて覚えていること（前提・好み・期間）。会話から自動で書き足され、ここで直せます。本人だけのものです。">
-        {{ icon('user') }} 覚え書き</a>
+        {{ icon('user') }} パーソナライズ</a>
       {% endif %}
       {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
          データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・利用状況 #}
       <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.')) }}" href="{{ url_for('catalog.index') }}"
-         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、覚え書き、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・用語・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
@@ -203,7 +203,7 @@ TEMPLATES = {
       {% if memory_feature %}
       <a class="navlink {{ 'is-active' if nav == 'chat.memory' }}" href="{{ url_for('chat.memory') }}"
          data-desc="AIがあなたについて覚えていること（前提・好み・期間）。会話から自動で書き足され、ここで直せます。本人だけのものです。">
-        {{ icon('user') }} 覚え書き</a>
+        {{ icon('user') }} パーソナライズ</a>
       {% endif %}
     </div>
     {% endif %}
@@ -975,12 +975,12 @@ window.CHAT_INIT = {
                   <b>どの表・どの列を使うかは、カタログに書かれた説明から判断します</b>（表の名前は決め打ちにしていません）。
                   名簿が見つからない・1人に絞れないときは、推測せずに聞き返します。うまく当たらないときは、
                   管理者が社員名簿の表と、ログインIDが入っている列（統一IDなど）に説明を書くと精度が上がります。</td></tr>
-          <tr><td>覚え書き</td>
+          <tr><td>パーソナライズ</td>
               <td>ChatGPT のメモリと同じ発想。回答のあとにAIがもう一度だけ働き、やり取りの中から
                   <b>次回以降の質問でも使える前提・好み・期間</b>（「うちの部署は関西工場」「Excel で欲しい」
-                  「特に言わなければ先月分」）を、あなたの覚え書き（1つの本文）に書き足します。データの中身や1回きりの指示は覚えません。
-                  次の質問からAIに渡り、使ったときは回答の末尾に「（覚え書き「…」を使いました）」と出ます。
-                  メニューの「<b>覚え書き</b>」（マイロボットの下）で本文をそのまま読んで直せます。「覚えない」にすると止まり、
+                  「特に言わなければ先月分」）を、あなたのパーソナライズ（1つの本文）に書き足します。データの中身や1回きりの指示は覚えません。
+                  次の質問からAIに渡り、使ったときは回答の末尾に「（パーソナライズ「…」を使いました）」と出ます。
+                  メニューの「<b>パーソナライズ</b>」（マイロボットの下）で本文をそのまま読んで直せます。「覚えない」にすると止まり、
                   いまの本文もAIに渡しません。会話で「忘れて」と言えば、その回答のあとに消えます（消えていなければ本文から消してください）。
                   他の利用者には見えませんが、<b>管理者は管理者メニューで内容を見られます</b>（利用状況の質問履歴と同じ扱い）。</td></tr>
           <tr><td>メールの決まり</td>
@@ -1183,7 +1183,7 @@ window.CHAT_INIT = {
     <div class="card__title">2. 管理者メニュー — データカタログ（テーブル・結合・用語集・ツール・ビュー・取り込み・出力）</div>
     <div class="card__desc">
       管理者の画面はサイドバーの「<b>管理者メニュー</b>」1つにまとまっていて、上のタブで切り替えます
-      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・覚え書き・利用状況・ヘルプ）。
+      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・利用状況・ヘルプ）。
       ここに書いた内容が<b>そのままAIの理解</b>になります。回答の質はカタログの質で決まります。
       未保存の変更は下部の「まとめて保存 (Ctrl+S)」でまとめて確定できます。
     </div>
@@ -1272,7 +1272,7 @@ window.CHAT_INIT = {
   </div>
 
   <div class="card mt">
-    <div class="card__title">3. 管理者メニュー — ナレッジベース／モデル設定／メール設定／マイロボット／覚え書き／利用状況</div>
+    <div class="card__title">3. 管理者メニュー — ナレッジベース／モデル設定／メール設定／マイロボット／パーソナライズ／利用状況</div>
     <div class="tablewrap">
       <table class="data">
         <thead><tr><th style="width:210px">画面</th><th>説明</th></tr></thead>
@@ -1297,8 +1297,8 @@ window.CHAT_INIT = {
                   利用者 → ロボットと開くと、手順の中身（SQL）・穴・定期実行の設定と次回・メールの自動送信・前回の実行まで見られます
                   （管理者が把握するためのもので、実行や編集は本人だけです）。
                   同じ名前・同じ内容のロボットは、決めごとに関係なく二重には登録できません。</td></tr>
-          <tr><td>覚え書き</td>
-              <td>利用者の覚え書き（AIが会話から覚える前提・好み・期間。1人1つの本文）の決めごと: <b>機能を使うか</b>（外すとメニューから消え、AIにも渡さない）、
+          <tr><td>パーソナライズ</td>
+              <td>利用者のパーソナライズ（AIが会話から覚える前提・好み・期間。1人1つの本文）の決めごと: <b>機能を使うか</b>（外すとメニューから消え、AIにも渡さない）、
                   <b>書き直しに使うモデル</b>（回答のたびに1回呼ぶので、安いモデルにできる）、<b>本文の上限（文字）</b>。
                   その下に<b>全利用者の本文</b>がそのまま並びます（閲覧のみ。直せるのは本人だけ）。</td></tr>
           <tr><td>利用状況</td>
@@ -1316,7 +1316,7 @@ window.CHAT_INIT = {
         <thead><tr><th style="width:210px">項目</th><th>説明</th></tr></thead>
         <tbody>
           <tr><td>権限</td>
-              <td>一般利用者＝マイエージェント・マイロボット・覚え書き。管理者＝全画面（管理者メニューの各タブ。ヘルプもここ）。
+              <td>一般利用者＝マイエージェント・マイロボット・パーソナライズ。管理者＝全画面（管理者メニューの各タブ。ヘルプもここ）。
                   管理者だけに渡るAIツールは、一般利用者のAIには渡りません。</td></tr>
           <tr><td>アカウント管理</td>
               <td>サーバ上のコマンドで行います:
@@ -2750,19 +2750,19 @@ window.CHAT_INIT = {
           <tr><td class="mono small">data/robot_settings.yaml</td>
               <td>マイロボットの決めごと（1人あたりの上限・実行の最低間隔・手順数の上限）。無ければ env の初期値。</td></tr>
           <tr><td class="mono small">data/memory_settings.yaml</td>
-              <td>覚え書きの決めごと（機能のON/OFF・書き直しに使うモデル・本文の上限）。無ければ env の初期値。</td></tr>
+              <td>パーソナライズの決めごと（機能のON/OFF・書き直しに使うモデル・本文の上限）。無ければ env の初期値。</td></tr>
           <tr><td class="mono small">data/output_dir.yaml</td>
               <td>出力先フォルダ（作ったファイルを置くサーバ上の場所）。空なら機能自体を出しません。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/prefs.yaml</td>
               <td>個人設定。読み書きするのは5項目だけ（モデル／検索対象から外したナレッジベース／
-                  検索の効き方／分析対象から外した表／覚え書きを止めているか）。Cookieでなくファイルに置くのは、
+                  検索の効き方／分析対象から外した表／パーソナライズを止めているか）。Cookieでなくファイルに置くのは、
                   ログアウトやブラウザを閉じても残すためです。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/robots.json</td>
               <td>その人のマイロボット（手順・穴・フォルダ出力・定期実行・本人の写し）と、
                   <code>last_ok</code>（同じ内容の前回うまくいった実行の台帳。消して作り直しても間隔が戻らないように）。
                   一時ファイル経由の<b>原子的な置き換え</b>で書きます。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/memory.yaml</td>
-              <td>その人の覚え書き（1つの本文と最終更新）。同じく原子的に置き換えます。
+              <td>その人のパーソナライズ（1つの本文と最終更新）。同じく原子的に置き換えます。
                   読めないファイルには書き足しません（全部消えるのを防ぐため）。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/chats/</td>
               <td>会話の実体（1会話1ファイル）と一覧ファイル。一覧を分けているのは、
@@ -2785,7 +2785,7 @@ window.CHAT_INIT = {
           <tr><td>裏で動くスレッド</td>
               <td>3本あります。<b>定期取り込みのスケジューラ</b>（60秒ごとに1周）、その周回が起こす
                   <b>マイロボットの定期実行</b>（前の分が終わっていなければ起こさない＝1本まで）、
-                  回答のあとに1回だけ動く<b>覚え書きの書き直し</b>（利用者ごと・回答は待たせない）。
+                  回答のあとに1回だけ動く<b>パーソナライズの書き直し</b>（利用者ごと・回答は待たせない）。
                   ロボットの実行は要求の外なので、Flaskの要求の文脈を作り、本人の名前（登録時の写し）で動かします。
                   同じロボットの二重実行は実行中の目印で止め、結果の置き場とマイロボットの保存は錠で直列にします。</td></tr>
           <tr><td>定期取り込みのジョブ</td>
@@ -2826,7 +2826,7 @@ window.CHAT_INIT = {
           <tr><td>取得日時の列名</td><td>取得日時</td><td>変更可</td></tr>
           <tr><td>スケジューラの巡回間隔</td><td>60秒</td><td>変更可</td></tr>
           <tr><td>マイロボット: 1人あたりの上限／実行の最低間隔／手順数</td><td>5件／12時間／20手順</td><td>管理者メニュー（初期値は変更可）</td></tr>
-          <tr><td>覚え書き: 機能／書き直しのモデル／本文の上限</td><td>使う／回答と同じ／2,000字</td><td>管理者メニュー（初期値は変更可）</td></tr>
+          <tr><td>パーソナライズ: 機能／書き直しのモデル／本文の上限</td><td>使う／回答と同じ／2,000字</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>出力先フォルダ</td><td>未設定（ダウンロードのみ）</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>スクレイピング: 最小間隔／タイムアウト</td><td>30分／5分</td><td>登録ごと（初期値は変更可）</td></tr>
           <tr><td>アップロードの可否</td><td>無効</td><td>変更可</td></tr>
@@ -5277,19 +5277,19 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
 # --- memory.html ---
 "memory.html": r"""{% extends "base.html" %}
 {% from "_icons.html" import icon %}
-{% block title %}覚え書き — {{ app_title }}{% endblock %}
+{% block title %}パーソナライズ — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
 <div class="content">
   <details class="card" id="howto">
-    <summary class="card__title" style="cursor:pointer">覚え書きとは</summary>
+    <summary class="card__title" style="cursor:pointer">パーソナライズとは</summary>
     <div class="card__desc" style="margin-top:8px">
       ChatGPT のメモリと同じ発想です。マイエージェントで質問して答えが返るたびに、AIがもう一度だけ働き、
       やり取りの中から<b>次回以降の質問でも使える前提・好み・期間</b>（「うちの部署は関西工場」「Excel で欲しい」
       「特に言わなければ先月分」）をこの本文に書き足します。データの中身や1回きりの指示は覚えません。
       <div class="mt">
-        本文はそのまま次の質問からAIに渡り、使ったときは回答の末尾に「（覚え書き「…」を使いました）」と出ます。
+        本文はそのまま次の質問からAIに渡り、使ったときは回答の末尾に「（パーソナライズ「…」を使いました）」と出ます。
         ここで自由に直せます（1行に1つ、「- 」で始める箇条書きがおすすめ）。会話で「忘れて」と言えば、その回答のあとに消えます。
         「覚えない」にすると新しく覚えるのをやめ、いまの本文もAIに渡しません。他の利用者には見えませんが、管理者は管理者メニューで内容を見られます。
       </div>
@@ -5331,7 +5331,7 @@ window.MEMORY_INIT = {{ memory|tojson }};
 "memory_admin.html": r"""{% extends "base.html" %}
 {% from "_icons.html" import icon %}
 {% from "_admintabs.html" import admintabs %}
-{% block title %}管理者メニュー（覚え書き） — {{ app_title }}{% endblock %}
+{% block title %}管理者メニュー（パーソナライズ） — {{ app_title }}{% endblock %}
 {# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
 
 {% block body %}
@@ -5339,16 +5339,16 @@ window.MEMORY_INIT = {{ memory|tojson }};
   <div class="tabs tabs--bar">{{ admintabs('memory') }}</div>
 
   <div class="card">
-    <div class="card__title">覚え書きの決めごと</div>
+    <div class="card__title">パーソナライズの決めごと</div>
     <div class="card__desc">
-      利用者の覚え書き（AIが会話から覚える、その人についての前提・好み・期間。1人につき1つの本文）の決めごとです。
+      利用者のパーソナライズ（AIが会話から覚える、その人についての前提・好み・期間。1人につき1つの本文）の決めごとです。
       全利用者に同じ値が効き、保存するとすぐ反映されます。
     </div>
     <div class="row mb" style="align-items:flex-end;gap:20px;flex-wrap:wrap">
       <div>
         <label class="field">機能</label>
         <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-          <input type="checkbox" id="msEnabled"> <span class="small">覚え書きを使う（外すと、メニューから消え、AIにも渡しません）</span>
+          <input type="checkbox" id="msEnabled"> <span class="small">パーソナライズを使う（外すと、メニューから消え、AIにも渡しません）</span>
         </label>
       </div>
       <div>
@@ -5378,7 +5378,7 @@ window.MEMORY_INIT = {{ memory|tojson }};
   </div>
 
   <div class="card mt">
-    <div class="card__title">全利用者の覚え書き</div>
+    <div class="card__title">全利用者のパーソナライズ</div>
     <div class="card__desc">利用者ごとの本文をそのまま表示します（閲覧のみ。直せるのは本人だけです）。利用者にも「管理者は見られる」と案内してあります。</div>
     {% if overview %}
     {% for o in overview %}
@@ -5395,7 +5395,7 @@ window.MEMORY_INIT = {{ memory|tojson }};
     </details>
     {% endfor %}
     {% else %}
-    <div class="small muted">まだ誰の覚え書きもありません。</div>
+    <div class="small muted">まだ誰のパーソナライズもありません。</div>
     {% endif %}
   </div>
 </div>
@@ -6589,7 +6589,7 @@ details.acc.is-target {
 .tblpick, .grppick { flex: none; margin: 0; cursor: pointer; }
 .dbpick__table:has(.tblpick:not(:checked)) .dbpick__tname { opacity: .45; }
 /* 一覧はチェックの分だけ左を詰める（インデントが二重にならないように） */
-/* --- 覚え書き（専用の画面。本文は1つのテキスト） ------------------------------------- */
+/* --- パーソナライズ（専用の画面。本文は1つのテキスト） ------------------------ */
 .memedit textarea { width: 100%; min-height: 340px; margin-top: 10px; font-size: 14px; line-height: 1.75;
                     font-family: inherit; resize: vertical; }
 .memedit.is-off textarea { opacity: .55; }
@@ -9366,14 +9366,14 @@ function wireScope() {
     syncTableUi();
 }
 
-/* --- 覚え書き（利用者について、会話から自動で覚える） ------------------------------
+/* --- パーソナライズ（利用者について、会話から自動で覚える） ------------------------
    保存はサーバが回答のあとに別スレッドで行う（end のあと数秒で増える）。ここは見せる・消す・止める。 */
 
 let mem = window.CHAT_INIT.memory || { enabled: false, on: true, text: '', updated_at: '' };
 let memTimers = [];                 // 取り直しの予約。次の質問が来たら前の予約は捨てる（二重に知らせない）
 
-/* 回答のあと、サーバが覚え書きを書き直していれば一言知らせる。書き直しは別スレッドなので、
-   end の数秒あとに何回か見る。中身はメニューの「覚え書き」で見る。 */
+/* 回答のあと、サーバがパーソナライズを書き直していれば一言知らせる。書き直しは別スレッドなので、
+   end の数秒あとに何回か見る。中身はメニューの「パーソナライズ」で見る。 */
 function scheduleMemoryRefresh() {
     if (!mem.enabled || !mem.on) return;
     memTimers.forEach(clearTimeout);
@@ -9384,8 +9384,8 @@ function scheduleMemoryRefresh() {
             if ((r.updated_at || '') === (mem.updated_at || '')) return false;
             const grew = (r.text || '').length > (mem.text || '').length;
             mem = { ...mem, ...r };
-            toast((grew ? '覚え書きを書き足しました' : '覚え書きを書き直しました')
-                  + '（メニューの「覚え書き」で見られます）。', 'ok', 7000);
+            toast((grew ? 'パーソナライズに書き足しました' : 'パーソナライズを書き直しました')
+                  + '（メニューの「パーソナライズ」で見られます）。', 'ok', 7000);
             return true;
         } catch (_) { return true; }         // 取れないときは黙って諦める
     };
@@ -10224,7 +10224,7 @@ async function rewindTo(item, text, wrap) {
         }
         currentChatId = r.chat_id || currentChatId;
         refreshHistory();
-        if (send) scheduleMemoryRefresh();        // 書き直して送ったときは、サーバが覚え書きを抜き出す
+        if (send) scheduleMemoryRefresh();        // 書き直して送ったときは、サーバがパーソナライズを抜き出す
     } catch (e) {
         toast(e.message, 'err', 8000);
     }
@@ -15023,7 +15023,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 })();
 
-// ===== 覚え書きの決めごと（window.MEMORY_SETTINGS_INIT がある画面だけ動く。管理者） =====
+// ===== パーソナライズの決めごと（window.MEMORY_SETTINGS_INIT がある画面だけ動く。管理者） =====
 (() => {
 if (!window.MEMORY_SETTINGS_INIT) return;
 function fill(s) {
@@ -15050,7 +15050,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 })();
 
-// ===== 覚え書きの画面（window.MEMORY_INIT がある画面だけ動く） =====
+// ===== パーソナライズの画面（window.MEMORY_INIT がある画面だけ動く） =====
 (() => {
 if (!window.MEMORY_INIT) return;
 /* 本文は1つのテキスト。保存はボタンで（打っている途中でAIの書き足しが来ても、消さずに知らせる）。 */
@@ -15091,7 +15091,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.disabled = false;
     });
     $('#memClear').addEventListener('click', async () => {
-        if (!confirm('覚え書きを全部消しますか？（元に戻せません）')) return;
+        if (!confirm('パーソナライズの内容を全部消しますか？（元に戻せません）')) return;
         try {
             m = { ...m, ...(await api('/api/memory/clear')) };
             $('#memText').value = ''; dirty = false; show();
@@ -15113,7 +15113,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if ((r.text || '') === (m.text || '')) { m = { ...m, ...r }; return; }
             const grew = (r.text || '').startsWith((m.text || '').slice(0, 40)) && (r.text || '').length > (m.text || '').length;
             m = { ...m, ...r };
-            const what = grew ? 'AIが覚え書きを書き足しました。' : 'AIが覚え書きを書き直しました。';
+            const what = grew ? 'AIがパーソナライズに書き足しました。' : 'AIがパーソナライズを書き直しました。';
             if (!dirty) { $('#memText').value = m.text || ''; show(); toast(what); }
             else toast(what + 'いま打っている内容を保存すると上書きになります（画面を読み直すと新しい本文が見えます）。', 'warn', 9000);
         } catch (_) { /* 取れないときは何もしない */ }

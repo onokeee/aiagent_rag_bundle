@@ -12958,7 +12958,7 @@ def build_system_prompt(scope: list[dict], admin: bool = False,
     渡していないツールを説明に書くと、AIが呼ぼうとして失敗するだけになる。
     model を渡すと、カタログをインラインするかの判定を「そのモデルが読める量」で行う
     （渡さなければ管理者設定/envの上限）。
-    memory は利用者の覚え書きの節（core.memory_prompt）。空なら載せない。
+    memory は利用者のパーソナライズの節（core.memory_prompt）。空なら載せない。
     """
     inline_cap = None
     if model:
@@ -13944,7 +13944,7 @@ _MEMORY_SYSTEM = """あなたは、社内データ分析アプリの利用者に
 
 def extract_memory(existing_text: str, question: str, answer: str,
                    model: str | None = None):
-    """直近のやり取りを踏まえて覚え書きの本文を書き直させる（回答のあとに1回呼ぶ）。
+    """直近のやり取りを踏まえてパーソナライズの本文を書き直させる（回答のあとに1回呼ぶ）。
 
     戻り値は書き直した本文（str）。変えないときは None。
     使うモデルは呼び元（core._schedule_memory）が決める: 管理者の決めごと > 回答に使ったモデル。
@@ -13952,7 +13952,7 @@ def extract_memory(existing_text: str, question: str, answer: str,
     user = (f"いま覚えている本文:\n{(existing_text or '').strip() or '（まだ無い）'}\n\n"
             f"利用者の質問:\n{str(question or '')[:1000]}\n\n"
             f"AIの回答（先頭のみ）:\n{str(answer or '')[:1500]}")
-    data = _ask_json(_MEMORY_SYSTEM, user, "覚え書きの書き直し", model=model or None)
+    data = _ask_json(_MEMORY_SYSTEM, user, "パーソナライズの書き直し", model=model or None)
     text = data.get("text")
     return text if isinstance(text, str) else None
 

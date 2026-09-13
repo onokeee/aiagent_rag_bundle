@@ -94,16 +94,16 @@ ROBOT_MAX_STEPS = int(os.getenv("ROBOT_MAX_STEPS", "20") or 20)                 
 ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
                                      str(DATA_DIR / "robot_settings.yaml"))).expanduser()
 
-# --- 覚え書き（利用者について、会話から自動で覚える） ---------------------------------
+# --- パーソナライズ（利用者について、会話から自動で覚える） ---------------------------
 # 回答のあとにもう1回AIを呼び、「次回以降の質問でも使える前提・好み・期間」を本文（1つのテキスト）に
 # 書き足して data/users/<利用者>/memory.yaml に残す。次の質問からシステムプロンプトに載る。
-# 利用者は「覚え書き」の画面で直す・止めることができる。
-# 管理者メニュー → 覚え書き で変えられる。ここは画面で保存する前の初期値。
+# 利用者は「パーソナライズ」の画面で直す・止めることができる。
+# 管理者メニュー → パーソナライズ で変えられる。ここは画面で保存する前の初期値。
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "2000") or 2000)   # 本文の文字数（1つのテキスト）
 # 書き直しに使うモデル。空なら回答と同じモデル。安いモデルにすると1質問あたりの追加費用を抑えられる
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "").strip() or None
-# 管理者メニュー → 覚え書き で保存した値（上の3つの初期値を上書きする）
+# 管理者メニュー → パーソナライズ で保存した値（上の3つの初期値を上書きする）
 MEMORY_SETTINGS_FILE = Path(os.getenv("MEMORY_SETTINGS_FILE",
                                       str(DATA_DIR / "memory_settings.yaml"))).expanduser()
 

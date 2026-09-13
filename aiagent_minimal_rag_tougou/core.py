@@ -1623,7 +1623,7 @@ _prefs_lock = threading.Lock()
 # rag_settings … 検索の効き方（rag/settings.py の RAG_SPECS）
 # tables_off   … 分析の対象から外したテーブル名（外したものを持つ理由は
 #                 rag_off と同じ。新しく取り込んだ表は既定で対象に入る）
-# memory_off   … 覚え書き（会話から自動で覚える）を止めているか
+# memory_off   … パーソナライズ（会話から自動で覚える）を止めているか
 KEYS = ("model", "rag_off", "rag_settings", "tables_off", "memory_off")
 
 
@@ -1669,7 +1669,7 @@ def set_value(user, key: str, value) -> None:
 
 
 # ==========================================================================
-# ===== 覚え書き（利用者について、会話から自動で覚える）
+# ===== パーソナライズ（利用者について、会話から自動で覚える）
 #
 #   data/users/<ユーザー>/memory.yaml
 #     text:       本文（1つのテキスト。箇条書きの行の集まり）
@@ -1677,7 +1677,7 @@ def set_value(user, key: str, value) -> None:
 #
 # ChatGPT のメモリと同じ発想。回答のあとにもう1回AIを呼び、直近のやり取りを踏まえて
 # 本文を書き直させる（足す・直す・消す）。次の質問からシステムプロンプトの「この利用者について」に載る。
-# 本人は「覚え書き」の画面（サイドバーのマイロボットの下）で本文をそのまま編集できる。
+# 本人は「パーソナライズ」の画面（サイドバーのマイロボットの下）で本文をそのまま編集できる。
 # データの中身や1回きりの指示は覚えない（brain.extract_memory の決まり）。本人だけのもの。
 # ==========================================================================
 _memory_lock = threading.RLock()
@@ -1690,7 +1690,7 @@ def _memory_setting_defaults() -> dict:
 
 
 def memory_settings() -> dict:
-    """覚え書きの決めごと。管理者が画面で保存した値 > env（config）。範囲の外は寄せる。"""
+    """パーソナライズの決めごと。管理者が画面で保存した値 > env（config）。範囲の外は寄せる。"""
     out = _memory_setting_defaults()
     p = config.MEMORY_SETTINGS_FILE
     if p.exists():
@@ -1731,7 +1731,7 @@ def save_memory_settings(values: dict, user: str | None = None) -> dict:
     cur = memory_settings()
     if "enabled" in values:
         if not isinstance(values["enabled"], bool):
-            raise ValueError("「覚え書きを使う」は true / false で指定してください。")
+            raise ValueError("「パーソナライズを使う」は true / false で指定してください。")
         cur["enabled"] = values["enabled"]
     if "model" in values:
         model = str(values.get("model") or "").strip()
@@ -1757,7 +1757,7 @@ def save_memory_settings(values: dict, user: str | None = None) -> dict:
 
 #: 「忘れて」の意図。本文が減る書き直しは、これが質問に無ければ捨てる（AIが黙って落とすのを防ぐ）。
 #: ふつうの質問に出てくる言葉（更新・違う・やめる）は入れない。入れると、関係のない質問のたびに
-#: 守りが外れて、覚え書きが黙って消える。
+#: 守りが外れて、パーソナライズが黙って消える。
 _MEMORY_FORGET_WORDS = ("忘れて", "忘れる", "消して", "削除して", "覚えないで", "覚えなくて",
                         "もう違う", "もういらな", "要らな", "間違い", "間違っ")
 
@@ -1855,7 +1855,7 @@ def memory_apply(user, new_text, question: str = "", base=None) -> dict:
     base … 書き直しを頼んだときの本文。いまの本文がそれと違えば書かない
            （AIに聞いているあいだに本人が直した・全部消したものを巻き戻さないため）。
     本文が空になる／行数が減る書き直しは、質問に「忘れて」などが無ければ捨てる
-    （AIが黙って覚え書きを落とすのを防ぐ）。
+    （AIが黙ってパーソナライズを落とすのを防ぐ）。
     戻り値: {"changed": bool, "reason": str}
     """
     if user is None or not isinstance(new_text, str):
@@ -1865,7 +1865,7 @@ def memory_apply(user, new_text, question: str = "", base=None) -> dict:
             return {"changed": False, "reason": "止めている"}
         data, broken = _memory_raw(user)
         if broken:
-            print(f"[memory] 保存ファイルが読めないので、覚え書きは書き直しません（{getattr(user, 'username', user)}）")
+            print(f"[memory] 保存ファイルが読めないので、パーソナライズは書き直しません（{getattr(user, 'username', user)}）")
             return {"changed": False, "reason": "読めない"}
         new = _memory_clean(new_text)
         old = data["text"]
@@ -1897,12 +1897,12 @@ def memory_prompt(user) -> str:
     if not text:
         return ""
     return (
-        "# この利用者について（会話から自動で覚えた覚え書き。本人が直すこともある）\n"
+        "# この利用者について（パーソナライズ。会話から自動で覚え、本人が直すこともある）\n"
         f"{text}\n"
         "- 質問に書かれていない前提・好み・期間はここから補う。ただし今回の質問の指定が常に優先。\n"
-        "- 覚え書きを使って答えたら、回答の末尾に「（覚え書き「…」を使いました）」と一言添える。\n"
-        "- 覚え書きに無いことは推測で決めない。利用者が「忘れて」「もう違う」と言ったら、それは使わず、"
-        "「次の回答のあとに自動で直ります。直っていなければメニューの覚え書きで直せます」と伝える。\n\n"
+        "- パーソナライズを使って答えたら、回答の末尾に「（パーソナライズ「…」を使いました）」と一言添える。\n"
+        "- パーソナライズに無いことは推測で決めない。利用者が「忘れて」「もう違う」と言ったら、それは使わず、"
+        "「次の回答のあとに自動で直ります。直っていなければメニューのパーソナライズで直せます」と伝える。\n\n"
     )
 
 
@@ -1952,12 +1952,12 @@ def memory_after_turn(user, chat_id: str, question: str, answer: str, model: str
         print(f"[memory] 書き直しに失敗しました（{getattr(user, 'username', user)}）: {e}")
         return {"changed": False, "reason": "失敗"}
     if done.get("changed"):
-        print(f"[memory] {getattr(user, 'username', user)}: 覚え書きを書き直しました")
+        print(f"[memory] {getattr(user, 'username', user)}: パーソナライズを書き直しました")
     return done
 
 
 def _schedule_memory(user, chat: dict) -> None:
-    """回答のあとに、覚え書きの書き直しを別スレッドでAIに頼む（回答は待たせない）。
+    """回答のあとに、パーソナライズの書き直しを別スレッドでAIに頼む（回答は待たせない）。
 
     短すぎる質問（「はい」「続けて」）では呼ばない。ただし「忘れて」「覚えて」は短くても呼ぶ。
     """
@@ -8536,7 +8536,7 @@ def stream():
                                 "message": _friendly_llm_error(e)})
         finally:
             _persist(chat)
-            _schedule_memory(user, chat)         # 覚え書きの抜き出し（別スレッド。end は待たない）
+            _schedule_memory(user, chat)         # パーソナライズの抜き出し（別スレッド。end は待たない）
             if not aborted:
                 yield _sse("end", {"chat_id": chat.get("id"),
                                    "title": chat.get("title", "")})
@@ -10271,7 +10271,7 @@ def robots_delete():
                     "robots": _robot_rows(g.user)})
 
 
-# --- 覚え書き（メニューの「マイロボット」の下。本文は1つのテキスト） ------------------
+# --- パーソナライズ（メニューの「マイロボット」の下。本文は1つのテキスト） -------
 
 @bp_chat.get("/memory", endpoint="memory")
 @login_required
@@ -10306,7 +10306,7 @@ def memory_clear_all():
 @bp_chat.post("/api/memory/toggle")
 @login_required
 def memory_toggle():
-    """覚えるのをやめる／再開する。止めているあいだは、いまある覚え書きもAIに渡さない。"""
+    """覚えるのをやめる／再開する。止めているあいだは、いまあるパーソナライズもAIに渡さない。"""
     on = _body().get("on")
     if not isinstance(on, bool):
         return jsonify({"error": "on は true / false で指定してください。"}), 400
@@ -11306,10 +11306,10 @@ def robot_admin_stop_route():
     return jsonify({"ok": True, "name": robot.get("name")})
 
 
-# --- 覚え書き（管理者メニューのタブ） -----------------------------------------------
+# --- パーソナライズ（管理者メニューのタブ） -----------------------------------------
 
 def _memory_overview() -> list[dict]:
-    """利用者ごとの覚え書き（管理者の画面用）。本文そのもの・止めているか・最終更新。"""
+    """利用者ごとのパーソナライズ（管理者の画面用）。本文そのもの・止めているか・最終更新。"""
     out = []
     try:
         dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
