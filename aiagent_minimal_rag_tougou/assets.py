@@ -1127,17 +1127,17 @@ window.IMP = {
     <summary class="card__title" style="cursor:pointer">マイロボットとは</summary>
     <div class="card__desc" style="margin-top:8px">
       マイエージェントとのやり取りの中でAIが実際に使った道具（SQLの実行・グラフ・Excel作成・メール下書き…）の
-      並びに名前を付けて保存したものです。「実行」を押すと同じ手順を<b>AIなしでそのまま</b>実行するので、
-      数字は毎回同じ・待ち時間なし・LLMの費用なし。結果はマイエージェントの<b>新しい会話</b>に出ます
+      並びに名前を付けて保存したものです。「いま試す」や定期実行で同じ手順を<b>AIなしでそのまま</b>実行するので、
+      AIによるぶれなし・待ち時間なし・LLMの費用なし（期間は「実行日で変わる値」で実行日に合わせられます）。結果はマイエージェントの<b>新しい会話</b>に出ます
       （そのあと「これをグラフにして」と続けられます）。
       <ol style="margin:8px 0 0 18px;padding:0;line-height:1.9">
         <li>マイエージェントで、いつもの流れを一度やる（集計 → グラフ → Excel など）</li>
         <li>自分の発言にマウスを乗せて「<b>ロボットにする</b>」→ 含める質問にチェック → 名前 → 保存</li>
-        <li>この画面で「実行」。穴（実行のたびに入れ替える値）があれば、そのとき聞かれます</li>
+        <li>この画面の「いま試す」で、いまの日付で1回動かして確かめます。定期実行は決めた時刻にサーバが動かします</li>
       </ol>
       <div class="mt small muted">
         自分だけのものです（他の人には見えません）。1人 {{ settings.max_per_user }} 件まで
-        {%- if interval_label %}、同じロボットは前回うまくいった実行から {{ interval_label }}たつまで実行できません{% endif %}
+        {%- if interval_label %}、定期実行の間隔は {{ interval_label }}より短くできません{% endif %}
         （管理者が決めています）。同じ名前・同じ内容のものは二重に登録できません。
         全員で使いたい流れは、管理者が「例文」や「ユーザー定義ツール」として登録してください。
       </div>
@@ -1884,7 +1884,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
         </div>
       </div>
       <div>
-        <label class="field">同じロボットの実行の最低間隔</label>
+        <label class="field">定期実行の最短の間隔</label>
         <div class="row" style="align-items:center;gap:6px">
           <input type="number" id="rsInterval" min="{{ ranges.min_interval_hours[0] }}" max="{{ ranges.min_interval_hours[1] }}" step="0.5" style="width:110px">
           <span class="small muted">時間（0 で制限なし・最大 {{ ranges.min_interval_hours[1] }}）</span>
@@ -1913,7 +1913,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
 
   <div class="card mt">
     <div class="card__title">いまの登録状況（全利用者）</div>
-    <div class="card__desc">利用者ごとのマイロボット。名前を開くと、手順の中身（SQLなど）・穴・定期実行・メール・前回の実行まで見られます。</div>
+    <div class="card__desc">利用者ごとのマイロボット。名前を開くと、手順の中身（SQLなど）・実行日で変わる値・定期実行・メール・前回の実行まで見られます。</div>
     {% if overview %}
     {% for o in overview %}
     <details class="acc">
@@ -1942,14 +1942,14 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
               <dt>手順</dt>
               <dd>{% for sd in r.steps_detail %}<div><span class="badge">手順{{ sd.i }}</span> <b>{{ sd.label }}</b></div><pre class="mono">{{ sd.text }}</pre>{% if sd.explanation %}<div class="muted" style="margin:-4px 0 8px">{{ sd.explanation }}</div>{% endif %}{% endfor %}</dd>
               <dt>元の質問</dt><dd>{{ r.questions|join(' ／ ') or '—' }}</dd>
-              <dt>穴</dt><dd>{% if r.holes %}{% for h in r.holes %}{{ h.label }}（登録時の値: {{ h.sample }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}</dd>
+              <dt>実行日で変わる値</dt><dd>{% if r.dates %}{% for d in r.dates %}{{ d.label }}（登録時 {{ d.sample }} → 今日なら {{ d.now }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}{% if r.holes %}／固定の値: {% for h in r.holes %}{{ h.label }}＝{{ h.sample }}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</dd>
               <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
               <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
               <dt>定期実行</dt><dd>{% if r.schedule.kind != 'manual' %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
               <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}{% if r.notify_to %}／失敗したら {{ r.notify_to|join('、') }} に知らせる{% endif %}</dd>
               <dt>実行履歴</dt>
               <dd>{% if r.history %}<div class="tablewrap" style="max-height:220px"><table class="data"><thead><tr><th style="width:120px">日時</th><th style="width:60px">種類</th><th style="width:56px">結果</th><th>内容</th></tr></thead><tbody>
-                {% for h in r.history|reverse %}<tr><td>{{ h.at[:16]|replace('T', ' ') }}</td><td>{{ '定期' if h.source == 'schedule' else '手動' }}</td><td>{{ '成功' if h.ok else '失敗' }}</td><td>{{ h.message }}</td></tr>{% endfor %}
+                {% for h in r.history|reverse %}<tr><td>{{ h.at[:16]|replace('T', ' ') }}</td><td>{{ '定期' if h.source == 'schedule' else '試す' }}</td><td>{{ '成功' if h.ok else '失敗' }}</td><td>{{ h.message }}</td></tr>{% endfor %}
               </tbody></table></div>{% else %}まだ実行していません{% endif %}</dd>
               <dt>作成・更新・前回の実行</dt><dd>{{ r.created_at|replace('T', ' ') }} ／ {{ r.updated_at|replace('T', ' ') }} ／ {% if r.last_run %}{{ r.last_run|replace('T', ' ') }}（{{ '成功' if r.last_status == 'ok' else ('実行中' if r.last_status == 'running' else '失敗') }}）{{ r.last_message }}{% else %}まだ実行していません{% endif %}</dd>
             </dl>
@@ -6103,7 +6103,8 @@ async function openChat(id) {
    登録は各発言の「ロボットにする」から。一覧と実行はメニューの「マイロボット」画面
    （robots.js。ダイアログの枠は window.ROBOT にある共通部品）。 */
 
-/** 登録。会話から手順の候補を取り出して見せ、名前と穴を決めて保存する。 */
+/** 登録。会話から手順を取り出して見せ、名前・実行日で変わる値・定期実行・届け先を決めて保存する。
+ *  「穴」（実行のたびに聞く値）は無い。日付らしい値は実行日から自動で決める（案A）。 */
 async function registerRobot(upto) {
     if (!currentChatId) { toast('この会話はまだ保存されていません。', 'warn'); return; }
     if (busy) { toast('回答を待っているあいだは登録できません。', 'warn'); return; }
@@ -6117,16 +6118,20 @@ async function registerRobot(upto) {
         toast('ここまでのやり取りには、保存できる手順（SQLの実行・グラフ・ファイル作成など）がありません。', 'warn', 8000);
         return;
     }
-    const turnOf = {};                               // 手順の番号 → 何回目の質問か
-    r.turns.forEach(t => t.steps.forEach(s => { turnOf[s.i] = t.turn; }));
+    const sec = (title, ...kids) => el('div', { style: 'margin-top:14px' },
+        el('div', { style: 'font-weight:600;font-size:13px;margin-bottom:4px' }, title), ...kids);
 
+    // 1. 名前
     const name = el('input', { type: 'text', style: 'width:100%',
                                value: (r.title || '').slice(0, 40) || 'マイロボット' });
+
+    // 2. 手順（畳んで確認。チェックを外した質問は入れない）
     const turnChecks = {};
+    let nSteps = 0;
     const turnList = el('div', {}, ...r.turns.map(t => {
         const cb = el('input', { type: 'checkbox', checked: 'checked' });
         turnChecks[t.turn] = cb;
-        cb.addEventListener('change', syncHoles);
+        nSteps += t.steps.length;
         return el('div', { class: 'robotturn' },
             el('label', { style: 'display:flex;gap:8px;align-items:flex-start;cursor:pointer' },
                 cb, el('div', { class: 'grow' },
@@ -6137,72 +6142,173 @@ async function registerRobot(upto) {
                             el('span', {}, s.label)),
                         el('div', { class: 'mono muted robotstep__sum' }, s.summary))))));
     }));
+    const stepsBox = el('details', { class: 'acc', ...(r.turns.length > 1 ? {} : {}) },
+        el('summary', { class: 'small', style: 'cursor:pointer' },
+           `${r.turns.length} つの質問・${nSteps} 手順（開いて確認。チェックを外した質問は入れません）`),
+        el('div', { class: 'acc__body' }, turnList));
 
-    const holeRows = r.candidates.map(c => {
-        const cb = el('input', { type: 'checkbox' });
-        const label = el('input', { type: 'text', placeholder: 'ラベル（例: 対象月）',
-                                    disabled: 'disabled', style: 'width:160px' });
-        cb.addEventListener('change', () => { label.disabled = !cb.checked; if (cb.checked) label.focus(); });
+    // 3. 実行日で変わる値（日付らしい値ごとに1行。同じ値はまとめる）
+    const dateRows = new Map();                  // 値 → {g, sel, prev, place}
+    const dateBody = el('tbody');
+    const dateNote = el('div', { class: 'small muted', style: 'margin-top:4px' });
+    function addDateRow(g) {
+        if (dateRows.has(g.value)) {
+            const row = dateRows.get(g.value);
+            (g.places || []).forEach(p => { if (row.g.places.indexOf(p) < 0) row.g.places.push(p); });
+            row.place.textContent = row.g.places.join('、');
+            return;
+        }
+        const sel = el('select', { style: 'max-width:200px' }, ...g.options.map(o =>
+            el('option', { value: o.mode, ...(o.mode === g.suggested ? { selected: 'selected' } : {}) }, o.label)));
+        const prev = el('span', { class: 'mono small' });
+        const syncPrev = () => {
+            const o = g.options.find(x => x.mode === sel.value) || g.options[0];
+            prev.textContent = sel.value === 'fixed' ? '（変わりません）' : `今日なら ${o.preview}`;
+        };
+        sel.addEventListener('change', syncPrev);
+        syncPrev();
+        const place = el('td', { class: 'small muted' }, (g.places || []).join('、'));
         const tr = el('tr', {},
-            el('td', {}, cb),
-            el('td', { class: 'muted small' }, `手順${c.step + 1}`),
-            el('td', { class: 'mono small', style: 'max-width:460px;white-space:pre-wrap;word-break:break-all' },
-               c.value.length > 160 ? c.value.slice(0, 160) + '…' : c.value),
-            el('td', { class: 'small muted' }, c.kind === 'number' ? '数値' : '文字'),
-            el('td', {}, label));
-        return { c, cb, label, tr };
-    });
-    function syncHoles() {
-        holeRows.forEach(h => {
-            const on = turnChecks[turnOf[h.c.step]]?.checked !== false;
-            h.tr.classList.toggle('hidden', !on);
-            if (!on) { h.cb.checked = false; h.label.disabled = true; }
-        });
+            el('td', { class: 'mono small', style: 'white-space:nowrap' }, g.value),
+            place, el('td', {}, sel), el('td', {}, prev));
+        dateBody.append(tr);
+        dateRows.set(g.value, { g, sel, prev, place, tr });
+        syncDateNote();
     }
-    const holeBox = holeRows.length
-        ? el('div', { class: 'tablewrap', style: 'max-height:260px' },
+    function syncDateNote() {
+        const n = [...dateRows.values()].filter(x => x.sel.value !== 'fixed').length;
+        dateNote.textContent = n
+            ? `${n} 件を実行日に合わせます。実行のたびに「先月＝2026-08 として動きました」のように会話の先頭に残ります。`
+            : '全部「固定のまま」です。毎回同じ期間の結果になります（定期実行なら、たいてい「先月」などにします）。';
+    }
+    dateBody.addEventListener('change', syncDateNote);
+    (r.dates || []).forEach(addDateRow);
+    const datesSec = sec('実行日で変わる値',
+        el('div', { class: 'small muted', style: 'margin-bottom:6px' },
+           '手順の中の日付らしい値です。「先月」などにすると、実行のたびに実行日から計算して差し込みます（AIは呼びません）。'),
+        el('div', { class: 'tablewrap', style: 'max-height:260px' },
             el('table', { class: 'data' },
-                el('thead', {}, el('tr', {}, el('th', { style: 'width:36px' }, '穴'), el('th', { style: 'width:70px' }, '手順'),
-                                       el('th', {}, '値'), el('th', { style: 'width:50px' }, '種類'), el('th', {}, 'ラベル'))),
-                el('tbody', {}, ...holeRows.map(h => h.tr))))
-        : el('div', { class: 'small muted' }, '穴にできる値はありません。');
+                el('thead', {}, el('tr', {}, el('th', { style: 'width:150px' }, '値'), el('th', {}, 'どこに'),
+                                       el('th', { style: 'width:210px' }, '扱い'), el('th', { style: 'width:170px' }, '例'))),
+                dateBody)),
+        dateNote);
+    const syncDatesSec = () => datesSec.classList.toggle('hidden', !dateRows.size);
+    syncDatesSec();
+    syncDateNote();
 
-    // フォルダ出力の決めごと（ファイルを作る手順があるときだけ）。共通部品で作る
-    const folder = r.has_file_steps ? window.ROBOT.folderOptions(r) : null;
-    // 定期実行（時刻になったらサーバが動かす）と、メールの自動送信（下書きを作る手順があるときだけ）
-    const sched = window.ROBOT.scheduleOptions({ schedule: {}, holes: [] }, window.CHAT_INIT.robotSchedVocab, null, false,
+    // 4. 定期実行。「先月」を使うなら毎月1日、「前日」なら毎日を初期値に
+    const modes = [...dateRows.values()].map(x => x.sel.value);
+    let sugSched = modes.some(m => m.startsWith('last_month')) ? { kind: 'monthly_day', day: 1, time: '08:00' }
+        : modes.some(m => m === 'yesterday' || m === 'today') ? { kind: 'daily', time: '08:00' }
+        : modes.some(m => m.startsWith('last_week')) ? { kind: 'weekly', weekday: 0, time: '08:00' }
+        : {};
+    {   // 管理者の最低間隔より短い初期値は付けない（保存で断られるだけになる）
+        const floorMin = Number(window.CHAT_INIT.robotMinIntervalHours || 0) * 60;
+        const gap = sugSched.kind ? window.ROBOT.scheduleGap(sugSched.kind, 1) : 0;
+        if (gap > 0 && floorMin > 0 && gap < floorMin) sugSched = {};
+    }
+    const notifyBox = el('div', { class: 'hidden', style: 'margin-top:8px' });
+    let syncDeliver = () => {};
+    const sched = window.ROBOT.scheduleOptions({ schedule: sugSched, holes: [] }, window.CHAT_INIT.robotSchedVocab,
+        () => { notifyBox.classList.toggle('hidden', sched.value().kind === 'manual'); syncDeliver(); }, false,
         { minIntervalHours: window.CHAT_INIT.robotMinIntervalHours, schedulerOn: window.CHAT_INIT.schedulerOn });
-    const mailCb = el('input', { type: 'checkbox' });
-    const body = el('div', {},
-        el('label', { class: 'field' }, '名前'), name,
-        el('div', { class: 'small muted', style: 'margin:10px 0 4px' },
-           '含める質問（チェックしたやり取りでAIが使った道具が、この順に手順になります）'),
-        turnList,
-        el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
-           '穴にする値（任意）: チェックした値は、実行のたびに入力を求めます。'),
-        holeBox,
-        folder ? el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
+    notifyBox.classList.toggle('hidden', sched.value().kind === 'manual');
+
+    // 5. 届け先
+    const folder = r.has_file_steps ? window.ROBOT.folderOptions(r) : null;
+    const mailEdits = {};                        // 手順の番号 → {subject, body}
+    const mailCb = el('input', { type: 'checkbox', checked: 'checked' });
+    const mailTable = el('input', { type: 'checkbox', checked: 'checked' });
+    const numbersIn = (text) => {
+        let t = String(text || '');
+        // 長い値から除く（'2026-08' を先に除くと '2026-08-31' の '31' が数字として残る）
+        [...dateRows.keys()].sort((a, b) => b.length - a.length).forEach(value => { t = t.split(value).join(' '); });
+        return [...new Set((t.match(/[0-9][0-9,]*(?:\.[0-9]+)?/g) || []).map(x => x.replace(/,/g, '')))];
+    };
+    let detectTimer = null;
+    const mailBoxes = (r.mail_steps || []).map(ms => {
+        const subject = el('input', { type: 'text', value: ms.subject || '', style: 'width:100%' });
+        const body = el('textarea', { rows: 6, style: 'width:100%;font-family:inherit;font-size:13px' });
+        body.value = ms.body || '';
+        const numNote = el('div', { class: 'small', style: 'margin-top:4px;color:var(--warn)' });
+        const syncNums = () => {
+            const nums = numbersIn(subject.value + '\n' + body.value);
+            if (!nums.length) { numNote.textContent = ''; numNote.classList.add('hidden'); return; }
+            numNote.classList.remove('hidden');
+            const marked = nums.map(n => (r.result_numbers || []).indexOf(n) >= 0 ? `${n}（手順の結果の値）` : n);
+            numNote.textContent = `本文に数字があります: ${marked.join('、')}。本文は登録時の文章のまま送られるので、`
+                + '数字を書いている場合は毎回同じ文になります。数字は本文に書かず、下の「結果の表を付ける」に任せてください。';
+        };
+        const detect = () => {
+            clearTimeout(detectTimer);
+            detectTimer = setTimeout(async () => {
+                try {
+                    const text = subject.value + '\n' + body.value;
+                    const d = await api('/api/robots/detect', { text, base: r.base || '' });
+                    const place = `手順${ms.i + 1} メール`;
+                    (d.dates || []).forEach(g => addDateRow({ ...g, places: [place] }));
+                    // メールにしか無かった値が本文から消えたら、行も消す（数と保存の内容をいまの本文に合わせる）
+                    [...dateRows.entries()].forEach(([value, row]) => {
+                        const mailOnly = row.g.places.every(p => p === place);
+                        if (mailOnly && text.indexOf(value) < 0) { row.tr.remove(); dateRows.delete(value); }
+                    });
+                    syncDatesSec(); syncDateNote(); syncNums();
+                } catch (_) { /* 取り直せなくても保存時にサーバが見る */ }
+            }, 500);
+        };
+        const onEdit = () => { mailEdits[ms.i] = { subject: subject.value, body: body.value }; syncNums(); detect(); };
+        subject.addEventListener('input', onEdit);
+        body.addEventListener('input', onEdit);
+        syncNums();
+        return el('div', { class: 'robotturn', style: 'margin-top:6px' },
+            el('div', { class: 'small muted' }, `手順${ms.i + 1} のメール（宛先: ${(ms.to || []).join(', ') || '—'}）。件名と本文はここで直せます。`),
+            el('label', { class: 'field', style: 'margin-top:6px' }, '件名'), subject,
+            el('label', { class: 'field', style: 'margin-top:6px' }, '本文'), body,
+            numNote);
+    });
+    const notify = el('input', { type: 'text', style: 'width:100%;max-width:420px',
+                                 placeholder: '例: yamada@example.co.jp（カンマ区切りで複数可）' });
+    notifyBox.append(el('label', { class: 'field' }, '定期実行が失敗したときに知らせるメール（任意）'), notify,
+        el('div', { class: 'small muted', style: 'margin-top:3px' },
+           '定期実行は無人で動くので、入れておくと失敗に気づけます。管理者が「メール設定」で許可したアドレスだけ指定できます。'));
+    const deliver = sec('届け先',
+        folder ? el('div', { class: 'small muted' },
                     'フォルダ出力（実行のたびに、出力先フォルダの自分の名前のフォルダへ置くか）'
                     + (window.CHAT_INIT.folderOut ? '' : '　※いまは出力先フォルダが未設定です。管理者が設定すると効きます')) : null,
         folder ? folder.node : null,
-        el('div', { class: 'small muted', style: 'margin:12px 0 4px' },
-           '定期実行（任意）: 決めた時刻に自動で動かす。「手動のみ」なら、マイロボットの画面の「実行」を押したときだけ動きます'),
-        el('div', { class: 'robotturn' }, sched.node),
         r.has_mail_steps ? el('div', { class: 'robotturn', style: 'margin-top:8px' },
             el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, mailCb,
                el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')),
-            el('div', { class: 'small muted', style: 'margin-top:4px' },
-               '宛先の許可・件数の上限・テスト送信モードは「メール設定」のとおりです。チェックしなければ、下書きが会話に出るだけで送りません。')) : null);
+            el('div', { class: 'small muted', style: 'margin:2px 0 0 22px' },
+               '宛先の許可・件数の上限・テスト送信モードは「メール設定」のとおりです。外すと、下書きが会話に出るだけで送りません。'),
+            el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px' }, mailTable,
+               el('span', {}, '結果の表を本文の末尾に付ける（直前の手順の表の先頭20行。それより多いぶんは添付を見てもらう）')),
+            ...mailBoxes) : null,
+        notifyBox);
+
+    // 届け先に出すものが何も無ければ（ファイルもメールも無く、手動のみ）節ごと出さない
+    syncDeliver = () => deliver.classList.toggle('hidden', !folder && !r.has_mail_steps && sched.value().kind === 'manual');
+    syncDeliver();
+    const body = el('div', {},
+        el('label', { class: 'field' }, '名前'), name,
+        sec('手順', stepsBox),
+        datesSec,
+        sec('定期実行', el('div', { class: 'small muted', style: 'margin-bottom:4px' },
+            '決めた時刻にサーバが自動で動かします。「手動のみ」なら、マイロボットの画面の「いま試す」を押したときだけ動きます。'),
+            el('div', { class: 'robotturn' }, sched.node)),
+        deliver);
     const save = el('button', { class: 'btn btn--primary', onclick: async () => {
         const turns = Object.entries(turnChecks).filter(([, cb]) => cb.checked).map(([t]) => Number(t));
-        const holes = holeRows.filter(h => h.cb.checked).map(h => ({ id: h.c.id, label: h.label.value.trim() }));
+        const dates = [...dateRows.values()].map(x => ({ value: x.g.value, mode: x.sel.value }));
         save.disabled = true;
         try {
-            const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, holes,
+            const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, dates,
+                                                       mail_edits: mailEdits, mail_table: mailTable.checked,
                                                        schedule: sched.value(), mail_auto: mailCb.checked,
+                                                       notify_to: sched.value().kind === 'manual' ? '' : notify.value,
                                                        ...(folder ? folder.value() : {}) });
             toast(`マイロボット「${res.robot.name}」を保存しました（${res.robot.n_steps}手順）。`
-                + 'メニューの「マイロボット」から実行できます。', 'ok', 9000);
+                + 'メニューの「マイロボット」で確かめられます。', 'ok', 9000);
             close();
         } catch (e) { toast(e.message, 'err', 9000); save.disabled = false; }
     } }, '保存する');
@@ -11621,8 +11727,8 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
         (r.holes || []).forEach(h => {
             const inp = el('input', { type: 'text', value: (sch.values || {})[h.key] ?? h.sample ?? '', style: 'max-width:260px' });
             holeInputs[h.key] = inp;
-            rows.push(el('span', { class: 'small' }, `穴「${h.label}」`), el('div', {}, inp,
-                el('span', { class: 'small muted', style: 'margin-left:6px' }, '定期実行のたびに使う値')));
+            rows.push(el('span', { class: 'small' }, `固定の値「${h.label}」`), el('div', {}, inp,
+                el('span', { class: 'small muted', style: 'margin-left:6px' }, '登録時の値。実行日で変える場合は登録し直してください')));
         });
     }
     const grid = el('div', { class: 'schedgrid mt' }, ...rows);
@@ -11696,7 +11802,7 @@ function folderLabel(r) {
         + (r.folder_overwrite ? '置き換える' : '番号を付けて残す');
 }
 
-window.ROBOT = { modal, askHoles, folderOptions, folderLabel, scheduleOptions, scheduleLabel };
+window.ROBOT = { modal, askHoles, folderOptions, folderLabel, scheduleOptions, scheduleLabel, scheduleGap };
 })();
 
 // ===== マイロボットの画面（window.ROBOTS_INIT がある画面だけ動く） =====
@@ -11726,18 +11832,27 @@ function render() {
 function cardMeta(r) {
     const wait = !!(r.next_run && new Date(r.next_run) > new Date());
     return `${r.n_steps}手順`
-        + ((r.holes || []).length ? `・穴 ${r.holes.map(h => h.label).join('、')}` : '')
+        + ((r.dates || []).length ? `・${[...new Set(r.dates.map(d => d.label))].join('、')}` : '')
+        + ((r.holes || []).length ? `・固定の値 ${r.holes.map(h => h.label).join('、')}` : '')
         + (r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')}` : '・まだ実行していません')
-        + (wait ? `・次に実行できるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
+        + (wait ? `・次に試せるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
         + (((r.schedule || {}).kind || 'manual') !== 'manual' ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
         + (r.mail_auto ? '・メール自動送信' : '')
         + (r.from_title ? `・元の会話「${r.from_title}」` : '');
 }
 
+let waitTimer = null;
 function card(r) {
-    // 決めごとの間隔で、まだ実行できない（サーバも同じ判断で断るが、押してから知るより先に見せる）
+    // 連打止めで、まだ試せない（サーバも同じ判断で断るが、押してから知るより先に見せる）
     const wait = !!(r.next_run && new Date(r.next_run) > new Date());
     const nextAt = wait ? r.next_run.slice(5, 16).replace('T', ' ') : '';
+    if (wait) {
+        // 数分で明けるので、明けたら一覧を取り直してボタンを戻す（読み直さなくてよいように）
+        clearTimeout(waitTimer);
+        waitTimer = setTimeout(async () => {
+            try { const res = await api('/api/robots', undefined, 'GET'); robots = res.robots || robots; render(); } catch (_) { /* 次に開いたときに直る */ }
+        }, Math.min(Math.max(new Date(r.next_run) - Date.now() + 500, 1000), 10 * 60 * 1000));
+    }
     const meta = cardMeta(r);
     return el('div', { class: 'card robotcard' },
         el('div', { class: 'row', style: 'align-items:center;gap:10px' },
@@ -11747,9 +11862,9 @@ function card(r) {
                 el('div', { class: 'small muted', 'data-meta': r.id }, meta)),
             el('button', { class: 'btn btn--primary', onclick: () => run(r),
                            ...(wait ? { disabled: 'disabled' } : {}),
-                           title: wait ? `次に実行できるのは ${nextAt} 以降です（同じロボットの実行の間隔は管理者が決めています）`
-                                       : 'この手順をAIなしでそのまま実行し、結果をマイエージェントの新しい会話に出します' },
-               '実行'),
+                           title: wait ? `続けて押しています。次に試せるのは ${nextAt} 以降です`
+                                       : 'いまの日付で1回動かして確かめます（AIなし。結果はマイエージェントの新しい会話に出ます。定期実行の予定は動きません）' },
+               'いま試す'),
             el('button', { class: 'btn btn--sm', title: '名前を変える', onclick: () => rename(r) }, '名前'),
             el('button', { class: 'btn btn--sm btn--danger', title: '削除', onclick: () => remove(r) }, '削除')),
         el('div', { class: 'small mt' }, el('span', { class: 'muted' }, '手順: '), r.tools.join(' → ')),
@@ -11824,9 +11939,22 @@ function mailRow(r) {
             toast(cb.checked ? '実行のたびにメールを送ります（宛先の許可はメール設定のとおり）。' : 'メールは下書きのまま出します（送りません）。');
         } catch (e) { cb.checked = !cb.checked; toast(e.message, 'err', 8000); }
     });
+    const tb = el('input', { type: 'checkbox', ...(r.mail_table ? { checked: 'checked' } : {}) });
+    tb.addEventListener('change', async () => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, mail_table: tb.checked });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) Object.assign(r, fresh);
+            toast(tb.checked ? '結果の表を本文の末尾に付けます（先頭20行）。' : '本文は登録時の文章だけを送ります。');
+        } catch (e) { tb.checked = !tb.checked; toast(e.message, 'err', 8000); }
+    });
     return el('div', { class: 'small', style: 'margin-top:8px' },
         el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, cb,
-           el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')));
+           el('span', {}, '実行のたびに、作ったメールの下書きをそのまま送る（確認なし）')),
+        el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px' }, tb,
+           el('span', {}, '結果の表を本文の末尾に付ける（直前の手順の表の先頭20行）')),
+        el('div', { class: 'muted', style: 'margin:2px 0 0 22px' },
+           '本文は登録時の文章のまま送られます。数字を本文に書いている場合は毎回同じ文になるので、数字は表に任せてください。'));
 }
 
 /** 実行履歴。いつ・手動か定期か・成否・一言。不具合はまずここを見る。 */
@@ -11844,7 +11972,7 @@ function historyRow(r) {
                                    el('th', {}, '内容'))),
                 el('tbody', {}, ...rows.map(h => el('tr', {},
                     el('td', { class: 'small' }, (h.at || '').slice(0, 16).replace('T', ' ')),
-                    el('td', { class: 'small' }, h.source === 'schedule' ? '定期' : '手動'),
+                    el('td', { class: 'small' }, h.source === 'schedule' ? '定期' : '試す'),
                     el('td', { class: 'small' }, h.ok ? '成功' : el('b', { style: 'color:var(--err)' }, '失敗')),
                     el('td', { class: 'small', style: 'white-space:pre-wrap' }, h.message || ''))))))
         : el('div', { class: 'small muted' }, 'まだ実行していません。');
@@ -11866,18 +11994,27 @@ function detailRow(r) {
         sd.explanation ? el('div', { class: 'small muted', style: 'margin:-4px 0 8px' }, sd.explanation) : null));
     const dl = el('dl', { class: 'robotdetail small' },
         el('dt', {}, '手順'), el('dd', {}, ...steps),
-        el('dt', {}, '穴（実行のたびに入れ替える値）'),
-        el('dd', {}, r.holes.length ? r.holes.map(h => `${h.label}（${h.kind === 'number' ? '数値' : '文字'}・登録時の値: ${h.sample}）`).join('、') : 'なし'),
+        el('dt', {}, '実行日で変わる値'),
+        el('dd', {}, (r.dates || []).length
+            ? r.dates.map(d => `${d.label}（登録時 ${d.sample} → 今日なら ${d.now}）`).join('、')
+            : 'なし（毎回同じ期間の結果になります）'),
+        ...(r.holes.length ? [el('dt', {}, '固定の値（昔の「穴」）'),
+                              el('dd', {}, r.holes.map(h => `${h.label}＝${h.sample}`).join('、') + '。実行日で変える場合は登録し直してください')] : []),
         el('dt', {}, '使う表'), el('dd', {}, (r.tables || []).join('、') || 'なし'),
         el('dt', {}, 'フォルダ出力'), el('dd', {}, r.has_file_steps ? window.ROBOT.folderLabel(r).replace('フォルダ: ', '') : 'ファイルを作る手順はありません'),
         el('dt', {}, '定期実行'), el('dd', {}, window.ROBOT.scheduleLabel(r).replace('定期実行: ', '')
             + ((sch.kind || 'manual') !== 'manual' && sch.start_at ? `（開始 ${sch.start_at.replace('T', ' ')}）` : '')),
-        el('dt', {}, 'メール'), el('dd', {}, r.has_mail_steps ? (r.mail_auto ? '実行のたびに自動で送る' : '下書きを出すだけ（送らない）') : 'メールの手順はありません'),
+        el('dt', {}, 'メール'), el('dd', {}, r.has_mail_steps
+            ? el('div', {}, (r.mail_auto ? '実行のたびに自動で送る' : '下書きを出すだけ（送らない）') + (r.mail_table ? '・結果の表を本文に付ける' : ''),
+                ...(r.mail_steps || []).map(ms => el('div', { style: 'margin-top:4px' },
+                    el('div', {}, el('b', {}, '件名: '), ms.subject || '（無題）'),
+                    el('pre', { class: 'mono', style: 'white-space:pre-wrap' }, ms.body || ''))))
+            : 'メールの手順はありません'),
         el('dt', {}, '元の会話'), el('dd', {}, r.from_title || '—'),
         el('dt', {}, '作成・更新'), el('dd', {}, `${(r.created_at || '').replace('T', ' ')} ／ ${(r.updated_at || '').replace('T', ' ')}`),
         el('dt', {}, '前回の実行'), el('dd', {}, r.last_run ? `${r.last_run.replace('T', ' ')}（${r.last_status === 'ok' ? '成功' : '失敗'}）${r.last_message || ''}` : 'まだ実行していません'));
     return el('details', { class: 'acc', style: 'margin-top:8px' },
-        el('summary', { class: 'small', style: 'cursor:pointer' }, el('span', { class: 'muted' }, '詳細（手順の中身・穴・表・決めごと）')),
+        el('summary', { class: 'small', style: 'cursor:pointer' }, el('span', { class: 'muted' }, '詳細（手順の中身・変わる値・表・決めごと）')),
         el('div', { class: 'acc__body' }, dl));
 }
 
@@ -11899,8 +12036,7 @@ function folderRow(r) {
 
 async function run(r) {
     if (running) return;
-    const values = r.holes.length ? await window.ROBOT.askHoles(r) : {};
-    if (values === null) return;
+    const values = {};                       // 昔の「穴」は登録時の値で動く（聞かない）
     running = true;
     // 待ち（次に実行できる時刻まで）で止めてあるボタンは、失敗のあとも止めたままにする
     const buttons = [...document.querySelectorAll('#robotCards button')].filter(b => !b.disabled);
@@ -11908,7 +12044,7 @@ async function run(r) {
     // 実行中の表示は閉じられない（閉じられると、走っている最中にもう一度押せてしまう）
     const close = window.ROBOT.modal(`マイロボット「${r.name}」`,
         el('div', { class: 'row', style: 'align-items:center;gap:8px;padding:8px 0' },
-            el('span', { class: 'spinner' }), `${r.n_steps}手順を実行しています…`),
+            el('span', { class: 'spinner' }), `${r.n_steps}手順をいまの日付で動かしています…`),
         [], { closable: false });
     try {
         await api('/api/robots/run', { id: r.id, values });
