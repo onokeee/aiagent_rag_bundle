@@ -115,6 +115,21 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL", "").strip() or None
 MEMORY_SETTINGS_FILE = Path(os.getenv("MEMORY_SETTINGS_FILE",
                                       str(DATA_DIR / "memory_settings.yaml"))).expanduser()
 
+# --- 画面の決めごと（会話の中の枠を畳むか） ------------------------------------------
+# ちょっとした質問でも、SQLの枠・社内文書の検索・登録の提案カードが答えの上に積まれる。
+# 畳んで1行にしておき、押した人だけに開く。どれを畳むかは管理者が決める（全員共通）。
+# 管理者メニュー → 画面 で変えられる。ここは画面で保存する前の初期値。
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+CHAT_FOLD_SQL = _flag("CHAT_FOLD_SQL", "1")              # SQLの枠（SQL本文・解説・正誤）
+CHAT_FOLD_SOURCES = _flag("CHAT_FOLD_SOURCES", "1")      # 社内文書の検索（出典の一覧）
+CHAT_FOLD_PROPOSALS = _flag("CHAT_FOLD_PROPOSALS", "1")  # 用語集・例文への登録の提案カード
+# 管理者メニュー → 画面 で保存した値（上の3つの初期値を上書きする）
+CHAT_DISPLAY_FILE = Path(os.getenv("CHAT_DISPLAY_FILE",
+                                   str(DATA_DIR / "chat_display.yaml"))).expanduser()
+
 # --- Webスクレイピングで取り込む ---------------------------------------------
 # scrapers/ に置いた Python ファイル（fetch(out_dir) を定義したもの）を実行し、
 # 出来た Excel/CSV を表に入れる。取得したファイルは表に入れたら消す（サーバに残さない）。

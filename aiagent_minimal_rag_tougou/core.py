@@ -1755,6 +1755,77 @@ def save_memory_settings(values: dict, user: str | None = None) -> dict:
     return memory_settings()
 
 
+# --- 画面の決めごと（会話の中の枠を畳むか。管理者メニューのタブ） ------------------------
+# 作りはパーソナライズの決めごとと同じ: 管理者が画面で保存した値 > env（config）。
+# 中身は3つの on/off だけなので、範囲の表は無い。
+
+#: 設定の名前と、画面に出す言い方。ここに無いキーは受け取らない。
+CHAT_DISPLAY_KEYS = {"fold_sql": "SQLの枠", "fold_sources": "社内文書の検索",
+                     "fold_proposals": "登録の提案カード"}
+
+
+def _chat_display_defaults() -> dict:
+    return {"fold_sql": bool(config.CHAT_FOLD_SQL),
+            "fold_sources": bool(config.CHAT_FOLD_SOURCES),
+            "fold_proposals": bool(config.CHAT_FOLD_PROPOSALS)}
+
+
+def _chat_display_file() -> dict:
+    p = config.CHAT_DISPLAY_FILE
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        print(f"[display] 画面の決めごとを読めませんでした: {p} ({e})")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def chat_display() -> dict:
+    """会話の中の枠を畳むか。管理者が保存した値 > env。知らないキー・真偽でない値は既定に寄せる。"""
+    out = _chat_display_defaults()
+    data = _chat_display_file()
+    for k in CHAT_DISPLAY_KEYS:
+        if isinstance(data.get(k), bool):
+            out[k] = data[k]
+    return out
+
+
+def chat_display_note() -> dict:
+    data = _chat_display_file()
+    return ({"updated_by": str(data.get("updated_by") or ""),
+             "updated_at": str(data.get("updated_at") or "")} if data else {})
+
+
+#: 保存の「読んで・足して・書く」を1人ずつにする。管理者が2人同時に保存すると、
+#: 同じ一時ファイルを取り合って片方が消えたり、置き換えに失敗して 400 が返ったりしていた。
+_chat_display_lock = threading.Lock()
+
+
+def save_chat_display(values: dict, user: str | None = None) -> dict:
+    """管理者が決めた値を保存する。真偽以外は ValueError（保存しない）。
+
+    書き込みは一時ファイルからの置き換え。途中で落ちても、読めない設定ファイルが残らない。
+    一時ファイル名はプロセスとスレッドごとに変える（ほかの設定ファイルの書き方と同じ）。
+    """
+    for k, label in CHAT_DISPLAY_KEYS.items():
+        if k in values and not isinstance(values[k], bool):
+            raise ValueError(f"「{label}を畳む」は true / false で指定してください。")
+    with _chat_display_lock:
+        cur = chat_display()
+        for k in CHAT_DISPLAY_KEYS:
+            if k in values:
+                cur[k] = values[k]
+        p = config.CHAT_DISPLAY_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
+                                      allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.replace(tmp, p)
+        return chat_display()
+
+
 #: 「忘れて」の意図。本文が減る書き直しは、これが質問に無ければ捨てる（AIが黙って落とすのを防ぐ）。
 #: ふつうの質問に出てくる言葉（更新・違う・やめる）は入れない。入れると、関係のない質問のたびに
 #: 守りが外れて、パーソナライズが黙って消える。
@@ -7608,6 +7679,7 @@ def chat_index():
         memory=memory_payload(g.user),
         robot_sched_vocab=_robot_sched_vocab(),
         robot_min_hours=robot_settings()["min_interval_hours"],
+        chat_display=chat_display(),          # 会話の中の枠を畳むか（管理者の決めごと）
         scheduler_on=scheduler.is_running(),
         starters=scope_starters(build_scope({f.name: [] for f in db.list_db_files()})),
         llm_ready=llm.is_configured(),
@@ -7912,6 +7984,7 @@ def _call_previews(calls: list[dict], scope: list[dict], question: str) -> list[
         # 「列の意味が分からない」と言われた場所から、そのまま説明を書きに行ける。
         if c["name"] in tools.SQL_TOOLS and "sql" in args:
             out.append({"role": "assistant", "kind": "sql", "tool": c["name"],
+                        "call_id": c.get("id"),      # 失敗の項目から、このSQLの枠を辿るため
                         "sql": args["sql"], "purpose": args.get("purpose", ""),
                         "explanation": args.get("explanation", ""),
                         "question": question,
@@ -7920,6 +7993,7 @@ def _call_previews(calls: list[dict], scope: list[dict], question: str) -> list[
             binds = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "（引数なし）"
             sql = tools.render_sql(custom)
             out.append({"role": "assistant", "kind": "sql", "tool": c["name"],
+                        "call_id": c.get("id"),
                         "sql": sql,
                         "purpose": f"{custom.get('description', '')[:60]} / 引数: {binds}",
                         # SQLは人が登録したものなので、AIの解説ではなく登録時の説明を出す
@@ -8233,7 +8307,12 @@ def _execute(chat: dict, calls: list[dict], scope: list[dict],
         chat["messages"].append({"role": "tool", "tool_call_id": c["id"],
                                  "content": content})
         if res.get("render"):
-            chat["render_log"].append(dict(res["render"]))
+            item = dict(res["render"])
+            if item.get("kind") == "error":
+                # 画面はこれで「どのSQLの失敗か」を辿り、畳んであってもそのSQLの枠を開く。
+                # 位置（最後に出たSQL）で推測すると、1回に複数のSQLが出たときに別の枠を開いてしまう。
+                item["call_id"] = c["id"]
+            chat["render_log"].append(item)
         for a in alerts:
             chat["render_log"].append(verify.render_item(a))
 
@@ -12099,6 +12178,35 @@ def memory_settings_post():
         return jsonify({"error": str(e)}), 400
     print(f"[memory] 決めごとを保存: {saved}（{g.user.username}）")
     return jsonify({"ok": True, "settings": saved, **memory_settings_note()})
+
+
+@bp_catalog.get("/catalog/display", endpoint="display_admin")
+@admin_required
+def display_admin_page():
+    return render_template("display_admin.html", settings=chat_display(),
+                           defaults=_chat_display_defaults(), labels=CHAT_DISPLAY_KEYS,
+                           note=chat_display_note())
+
+
+@bp_catalog.get("/api/catalog/chat-display")
+@admin_required
+def chat_display_get():
+    return jsonify({"ok": True, "settings": chat_display(), "defaults": _chat_display_defaults(),
+                    **chat_display_note()})
+
+
+@bp_catalog.post("/api/catalog/chat-display")
+@admin_required
+def chat_display_post():
+    body = _body()
+    if not any(k in body for k in CHAT_DISPLAY_KEYS):
+        return jsonify({"error": "変える内容がありません。"}), 400
+    try:
+        saved = save_chat_display(body, g.user.username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    print(f"[display] 画面の決めごとを保存: {saved}（{g.user.username}）")
+    return jsonify({"ok": True, "settings": saved, **chat_display_note()})
 
 
 @bp_catalog.get("/api/catalog/robot-settings")

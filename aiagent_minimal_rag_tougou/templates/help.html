@@ -42,7 +42,8 @@
         <tbody>
           <tr><td>質問する</td>
               <td>日本語で入力して送信（Enter）。AIが必要なテーブルを自分で選び、SELECT文を書いて
-                  集計します。実行したSQLは回答に必ず表示され、その下に
+                  集計します。実行したSQLは回答に必ず残ります（標準では「SQL実行」の見出し1行に畳まれていて、
+                  押すと開きます。失敗したSQLは原因を見に来る場所なので開いたまま出ます）。その下に
                   <b>「このSQLがしていること」</b>の日本語の解説が付きます（SQLを読めなくても、
                   何をどう数えた結果かが分かります）。
                   文書の質問（手順・原因・規則）はナレッジベースを検索し、<b>[出典n]の番号つき</b>で
@@ -67,7 +68,9 @@
                   <b>AIが実際に根拠にした出典だけを開いて見せ</b>、残りは
                   「引用されなかった N 件も見る」に畳んでいます。<b>消してはいない</b>ので、押せば全部見られます。
                   抜粋は文書の先頭200字だけです（その先はこの画面には来ていないので、
-                  原本を読みたいときはファイル名から当たってください）。</td></tr>
+                  原本を読みたいときはファイル名から当たってください）。
+                  標準では「社内文書の検索」の枠そのものも見出し1行に畳まれていて、押すと開きます
+                  （用語登録・例文登録の提案カードも同じ）。畳むかどうかは管理者が「画面」タブで決めます。</td></tr>
           <tr><td>このデータがほしい、と伝える</td>
               <td>AIが「いまのデータでは答えられない」と判断したときだけ、黄色いカードが出ます。
                   何が足りなかったかをAIが一文で書くので、<b>伝える／伝えない</b>を選ぶだけです。
@@ -278,7 +281,7 @@
     <div class="card__title">2. 管理者メニュー — データカタログ（テーブル・結合・用語集・ツール・ビュー・取り込み・出力）</div>
     <div class="card__desc">
       管理者の画面はサイドバーの「<b>管理者メニュー</b>」1つにまとまっていて、上のタブで切り替えます
-      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・利用状況・ヘルプ）。
+      （データカタログのタブに続けて、ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・画面・利用状況・ヘルプ）。
       ここに書いた内容が<b>そのままAIの理解</b>になります。回答の質はカタログの質で決まります。
       未保存の変更は下部の「まとめて保存 (Ctrl+S)」でまとめて確定できます。
     </div>
@@ -367,7 +370,7 @@
   </div>
 
   <div class="card mt">
-    <div class="card__title">3. 管理者メニュー — ナレッジベース／モデル設定／メール設定／マイロボット／パーソナライズ／利用状況</div>
+    <div class="card__title">3. 管理者メニュー — ナレッジベース／モデル設定／メール設定／マイロボット／パーソナライズ／画面／利用状況</div>
     <div class="tablewrap">
       <table class="data">
         <thead><tr><th style="width:210px">画面</th><th>説明</th></tr></thead>
@@ -396,6 +399,12 @@
               <td>利用者のパーソナライズ（AIが会話から覚える前提・好み・期間。1人1つの本文）の決めごと: <b>機能を使うか</b>（外すとメニューから消え、AIにも渡さない）、
                   <b>書き直しに使うモデル</b>（回答のたびに1回呼ぶので、安いモデルにできる）、<b>本文の上限（文字）</b>。
                   その下に<b>全利用者の本文</b>がそのまま並びます（閲覧のみ。直せるのは本人だけ）。</td></tr>
+          <tr><td>画面</td>
+              <td>マイエージェントの回答に付く<b>SQLの枠</b>・<b>社内文書の検索</b>・<b>登録の提案カード</b>（用語集・例文）を、
+                  それぞれ見出し1行に<b>畳むか</b>の決めごと（標準はすべて畳む）。畳んでも消えてはおらず、押した人にだけ開きます。
+                  失敗したSQLは畳む設定でも開いたまま出ます。社内文書の検索は、開いたあとも「AIが根拠にした出典だけを開く」
+                  仕組みがそのまま効きます。全利用者に同じ値が効き、利用者が画面を次に開いたときから反映されます
+                  （<code>data/chat_display.yaml</code>。無ければ env の初期値）。</td></tr>
           <tr><td>利用状況（要望・前提の地図・レポート）</td>
               <td><b>要望</b>: 「知りたいことと違う」と押されたもの、AIが答えきれないと申告したもの、
                   社内文書の検索が0件で終わったものを、多い順に束ねて並べます。
@@ -1861,6 +1870,8 @@
               <td>マイロボットの決めごと（1人あたりの上限・実行の最低間隔・手順数の上限）。無ければ env の初期値。</td></tr>
           <tr><td class="mono small">data/memory_settings.yaml</td>
               <td>パーソナライズの決めごと（機能のON/OFF・書き直しに使うモデル・本文の上限）。無ければ env の初期値。</td></tr>
+          <tr><td class="mono small">data/chat_display.yaml</td>
+              <td>画面の決めごと（SQLの枠・社内文書の検索・提案カードを畳むか）。無ければ env の初期値。真偽でない値は既定に寄せ、読めないファイルは初期値に落として警告を出す。</td></tr>
           <tr><td class="mono small">data/output_dir.yaml</td>
               <td>出力先フォルダ（作ったファイルを置くサーバ上の場所）。空なら機能自体を出しません。</td></tr>
           <tr><td class="mono small">data/users/&lt;利用者&gt;/prefs.yaml</td>
@@ -1937,6 +1948,7 @@
           <tr><td>スケジューラの巡回間隔</td><td>60秒</td><td>変更可</td></tr>
           <tr><td>マイロボット: 1人あたりの上限／実行の最低間隔／手順数</td><td>5件／12時間／20手順</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>パーソナライズ: 機能／書き直しのモデル／本文の上限</td><td>使う／回答と同じ／2,000字</td><td>管理者メニュー（初期値は変更可）</td></tr>
+          <tr><td>画面: SQLの枠／社内文書の検索／提案カードを畳む</td><td>畳む／畳む／畳む</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>出力先フォルダ</td><td>未設定（ダウンロードのみ）</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>スクレイピング: 最小間隔／タイムアウト</td><td>30分／5分</td><td>登録ごと（初期値は変更可）</td></tr>
           <tr><td>アップロードの可否</td><td>無効</td><td>変更可</td></tr>
@@ -2106,7 +2118,7 @@
                     Web検索とも別物です（どこかにある文章を探して写すのではなく、その場で文章を作っているため）。
                     このうち文章を読み書きするタイプをLLM（大規模言語モデル）と呼びます。
                     <b>このアプリでは</b>マイエージェントの回答の書き手がこの生成AIです。確率で文章を作る以上は
-                    間違い得るため、根拠のSQLを必ず表示し、文書の答えには出典番号を付け、
+                    間違い得るため、根拠のSQLを必ず回答に残し（畳まれていても押せば開きます）、文書の答えには出典番号を付け、
                     検算を裏で走らせています。</td></tr>
             <tr><td>AIモデル</td>
                 <td>モデルはAIの「銘柄」のことで、同じ会社のAIでも銘柄ごとに賢さ・速さ・料金・
@@ -2244,7 +2256,7 @@
                 <td>データベース（次項）に指示を出すための世界共通の言語で、人が読める英単語でできています。
                     例えば <code>SELECT 地域, SUM(金額) FROM 注文 GROUP BY 地域</code> は
                     「注文の表から、地域ごとに金額を合計して読み出す」という意味です。
-                    <b>このアプリでは</b>AIが質問に合わせてSQLを書き、実行したSQLが回答に必ず表示されます。
+                    <b>このアプリでは</b>AIが質問に合わせてSQLを書き、実行したSQLが回答に必ず残ります（標準では「SQL実行」の見出しに畳まれていて、押すと開きます）。
                     全部読めなくても、<code>FROM</code> の後ろの表名と <code>WHERE</code> の条件だけ眺めれば
                     「どの表をどう絞ったか」の確認になります（読み違いの多くはこの2点で気づけるため）。</td></tr>
             <tr><td>データベース（DB）</td>
@@ -2677,7 +2689,7 @@
             <tr><td>PythonとFlask（フラスク）</td>
                 <td>Pythonはこのアプリを書いているプログラミング言語、FlaskはPythonでWebアプリを作るための土台（フレームワーク）です。どちらも道具の名前だと分かれば、第3部の文の主語が読めるようになります。
                     同類の道具として、画面の雛形に値を流し込むJinja2（ジンジャ）、機能単位の部品であるブループリントという名前も出てきます。
-                    <b>このアプリでは</b>Python+Flaskの1プロセスで画面とAPIの両方を返し、マイエージェント／カタログ／取り込みなど11個のブループリントに分かれています（3-1参照）。</td></tr>
+                    <b>このアプリでは</b>Python+Flaskの1プロセスで画面とAPIの両方を返し、マイエージェント／カタログ／取り込みなど12個のブループリントに分かれています（3-1参照）。</td></tr>
             <tr><td>本番用サーバとリバースプロキシ</td>
                 <td>本番用サーバは、多数の同時アクセスを安定してさばくためのWebサーバで、waitress（ウェイトレス）やgunicorn（ガニコーン）が代表です（Flask付属の簡易サーバは開発向けのため）。このアプリの <code>python core.py</code> は内部でwaitressを使って待ち受けるので、本番でも同じコマンドのまま載せ替えは不要です。
                     リバースプロキシは利用者とアプリの間に置く中継サーバのことで、代表がnginx（エンジンエックス）です。
@@ -2753,9 +2765,9 @@
     <div class="card__title" id="impl-map">5-0. コードの地図</div>
     <div class="card__desc">元は58個のモジュールに分かれていたものを1ファイルへ畳んであります。畳んだあとも <code>import db</code> や <code>catalog.load_meta()</code> がそのまま動くよう、起動時に <code>sys.modules</code> へ自分自身を<b>31個の別名</b>で登録しています。このため<b>モジュールの境界は実行時には存在せず、名前空間は1つ</b>です——同名の <code>def</code> と <code>import</code> がぶつかると、後に書いた方が勝ちます。<span class="small muted">（実際に <code>def inspect</code> が標準ライブラリの <code>import inspect</code> に食われて、機能が死んでいたことがあります）</span></div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:210px">項目</th><th>内容</th></tr></thead><tbody>
-      <tr><td>規模</td><td>core.py <b>37,458行</b>（1,482,688字）。トップレベルの関数 829、クラス 15、大文字の定数 199。ほかに auth.py（ログイン設定）と config.py（設定）。</td></tr>
-      <tr><td>画面まわり</td><td>HTML・CSS・JS もこのファイルの中にあります。Jinja2 は <code>DictLoader(TEMPLATES)</code> で読み、静的ファイルは <code>/static/&lt;path&gt;</code> の自前ルートが ETag つきで返します。<br>・<code>js/app.js</code> … 324,473 字<br>・<code>css/app.css</code> … 50,785 字<br>・<code>templates/help.html</code> … 487,303 字（別ファイル）<br>・<code>catalog.html</code> … 20,285 字<br>・<code>chat.html</code> … 6,383 字<br>・<code>models.html</code> … 5,366 字</td></tr>
-      <tr><td>ルート</td><td>全 <b>84</b> 本。catalog 29、chat 15、imp 15、knowledge 7、usage 4、mail 3、models 3、tableview 3、auth 2、api 2、help 1。<br>権限は2段だけで、<code>admin_required</code> が60本、<code>login_required</code> が21本、認証なしが3本（ログイン・ログアウト・Plotly配布）。どちらのデコレータも <code>request.path.startswith("/api/")</code> を見て、「APIならJSONで401/403、画面ならリダイレクトか権限ページ」を出し分けます。</td></tr>
+      <tr><td>規模</td><td>py は5本。core.py <b>15,266行</b>（559,328字。土台・データと画面のルート）、brain.py <b>14,366行</b>（564,089字。AI・分析）、assets.py <b>13,113行</b>（558,341字。HTML・CSS・JS）、config.py 475行（設定）、auth.py 363行（ログイン設定）。トップレベルの関数は core 612・brain 415、クラスは 6・11、大文字の定数は 46・88。</td></tr>
+      <tr><td>画面まわり</td><td>HTML・CSS・JS は assets.py の中（<code>TEMPLATES</code> と <code>STATIC_FILES</code>）。ヘルプの本文だけは <code>templates/help.html</code> にあり、起動時に読み込みます。Jinja2 は <code>DictLoader(TEMPLATES)</code> で読み、静的ファイルは <code>/static/&lt;path&gt;</code> の自前ルートが ETag つきで返します。<br>・<code>js/app.js</code> … 413,270 字<br>・<code>css/app.css</code> … 56,007 字<br>・<code>templates/help.html</code> … 約48.8万字（別ファイル）<br>・<code>catalog.html</code> … 21,283 字<br>・<code>chat.html</code> … 7,241 字<br>・<code>models.html</code> … 5,507 字</td></tr>
+      <tr><td>ルート</td><td>全 <b>117</b> 本。catalog 41、chat 27、imp 20、knowledge 7、usage 6、mail 3、models 3、tableview 3、api 3、auth 2、robots 1、help 1。<br>権限は2段だけで、<code>admin_required</code> が79本、<code>login_required</code> が35本、認証なしが3本（ログイン・ログアウト・Plotly配布）。どちらのデコレータも <code>request.path.startswith("/api/")</code> を見て、「APIならJSONで401/403、画面ならリダイレクトか権限ページ」を出し分けます。</td></tr>
     </tbody></table></div>
     <div class="card__title mt">ファイル内の並び</div>
     <div class="tablewrap"><table class="data"><thead><tr><th style="width:300px">節</th><th style="width:110px">開始行</th><th>行数</th></tr></thead><tbody>

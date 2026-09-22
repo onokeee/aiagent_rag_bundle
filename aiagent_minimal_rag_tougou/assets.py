@@ -148,6 +148,7 @@ TEMPLATES = {
                           ('knowledge', 'knowledge.index', 'ナレッジベース'), ('models', 'models.index', 'モデル設定'),
                           ('mail', 'mail.index', 'メール設定'), ('robots', 'catalog.robot_settings', 'マイロボット'),
                           ('memory', 'catalog.memory_admin', 'パーソナライズ'),
+                          ('display', 'catalog.display_admin', '画面'),
                           ('usage', 'usage.index', '利用状況'), ('help', 'help.index', 'ヘルプ')] -%}
 {% if key == 'sep' %}<span class="tabs__sep" aria-hidden="true"></span>
 {% elif key == active %}<button class="tab is-active">{{ label }}</button>
@@ -190,9 +191,9 @@ TEMPLATES = {
         {{ icon('user') }} パーソナライズ</a>
       {% endif %}
       {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
-         データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・利用状況 #}
+         データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・画面・利用状況・ヘルプ #}
       <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.', 'help.')) }}" href="{{ url_for('catalog.index') }}"
-         data-desc="管理者だけの画面。データカタログ（テーブル・結合・ER図・用語集・例文・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・ER図・用語集・例文・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、画面、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
@@ -910,6 +911,7 @@ window.CHAT_INIT = {
   robotSchedVocab: {{ robot_sched_vocab|tojson }},
   robotMinIntervalHours: {{ robot_min_hours|tojson }},
   schedulerOn: {{ scheduler_on|tojson }},
+  fold: {{ chat_display|tojson }},
   starters: {{ starters|tojson }}
 };
 </script>
@@ -1703,6 +1705,55 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
 {% block scripts %}
 <script>
 window.MEMORY_INIT = {{ memory|tojson }};
+</script>
+{% endblock %}
+""",
+
+# --- display_admin.html ---
+"display_admin.html": r"""{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% from "_admintabs.html" import admintabs %}
+{% block title %}管理者メニュー（画面） — {{ app_title }}{% endblock %}
+{# 見出しは置かない。画面の説明はサイドバーの項目にマウスを乗せると出る #}
+
+{% block body %}
+<div class="content content--wide">
+  <div class="tabs tabs--bar">{{ admintabs('display') }}</div>
+
+  <div class="card">
+    <div class="card__title">会話の中の枠を畳む</div>
+    <div class="card__desc">
+      マイエージェントの回答には、答えの文章のほかに SQL の枠・社内文書の検索・登録の提案カードが出ます。
+      ちょっとした質問でも積み上がるので、チェックしたものは<b>1行の見出しに畳み、押した人にだけ開きます</b>。
+      消すわけではありません。全利用者に同じ値が効き、保存すると、利用者が画面を次に開いたとき（再読み込み）から反映されます。
+    </div>
+    <div class="row mb" style="align-items:flex-start;gap:24px;flex-wrap:wrap">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="dsSql"> <span class="small">SQL の枠を畳む（SQL本文・日本語の解説・取り方の正誤）</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="dsSources"> <span class="small">社内文書の検索を畳む（出典の一覧）</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="dsProposals"> <span class="small">登録の提案カードを畳む（用語集・例文）</span>
+      </label>
+    </div>
+    <div class="small muted mb">
+      失敗した SQL は、畳む設定でも開いたまま出します（原因を見に来る場所なので）。
+      初期値は SQL {{ '畳む' if defaults.fold_sql else '開く' }}・社内文書 {{ '畳む' if defaults.fold_sources else '開く' }}・提案 {{ '畳む' if defaults.fold_proposals else '開く' }}
+      （環境変数 CHAT_FOLD_SQL / CHAT_FOLD_SOURCES / CHAT_FOLD_PROPOSALS でも変えられます）。
+    </div>
+    <div class="row" style="align-items:center;gap:10px">
+      <button class="btn btn--primary btn--sm" id="dsSave">保存</button>
+      <span class="small muted" id="dsNote">{% if note.updated_at %}{{ note.updated_at|replace('T', ' ') }} に {{ note.updated_by }} が保存{% else %}まだ保存していません（初期値のまま）{% endif %}</span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.DISPLAY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
 </script>
 {% endblock %}
 """,
@@ -2648,6 +2699,18 @@ details.acc > summary::-webkit-details-marker { display: none; }
 details.acc > summary::before { content: "▸"; color: var(--muted); }
 details.acc[open] > summary::before { content: "▾"; }
 details.acc > .acc__body { padding: 0 13px 13px; }
+/* 畳める道具の枠。見出しが summary になり、右端に ▸ / ▾ を出す */
+details.toolblock--fold > summary { cursor: pointer; list-style: none; }
+details.toolblock--fold > summary::-webkit-details-marker { display: none; }
+details.toolblock--fold > summary::after {
+    content: "▸"; color: var(--muted); margin-left: auto; padding-left: 6px; flex: none;
+}
+details.toolblock--fold[open] > summary::after { content: "▾"; }
+details.toolblock--fold > summary:hover { color: var(--text); }
+details.toolblock--fold > .toolblock__inner { padding: 2px 0 6px; }
+/* 提案カードは自前の見出しと枠を持つ。畳んだ枠の中では見出しは summary が兼ねるので、二重に出さない */
+details.toolblock--fold > .toolblock__inner > .mailcard { border: 0; border-radius: 0; margin-bottom: 0; }
+details.toolblock--fold > .toolblock__inner > .mailcard > .mailcard__head { display: none; }
 /* 行の右端に置く削除。ふだんは目立たせず、その行に近づいたときだけ出す。
    常に赤いボタンが並ぶと、一覧が「消す画面」に見えてしまうため。 */
 details.acc > summary .t-drop {
@@ -6526,6 +6589,51 @@ function gapCard(item) {
 }
 
 
+/* --- 会話の中の枠を畳む ----------------------------------------------------------
+   SQLの枠・社内文書の検索・登録の提案カードは、答えの上に積まれて画面を食う。
+   管理者が「畳む」と決めた種類は、見出し1行の details にして、押した人にだけ開く。
+   畳んでも消さない（根拠を辿れないと意味がない）。設定は CHAT_INIT.fold で来る。 */
+function foldOn(key) {
+    return !!(((window.CHAT_INIT || {}).fold || {})[key]);
+}
+
+/** 道具の枠。head は見出しの中身（配列）、あとは本体。畳む設定なら details にする。 */
+function toolBlock(foldKey, head, ...parts) {
+    if (!foldOn(foldKey)) {
+        return el('div', { class: 'toolblock' }, el('div', { class: 'toolblock__head' }, ...head), ...parts);
+    }
+    return el('details', { class: 'toolblock toolblock--fold' },
+              el('summary', { class: 'toolblock__head' }, ...head), ...parts);
+}
+
+/** 自前の枠を持つカード（提案カード）を、畳む設定のときだけ details で包む。 */
+function foldCard(foldKey, head, card) {
+    if (!foldOn(foldKey)) return card;
+    return el('details', { class: 'toolblock toolblock--fold' },
+              el('summary', { class: 'toolblock__head' }, ...head),
+              el('div', { class: 'toolblock__inner' }, card));
+}
+
+/** 失敗が出たら、その原因になったSQLの枠を開く。原因を見に来る場所なので、畳んだままにしない。
+ *  失敗の項目には call_id（どの道具の呼び出しか）が付いて来る。付いていない古い会話では、
+ *  同じ回答の中で直前に置かれたSQLの枠だけを開く（別の質問のSQLや、SQL以外の失敗では開かない）。 */
+function openFailedSql(item, body) {
+    let target = null;
+    if (item.call_id) {
+        target = $$('#logInner details.toolblock--fold').find(d => d.dataset.callId === String(item.call_id));
+    } else {
+        const last = body.lastElementChild;      // 失敗の表示を足す前の、直前の要素
+        if (last && last.matches('details.toolblock--fold') && last.querySelector('pre.mono')) target = last;
+    }
+    if (target) target.open = true;
+}
+
+/** 提案カードの「新規登録／既存」の印。畳んだ見出しにも出す（開かなくても分かるように）。 */
+function proposalBadge(item, existsText) {
+    return el('span', { class: 'badge' + (item.exists ? ' badge--warn' : ' badge--ok') },
+              item.exists ? existsText : '新規登録');
+}
+
 /** 回答の本文に出てきた出典番号。半角・全角どちらの括弧でも拾う。
  *  括弧無しの「出典15」まで拾うと、「出典が15件」のような文まで数えてしまうので取らない。 */
 function citedNumbers(text) {
@@ -6553,14 +6661,12 @@ function revealCitedSources(text) {
 
 function sourcesCard(item) {
     const sources = item.sources || [];
-    const head = el('div', { class: 'toolblock__head' },
+    const block = toolBlock('fold_sources', [
         icon('book', 'icon--sm'),
         el('span', {}, '社内文書の検索'),
         el('span', { class: 'muted small' }, `— 「${item.query}」`),
         el('div', { class: 'spacer' }),
-        el('span', { class: 'badge' }, `${sources.length}件`));
-
-    const block = el('div', { class: 'toolblock' }, head);
+        el('span', { class: 'badge' }, `${sources.length}件`)]);
 
     if (!sources.length) {
         // 「渡せる文字数に入らなかった」と「本当に無かった」は別のこと。
@@ -6644,10 +6750,9 @@ function addItem(item) {
         revealCitedSources(item.content);     // この本文が根拠にした出典だけを開く
         feedbackRow();                        // 「この答えはどうだったか」を末尾に置き直す
     } else if (item.kind === 'sql') {
-        const block = el('div', { class: 'toolblock' },
-            el('div', { class: 'toolblock__head' },
-                icon('table', 'icon--sm'), el('span', {}, item.label || item.tool),
-                item.purpose ? el('span', { class: 'muted small' }, `— ${item.purpose}`) : null),
+        const block = toolBlock('fold_sql',
+            [icon('table', 'icon--sm'), el('span', {}, item.label || item.tool),
+             item.purpose ? el('span', { class: 'muted small' }, `— ${item.purpose}`) : null],
             el('pre', { class: 'mono' }, item.sql),
             // SQLを読めない人向けの解説。AIが書いたものなので、根拠はSQL本体で確かめられる
             item.explanation
@@ -6655,6 +6760,7 @@ function addItem(item) {
                     el('b', {}, 'このSQLがしていること'),
                     el('div', { style: 'white-space:pre-wrap;margin-top:3px' }, item.explanation))
                 : null);
+        if (item.call_id) block.dataset.callId = String(item.call_id);   // 失敗の項目から辿るため
         if (fbTurn) fbTurn.usedSql = true;
         const links = catalogLinks(item.tables);
         {
@@ -6756,9 +6862,17 @@ function addItem(item) {
                 el('div', { class: 'acc__body' }, dataTable(s.columns, s.rows))));
         });
     } else if (item.kind === 'glossary_term') {
-        body.append(glossaryCard(item));
+        body.append(foldCard('fold_proposals',
+            [icon('catalog', 'icon--sm'), el('span', {}, '用語集への登録の提案'),
+             item.term ? el('span', { class: 'muted small' }, `— ${item.term}`) : null,
+             el('div', { class: 'spacer' }), proposalBadge(item, '既存の定義を変更')],
+            glossaryCard(item)));
     } else if (item.kind === 'example_proposal') {
-        body.append(exampleCard(item));
+        body.append(foldCard('fold_proposals',
+            [icon('catalog', 'icon--sm'), el('span', {}, '例文への登録の提案'),
+             item.question ? el('span', { class: 'muted small' }, `— ${String(item.question).slice(0, 40)}`) : null,
+             el('div', { class: 'spacer' }), proposalBadge(item, '既存の例文を更新')],
+            exampleCard(item)));
     } else if (item.kind === 'sources') {
         if (fbTurn) fbTurn.usedDoc = true;
         body.append(sourcesCard(item));
@@ -6777,6 +6891,7 @@ function addItem(item) {
     } else if (item.kind === 'mail_draft') {
         body.append(mailCard(item));
     } else if (item.kind === 'error') {
+        openFailedSql(item, body);            // 失敗の原因を見に来る場所なので、畳んだままにしない
         body.append(el('div', { class: 'alert alert--err' }, item.message));
     }
 }
@@ -11843,6 +11958,31 @@ document.addEventListener('DOMContentLoaded', () => {
             fill(r.settings || {});
             if (r.updated_at) $('#msNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
             toast('保存しました。すぐ効きます（メニューの表示は次に画面を開いたときに変わります）。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
+});
+})();
+
+// ===== 画面の決めごと（window.DISPLAY_SETTINGS_INIT がある画面だけ動く。管理者） =====
+(() => {
+if (!window.DISPLAY_SETTINGS_INIT) return;
+function fill(s) {
+    $('#dsSql').checked = !!s.fold_sql;
+    $('#dsSources').checked = !!s.fold_sources;
+    $('#dsProposals').checked = !!s.fold_proposals;
+}
+document.addEventListener('DOMContentLoaded', () => {
+    fill(window.DISPLAY_SETTINGS_INIT.settings || {});
+    $('#dsSave').addEventListener('click', async () => {
+        const btn = $('#dsSave'); btn.disabled = true;
+        try {
+            const r = await api('/api/catalog/chat-display', {
+                fold_sql: $('#dsSql').checked, fold_sources: $('#dsSources').checked,
+                fold_proposals: $('#dsProposals').checked });
+            fill(r.settings || {});
+            if (r.updated_at) $('#dsNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
+            toast('保存しました。利用者がマイエージェントの画面を次に開いたとき（再読み込み）から効きます。');
         } catch (e) { toast(e.message, 'err', 9000); }
         btn.disabled = false;
     });
