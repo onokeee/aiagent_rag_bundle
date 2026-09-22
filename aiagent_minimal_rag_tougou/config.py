@@ -164,10 +164,15 @@ CATALOG_HISTORY_MAX = int(os.getenv("CATALOG_HISTORY_MAX", "2000") or 2000)
 # 「必ずその定義に従う」、用語のSQL式は「そのまま使う」とAIに指示しているので、
 # ここを開けると、権限の低い利用者が管理者を含む全員の回答を左右できてしまう
 # （書けるのは読み取り専用のSELECTだけだが、答えの中身は歪められる）。
-# 既定は管理者のみ。皆でカタログを育てる運用に戻すなら env で true にする。
+# 既定は管理者と、管理者メニュー → 画面 の一覧にある人（下の CATALOG_CONTRIB_FILE）。
+# 皆でカタログを育てる運用に戻すなら env で true にする（そのとき一覧は使わない）。
 # なお、どちらの設定でも「誰がいつ何を変えたか」は catalog_history に残る。
 CATALOG_OPEN_CONTRIB = (os.getenv("CATALOG_OPEN_CONTRIB", "false").strip().lower()
                         in ("1", "true", "yes", "on"))
+# 管理者メニュー → 画面 で決める「カタログに登録できる人」（ログインIDの一覧）。
+# 管理者はいつでも可。上の CATALOG_OPEN_CONTRIB が true なら全員可で、この一覧は使わない。
+CATALOG_CONTRIB_FILE = Path(os.getenv("CATALOG_CONTRIB_FILE",
+                                      str(DATA_DIR / "catalog_contrib.yaml"))).expanduser()
 
 # --- メール送信（SMTP） -------------------------------------------------------
 # ここの値は「初期値」で、画面（メール設定）から保存すると上書きされる。

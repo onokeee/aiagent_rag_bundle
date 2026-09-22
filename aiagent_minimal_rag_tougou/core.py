@@ -1772,13 +1772,14 @@ def _chat_display_defaults() -> dict:
 
 def _chat_display_file() -> dict:
     p = config.CHAT_DISPLAY_FILE
-    if not p.exists():
-        return {}
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except Exception as e:
-        print(f"[display] 画面の決めごとを読めませんでした: {p} ({e})")
-        return {}
+    with _chat_display_lock:
+        if not p.exists():
+            return {}
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[display] 画面の決めごとを読めませんでした: {p} ({e})")
+            return {}
     return data if isinstance(data, dict) else {}
 
 
@@ -1800,7 +1801,29 @@ def chat_display_note() -> dict:
 
 #: 保存の「読んで・足して・書く」を1人ずつにする。管理者が2人同時に保存すると、
 #: 同じ一時ファイルを取り合って片方が消えたり、置き換えに失敗して 400 が返ったりしていた。
-_chat_display_lock = threading.Lock()
+#: 読む側も同じ lock を通す。Windows では、誰かが読んでいる最中の置き換えが失敗するため。
+_chat_display_lock = threading.RLock()
+
+
+def _replace_settings_file(tmp, p) -> None:
+    """一時ファイルを本体に置き換える。
+
+    Windows では、別のプログラム（エディタ・ウイルス対策）が開いている瞬間に
+    PermissionError になることがあるので、少しだけ待って数回やり直す。
+    それでも駄目なら一時ファイルを消してから例外をそのまま上げる。
+    """
+    for i in range(5):
+        try:
+            os.replace(tmp, p)
+            return
+        except PermissionError:
+            if i == 4:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.05 * (i + 1))
 
 
 def save_chat_display(values: dict, user: str | None = None) -> dict:
@@ -1822,8 +1845,99 @@ def save_chat_display(values: dict, user: str | None = None) -> dict:
         tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
                                       allow_unicode=True, sort_keys=False), encoding="utf-8")
-        os.replace(tmp, p)
+        _replace_settings_file(tmp, p)
         return chat_display()
+
+
+# --- カタログに登録できる人（管理者メニュー → 画面） --------------------------------------
+# チャットの登録カード（用語集・例文）からカタログを書き換えてよい人の、ログインIDの一覧。
+# 管理者はいつでも可。env の CATALOG_OPEN_CONTRIB が true なら全員可で、この一覧は使わない。
+# 判定そのものは _may_contribute_catalog の1か所（用語集も例文も同じ）。
+
+CATALOG_CONTRIB_MAX = 500          # 一覧に置ける人数
+CATALOG_CONTRIB_NAME_MAX = 100     # 1人分のログインIDの長さ
+_catalog_contrib_lock = threading.RLock()   # 読む側も通す（画面の決めごとと同じ理由）
+
+
+def _catalog_contrib_file() -> dict:
+    p = config.CATALOG_CONTRIB_FILE
+    with _catalog_contrib_lock:
+        if not p.exists():
+            return {}
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[display] カタログに登録できる人の一覧を読めませんでした: {p} ({e})")
+            return {}
+    if not isinstance(data, dict):
+        print(f"[display] カタログに登録できる人の一覧の形が違うため、無い扱いにします: {p}")
+        return {}
+    return data
+
+
+def _tidy_contrib_users(values) -> list[str]:
+    """ログインIDの一覧を整える。前後の空白を落とし、空と重複（大文字小文字は同じ扱い）を除く。
+
+    形が違えば ValueError。並びは書いた順のまま（管理者が見て分かるように）。
+    """
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("ログインIDは一覧（1行に1人）で指定してください。")
+    out, seen = [], set()
+    for v in values:
+        if not isinstance(v, str):
+            raise ValueError("ログインIDは文字で指定してください。")
+        name = v.strip()
+        if not name:
+            continue
+        if len(name) > CATALOG_CONTRIB_NAME_MAX:
+            raise ValueError(f"ログインIDが長すぎます（{CATALOG_CONTRIB_NAME_MAX}字まで）: {name[:20]}…")
+        if any(ord(ch) < 32 for ch in name):
+            raise ValueError(f"ログインIDに使えない文字が入っています: {name[:20]}…")
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    return out
+
+
+def catalog_contrib_users() -> list[str]:
+    """一覧（保存した並びのまま）。ファイルが無い・壊れている・形が違うときは空。
+
+    形が違えば一覧ごと無い扱いにする（一部だけ効かせない）。手で直した人が気づけるように警告は出す。
+    """
+    try:
+        return _tidy_contrib_users(_catalog_contrib_file().get("users") or [])
+    except ValueError as e:
+        print(f"[display] カタログに登録できる人の一覧の形が違うため、無い扱いにします: "
+              f"{config.CATALOG_CONTRIB_FILE} ({e})")
+        return []
+
+
+def catalog_contrib_note() -> dict:
+    data = _catalog_contrib_file()
+    return ({"updated_by": str(data.get("updated_by") or ""),
+             "updated_at": str(data.get("updated_at") or "")} if data else {})
+
+
+def save_catalog_contrib(values, user: str | None = None) -> list[str]:
+    """一覧を保存する。形が違えば ValueError（保存しない）。書き込みは一時ファイルからの置き換え。"""
+    users = _tidy_contrib_users(values)
+    if len(users) > CATALOG_CONTRIB_MAX:
+        raise ValueError(f"一覧に置けるのは {CATALOG_CONTRIB_MAX} 人までです。")
+    with _catalog_contrib_lock:
+        p = config.CATALOG_CONTRIB_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(yaml.safe_dump({"users": users, "updated_by": user or "", "updated_at": chats.now()},
+                                      allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _replace_settings_file(tmp, p)
+    return catalog_contrib_users()
+
+
+def in_catalog_contrib(username: str | None) -> bool:
+    """一覧にある人か。大文字小文字は区別しない（ログインIDの揺れを吸収する）。"""
+    name = (username or "").strip().lower()
+    return bool(name) and name in {u.lower() for u in catalog_contrib_users()}
 
 
 #: 「忘れて」の意図。本文が減る書き直しは、これが質問に無ければ捨てる（AIが黙って落とすのを防ぐ）。
@@ -7680,6 +7794,7 @@ def chat_index():
         robot_sched_vocab=_robot_sched_vocab(),
         robot_min_hours=robot_settings()["min_interval_hours"],
         chat_display=chat_display(),          # 会話の中の枠を畳むか（管理者の決めごと）
+        can_contribute=_may_contribute_catalog(),   # 登録カードのボタンを出す人か
         scheduler_on=scheduler.is_running(),
         starters=scope_starters(build_scope({f.name: [] for f in db.list_db_files()})),
         llm_ready=llm.is_configured(),
@@ -8104,8 +8219,8 @@ def _is_admin() -> bool:
 
 #: カタログへの書き込みを断るときの文面（チャットのカードにそのまま出る）
 _CATALOG_CONTRIB_DENIED = (
-    "カタログ（用語集・例文）への登録は管理者のみです。"
-    "全員の回答に効く共有の設定のため、既定では管理者に限っています。"
+    "カタログ（用語集・例文）への登録は、管理者と、管理者が決めた人だけです。"
+    "全員の回答に効く共有の設定のため、登録できる人を限っています。"
     "登録したい内容は管理者にお伝えください。")
 
 
@@ -8115,9 +8230,11 @@ def _may_contribute_catalog() -> bool:
     カタログは全利用者のシステムプロンプトに毎回そのまま載り、AIには
     用語の定義に「必ず従う」・用語のSQL式を「そのまま使う」と指示している。
     つまりここを開けると、権限の低い利用者が管理者を含む全員の回答を
-    左右できてしまう。既定は管理者のみ、env で従来の全員可に戻せる。
+    左右できてしまう。既定は管理者と、管理者メニュー → 画面 の一覧にある人。
+    env で従来の全員可に戻せる（そのときは一覧を見ない）。
     """
-    return config.CATALOG_OPEN_CONTRIB or _is_admin()
+    return (config.CATALOG_OPEN_CONTRIB or _is_admin()
+            or in_catalog_contrib(getattr(g.get("user"), "username", None)))
 
 
 def _advance(chat: dict, scope: list[dict], question: str) -> None:
@@ -8795,7 +8912,8 @@ def glossary_save():
     エンドポイントだけで、カードのボタンを押したときに起こる。
     誰がいつ何を変えたかは catalog_history に必ず残す。
 
-    既定では管理者のみ。用語集は全利用者のシステムプロンプトに載り、AIには
+    既定では管理者と、管理者メニュー → 画面 の一覧にある人（_may_contribute_catalog）。
+    用語集は全利用者のシステムプロンプトに載り、AIには
     「必ずその定義に従う」と指示しているため、ここを開けると権限の低い利用者が
     全員の回答を左右できる。皆で育てる運用に戻すなら CATALOG_OPEN_CONTRIB。
     """
@@ -8842,7 +8960,7 @@ def save_example():
     """チャットの登録カードから、例文をカタログへ保存する。
 
     誰がいつ何を変えたかは catalog_history に必ず残す。同じSQLの例文が既にあれば、
-    質問文と説明を更新する。既定では管理者のみ（glossary_save と同じ理由。
+    質問文と説明を更新する。既定では管理者と一覧の人だけ（glossary_save と同じ理由。
     例文もシステムプロンプトに「正しいと確認済みの例」として載るため）。
     """
     if not _may_contribute_catalog():
@@ -12185,7 +12303,31 @@ def memory_settings_post():
 def display_admin_page():
     return render_template("display_admin.html", settings=chat_display(),
                            defaults=_chat_display_defaults(), labels=CHAT_DISPLAY_KEYS,
-                           note=chat_display_note())
+                           note=chat_display_note(),
+                           contrib=catalog_contrib_users(), contrib_note=catalog_contrib_note(),
+                           open_contrib=bool(config.CATALOG_OPEN_CONTRIB))
+
+
+@bp_catalog.get("/api/catalog/contrib-users")
+@admin_required
+def contrib_users_get():
+    return jsonify({"ok": True, "users": catalog_contrib_users(),
+                    "open_contrib": bool(config.CATALOG_OPEN_CONTRIB), **catalog_contrib_note()})
+
+
+@bp_catalog.post("/api/catalog/contrib-users")
+@admin_required
+def contrib_users_post():
+    body = _body()
+    if "users" not in body:
+        return jsonify({"error": "ログインIDの一覧（users）がありません。"}), 400
+    try:
+        users = save_catalog_contrib(body["users"], g.user.username)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    print(f"[display] カタログに登録できる人を保存: {len(users)} 人（{g.user.username}）")
+    return jsonify({"ok": True, "users": users, "open_contrib": bool(config.CATALOG_OPEN_CONTRIB),
+                    **catalog_contrib_note()})
 
 
 @bp_catalog.get("/api/catalog/chat-display")

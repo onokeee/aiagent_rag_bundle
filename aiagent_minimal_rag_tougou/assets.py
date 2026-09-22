@@ -912,6 +912,7 @@ window.CHAT_INIT = {
   robotMinIntervalHours: {{ robot_min_hours|tojson }},
   schedulerOn: {{ scheduler_on|tojson }},
   fold: {{ chat_display|tojson }},
+  canContribute: {{ can_contribute|tojson }},
   starters: {{ starters|tojson }}
 };
 </script>
@@ -1748,12 +1749,30 @@ window.MEMORY_INIT = {{ memory|tojson }};
       <span class="small muted" id="dsNote">{% if note.updated_at %}{{ note.updated_at|replace('T', ' ') }} に {{ note.updated_by }} が保存{% else %}まだ保存していません（初期値のまま）{% endif %}</span>
     </div>
   </div>
+
+  <div class="card mt">
+    <div class="card__title">カタログに登録できる人</div>
+    <div class="card__desc">
+      マイエージェントの登録カード（用語集・例文）からカタログに書き込めるのは、<b>管理者と、ここに書いた人</b>だけです。
+      カタログは全員のAIの理解になるので、書ける人を限っています。ここに無い人には
+      「この質問と答え方を例文にする」のボタンと、提案カードの登録ボタンを出しません（提案カードそのものは出ます）。
+    </div>
+    {% if open_contrib %}
+    <div class="small mb" style="color:var(--warn)">いまは環境変数 CATALOG_OPEN_CONTRIB で「全員が登録できる」になっているため、この一覧は使われません。</div>
+    {% endif %}
+    <label class="field" for="ccUsers">ログインID（1行に1人。大文字小文字は区別しません）</label>
+    <textarea id="ccUsers" rows="6" style="max-width:420px;font-family:var(--mono);font-size:13px" placeholder="t.tanaka&#10;s.suzuki"></textarea>
+    <div class="row mt" style="align-items:center;gap:10px">
+      <button class="btn btn--primary btn--sm" id="ccSave">保存</button>
+      <span class="small muted" id="ccNote">{% if contrib_note.updated_at %}{{ contrib_note.updated_at|replace('T', ' ') }} に {{ contrib_note.updated_by }} が保存（{{ contrib|length }} 人）{% elif open_contrib %}まだ誰も書いていません{% else %}まだ誰も書いていません（登録できるのは管理者だけ）{% endif %}</span>
+    </div>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-window.DISPLAY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
+window.DISPLAY_SETTINGS_INIT = { settings: {{ settings|tojson }}, contrib: {{ contrib|tojson }} };
 </script>
 {% endblock %}
 """,
@@ -6376,6 +6395,22 @@ function openErModal(item) {
     }, true);
 }
 
+/** カタログに登録できる人か（管理者、または管理者メニュー → 画面 の一覧にある人）。サーバが決めて渡す。 */
+function canContribute() {
+    return !!(window.CHAT_INIT || {}).canContribute;
+}
+
+/** 登録カードの末尾の行。登録できない人には、ボタンの代わりに一言だけ置く（カード自体は出す）。 */
+function contribRow(note, btn) {
+    if (!canContribute()) {
+        return el('div', { class: 'mailcard__row' },
+            el('span', { class: 'small muted grow' },
+                '登録できるのは管理者と、管理者が決めた人だけです。登録したい内容は管理者に伝えてください。'));
+    }
+    return el('div', { class: 'mailcard__row', style: 'justify-content:flex-end' },
+        el('span', { class: 'small muted grow' }, note), btn);
+}
+
 /* 用語の登録カード。AIは提案まで。書き込みはボタンを押したときだけ。
    SQLや置き場所は出さない。代わりに「どう数えるか」の日本語と実データの件数で、
    SQLを読めない人でも正しさを判断できるようにする。 */
@@ -6410,10 +6445,7 @@ function glossaryCard(item) {
             btn.textContent = '登録済み';
         } catch (e) { toast(e.message, 'err', 8000); btn.disabled = false; }
     } }, '用語集に登録');
-    card.append(el('div', { class: 'mailcard__row', style: 'justify-content:flex-end' },
-        el('span', { class: 'small muted grow' },
-            '登録すると全員のAIがこの定義に従います。登録した人と変更の記録は残ります。'),
-        btn));
+    card.append(contribRow('登録すると全員のAIがこの定義に従います。登録した人と変更の記録は残ります。', btn));
     return card;
 }
 
@@ -6452,10 +6484,7 @@ function exampleCard(item) {
             btn.textContent = '登録済み';
         } catch (e) { toast(e.message, 'err', 8000); btn.disabled = false; }
     } }, '例文として登録');
-    card.append(el('div', { class: 'mailcard__row', style: 'justify-content:flex-end' },
-        el('span', { class: 'small muted grow' },
-            '登録すると似た質問へのAIのお手本になります。登録した人と変更の記録は残ります。'),
-        btn));
+    card.append(contribRow('登録すると似た質問へのAIのお手本になります。登録した人と変更の記録は残ります。', btn));
     return card;
 }
 
@@ -6794,9 +6823,10 @@ function addItem(item) {
                 el('button', { class: 'fbrow__b',
                     onclick: pick('sql_ng', 'ありがとうございます。管理者に伝わりました。') }, '合っていない'));
             foot.append(judge);
-            if (item.question) {
+            if (item.question && canContribute()) {
                 // 直接保存ではなくAIに頼む。AIが内容の日本語説明と実データ付きの
                 // 登録カードを出し、そこで確定する（何が登録されるか見えるように）
+                // 登録できない人（管理者メニュー → 画面 の一覧に無い人）には出さない
                 foot.append(el('button', {
                     class: 'btn btn--sm',
                     onclick: ev => {
@@ -11991,6 +12021,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 fold_proposals: $('#dsProposals').checked });
             fill(r.settings || {});
             if (r.updated_at) $('#dsNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
+            toast('保存しました。利用者がマイエージェントの画面を次に開いたとき（再読み込み）から効きます。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
+    // カタログに登録できる人（1行に1人）
+    $('#ccUsers').value = (window.DISPLAY_SETTINGS_INIT.contrib || []).join('\n');
+    $('#ccSave').addEventListener('click', async () => {
+        const btn = $('#ccSave'); btn.disabled = true;
+        try {
+            // 1行に1人が基本だが、読点や空白で区切って書かれても1人ずつに分ける（IDに空白は入らない）
+            const users = $('#ccUsers').value.split(/[\r\n,、\s]+/).map(s => s.trim()).filter(Boolean);
+            const r = await api('/api/catalog/contrib-users', { users });
+            $('#ccUsers').value = (r.users || []).join('\n');
+            if (r.updated_at) $('#ccNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存（${(r.users || []).length} 人）`;
             toast('保存しました。利用者がマイエージェントの画面を次に開いたとき（再読み込み）から効きます。');
         } catch (e) { toast(e.message, 'err', 9000); }
         btn.disabled = false;
