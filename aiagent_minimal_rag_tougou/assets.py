@@ -3078,19 +3078,28 @@ details.acc.is-target {
 .tblpick, .grppick { flex: none; margin: 0; cursor: pointer; }
 .dbpick__table:has(.tblpick:not(:checked)) .dbpick__tname { opacity: .45; }
 /* 一覧はチェックの分だけ左を詰める（インデントが二重にならないように） */
-/* --- この答えはどうだったか（回答の下の3つのボタン） --------------------------------
+/* --- この答えはどうだったか（回答の右下の3つの選択肢） ------------------------------
    「役に立ったか」と「合っているか」は別の軸だが、ボタンを4つ並べると
-   非IT部門の人は読み分けられない。1行1問にして、選択肢を3つにする。 */
+   非IT部門の人は読み分けられない。1行1問にして、選択肢を3つにする。
+   見た目は静かに: 枠も背景も持たない薄い文字を細い縦線で区切り、右端に寄せる。
+   本文は左から読むので、右端なら視線の通り道に入らない。乗せると下線が出て押せると分かる。
+   強調色（オレンジ）は使わない。答えより評価が目立ってしまうため。 */
 .fbrow {
-    display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
-    font-size: 12px; color: var(--muted); margin: 2px 0 10px 2px;
+    display: flex; align-items: center; gap: 0; flex-wrap: wrap; justify-content: flex-end;
+    font-size: 11.5px; color: var(--muted); margin: 0 0 8px;
 }
 .fbrow__b {
-    border: 1px solid var(--border-2); background: var(--surface); color: var(--text);
-    border-radius: 999px; padding: 2px 11px; font-size: 12px; cursor: pointer;
+    border: 0; border-left: 1px solid var(--border); background: transparent; color: var(--muted);
+    border-radius: 0; padding: 1px 8px; font: inherit; font-size: 11.5px; line-height: 1.5; cursor: pointer;
 }
-.fbrow__b:hover { border-color: var(--accent); color: var(--accent); }
-.fbrow__done { color: var(--ok); }
+.fbrow__b:first-of-type { border-left: 0; padding-left: 6px; }
+.fbrow__b:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+.fbrow__b:disabled { opacity: .5; cursor: default; text-decoration: none; }
+.fbrow__done { color: var(--muted); }
+/* SQLの枠の下: 「合っている／合っていない」は右へ、「この質問と答え方を例文にする」は左に枠なしで */
+.toolblock__foot--judge > .fbrow { margin: 0 0 0 auto; order: 2; }
+.toolblock__foot--judge > .btn { order: 1; border-color: transparent; background: transparent; color: var(--muted); }
+.toolblock__foot--judge > .btn:hover { background: var(--surface-2); color: var(--text); }
 .fbask {
     background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
     padding: 9px 11px; margin: 0 0 10px 2px; font-size: 12px; max-width: 640px;
@@ -6764,12 +6773,12 @@ function addItem(item) {
         if (fbTurn) fbTurn.usedSql = true;
         const links = catalogLinks(item.tables);
         {
-            const foot = el('div', { class: 'toolblock__foot' });
+            const foot = el('div', { class: 'toolblock__foot toolblock__foot--judge' });
             // 取り方が合っているかは、解説を読んだ人にしか判断できない。
             // 押せる人を絞るのではなく、解説のすぐ下に置いて目に入るようにする。
             // 「合っている」は、そのまま例文にしてよいという評価と同じもの。
-            const judge = el('div', { class: 'row', style: 'gap:6px;align-items:center' },
-                el('span', { class: 'small muted' }, 'この取り方は'));
+            // 見た目は回答の下の「この答えは」と同じ（.fbrow）。右に寄せるのは CSS 側。
+            const judge = el('div', { class: 'fbrow' }, el('span', {}, 'この取り方は'));
             const sqlSt = fbTurn;             // このSQLが出た回の turn を掴んでおく
             const pick = (kind, msg) => async (ev) => {
                 ev.currentTarget.disabled = true;   // 応答を待つあいだの連打を止める
