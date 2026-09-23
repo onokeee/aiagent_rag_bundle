@@ -1,0 +1,1486 @@
+﻿あなたは経験豊富なセキュリティアーキテクトです。
+社内向け Flask アプリ「AIワークハブ」（SQLite のデータに日本語で質問すると、AI が Function Calling で SQL を書いて実行し、
+表・グラフ・ファイル・メール下書きを返すアプリ）の「セキュリティ設計」の詳細設計図を作成してください。
+作成日: 2026-09-23。下の事実は 2026-09-23 時点の実装から抽出したものです。
+
+【この資料の扱い方（あなたへの指示）】
+- 下の「実装から抽出した事実」だけを根拠にしてください。事実に無いことを推測で補わないでください。
+  図に描くために不足している情報があれば、その箇所に「仕様に記載なし」と明記してください。
+- 識別子（関数名・ルート・設定名・イベント名・JSONのキー）は原文のまま使い、日本語の説明を添えてください。
+- 図は Mermaid 記法で出力してください（sequenceDiagram / flowchart / stateDiagram-v2 / classDiagram）。
+  Mermaid で表現しにくい表は Markdown の表にしてください。
+- 出力は日本語。各図の前に「この図が示すもの」「読み方」を2〜3行で書いてください。
+- 事実の中に file:line の参照がある場合は、図の注記や表の備考に残してください（あとで実装と突き合わせるため）。
+- この資料は長いです。一度に受け取れない場合は、「## 」で始まる節ごとに順に渡すので、節ごとに図を作り、
+  最後に「全体を統合した図」をまとめてください。渡された節の内容は忘れずに保持してください。
+
+【作ってほしい成果物（この順で）】
+1. 信頼境界図（Mermaid flowchart）
+   境界: ブラウザ / Flask サーバ(core.py, brain.py) / SQLite ファイル / OpenAI互換API（社外） / LightRAG サーバ群 / SMTP サーバ /
+   出力先フォルダ（共有フォルダ） / 取り込み元フォルダ。境界をまたぐデータに「何が渡るか（渡らないか）」を書くこと
+   （例: AI には道具の宣言と結果の先頭数行だけ、全行は渡らない）。
+2. 多層防御の図（Mermaid flowchart）: AI が書いた SQL が通る検査と鍵の層（validate_select → 読み取り専用接続 → authorizer →
+   行数の上限）を層ごとに、それぞれが「何を防ぎ、何を防がないか」の注記つきで。
+3. 認可マトリクス（Markdown の表）: 画面・API ルート・AI ツールごとに、未ログイン / 一般利用者 / 管理者 / 一覧の人（カタログ登録）の可否。
+   判定がサーバのどこで行われるか（デコレータ名・関数名）を備考に。
+4. データの出口の制御（Mermaid flowchart または表）: メール（許可リスト・上限・テスト送信）、ファイル（出力先・本人フォルダ・引換券URL）、
+   取り込み元、アップロード、LightRAG への送信内容。
+5. 秘密情報の置き場所と表示の表: 何がどこに（env / data の yaml・json）、画面に何が出るか、ログに何が出るか。
+6. 堅牢性の図または表: 原子的な書き込み、ロック、壊れたファイルの扱い、定期実行の二重起動防止、デバッガ拒否。
+7. 脅威と対策の表（STRIDE でもよい）: 事実から裏付けられる対策だけを書き、対策が無い・弱い項目は「残存リスク」として正直に列挙。
+8. 最後に「設計上の要点」を10項目以内で箇条書き。
+
+=====================================================================
+以下、実装から抽出した事実
+=====================================================================
+
+## SQLの安全性とデータアクセス（SELECT専用ガード・読み取り専用接続・オーソライザ・スコープ制御・パス解決）
+
+対象コード: `C:\Users\onoke\Desktop\aiagent_rag_bundle\aiagent_minimal_rag_tougou\core.py`（元 db.py / catalog.py / verify.py / importer.py / web 各ルート）、`brain.py`（tools / results / custom_tools / rag / models）、`config.py`、`auth.py`。行番号はすべて 2026-09-23 時点のファイルに対するもの。実行環境（.venv）で確認した値: Python 3.13.2 / SQLite 3.45.3。
+
+---
+
+### 0. 全体像 — 4層防御と周辺部品（core.py:63-76 のヘッダコメントが宣言）
+
+| 層 | 実装（関数 / 定数） | 位置 | 何を止めるか |
+|---|---|---|---|
+| 1. 構文チェック | `validate_select` + `_FORBIDDEN` / `_REPLACE_INTO` / `_SCHEMA_TABLE` / `_QUOTED` / `_strip_sql_comments` / `_trim_tail` / `_blank_quoted` | core.py:252-329 | 空文・複文（`;`）・SELECT/WITH以外の開始・書込/DDL 19語・`REPLACE INTO`・SQLite管理表名 |
+| 2. 読み取り専用接続 | `_ro_uri`（`?mode=ro`）+ `connect_scope`（main は `file::memory:`、実DBはすべて ATTACH）/ `connect_ro` | core.py:140-172 | 物理的な書き込み。main が空メモリDBなので、仮に main への書込が通っても実ファイルには届かない |
+| 3. オーソライザ | `_ALLOWED_ACTIONS` + `_make_authorizer` + `_view_closure` + `_names_in`、`conn.set_authorizer` | core.py:332-434, 521-522 | SELECT/READ/FUNCTION/RECURSIVE 以外の全アクション、`sqlite_*` の読み取り、スコープ外の表の読み取り（ビュー経由の例外あり） |
+| 4. 時間・件数の制限 | `conn.set_progress_handler(..., 10000)` + `cur.fetchmany(max_rows + 1)` | core.py:523-529 | 暴走クエリ（既定10秒）、行数（既定2,000行） |
+
+周辺部品:
+- スコープの伸縮: `dbs_named_in`（175-182）/ `widen_scope`（185-207）/ `narrow_scope`（209-250）/ `MAX_ATTACHED = 10`（154）
+- エラーの言い換え: `explain_error`（460-480）+ `_MISSING_FUNC_HINTS`（439-457）
+- 表単位の制限の供給元: `build_scope`（core.py:7417-7432）→ `_auto_scope`（8464-8517）→ `rag.excluded_tables`（brain.py:11972-11981）/ `llm.route_tables`（brain.py:13149-13210）/ `expand_tables_by_relations`（13213-13252）
+- 結果の預かり（result_id 経路）: brain.py 7391-7507（`MAX_ENTRIES=40`, `MAX_CELLS=400_000`, `scope_key`, `get`, `find_by_sql`）
+- セルフテスト: `_sql_guard_selftest`（core.py:539-594、`python core.py selftest`）
+
+原則: **AIと画面が組み立てた「読み取り」SQLは例外なく `db.run_select` を通る**（呼び出し元一覧は §12）。書き込み系（取り込み・DROP・CREATE VIEW）は別系統で、`admin_required` と `DATA_DIR` 直下チェックで守る（§9, §13）。
+
+---
+
+### 1. 第1層 `validate_select(sql: str) -> str`（core.py:294-329）
+
+#### 1.1 検査用コピー（probe）の作り方 — 順序固定
+
+```
+cleaned = _trim_tail(sql)                                           # (a)
+probe   = _trim_tail(_strip_sql_comments(_blank_quoted(cleaned)))   # (b)(c)(d)
+```
+
+- (a) `_trim_tail`（279-281）: `sql.strip().rstrip(";").strip()` — 前後空白と**末尾に並んだ `;`** を落とす。
+- (b) `_blank_quoted`（284-292）: `_QUOTED` にマッチした塊を「先頭1文字＋末尾1文字」に潰す（`'don''t drop it'` → `''`、`"delete"` → `""`、`` `x` `` → ``` `` ```、`[delete]` → `[]`）。
+  - `_QUOTED`（266）: `'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]` — `''` / `""` / ` `` ` のエスケープも1塊として食う。
+- (c) `_strip_sql_comments`（269-276）: `--[^\n]*` → `" "`、`/\*.*?\*/`（DOTALL）→ `" "`。**必ず (b) の後に呼ぶ**（docstring 明記。生SQLに当てると値の中の `--` / `/* */` まで消える）。
+- (d) もう一度 `_trim_tail`（コメントを消した結果、末尾に `;` が露出する場合のため）。
+- **実行するのは `cleaned`（コメントを残した元SQL）**。probe は判定にしか使わない。理由（docstring 294-306）: `SELECT '2024/*x*/end'` を除去すると `'2024 end'` に黙って変わる／`WHERE note = 'foo -- bar'` は引用符が閉じず構文エラーになる。
+
+#### 1.2 判定順序とエラーメッセージ（すべて `ValueError`）
+
+| # | 条件 | メッセージ | 行 |
+|---|---|---|---|
+| 1 | `not sql or not sql.strip()` | `SQLが空です。` | 307-308 |
+| 2 | `cleaned` が空 | `実行可能なSQLがありません。` | 309-311 |
+| 3 | `probe` が空 | `実行可能なSQLがありません。` | 313-315 |
+| 4 | `";" in probe` | `複数ステートメントは実行できません(SELECT文を1つだけ指定してください)。` | 316-317 |
+| 5 | `probe.lower()` が `select` でも `with` でも始まらない | `SELECT文(または WITH ... SELECT)のみ実行できます。` | 318-320 |
+| 6 | `_FORBIDDEN.search(probe) or _REPLACE_INTO.search(probe)` | `書き込み・DDL系のキーワード '{語}' は使用できません。読み取り専用です。` | 321-323 |
+| 7 | `_SCHEMA_TABLE.search(probe)` | `SQLiteの管理表 '{名}' は読めません。テーブルの一覧・列の名前・型は、データカタログの説明としてすでに渡されています。そちらを見てください。` | 324-328 |
+| — | 通過 | `return cleaned` | 329 |
+
+#### 1.3 正規表現の定義
+
+- `_FORBIDDEN`（252-256）: `\b(insert|update|delete|drop|alter|create|truncate|attach|detach|reindex|vacuum|pragma|grant|revoke|begin|commit|rollback|savepoint|merge)\b`、`re.IGNORECASE`。**19語**。`replace` は意図的に不在（コメント 245-248: `replace(X,Y,Z)` は文字列関数で常用するため）。
+- `_REPLACE_INTO`（257）: `\breplace\s+into\b`、IGNORECASE。
+- `_SCHEMA_TABLE`（262-263）: `\bsqlite_(master|schema|temp_master|temp_schema|sequence|stat\d*)\b|\bpragma_\w+`、IGNORECASE。コメント（259-261）: `sqlite_master` には全表・全ビューの名前と CREATE 文が入るので、読めると「対象から外した表」の名前と定義が見える。`pragma_*` はテーブル値関数（`pragma_table_info` 等）の代替経路を塞ぐ。
+
+#### 1.4 この層で「していない」こと（コード上の事実）
+
+- SQL文字列の**長さ上限は無い**。
+- `EXPLAIN` / `EXPLAIN QUERY PLAN` / `VALUES(...)` は判定5（select/with で始まらない）で拒否される。実行計画は AI に見せない（内部の `view_used_data` だけが EXPLAIN を使う、§9.3）。
+- `\b` 境界は Unicode `\w` に依存するため、`create_log` や `受注create` のような識別子はキーワードとして誤検出しない（`_` も日本語も `\w`）。
+- 検査は `validate_select` 単体で完結し、DBには触れない。
+
+#### 1.5 セルフテスト `_sql_guard_selftest`（539-594）
+
+- ok_cases 8本: `SELECT 1` / `select a.x from t a join u b on a.id=b.id` / `WITH t AS (SELECT 1 AS a) SELECT a FROM t` / `SELECT replace(name,'株式会社','') FROM t` / `SELECT * FROM t WHERE x='delete me'` / `SELECT * FROM t WHERE note=';'` / `SELECT * FROM t WHERE s='don''t drop it'` / `SELECT "delete" FROM t`
+- ng_cases 9本: `DELETE FROM t` / `DROP TABLE t` / `UPDATE t SET x=1` / `SELECT 1; DELETE FROM t` / `INSERT INTO t VALUES(1)` / `PRAGMA table_info(t)` / `ATTACH DATABASE 'x.db' AS z` / `REPLACE INTO t VALUES(1)` / `SELECT * FROM t WHERE x='a'; DROP TABLE t`
+- 続いて tempfile に a.db / b.db を作り `run_select("SELECT t.v, u.w FROM a.t t JOIN b.u u ON t.id=u.id", scope)` で ATTACH 横断 JOIN、`connect_scope` の接続へ直接 `INSERT INTO a.t VALUES(9,'z')` を撃って `sqlite3.OperationalError` になれば読み取り専用が効いていると判定（例外が出なければ `!! 読み取り専用が効いていない` で戻り値 1）。
+- ガードすり抜けは `!! ガードすり抜け:` の print のみで、終了コードには反映されない（566-572）。
+
+---
+
+### 2. 第2層 読み取り専用接続（core.py:140-172）
+
+#### 2.1 URI と接続
+
+- `_ro_uri(path)`（140-141）: `Path(path).resolve().as_uri() + "?mode=ro"`（例: `file:///C:/.../data/%E3%83%87%E3%83%BC%E3%82%BF.db?mode=ro`）。
+- `connect_ro(path)`（144-150）: `sqlite3.connect(_ro_uri(path), uri=True, timeout=30)`。単一DBの読み取り専用接続（プロファイリング・表ビューア・メール宛先検索用）。`timeout=30` は取り込み側の書き込み接続と同じ値（既定5秒だと大きな表の入れ替えコミット中に `database is locked` で落ちる、docstring）。
+- `MAX_ATTACHED = 10`（154）: SQLite が同時に ATTACH できる上限（main は空メモリDBなので実質この数）。
+- `connect_scope(paths_aliases)`（157-172）:
+  1. `len(paths_aliases) > MAX_ATTACHED` → `ValueError("1つのSQLで扱えるDBは10個までです（この問い合わせはN個を必要としています）。SQLiteの制限です。テーブル名を『DB名.テーブル名』の形で書けば、実際に使うDBだけを繋ぐので多くの場合はこの制限に当たりません。")`
+  2. `conn = sqlite3.connect("file::memory:", uri=True)` — **main は空の :memory:**。`uri=True` があるからこそ ATTACH 先の `?mode=ro` が URI として解釈される。
+  3. 各 `(path, alias)` について `conn.execute(f'ATTACH DATABASE ? AS "{alias}"', (_ro_uri(path),))` — パスはプレースホルダ、alias は識別子として直接埋め込み（alias は `alias_for` で `[^\w]` を `_` に潰した後の値なので安全）。
+- **PRAGMA は接続時に一切発行しない**（`query_only`、`foreign_keys`、`journal_mode` 等は未使用）。読み取り専用は `mode=ro` のみで担保。PRAGMA が出るのはプロファイリング（`PRAGMA table_info` / `PRAGMA foreign_key_list`、core.py:2524, 2530）、importer（5509）、表ビューア（15273, 15324）だけで、いずれも `run_select` 経路の外。
+
+#### 2.2 エイリアス
+
+- `_ALIAS_BAD = re.compile(r"[^\w]", re.UNICODE)`（108）、`_RESERVED_ALIASES = {"main", "temp"}`（110）。
+- `alias_for(path)`（113-120）: `Path(path).stem` の記号・空白を `_` に、空または数字始まりなら `db_` を前置、`main`/`temp` なら `_db` を後置。日本語は残す（`売上.db` → `売上`。ASCII に絞ると「店舗マスタ」が `_____` になり複数DBを区別できない、コメント 104-107）。
+- `aliases_for(paths)`（123-134）: 衝突時は `_2`, `_3` … を付ける（小文字比較）。
+
+#### 2.3 スコープの伸縮（run_select の前後）
+
+- `dbs_named_in(sql)`（175-182）: `list_db_files()` を走査し、`(?<![\w."])` + alias + `\s*\.`（IGNORECASE）に当たる DB のファイル名を返す（会話が触ったDBの記録に使う、core.py:7941）。
+- `widen_scope(sql, scope)`（185-207、呼び出し側が run_select の前に呼ぶ）: SQL が `alias.` の形で名指しする DB を、選ばれていなくても足す。足す要素は `{"path": str(p), "alias": a, "name": p.name, "tables": None}`（**tables=None**）。`len(out) >= MAX_ATTACHED` で打ち止め。docstring の根拠: DBの選択は「見る範囲を絞る」ためのもので、アクセス制御ではない。
+- `narrow_scope(sql, scope)`（209-250、run_select の内部）: `len(scope) <= 1` なら即 return。(1) `alias\s*\.` で名指しされた DB、(2) 修飾なしの表名 `(?<![\w."])` + 表名 + `(?![\w"])` が一致する DB（`s["tables"]` を走査）を集め、`picked[:MAX_ATTACHED] if picked else scope`。判断できないときは全部を返す（勝手に減らして `no such table` にしない）。
+
+---
+
+### 3. 第3層 SQLite オーソライザ（core.py:332-434）
+
+#### 3.1 許可アクション
+
+```
+_ALLOWED_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}   # 332
+for _name in ("SQLITE_RECURSIVE",): if hasattr(sqlite3, _name): _ALLOWED_ACTIONS.add(...)  # 333-335
+```
+
+実環境の値（.venv で確認）: `SQLITE_SELECT=21`, `SQLITE_READ=20`, `SQLITE_FUNCTION=31`, `SQLITE_RECURSIVE=33`（存在する）。参考: `SQLITE_ATTACH=24`, `SQLITE_PRAGMA=19` は含まれない。戻り値は `SQLITE_OK=0` / `SQLITE_DENY=1`（`SQLITE_IGNORE=2` は使っていない）。
+
+#### 3.2 `_make_authorizer(allowed: set | None, via_view: set | None = None)`（395-434）
+
+- `allow_ci = None if allowed is None else {str(x).lower() for x in allowed}`、`via_ci = {str(x).lower() for x in (via_view or ())}`（SQLite は「SQLに書かれたとおりの綴り」で名前を渡すので小文字で比較、コメント 405-409）。
+- コールバック `_authorizer(action, arg1, arg2, db_name, trigger)`（412-433）の分岐順:
+  1. `action not in _ALLOWED_ACTIONS` → `SQLITE_DENY`（413-414）。
+  2. `action == SQLITE_READ and str(arg1 or "").startswith("sqlite_")` → `SQLITE_DENY`（419-420）。**allowed の有無によらず**管理表は読ませない。
+  3. `allowed is not None and action == SQLITE_READ and arg1` のとき（422-432）:
+     - `name = str(arg1).lower()`; `name in allow_ci` → `SQLITE_OK`
+     - `via_ci and name in via_ci and (trigger or not arg2)` → `SQLITE_OK`（ビューの中身を読んでいる最中＝第5引数 `trigger` にビュー名が入る、または列名 `arg2` が空の「表を参照する」照会。どちらも `via_view` に入っている名前に限る）
+     - それ以外 → `SQLITE_DENY`
+  4. その他 → `SQLITE_OK`（433）。
+- `db_name` は受け取るだけで使わない → **allowed は表名だけのフラットな集合で、DB名で分離しない**。
+- `allowed is None` のときは 2 の `sqlite_` 拒否と 1 のアクション制限だけが効く（表単位の制限なし）。
+- `SQLITE_FUNCTION` は関数名（arg2）で絞っていない。`create_function` は呼んでいないので SQLite 組み込み関数だけが呼べる。
+
+#### 3.3 ビューの扱い — `_view_closure(conn, aliases, allowed, sql="")`（350-392）と `_names_in`（338-345）
+
+- `_names_in(text, name)`: `(?<![\w."])"?` + `re.escape(name)` + `"?(?![\w])`、IGNORECASE（引用符付き・無しの両方に当たる。`\w` は Unicode）。
+- `_view_closure`:
+  1. `not allowed` → `set()`。
+  2. 各 alias について `SELECT name, type, sql FROM "{alias}".sqlite_master WHERE type IN ('table','view')` を実行（`sqlite3.Error` は握って continue）。**この SELECT は `set_authorizer` より前に実行される**（run_select 521-522 で `_make_authorizer(allowed, _view_closure(...))` の引数評価が先）ので、上記 3.2-2 の `sqlite_` 拒否には当たらない。
+  3. `todo = [v for v in allowed if v in views and (not sql or _names_in(sql, v))]` — **SQLに名前が出てくる許可済みビュー**だけを起点にする（docstring: ここを絞らないと、入れ子ビュー用の穴（列名が空の READ を通す）から対象外の表の `COUNT(*)` が読めてしまう）。
+  4. ビュー定義本文に `_names_in` で当たる表・ビュー名を `out` に集め、当たったのがビューなら `todo` に積んで増えなくなるまでたどる（自分自身と既出は除外）。
+- 結果 `out`（表名とビュー名の集合）が `via_view` として `_make_authorizer` に渡る。
+- ビューを SELECT すると SQLite は READ を「ビュー名」と「実体の表名（trigger=ビュー名）」の両方で通知するため、ビューだけを allowed に入れても、この closure が無いと元表で DENY される（コメント 355-358）。
+- `profile_db`（2600-2603）は `sqlite_master` を `type IN ('table','view')` で引くので、ビューも `profile["tables"]` に入り、`build_scope` の `tables` にも入る（サイドバーでは `"type": "view"` で見分ける、core.py:7766）。
+
+#### 3.4 `allowed` の作り方（run_select 509-515）
+
+```
+allowed: set | None = set()
+for s_ in use:                      # use = narrow_scope の結果
+    if s_.get("tables"): allowed |= set(s_["tables"])
+    else: allowed = None; break     # 1つでも tables が無い/空/None なら制限なし
+```
+
+- したがって `widen_scope` が足した要素（`tables: None`）が `use` に残ると、**そのSQL全体で表単位の制限が外れる**（widen が足すのは SQL が alias を名指ししているときだけなので narrow でも必ず残る）。
+- `_sql_scope`（13057-13078）・`_view_run`（11710-11721）・`view_export`（11759）が作る scope には `tables` キー自体が無い → 常に `allowed = None`（いずれも `admin_required` のルート）。
+
+#### 3.5 順序の制約
+
+- `connect_scope`（ATTACH）→ `set_authorizer` の順は入れ替え不可（`SQLITE_ATTACH=24` は許可アクションに無いので、先に付けると自分の ATTACH が DENY される）。
+- DENY 時の例外は `conn.execute` 内で `sqlite3.Error` として捕まり `explain_error` を通るが、該当パターンは無いので SQLite の英語文言のまま `sqlite3.OperationalError` として再送出される（525-527）。
+
+---
+
+### 4. 第4層 タイムアウトと件数上限（core.py:523-529、config.py:307-309）
+
+- `config.MAX_RESULT_ROWS = 2000`（config.py:307、env 不可・固定値）
+- `config.QUERY_TIMEOUT_SEC = 10`（config.py:308、固定値）
+- `config.SAMPLE_ROWS_FOR_LLM = 40`（config.py:309、固定値。LLMへ返す行数）
+- `config.EXPORT_MAX_ROWS`（config.py:317）: env `EXPORT_MAX_ROWS`、既定 `1000000`。ファイル出力の上限。Excel は `min(config.EXPORT_MAX_ROWS, 1_048_575)` に丸める（brain.py:12576-12577、core.py:11762）。
+- `config.PROFILE_TIMEOUT_SEC = 30`（config.py:322、固定値）、`PROFILE_STATS_MAX_ROWS = 2_000_000`（323）。
+
+run_select 内:
+```
+start = time.time()
+conn.set_progress_handler(lambda: 1 if (time.time() - start) > timeout_s else 0, 10000)   # 524
+cur = conn.execute(safe_sql, params or {})                                                 # 526
+columns = [d[0] for d in cur.description] if cur.description else []                      # 528
+rows = cur.fetchmany(max_rows + 1); truncated = len(rows) > max_rows; rows = [tuple(r) for r in rows[:max_rows]]  # 529-531
+```
+- 10,000 VM命令ごとにコールバック、非0で SQLite が中断。`start` は execute の直前に1回だけ取り、fetchmany 中もリセットしない（execute + fetch 合計で `timeout_s` 秒）。
+- `max_rows` / `timeout_s` に `0` を渡すと `or` で既定値に落ちる（無制限は表現できない）。
+- `fetchmany` は `try/except sqlite3.Error` の外（525-527 の try は execute だけ）。fetch 中の中断は `explain_error` を通らない。
+- 上限+1行を取って `truncated` を決めるだけで総件数は数えない。総件数は brain.py `_total_rows(sql, scope)`（7551-7562）が `SELECT COUNT(*) FROM ({sql.strip().rstrip(';')})` を `max_rows=1` で撃ち直す（例外は握って `None`）。
+- プロファイリングは別系統 `_make_timeout(conn, seconds)`（core.py:2506-2513）: `box["t"]` を持ち、100,000 命令ごとに判定、クエリごとに `reset()`（`_profile_table` 2520-2537 で各PRAGMA/COUNT前に呼ぶ）。
+
+---
+
+### 5. `run_select(sql, scope, max_rows=None, timeout_s=None, params=None)` の全手順（core.py:483-534）
+
+引数: `scope = [{"path": str, "alias": str, "name": str, "tables": list[str] | None, "meta": dict}, ...]`（path/alias 以外は経路により欠ける）、`params` は `:name` バインド用 dict。戻り値 `(columns: list[str], rows: list[tuple], truncated: bool)`。
+
+1. `not scope` → `ValueError("対象のDBがありません。SQLは実行できません。出力したい内容が手元にある（文書を調べた・自分で整理した）なら、sql の代わりに rows で表をそのまま渡して呼び直すこと。DBのデータが必要なら、data/ にDBを置くよう利用者に案内する。")`（494-501）
+2. `safe_sql = validate_select(sql)`（502）
+3. `max_rows = max_rows or config.MAX_RESULT_ROWS`、`timeout_s = timeout_s or config.QUERY_TIMEOUT_SEC`（503-504）
+4. `use = narrow_scope(safe_sql, scope)`（507）
+5. `allowed` 構築（509-515、§3.4）
+6. `conn = connect_scope([(s["path"], s["alias"]) for s in use])`（517）
+7. `conn.set_authorizer(_make_authorizer(allowed, _view_closure(conn, [s["alias"] for s in use], allowed, safe_sql)))`（521-522）
+8. progress handler（523-524）
+9. `conn.execute(safe_sql, params or {})`、`sqlite3.Error` → `raise sqlite3.OperationalError(explain_error(e)) from e`（525-527）
+10. columns / fetchmany / truncated（528-531）
+11. `finally: conn.close()`（533-534）— 接続は1回のSELECTごとに作って捨てる。
+
+バインド変数: 値はSQL文字列に埋め込まれず `conn.execute(safe_sql, params)` の名前付きプレースホルダで渡る（docstring 489-491）。`render_sql`（brain.py:12561-12563）は「UIのプレビュー用。実行時は :name のままバインドするので置換はしない」。
+
+---
+
+### 6. `explain_error(e)`（core.py:460-480）と `_MISSING_FUNC_HINTS`（439-457）
+
+1. `no such function:\s*([A-Za-z_0-9]+)` → ヒントがあれば `"{msg} … SQLite には {fn}() がありません。SQLで書き直そうとせず、{hint} を使ってください。"`、無ければ `"… 標準のSQLite関数だけで書き直すか、専用の分析ツールを使ってください。"`
+2. `no such column:\s*(\S+)` → `"{msg} … 列名が違います。describe_table でテーブルの列を確認してから書き直してください（推測で列名を作らないこと）。"`
+3. `"syntax error" in msg` → `"{msg} … SQLite で解釈できない書き方です。ウィンドウ関数の一部・WITHIN GROUP・PIVOT などは使えません。集計や統計は専用ツール（pivot_table / analyze_stats）に任せてください。"`
+4. それ以外 → `msg` そのまま。
+
+`_MISSING_FUNC_HINTS` のキー: `stddev, stdev, stddev_samp, variance, var_samp, median, percentile, percentile_cont, percentile_disc, corr, regr_slope, stddev_pop, sqrt, power, date_trunc, now, year, month, day, concat, ifnull_, listagg, string_agg, top`（値は `analyze_stats(method='describe')` / `analyze_stats(method='correlation')` / `regression` / `strftime(...)` / `||` / `group_concat` / `LIMIT` など）。
+
+`validate_select` の `ValueError` は try の外で投がるので `explain_error` を通らず、日本語のガード文言がそのまま呼び出し元（→ `_err("SQL実行エラー: ...")` → LLM）へ届く。
+
+---
+
+### 7. AIが見てよい表の決定（スコープ制御）
+
+#### 7.1 `build_scope(selection: dict) -> list[dict]`（core.py:7417-7432）
+
+- `selection = {DBファイル名: [表名, ...]}`。`files = {f.name: f for f in db.list_db_files()}`、`chosen = [files[n] for n in selection if n in files]`（存在するファイル名だけ）。
+- 各DB: `prof = catalog.profile_db(f)`、`available = list(prof["tables"].keys())`（表＋ビュー）、`want = [t for t in (selection.get(f.name) or available) if t in available]`。
+- 要素: `{"path": str(f), "alias": alias, "name": f.name, "tables": want or available, "meta": catalog.load_meta(f)}`。空リスト `[]` を渡すと全表になる。
+
+#### 7.2 利用者が外した表 — `tables_off`
+
+- 保存先: `prefs.yaml` の `KEYS = ("model", "rag_off", "rag_settings", "tables_off", "memory_off")`（core.py:1627）。パスは `config.USER_META_DIR / _key(user) / "prefs.yaml"`（1630-1635）、`USER_META_DIR = DATA_DIR / "users"`（config.py:431）、`_key(user) = user.safe_key`（auth.py:96-105: `username` の英数字と `-_.@` 以外を `_` に、64文字まで、空または `.` 始まりは `_` を前置）。
+- `rag.excluded_tables(user=None) -> list[str]`（brain.py:11972-11981）: `prefs.load(...).get("tables_off")` が list なら `str` 化して返す。「選んだもの」ではなく「外したもの」を持つ（新しい表は既定で対象に入る）。
+- 保存ルート `POST /api/tables/prefs`（core.py:14681-14695、`login_required`）: `known` = 全DBの `profile_db(f)["tables"].keys()`、`off` が list/tuple でなければ 400、`prefs.set_value(g.user, "tables_off", [str(t) for t in off if str(t) in known])`（実在する表だけ保存）。
+- 表の改名時（`cleanup.rename_table`、core.py:7116-7130）は全利用者の `prefs.yaml` を走査して `tables_off` 内の旧名を新名に置換。
+- サイドバー（`chat_index`、core.py:7752-7787）: 表ごとに `"on": t not in off`、`"type": info.get("type") or "table"`。DBの概念は見せない（7755-7756）。
+
+#### 7.3 `_auto_scope(question, chat)`（core.py:8464-8517）— チャットの1質問ごとのスコープ
+
+1. `scope = build_scope({f.name: [] for f in db.list_db_files()})` — 全DB・全表。
+2. `off = set(rag.excluded_tables(g.user))`; あれば各要素の `tables` から除き、表が空になったDB要素は落とす（8483-8487）。
+3. `not scope` → そのまま返す。
+4. `config.SCOPE_MODE`（config.py:297-299、env `SCOPE_MODE`、既定 `"auto"`、許容 `auto|router|all`、それ以外は `auto`）:
+   - `all` → 絞らずに返す。
+   - `auto` かつ `catalog.inline_length(scope) <= models.inline_limit_for(models.current(g.user))` → 絞らずに返す。
+   - それ以外（`router`、または収まらない `auto`）→ `llm.route_tables(question, scope, chat_history)`。
+5. `picked` があれば: この会話で実際にSQLが触った表 `chat["table_names"]`（`"DBファイル名.表名"`、`rpartition(".")` で分割）をピン留め → `llm.expand_tables_by_relations(picked, scope)` → **再度 `off` で落とし直す**（8507-8512）→ `s["tables"] = sel`。
+- 呼び出し元: `_begin_turn`（8577、`/api/chat/send` と `/api/chat/stream` 共通）、書き直しルート（8803）。
+
+`inline_limit_for(model)`（brain.py:2153-2166）: `context_window(model)` × `CATALOG_CONTEXT_RATIO = 0.5`（2132）÷ `TOKENS_PER_CHAR_TEXT = 0.55`（13504）を `INLINE_LIMIT_MIN = 4_000`（2038）と `prompt_inline_limit() = INLINE_LIMIT_MAX = 400_000`（2039, 2120-2128）で丸める。モデル不明時のフォールバックは `config.PROMPT_INLINE_LIMIT_CHARS`（config.py:340、env、既定 `80000`）（core.py:3774-3785）。
+
+#### 7.4 表ルーター `route_tables(question, scope, history)`（brain.py:13149-13210）
+
+- 対応表 `known` は `alias.table`（必ず引ける）と `table` 単独（複数DBで曖昧なら除外）。
+- 表の総数 `total <= 8` → `None`（絞らない）。
+- LLM 呼び出し: `_ROUTE_TABLE_SYSTEM` + カード（`db_text_cached(..., full=False)`）+ 直前3件の質問、`temperature=0, max_tokens=300`。応答から `\[.*?\]` を JSON として読む。例外・`"*"` を含む・空 → `None`。
+- 戻り値 `{DBファイル名: [表名...]}`。
+- `expand_tables_by_relations(picked, scope)`（13213-13252）: `.meta.yaml` の `relationships` を `from → to` の1ホップだけ（元の選択のスナップショットに対して）足す。
+
+#### 7.5 ロボット（マイロボット）実行時のスコープ
+
+- `_robot_run`（core.py:9898-）: `scope = build_scope({f.name: [] for f in db.list_db_files()})`（9906）。**`rag.excluded_tables` による除外は行っていない**（9906-9912 の間に off の処理は無い）。手順は `_execute(chat, [call], scope)` → `tools.dispatch(..., admin=_is_admin())`（8416）で実行され、`allowed` は全DBの全表になる。
+- 他の `build_scope({...全DB...})` 呼び出し: 例文保存 `save_example`（8969）、ロボット保存（10810、`tables_in_sql(sql, scope, limit=200)` で使う表を記録）、モデル画面 `_scope`（14537）、チャット初期画面の例文 `scope_starters`（7800）。
+
+#### 7.6 `describe_table` の露出範囲
+
+- ツール定義（brain.py:9285-9301）: `name: "describe_table"`、`parameters.properties = {"table": string}`、`required: ["table"]`（**`db` はスキーマに無い**。ハンドラは `args.get("db", "")` を読むだけ）。
+- ハンドラ `_describe_table`（brain.py:10211-10213）: `catalog.describe_table_text(scope, args.get("db",""), args.get("table",""))`、`"ok": not text.startswith("エラー")`、`render: None`。
+- `describe_table_text(scope, db_alias, tname)`（core.py:3826-3861）:
+  1. `tname` に `.` があり、先頭が scope 内の alias（小文字比較）で、`db_alias` が空か同じなら `alias.table` を剥がす。
+  2. `db_alias` 空なら `scope[0]`、それ以外は alias 一致（小文字）。無ければ `"エラー: DBエイリアス '{db_alias}' は選択されていません。選択中: {aliases}"`。
+  3. `profile = profile_db(entry["path"])`、`meta = load_meta(entry["path"])`。
+  4. `tname not in profile["tables"]` → `"エラー: テーブル '{tname}' は {db_alias} にありません。存在するテーブル: {全表名}"`（**存在する全表名を列挙する**。除外表の名前もこの一覧に含まれる）。
+  5. `entry.get("tables") and tname not in entry["tables"]` → `"エラー: テーブル '{tname}' は実在しますが、いまの対象に入っていません。サイドバーの一覧でチェックを入れると使えます。"`（説明も見せない）。
+  6. `table_text(entry["alias"], tname, profile, meta, full=True)`。
+- システムプロンプト側 `prompt_for_scope`（core.py:3788-3823）: 詳細版が limit 以下なら全文、超えるなら要約（列名なし）＋「必ず describe_table を呼んで確かめること」の注意文。
+
+#### 7.7 SQLから表・DBを当てる正規表現（Unicode `\w` 前提）
+
+| 関数 | 位置 | パターン | 用途 |
+|---|---|---|---|
+| `dbs_named_in` / `widen_scope` / `narrow_scope`(1) | core.py:175-250 | `(?<![\w."])` + alias + `\s*\.` | 繋ぐDBの決定・会話が触ったDBの記録 |
+| `narrow_scope`(2) / `dbs_in_sql`(2) | core.py:236-247, 7458-7466 | `(?<![\w."])` + 表名 + `(?![\w"])` | 修飾なし表名からDBを当てる（引用符付き表名には当たらない） |
+| `tables_in_sql(sql, scope, limit=6)` | core.py:7474-7500 | `sql.replace('"', "")` 後に `(?<![\w.])alias\s*\.\s*表名(?![\w])` または `(?<![\w.])表名(?![\w])` | マイエージェントのSQLからカタログへのリンク（最大 `limit` 件） |
+| `_names_in` | core.py:338-345 | `(?<![\w."])"?名前"?(?![\w])` | ビュー定義の参照表抽出 |
+| 会話が触った表の記録 | core.py:7953-7956 | `(?<!\w)表名(?!\w)` | `chat["table_names"]` |
+
+---
+
+### 8. 結果の預かり（result_id 経路）と `fetch`（brain.py:7391-7691）
+
+- `MAX_ENTRIES = 40`（7391）、`MAX_CELLS = 400_000`（7393、行×列の合計）。`_store` はモジュール変数の `OrderedDict`（プロセス全体で共有、利用者単位ではない）。`_store_lock = threading.RLock()`。
+- `scope_key(scope) = "|".join(sorted(path...))`（7433-7435、**tables は含まない**）。
+- `put`（7461-7474）: `rid = "r_" + uuid4().hex[:8]`、エントリ `{"scope", "columns", "rows", "truncated", "sql", "norm_sql", "turn", "label"}`、`_evict()`（古い順に破棄）。
+- `get(scope, rid)`（7477-7484）: `entry["scope"] != scope_key(scope)` なら `None`。DB には触れない。
+- `find_by_sql(scope, sql)`（7487-7507）: 同じ質問（`current_turn()`）・同じ `scope_key`・同じ `normalize_sql`（空白正規化のみ、大小は区別）なら既存 rid を返す。
+- `new_turn()`（7405-7409）: `"t_" + uuid4().hex[:8]`。`/api/chat/send` と `/api/chat/stream` の `_begin_turn`（core.py:8552）、ロボット実行（9905）で呼ぶ。
+- `fetch(spec, scope, *, label=None, max_rows=None)`（7619-7691）→ `(columns, rows, truncated, result_id, total_rows)`:
+  1. `spec["rows"]` が非 None: 中身があるか sql/result_id が無ければ `_inline_table`（DBを介さない表。`cap = max_rows or MAX_RESULT_ROWS`）。
+  2. `result_id` 未指定なら `results.find_by_sql` で同一SQLの使い回しを試みる。
+  3. `rid` あり: `results.get` が `None` → `AnalysisError("result_id '...' のデータが見つかりません。…")`。預けた結果が `truncated` で `max_rows > len(entry["rows"])` なら `entry["sql"]` を `widen_scope` → `run_select` で取り直す。それ以外は預けた結果をそのまま返す（**run_select を通らない**）。
+  4. `sql` 無し → `AnalysisError("sql と result_id のどちらも指定されていません。…")`。
+  5. `scope = db.widen_scope(sql, scope)` → `db.run_select(sql, scope, max_rows=max_rows)` → `keep = rows[:MAX_RESULT_ROWS]` を `results.put`、`truncated` なら `_total_rows`。
+- `source_note(row_count, truncated, total, cap=None)`（7693-7705）: `{"source_row_count", "source_truncated", ["source_total_rows", "warning"]}`。warning 文: `"上限 {cap or MAX_RESULT_ROWS:,} 行で切り詰めました。実際は {total:,} 行あります。この結果は全体の一部です。全体を語るなら、SQL側でGROUP BY で集計するか、条件を絞って取り直してください。"`
+- `render_source_note(truncated, total)`（7708-7718）: 画面用 `{"truncated": True, "source_total_rows": total}`。
+- `_run_sql_query(args, scope)`（brain.py:10095-10125）: `fetch(args, scope, label=args.get("purpose"))`、例外は `_err(str(e))` / `_err(f"SQL実行エラー: {e}")`。LLMへは `{"columns", "row_count", "rows": 先頭 SAMPLE_ROWS_FOR_LLM=40 行, "result_id", "note", **source_note, "example_registered"}`、画面へは `{"role":"assistant","kind":"table","columns","rows"(全行),"truncated"}`。
+- ツール定義 `run_sql_query`（brain.py:7943-7968）: `parameters.properties = {"sql": string, "purpose": string}`, `required: ["sql","purpose"]`。説明文「SELECT(または WITH ... SELECT)以外は実行不可」。
+- SQLを受け取る組み込みツール `SQL_TOOLS_query = {"run_sql_query","plot_chart","plot_dual_axis","pivot_table","analyze_stats", *_CHART_TOOLS}`（10816-10817）。`_gather_sqls`（12802-12819）は引数の入れ子から `sql` と `result_id`（→ 預けた SQL）を全部拾い、`_attach_verification`（12823-12839）で検算に回す。
+
+---
+
+### 9. ビュー（CREATE VIEW）の検証と実行
+
+#### 9.1 定数・関数（core.py:11633-11721）
+
+- `VIEW_PREVIEW_ROWS = 20`（11640）。
+- `_view_check_sql(sql) -> str`（11643-11649）: `strip().rstrip(";").strip()`、空なら `ValueError("SQLが空です。")`、`db.validate_select(sql)`（**ビュー定義の唯一の文字列ガード**）、整形後の `sql` を返す。
+- `_view_run(path, sql, limit=VIEW_PREVIEW_ROWS)`（11710-11721）: `scope = [{"path": str(path), "alias": db.alias_for(path), "name": path.name}]`（tables 無し → allowed None）、`db.run_select(sql, scope, max_rows=limit)`、件数は `SELECT COUNT(*) FROM ({sql})` を `max_rows=1`（失敗は握る）。戻り `{"columns", "rows", "total"}`。
+- `importer.create_view(db_path, name, sql, replace=False)`（core.py:5744-5768、**書き込み系**）: `db_path.parent.resolve() != config.DATA_DIR.resolve()` → `ImportError_("data/ の外は操作できません。")`; `sqlite3.connect(db_path)`（書込可）; `SELECT type FROM sqlite_master WHERE name = ?` で既存を見て、表なら `"'{name}' は既にテーブルとして存在します。…"`、ビューかつ `not replace` なら `"ビュー '{name}' は既にあります。…"`、`replace` なら `DROP VIEW IF EXISTS "{name}"`; `CREATE VIEW {_importer_qi(name)} AS {sql}`（**f-string 連結**。docstring「SQLは SELECT専用ガードを通ったものだけを渡すこと」）; `sqlite3.Error` → rollback + `ImportError_("ビューを作れませんでした: …")`。
+- `importer.drop_table(db_path, table)`（5719-5741）: DATA_DIR チェック → `SELECT name, type FROM sqlite_master WHERE name = ? COLLATE NOCASE` で種類を見て `DROP {VIEW|TABLE} IF EXISTS "{real}"`。
+- `list_views`（5771-5781、`mode=ro`、`type='view' AND name NOT LIKE 'sqlite_%'`）、`view_body`（5784-5789、`\bAS\b\s*(.+)$` で本体抽出）。
+- `_importer_qi(name)`（5487-5488）: `"` を `""` にエスケープして二重引用符で囲む。`safe_name(name, fallback="col", *, table=False)`（5336-5356）: NFKC → `[^\w]`→`_` → `table=True` なら `_{2,}`→`__` を保つ、それ以外は `_+`→`_` → strip("_") → 数字始まりは `_` 前置 → `_RESERVED`（4494-4502、SQL予約語 68語）なら `_` 後置 → 64文字。
+
+#### 9.2 ルート（すべて `bp_catalog` + `@admin_required`）
+
+| ルート | 関数 | 行 | 処理 |
+|---|---|---|---|
+| `POST /api/catalog/view/preview` | `view_preview` | 11726-11739 | `path_for(body.db)` → `_view_check_sql` → `_view_run` + `_view_used_safe`。`FileNotFoundError`→404、他→400 |
+| `POST /api/catalog/view/export` | `view_export` | 11742-11773 | 同上 → `cap = min(EXPORT_MAX_ROWS, 1_048_575)` で `run_select` → Excel |
+| `POST /api/catalog/view/explain` | `view_explain` | 11776-11800 | `_view_run(path, sql, limit=1)` で動くことを確認 → `llm.explain_sql`（読む表名だけ渡す） |
+| `POST /api/catalog/view/draft` | `view_draft` | 11805-11838 | `llm.draft_view` を最大2回、毎回 `_view_check_sql` + `_view_run` |
+| `POST /api/catalog/view` | `view_save` | 11844-11926 | `importer.safe_name(name, table=True)`、`"__"` を含まない名前は 400、`_view_check_sql`、既存が表なら 400、`old` が実ビューでなければ 400、上書きは `overwrite` 明示時のみ（409）、**保存前に `_view_run(path, sql, limit=1)`**、改名は `cleanup.rename_table`、`importer.create_view(..., replace=bool(old) or bool(existing))`、説明・解説を `.meta.yaml` に保存 |
+| `POST /api/catalog/view/delete` | `view_delete` | 11929-11955 | 実ビューでなければ 404、`cleanup.views_using` が空でなく `force` 無しなら 409、`importer.drop_table` + `cleanup.clean_table` |
+
+#### 9.3 「使ったデータ」の抽出 — `view_used_data(path, sql, ...)`（11652-11700）
+
+- 記録用オーソライザ `_rec`（11668-11673）: `SQLITE_READ` かつ `arg1` が `sqlite_` 始まりでないものを `{表名: [列名...]}` に記録し、常に `SQLITE_OK`。
+- `conn = db.connect_scope([(str(path), db.alias_for(path))])` → `conn.set_authorizer(_rec)` → `conn.execute("EXPLAIN " + sql).fetchall()`（prepare 段階の通知だけを利用、データは読まない）。ビューは SQLite が展開するので元表まで出る。
+- 表名の綴りは `profile["tables"]` の小文字比較でカタログ側に寄せる。`_view_used_safe` は例外時に `[]`。
+
+---
+
+### 10. ユーザー定義ツール（カスタムツール）の検証と実行
+
+#### 10.1 定義の検証（brain.py:7147-7261）
+
+- `RENDER_KINDS = ("table", "chart", "chart_dual", "excel", "csv", "none")`（7147）、`PARAM_TYPES = ("string", "integer", "number", "boolean")`（7148）。
+- `_NAME_RE = ^[A-Za-z][A-Za-z0-9_]{0,47}$`（7151）、`_BIND_RE = (?<!:):([A-Za-z_][A-Za-z0-9_]*)`（7153、`::` は除外）。
+- `bind_names(sql)`（7184-7190）: 重複なし・出現順。
+- `validate_custom_tool(tool, existing_names=frozenset()) -> list[str]`（7194-7261）: 名前必須／`_NAME_RE`／組み込み名（`builtin_names()` = `tools.BUILTIN_TOOLS` の全名）との衝突／既存名との衝突、説明必須、SQL必須、パラメータ名 `^[A-Za-z_][A-Za-z0-9_]*$`・重複・型、**SQL中の `:name` とパラメータ定義の相互対応**（未定義・未使用をそれぞれエラー）、`render` の妥当性、`chart` / `chart_dual` の必須項目。**`validate_select` は呼ばない**（SELECT縛りは実行時の `run_select` のみ）。
+- `to_schema(tool)`（7264-7282）: OpenAI function 形式へ。`coerce_params(tool, args)`（7285-7308）: `integer→int`, `number→float`, `boolean→1/0`（`True`/`"true"/"1"/"yes"`）, それ以外 `str`; `None` は `None`; 失敗は `ValueError("パラメータ '{pn}' を {t} として解釈できません: …")`。
+
+#### 10.2 保存・試行ルート（core.py、すべて `@admin_required`）
+
+- `POST /api/catalog/tool`（`save_tool`、13706-13735）: `path_for(body.db)`、`action == "delete"` なら名前で除去、それ以外は `validate_custom_tool(tool, others)`（`original` を除く既存名）→ エラーなら 400 → `.meta.yaml` の `tools` に保存。**保存時に SQL は実行しない**。
+- `POST /api/catalog/tool/try`（`try_tool`、13369-13400）: `validate_custom_tool` の結果（`'` 始まり＝名前衝突は除外）を `problems` として添え、`coerce_params(tool, _sample_params(...))` → `scope = _sql_scope(sql, path)` → `db.run_select(sql, scope, max_rows=8, params=params)`。
+- `POST /api/catalog/tool/draft`（`_w_draft_tool`、13403-13473）: `llm.draft_tool` 最大2回、`custom_tool_safe_name` で名前を強制的に有効化、`_sql_scope`（db 指定あり）または `db.widen_scope(sql, [])`／全DB `[:MAX_ATTACHED]`（db 指定なし）で `run_select(max_rows=8, params=params)`。
+- `_sql_scope(sql, path)`（13057-13078）: `[{"path": str(path), "alias": alias}]` に、SQL が `alias\s*\.` で名指しする他DBを `MAX_ATTACHED` まで足す。**tables キー無し → allowed None**。
+
+#### 10.3 実行（brain.py:12566-12600、`_run_custom(tool, args, scope)`）
+
+1. `sql = render_sql(tool)`; `params = custom_tools.coerce_params(tool, args)`（`ValueError` → `_err`）。
+2. `scope = db.widen_scope(sql, scope)`（作った人がDBを意識しないため）。
+3. `cap = min(EXPORT_MAX_ROWS, 1_048_575) if render in ("excel","csv") else None`。
+4. `db.run_select(sql, scope, params=params, max_rows=cap)`（例外 → `_err(f"ツール '{name}' のSQL実行エラー: {e}")`）。
+5. `keep = rows[:MAX_RESULT_ROWS]` を `_results.put(..., sql=sql, label=f"{name}（ユーザー定義ツール）")`。LLMへは先頭40行 + `result_id`。
+- ツールの露出: `build_tools(entries, admin)`（12695-12727）は `validate_custom_tool(tool, set())` が空のものだけ `to_schema` で渡す（壊れた定義はAIに見せない）。`dispatch`（12842-12878）は `_HANDLERS` に無い名前を `custom_tools.collect_everywhere(entries)` から探し、`sqls.append(render_sql(tool))` してから `_run_custom`。
+
+---
+
+### 11. 例文・用語（SQL式）・検算の検証経路（すべて `run_select` 経由）
+
+- `POST /api/catalog/glossary/verify`（`verify_glossary`、core.py:13191-13279、admin）: 用語の SQL 式ごとに `_sql_scope(sql, path)` → 表を特定（`_referenced_tables` / `_tables_having_columns` / `_from_clause`）→ `SELECT COUNT(*) AS n, (SELECT COUNT(*) FROM {src}) AS total FROM {src} WHERE {sql}`（max_rows=1）→ 該当行例 `SELECT * FROM {src} WHERE {sql}`（max_rows=3）→ 失敗なら `SELECT {sql} AS v FROM {src}`（max_rows=1）→ 表なしなら `SELECT {sql} AS v`（max_rows=1）。式は f-string で埋め込まれるが、組み立て後の全文が `validate_select` を通る。
+- `POST /api/catalog/examples/verify`（`verify_examples`、13279-13330、admin）: `_sql_scope` → `run_select(sql, scope, max_rows=5)`。
+- AI ツール側: `_propose_glossary_term`（brain.py:10386-10416）は `widen_scope(f"{alias}. {sql}", [{..., "tables": None}])` で編集対象DBを必ず繋ぎ、同じ3段の式検証を `max_rows=1` で行う。`_propose_example`（10440-10460）は `widen_scope` → `run_select(sql, wide, max_rows=5)`、`truncated` なら `_total_rows`。
+- 検算（元 verify.py、core.py:3862-4120）: `DEFAULT_TOLERANCE_PCT = 0.5`（3896）、`DRILL_ROWS = 8`（3898）。`_scalar(sql, scope)`（3972-3977）は `run_select(..., max_rows=1)`、`run_check`（4014-4066）は左右のスカラを比較し不一致なら `drilldown` を `max_rows=DRILL_ROWS` で実行。`_data_version`（4000-4011）は `narrow_scope` で関係DBの `st_mtime_ns` を版にする。`alerts_for(sql_texts, scope)`（4074-）は実行SQL群が触れた表（`tables_in`、3951）と検算の表が交差するものだけ走らせる。
+- データ品質チェック（brain.py:9425-9500）: `_MAX_TABLES = 12`、`_HEAVY_ROWS = 200_000`（これを超える表は `COUNT(DISTINCT)` を省く）。`_q(alias, table) = f'{alias}."{table}"'`（9434-9435）、列名は `"` を `""` にエスケープ。すべて `run_select(..., max_rows=1)`。
+
+---
+
+### 12. `run_select` の呼び出し元一覧（読み取りSQLの全経路）
+
+| 呼び出し元 | 位置 | max_rows | scope の由来（tables の有無） |
+|---|---|---|---|
+| `fetch`（組み込みツール全般） | brain.py:7671, 7684 | 呼び出し側指定 or 2000 | `_auto_scope` → `widen_scope`（widen が足すと None） |
+| `_total_rows` | brain.py:7558 | 1 | 同上 |
+| `_run_custom` | brain.py:12580 | None or Excel上限 | 同上 |
+| データ品質チェック | brain.py:9453, 9477, 9490, 9499 | 1 | チャットの scope |
+| `_propose_glossary_term` / `_propose_example` | brain.py:10400-10412, 10458 | 1 / 5 | `tables: None` / widen |
+| 検算 `_scalar` / `run_check` | core.py:3974, 4047 | 1 / 8 | チャットの scope |
+| `_view_run` / `view_export` | core.py:11713, 11716, 11759 | 20 / 1 / Excel上限 | tables 無し（None） |
+| 用語・例文の検証 | core.py:13232-13270, 13306 | 1 / 3 / 5 | `_sql_scope`（None） |
+| ツール試行・下書き | core.py:13391, 13464 | 8 | `_sql_scope` / widen / 全DB（None） |
+| セルフテスト | core.py:583, 587 | 2000 | tempfile |
+
+---
+
+### 13. `run_select` を通らない DB アクセス経路
+
+| 経路 | 位置 | 接続 | ガード |
+|---|---|---|---|
+| プロファイリング `profile_db` / `_profile_table` | core.py:2581-2630 / 2516-2578 | `db.connect_ro`（mode=ro） | オーソライザ無し（`PRAGMA table_info` / `PRAGMA foreign_key_list` / `SELECT COUNT(*)` / サンプル行を撃つため）。`_make_timeout` 30秒。`sqlite_master` を `type IN ('table','view') AND name NOT LIKE 'sqlite_%'` で列挙。結果は `PROFILE_CACHE_DIR/<DB名>.profile.json`（2503-2504）にキャッシュ（mtime+size 一致で再利用） |
+| 関連の実データ検査 `tuple_unique` / `link_check` | core.py:3313-3326 / 3392-3410 | `db.connect_scope`（mode=ro） | オーソライザ無し。識別子は `"`→`""` エスケープで引用 |
+| ビューの使用表抽出 `view_used_data` | core.py:11672-11677 | `db.connect_scope` | `EXPLAIN` のみ・記録用オーソライザ（常に OK） |
+| メール宛先検索 `address_tables` / `find_recipients` | brain.py:6697-6770 | `db.connect_ro` | `s["tables"]` に無い表はスキップ（6708-6709）。`PRAGMA table_info("{t}")`、`LIKE :q` はプレースホルダ、列名は実在するもののみ |
+| 表ビューア `GET /api/table/rows` / `/api/table/values` | core.py:15255-15335 | `db.connect_ro` | `@login_required`。`_resolve`（15148-15161）はファイル名または alias で DB を引き、表名は `profile_db` の一覧に無ければ 404。`MAX_LIMIT = 500`、`PAGE_SIZES = (50,100,200,500)`、列名は `PRAGMA table_info` の実在列のみ（`sort` も検証）、値は `?` プレースホルダ、`_like`（15187-15189）は `\ % _` をエスケープして `ESCAPE '\'`、`_filters_sql`（15192-15250）は `values`/`op`(`=,!=,>,>=,<,<=,contains,not_contains,empty,not_empty`) を全部パラメータ化。**`tables_off` は参照しない** |
+| 取り込みの下見 `GET /api/import/table`（`table_detail`） | core.py:14202-14219 | `importer.sample_rows`（mode=ro） | `@admin_required`。`path = config.DATA_DIR / db_file` に対し `path.parent.resolve() != config.DATA_DIR.resolve() or not path.exists()` → 404 |
+| importer の読み `existing_tables` / `table_columns` / `sample_rows` / `run_count` / `list_views` | core.py:5491-5514, 5664-5716, 5771-5781 | `sqlite3.connect(f"file:{path}?mode=ro", uri=True)` | 識別子は `_importer_qi`、`LIMIT ?` |
+| importer の書き `import_dataframe` / `drop_table` / `create_view` | core.py:5516-, 5719-, 5744- | `sqlite3.connect(db_path[, timeout=30])`（書込可） | `admin_required` ルートからのみ。`db_path.parent.resolve() != config.DATA_DIR.resolve()` で拒否。`IMPORT_MAX_ROWS`（env、既定 1000000、config.py:60）。`BEGIN` を自分で張って DROP→CREATE→INSERT を1トランザクションに |
+| 結果の使い回し `results.get` | brain.py:7477-7484 | 接続しない | `scope_key`（path のみ）一致のみ。表の絞り込みは効かない |
+
+---
+
+### 14. DB パスの解決とパストラバーサル対策
+
+- `config.BASE_DIR = Path(__file__).resolve().parent`（config.py:18）。`config.DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))`（config.py:26、env `DATA_DIR`）。起動時 `DATA_DIR.mkdir(parents=True, exist_ok=True)`（config.py:480）。`PROFILE_CACHE_DIR = DATA_DIR / ".profile_cache"`（28）。カタログは `str(db_path) + ".meta.yaml"`（core.py:2238、`data/<DB>.db.meta.yaml`）。
+- `db.list_db_files()`（core.py:86-89）: `config.DATA_DIR.glob("*.db")` のうち `is_file()` を名前順。サブフォルダは見ない。
+- `db.path_for(name)`（92-103）: `target = Path(str(name or "")).name`（**ディレクトリ部分を捨てる**）→ `list_db_files()` の列挙結果と `p.name == target` で一致するものを返す。一致しなければ `FileNotFoundError(f"DBが見つかりません: {name}")`。`data/` に名前を連結しないので `../` を入れても外に出られない（docstring）。画面からの `db` 指定はすべてこの関数（core.py:7951, 8931, 11356-11403, 11730-11933, 12898-13741, 14231, 14252 など）か、`_resolve`（15148-15161、ファイル名または alias で列挙一致）を通る。
+- 例外的に `config.DATA_DIR / db_file` を直接連結するのは `table_detail`（14211）と取り込みジョブ（6304, 13874, 14402, 14427 の `db_file`）で、前者は `parent.resolve()` 比較、後者は保存済みジョブ定義（`data/import_jobs.yaml`）由来。
+- 単一DB設計: `_ensure_default_db`（15441-15453）は `.db` が無ければ `config.DATA_DIR / "データ.db"` を作り `catalog.save_meta(path, {"title": "データ"})`。取り込み先は常に `db.list_db_files()[0]`（14150-14156、「クライアントが何を送ってきても選ばせない」）。
+- 出力先フォルダ `check_output_dir`（5141-5165）: 絶対パス必須、`DATA_DIR` と `BASE_DIR` の中・同一・親を拒否、書き込み試験。
+- 利用者フォルダ: `USER_META_DIR / user.safe_key`（auth.py:96-105 で `.`/`..`/`.`始まりを `_` 前置で逃がす）。
+
+---
+
+### 15. 認可（誰がどの経路を使えるか）
+
+- `login_required`（core.py:7358-7366）: `g.user` 無し → `/api/` は 401 JSON `{"error": "ログインしてください。"}`、それ以外はログイン画面へ。
+- `admin_required`（7369-7388）: 未ログインは同上、`not user.is_admin` → `/api/` は 403 `{"error": "この操作は管理者のみです。"}`、画面は `_TPL_403`。カタログ（ビュー・ツール・用語・例文の編集と検証）・取り込み・DROP はすべてこれ。
+- `_is_admin()`（8211-）: AI経由で管理者専用ツールを渡すか。`tools.build_tools(scope, admin=_is_admin())`（8618）、`tools.dispatch(..., admin=_is_admin())`（8416）。
+- `ADMIN_TOOLS`（brain.py:12558）= `ADMIN_TOOLS_files = {"explore_import_files"}`（9989）∪ `ADMIN_TOOLS_usage = {"analyze_usage"}`（11448）∪ `ADMIN_TOOLS_knowledge = set()`（12378）。`build_tools` は非管理者にこれらを渡さず（12707-12708）、`dispatch` も名指し呼び出しを `_err(f"'{name}' は管理者だけが使えます。")` で拒否（12850-12851、「守りは2箇所」）。
+- `describe_table` / `run_sql_query` 等の SQL ツールは一般利用者も使える（表単位の制限は `_auto_scope` → `allowed` で効く）。
+
+---
+
+### 16. 定数・しきい値一覧
+
+| 名前 | 値 | 位置 | env |
+|---|---|---|---|
+| `MAX_ATTACHED` | 10 | core.py:154 | — |
+| `_FORBIDDEN` 語数 | 19 | core.py:252-256 | — |
+| `_ALLOWED_ACTIONS` | {21, 20, 31, 33} | core.py:332-335 | — |
+| progress handler 間隔 | 10000（run_select）/ 100000（profile） | core.py:524 / 2509 | — |
+| `MAX_RESULT_ROWS` | 2000 | config.py:307 | なし |
+| `QUERY_TIMEOUT_SEC` | 10 | config.py:308 | なし |
+| `SAMPLE_ROWS_FOR_LLM` | 40 | config.py:309 | なし |
+| `EXPORT_MAX_ROWS` | 1000000 | config.py:317 | `EXPORT_MAX_ROWS` |
+| Excel 行上限 | `min(EXPORT_MAX_ROWS, 1_048_575)` | brain.py:12577, core.py:11762 | — |
+| `PROFILE_TIMEOUT_SEC` | 30 | config.py:322 | なし |
+| `PROFILE_STATS_MAX_ROWS` | 2_000_000 | config.py:323 | なし |
+| `connect_ro` timeout | 30秒 | core.py:150 | — |
+| `SCOPE_MODE` | "auto"（auto/router/all） | config.py:297-299 | `SCOPE_MODE` |
+| `PROMPT_INLINE_LIMIT_CHARS` | 80000 | config.py:340 | `PROMPT_INLINE_LIMIT_CHARS` |
+| `INLINE_LIMIT_MIN` / `INLINE_LIMIT_MAX` | 4_000 / 400_000 | brain.py:2038-2039 | — |
+| `CATALOG_CONTEXT_RATIO` / `TOKENS_PER_CHAR_TEXT` | 0.5 / 0.55 | brain.py:2132 / 13504 | — |
+| ルーター省略のしきい値 | 表の総数 ≤ 8 | brain.py:13180 | — |
+| `results.MAX_ENTRIES` / `MAX_CELLS` | 40 / 400_000 | brain.py:7391-7393 | — |
+| `VIEW_PREVIEW_ROWS` | 20 | core.py:11640 | — |
+| `DRILL_ROWS` / `DEFAULT_TOLERANCE_PCT` | 8 / 0.5 | core.py:3898 / 3896 | — |
+| `_MAX_TABLES` / `_HEAVY_ROWS`（品質チェック） | 12 / 200_000 | brain.py:9429 / 9431 | — |
+| 表ビューア `MAX_LIMIT` / `PAGE_SIZES` | 500 / (50,100,200,500) | core.py:15141 / 15140 | — |
+| `IMPORT_MAX_ROWS` / `IMPORT_SAMPLE_ROWS` | 1000000 / 20 | config.py:60 / 153 | 同名 env |
+| `USER_META_DIR` | `DATA_DIR / "users"` | config.py:431 | — |
+| `tables_in_sql` の既定 limit | 6 | core.py:7474 | — |
+
+---
+
+### 17. コードで確認した注意点（設計図に反映すべき事実）
+
+1. `allowed` は「`use` の要素が1つでも `tables` を持たなければ None」（core.py:509-515）。`widen_scope` が足す要素は `tables=None` なので、SQL が別DBを `alias.` で名指しした瞬間に表単位の制限が全体で外れる。
+2. `allowed` は表名だけの集合で `db_name` を見ない（core.py:412-433）。同名の表が複数DBにあれば区別しない（現行は単一DB運用）。
+3. `sqlite_` 始まりの READ は `allowed` の有無によらず DENY（419-420）。加えて `validate_select` の `_SCHEMA_TABLE` で文字列段階でも拒否（262-263, 324-328）。`_view_closure` 自身の `sqlite_master` 読みはオーソライザ設定前に実行される（521-522）。
+4. ビュー経由の元表読みは `via_view` かつ `(trigger or not arg2)` のときだけ通し、`via_view` は「SQLに名前が出てくる許可済みビュー」から辿った集合に限る（350-392, 425-431）。
+5. マイロボットの実行は `build_scope(全DB)` をそのまま使い、`tables_off` を引かない（core.py:9906）。チャット（`_auto_scope`）とは異なる。
+6. `result_id` 経路（`results.get`）は `run_select` を通らず、`scope_key` は path のみ（brain.py:7433-7484）。`_store` はプロセス共有。
+7. `validate_custom_tool` は `validate_select` を呼ばない（brain.py:7194-7261）。保存ルート（core.py:13706-13735）も SQL を実行しない。SELECT 縛りは `try_tool` / `draft` / `_run_custom` の `run_select` 時のみ。
+8. `validate_select` はビュー定義（`create_view` の f-string 連結）の唯一の文字列ガード（core.py:11643-11649, 5762）。
+9. `fetchmany` は `try/except sqlite3.Error` の外（core.py:525-531）。`max_rows`/`timeout_s` の `0` は既定値に落ちる（503-504）。
+10. `describe_table_text` は「存在しない表」のエラー文で `profile["tables"]` の全名（除外表を含む）を列挙する（core.py:3850-3852）。除外表そのものを指定した場合は説明を返さない（3855-3859）。
+11. 表ビューア（`/api/table/rows` 等）は `login_required` のみで `tables_off` を参照しない（core.py:15148-15335）。
+12. EXPLAIN は AI からは使えない（判定5）が、`view_used_data` が内部で使う（11675）。
+
+---
+
+### 18. ヘルプ第5部の記述と現行コードの差分（設計図では現行コードを正とする）
+
+- ヘルプ第5部「第3層」は `sqlite_ で始まる名前は常に許す` / `sqlite_master を読む SELECT は通る` と記すが、現行コードは `_SCHEMA_TABLE`（validate_select 判定7）と `_make_authorizer` の `sqlite_` DENY（419-420）で**両方とも拒否**する。
+- 同「_make_authorizer(allowed)」の擬似コードには `via_view` / `trigger` / `_view_closure` が無いが、現行は `_make_authorizer(allowed, via_view)` と `_view_closure(conn, aliases, allowed, sql)` を持つ（350-434）。
+- 同「custom_tools.validate_custom_tool は validate_select を呼ばない」は現行も同じ。
+- 同「検証環境: Python 3.12.10 / SQLite 3.49.1」は本調査の .venv では Python 3.13.2 / SQLite 3.45.3。`SQLITE_RECURSIVE` はこの環境にも存在する（値 33）。
+- ヘルプ 3-8 の「実行時間は10秒／取得は2,000行／ファイル出力は最大100万行（Excelは1,048,575行で丸め）／AIに渡すのは先頭40行」はコードと一致（config.py:307-317、brain.py:10104, 12577）。
+
+## 認証・認可・セッション・秘密情報の設計（AIワークハブ / auth.py・core.py・brain.py・config.py の実装事実）
+
+対象コード: `C:\Users\onoke\Desktop\aiagent_rag_bundle\aiagent_minimal_rag_tougou`（core.py 15,927行 / brain.py 14,366行 / assets.py 13,387行 / config.py 480行 / auth.py 363行）。
+実行基盤（.venv 実測）: Flask 3.1.3 / Werkzeug 3.1.8 / itsdangerous 2.2.0 / waitress（requirements.txt: `flask>=3.0`, `waitress>=3.0`）。
+以下はすべてコードを直接読んで確認した事実のみ。行番号は `ファイル:行`。
+
+---
+
+### 0. 全体像（設計図の骨格）
+
+- 認証（誰か）は **auth.py** に完結。設定値も env / config.py ではなく auth.py 冒頭の定数（auth.py:41-82）。
+- 認可（何をしてよいか）は **core.py** の 2 つのデコレータ `login_required` / `admin_required`（core.py:7358-7388）＋ 3 つの関数 `_is_admin`（core.py:8211）・`_may_contribute_catalog`（core.py:8228）・`_fs_get` の所有者照合（core.py:7313）。
+- 権限の単位は「一般利用者」と「管理者（`User.is_admin`）」の 2 段のみ。ロール表・ACL・スコープ制御は存在しない。
+- セッションは Flask 標準の署名付き Cookie（サーバ側セッションストアなし）。格納キーは `user` と `chat_id` の 2 つ。
+- 利用者データは `config.USER_META_DIR = DATA_DIR / "users"`（config.py:437）配下の `<User.safe_key>/` フォルダで物理的に分ける。他人のフォルダを参照する経路は「管理者専用ルート」と「定期実行スケジューラ」だけ。
+- 秘密情報は 3 種: (a) LLM APIキー（env `OPENAI_API_KEY` または `data/model_settings.yaml` の `api_key`）、(b) LightRAG APIキー（`data/knowledge_bases.json` の `api_key`）、(c) SMTP 認証（env `SMTP_USER` / `SMTP_PASSWORD` のみ）。
+- 起動時の防御: Flask デバッガの拒否（`_refuse_debugger`）、`DEBUG=True` かつ非ループバックの起動拒否（`_is_loopback`）。
+- **存在しないもの（コード上で確認）**: CSRF トークン、Origin/Referer 検査、ログイン試行回数制限・ロックアウト、受信側レートリミッタ、`logging` モジュールの利用（すべて `print`）、`SESSION_COOKIE_SECURE`、TLS 終端（waitress 平文 HTTP）、ProxyFix、セキュリティヘッダ（X-Frame-Options / CSP / HSTS 等）、アプリ全体の `errorhandler`。
+
+---
+
+### 1. auth.py — 認証プロバイダ
+
+#### 1-1. 設定定数（すべて auth.py 冒頭・env からは読まない）
+
+| 定数 | 値（ソース既定） | 行 | 意味 |
+|---|---|---|---|
+| `AUTH_PROVIDER` | `"local"` | auth.py:48 | `"local"` / `"http"` |
+| `AUTH_USERS_FILE` | `Path(__file__).resolve().parent / "auth_users.yaml"` | :51 | local 用ユーザー定義。**現在のチェックアウトには存在しない**（`ls auth_users.yaml` → No such file） |
+| `AUTH_ADMIN_GROUP` | `"admin"` | :55 | このグループ名を含む人が管理者（完全一致） |
+| `ADMIN_USER` | `"admin"` | :63 | 常設管理者（非常口） |
+| `ADMIN_PASS` | `"adminpass"` | :64 | ソース既定値。**空文字にするとこのアカウント自体が無効**。コメントで「本番では必ず変更」 |
+| `BUILTIN_USERS` | `["user1", "user2", "user3"]` | :71 | 常設一般ユーザー。**ID＝パスワード**。空リストで無効化 |
+| `AUTH_API_URL` | `""` | :74 | http 用エンドポイント（空だと `AuthError`） |
+| `AUTH_API_USER_FIELD` | `"username"` | :75 | 送信 JSON のユーザーID キー |
+| `AUTH_API_PASS_FIELD` | `"password"` | :76 | 送信 JSON のパスワード キー |
+| `AUTH_API_SUCCESS_FIELD` | `""` | :77 | 応答の成功フラグの場所（空＝HTTP 200 で成功） |
+| `AUTH_API_DISPLAY_FIELD` | `"display_name"` | :78 | 表示名（`"user.name"` のドット区切り可） |
+| `AUTH_API_GROUPS_FIELD` | `""` | :81 | グループ一覧の場所（空＝全員一般） |
+| `AUTH_API_TIMEOUT` | `10`（秒） | :82 | `urllib.request.urlopen(timeout=)` |
+
+#### 1-2. `User` データクラス（auth.py:86-106）
+
+- フィールド: `username: str` / `display_name: str = ""` / `groups: list = []` / `is_admin: bool = False`。
+- `__post_init__`: `display_name` が空なら `username` を入れる（:93-94）。
+- `safe_key` プロパティ（:96-106）: フォルダ名用の識別子。
+  - `username` の各文字を `c.isalnum() or c in "-_.@"` なら残し、それ以外は `_` に置換、先頭 64 文字に切る。
+  - 結果が空、または `.` 始まりなら先頭に `_` を付ける（`.`/`..` による親フォルダ参照と隠しフォルダ化を防ぐ）。
+- アプリ側（core.py:7345）は `auth.User(**session["user"])` で毎リクエスト復元する。
+
+#### 1-3. パスワードハッシュ（local 用、auth.py:109-129）
+
+- `_ITER = 200_000`（:111）。
+- `hash_password(password)`（:114-117）: `salt = secrets.token_bytes(16)`、`hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _ITER)`。
+  - 保存形式: `"pbkdf2_sha256$<iters>$<salt hex(32桁)>$<dk hex(64桁)>"`。
+- `verify_password(password, stored)`（:120-129）: `stored.split("$")` で 4 要素に分解、`algo != "pbkdf2_sha256"` は False、反復回数は **保存値** `int(iters)` を使う、比較は `hmac.compare_digest(dk.hex(), hash_hex)`。`ValueError`/`AttributeError` は False。
+
+#### 1-4. `LocalAuthProvider`（auth.py:151-186）と auth_users.yaml の形式
+
+- `name = "local"`, `hint = "社内LDAP導入までの暫定アカウントです。"`。
+- `_load()`（:163-170）: ファイルが無ければ `[]`。`yaml.safe_load` 失敗は `AuthError("ユーザー定義を読めませんでした: ...")`。返すのは `data.get("users") or []`。
+- `authenticate(username, password)`（:172-186）:
+  1. ユーザーが 0 件なら `None`（異常扱いしない。常設アカウントだけで運用できるため）。
+  2. `u["username"].lower() == username.lower()`（**大文字小文字を区別しない**）で最初に一致した 1 件だけ検証。
+  3. `verify_password(password, u.get("password_hash", ""))` が偽なら `None`（同名の 2 件目は見ない）。
+  4. `groups = list(u.get("groups") or [])`、`is_admin = AUTH_ADMIN_GROUP in groups`。
+- auth_users.yaml の形（`save_users_file` / `_mu_cmd_add` core.py:15655-15671 から）:
+  ```yaml
+  users:
+    - username: onoke
+      display_name: onoke
+      password_hash: pbkdf2_sha256$200000$<salt hex>$<hash hex>
+      groups: [admin]
+  ```
+- `save_users_file`（auth.py:353-361）: `yaml.safe_dump(allow_unicode=True, sort_keys=False)` → `os.chmod(p, 0o600)` を試みる（`OSError` は握りつぶし。Windows では無効）。
+
+#### 1-5. `HttpApiAuthProvider`（LDAP 連携 API、auth.py:189-258）
+
+- `name = "http"`, `hint = "社内アカウントでログインしてください。"`。
+- `AUTH_API_URL` が空 → `AuthError("AUTH_API_URL が設定されていません…")`。
+- 送信: `POST`、`Content-Type: application/json`、`Accept: application/json`、本文 `{AUTH_API_USER_FIELD: username, AUTH_API_PASS_FIELD: password}`（パスワード平文を JSON で送る。TLS は URL 次第）。
+- 応答分岐:
+  - `HTTPError` で `e.code in (400, 401, 403)` → `None`（認証失敗）。それ以外の HTTP エラー → `AuthError("認証APIがエラーを返しました: HTTP n")`。
+  - 接続例外 → `AuthError("認証APIに接続できません: …")`。
+  - 本文が JSON でない → `AuthError("認証APIの応答がJSONではありません。")`。空本文は `{}`。
+  - `AUTH_API_SUCCESS_FIELD` が設定されていれば `bool(_dig(data, field))` が偽で `None`。未設定なら `status != 200` で `None`。
+- 結果 `User`: `username = _dig(data, AUTH_API_USER_FIELD) or username`、`display_name = _dig(data, AUTH_API_DISPLAY_FIELD) or ""`、`groups` は `AUTH_API_GROUPS_FIELD` 指定時のみ（文字列 1 個なら 1 要素リストに）、`is_admin = bool(AUTH_ADMIN_GROUP) and AUTH_ADMIN_GROUP in groups`。
+- `_dig(data, "a.b.c")`（:261-270）: ドット区切りで dict をたどる。途中で dict でない/キーが無ければ `None`。
+- LDAP そのものに直接バインドする実装は無い。「LDAP 計画」は docstring（auth.py:2-8, 189-203）で「社内の認証API（LDAP連携API）に HTTP で問い合わせる」方式として `http` プロバイダを差し替え口にしている。
+
+#### 1-6. 常設アカウント（auth.py:285-322）
+
+- `admin_enabled()`（:295）: `bool(ADMIN_USER and ADMIN_PASS)`。
+- `_try_builtin_admin(username, password)`（:299-309）:
+  - 無効なら `None`。`username.strip().lower() != ADMIN_USER.lower()` なら `None`。
+  - `hmac.compare_digest(password.encode("utf-8"), ADMIN_PASS.encode("utf-8"))`（非ASCII対応のため bytes）。
+  - 成功時 `User(username=ADMIN_USER, display_name="管理者", groups=[AUTH_ADMIN_GROUP], is_admin=True)`。
+- `_try_builtin_user`（:312-322）: `BUILTIN_USERS` と ID 一致（strip/lower）→ `compare_digest(password, u)`。成功時 `User(username=u, display_name="", groups=[], is_admin=False)`。ID 一致・パスワード違いは `None`。
+
+#### 1-7. `authenticate()` の判定順序（auth.py:325-341）— 画面が呼ぶ唯一の入口
+
+1. `_try_builtin_admin` が `User` を返せば即返す。
+2. `admin_enabled()` かつ ID が `ADMIN_USER` と一致（strip/lower）なら **プロバイダに渡さず** `None`（LDAP 側の同名ユーザーと取り違えない）。
+3. ID が `BUILTIN_USERS` のいずれかと一致なら `_try_builtin_user` の結果で確定（プロバイダに渡さない）。
+4. それ以外は `get_provider().authenticate(username, password)`。
+- `get_provider(name=None)`（:276-282）: `(name or AUTH_PROVIDER or "local").strip().lower()` を `_PROVIDERS = {"local": LocalAuthProvider, "http": HttpApiAuthProvider}` から引く。未知なら `AuthError`。
+
+#### 1-8. 利用者管理 CLI（core.py:15603-15760、`python core.py users …`）
+
+- サブコマンド: `list` / `add <username> [--display-name] [--groups a,b] [--admin] [--password]` / `passwd <username> [--password]` / `remove <username>`。
+- `--admin` で `AUTH_ADMIN_GROUP` を groups に追加（core.py:15660-15662）。
+- パスワードは `getpass` で 2 回入力・不一致なら終了。`--password` で渡すと「履歴に残ります」警告を stderr に出す（`_mu_ask_password`）。
+- `remove` はユーザー定義だけ削除し、`stop_robots_of(username)`（core.py:12053）でその人のマイロボットの定期実行と自動送信を止める。`data/users/` 配下のフォルダは残す（core.py:15690-15700）。
+- 起動時 `_warn_if_no_admin()`（core.py:15455-15482）: `admin_enabled()` が偽で、local にも `admin` グループの人が居なければ `[auth] 警告: 管理者が1人も居ません…` を print。
+
+---
+
+### 2. ログイン／ログアウト経路（core.py bp_auth = Blueprint("auth")、core.py:7592-7634）
+
+#### `GET|POST /login`（core.py:7595-7628、エンドポイント `auth.login`、デコレータなし）
+
+1. `g.user` が既にあれば `redirect(url_for("chat.index"))`（= `/`）。
+2. `auth.get_provider()`。local かつ `admin_enabled()` が偽かつ users が 0 件なら `setup_needed=True`（画面に `python core.py users add <ユーザー名> --admin` を案内、assets.py:1304-1309）。`AuthError` なら `login.html` を `fatal=str(e)` で描いて終わり（フォームは出さない、assets.py:1285-1286）。
+3. POST: `request.form["username"].strip()`, `request.form["password"]`（フォームは `application/x-www-form-urlencoded`、assets.py:1293-1301。`autocomplete="username"` / `"current-password"`）。
+   - 空 → `flash("ユーザー名とパスワードを入力してください。", "warning")`。
+   - `auth.authenticate` が `AuthError` → `flash(f"認証できませんでした: {e}", "error")`。
+   - `None` → `flash("ユーザー名またはパスワードが違います。", "error")`（ID 不存在とパスワード違いを区別しない）。
+   - 成功 → `login_user(user)` → `nxt = request.args.get("next") or url_for("chat.index")` → `redirect(nxt if nxt.startswith("/") else url_for("chat.index"))`。
+     - `next` の検査は `startswith("/")` のみ（core.py:7625-7626）。
+4. **ログイン失敗の記録（print/ファイル）は無い**。試行回数制限も無い。
+
+#### `POST /logout`（core.py:7631-7634、エンドポイント `auth.logout`、デコレータなし）
+
+- `logout_user()` = `session.clear()`（core.py:7354-7355）→ `redirect(url_for("auth.login"))`。
+- 画面側はサイドバーの `<form method="post" action="{{ url_for('auth.logout') }}">`（assets.py:225-227）。GET は 405。
+
+---
+
+### 3. セッション
+
+#### 3-1. Flask 設定（core.py:15552-15558 `app.config.update`）
+
+| キー | 値 | 備考 |
+|---|---|---|
+| `SECRET_KEY` | `_secret_key()` | 下記 |
+| `MAX_CONTENT_LENGTH` | `64 * 1024 * 1024`（64 MiB） | 超過は Werkzeug 既定の 413 |
+| `SESSION_COOKIE_HTTPONLY` | `True` | Flask 既定も True |
+| `SESSION_COOKIE_SAMESITE` | `"Lax"` | Flask 既定は `None` |
+| `JSON_AS_ASCII` | `False` | **Flask 3.1.3 にこのキーは存在しない**（flask/*.py に参照なし）。`DefaultJSONProvider.ensure_ascii = True`（flask/json/provider.py:144）が効いたまま |
+| `SESSION_COOKIE_SECURE` | 未設定 → Flask 既定 `False`（flask/app.py:194） | HTTP 平文でも送る |
+| `PERMANENT_SESSION_LIFETIME` | 未設定 → 既定 `timedelta(days=31)`（flask/app.py:185） | `session.permanent=False` のため実質未使用 |
+| `SESSION_COOKIE_NAME` | 既定 `"session"` | |
+
+#### 3-2. 署名鍵 `_secret_key()`（core.py:15422-15437）
+
+- `_SECRET_FILE = config.BASE_DIR / ".flask_secret"`。
+- 優先順: (1) env `FLASK_SECRET_KEY`（strip して非空）→ (2) `.flask_secret` があればその内容（strip）→ (3) `secrets.token_urlsafe(48)`（64 文字）を生成して `.flask_secret` に書き、`os.chmod(0o600)` を試みる（`OSError` 無視）。
+- 目的は「再起動でログアウトさせない」（docstring）。`.gitignore` に `.flask_secret` あり。プロジェクト直下に 64 バイトの `.flask_secret` が実在（ls 確認）。
+
+#### 3-3. Cookie の仕組み（Flask 3.1.3 標準 `SecureCookieSessionInterface`、flask/sessions.py:284-320）
+
+- `itsdangerous.URLSafeTimedSerializer`、`salt="cookie-session"`、`key_derivation="hmac"`、`digest_method=sha1`、`TaggedJSONSerializer`。
+- 署名付き・**暗号化なし**（中身は base64 で復号可能、改ざんは検知）。
+
+#### 3-4. セッションの中身（core.py での全使用箇所）
+
+- `_USER_KEY = "user"`（core.py:7337）。`login_user(user)`（:7348-7351）が `session["user"] = {"username", "display_name", "groups": list, "is_admin": bool}` を格納し、`session.permanent = False`（→ Expires/Max-Age 無し＝**ブラウザ終了で消える**）。
+- `session["chat_id"]`: 開いている会話 ID。設定箇所 core.py:7969, 8051, 8726, 12119。削除 core.py:7967, 8046, 8064。参照 :7790, :7917, :7966, :8038, :8063。
+- `load_user_into_context()`（:7342-7345）を `app.before_request` に登録（:15573）: `g.user = auth.User(**session["user"])` または `None`。
+  - 権限（`is_admin`, `groups`）は **ログイン時の写し**。auth_users.yaml や LDAP 側で権限が変わっても再ログインまで反映されない。
+- `inject_globals()`（:7403-7408、`app.context_processor`）: 全テンプレートに `user`, `app_title`, `app_tagline`, `memory_feature`, `nav` を渡す。サイドバーに `user.username` と `groups` を表示（assets.py:221-224）。
+- README.md:1229-1236「ブラウザを再読込するとログインし直しになります」は **コードと一致しない**（Cookie はブラウザ終了まで有効。help.html:2852 の「ブラウザを閉じるとログアウト・再起動ではログアウトしない」がコードと一致）。
+
+---
+
+### 4. `login_required` / `admin_required`（core.py:7358-7388）
+
+```
+login_required(view):
+  g.user is None →
+     request.path.startswith("/api/") → jsonify({"error": "ログインしてください。"}), 401
+     それ以外                          → redirect(url_for("auth.login", next=request.path))
+  else → view()
+
+admin_required(view):
+  g.user is None → login_required と同じ（401 JSON / redirect）
+  not user.is_admin →
+     /api/ 配下 → jsonify({"error": "この操作は管理者のみです。"}), 403
+     それ以外   → render_template_string(_TPL_403), 403
+```
+
+- `_TPL_403`（core.py:7258-7284）: `base.html` を継承する内蔵テンプレート。見出し「権限がありません」、本文に「データカタログ・データ取り込み・モデル設定・メール設定は…管理者のみ」、現在のログイン名（`user.display_name or user.username`）、`chat.index` へ戻るボタン。
+- API/画面の判定は **パス文字列 `/api/` 接頭辞** のみ（Accept ヘッダは見ない）。SSE の `/api/chat/stream` も `/api/` なので未ログインは 401 JSON。
+- ブラウザ側 `api()`（assets.py:3550-3565）: `fetch` に `Content-Type: application/json` を付け、`!res.ok` なら `Error(data.error)` に `status` と `data` を載せて throw。**401/403 でログイン画面へ自動遷移する処理は無い**（`location.href` の使用箇所 assets.py:7050, 10117, 10828, 12137 はいずれもダウンロード／ロボット画面遷移）。
+
+---
+
+### 5. 認可の詳細
+
+#### 5-1. `_is_admin()`（core.py:8211-8218）
+
+- `bool(getattr(g.get("user"), "is_admin", False))`。docstring: 「データ取り込み」画面が管理者専用なので AI 経由でも同じ線を引く。
+
+#### 5-2. 管理者専用ツール `ADMIN_TOOLS` と 2 か所の強制
+
+- 定義（brain.py）: `ADMIN_TOOLS_files = {"explore_import_files"}`（:9989）、`ADMIN_TOOLS_usage = {"analyze_usage"}`（:11448）、`ADMIN_TOOLS_knowledge = set()`（:12378）。`_MODULES`（:12538-12547）の第 3 要素を集めて `ADMIN_TOOLS = {"explore_import_files", "analyze_usage"}`（:12558）。
+- 強制点 1: `build_tools(entries, admin=False)`（brain.py:12695-12707）— `name in ADMIN_TOOLS and not admin` なら **宣言を AI に渡さない**。core.py からの呼び出しは `tools.build_tools(scope, admin=_is_admin())`（core.py:8251 `_advance`、:8629 ストリーム版）。
+- 強制点 2: `dispatch(name, arguments_json, scope, entries, admin=False)`（brain.py:12841-12851）— `name in ADMIN_TOOLS and not admin` なら `_err(f"'{name}' は管理者だけが使えます。")` を返して実行しない（「渡していないツールを名指しで呼ばれても実行しない（守りは2箇所で持つ）」）。core.py からは `tools.dispatch(..., admin=_is_admin())`（core.py:8416, 8594, 8817）。
+- 付随: ヘルプ画面のツール一覧も `name in tools.ADMIN_TOOLS and not g.user.is_admin` で非表示（core.py:15116）。ヘルプの `bases`（ナレッジベース一覧）も `rag.kb_list() if g.user.is_admin else []`（core.py:15133）。
+- 定期実行ロボットも同じ経路（`g.user` に本人の写しを入れて `_is_admin()` を通る。§7-6）。
+
+#### 5-3. `_may_contribute_catalog()`（core.py:8228-8238）
+
+- 式: `config.CATALOG_OPEN_CONTRIB or _is_admin() or in_catalog_contrib(g.user.username)`。
+- `config.CATALOG_OPEN_CONTRIB`（config.py:206-207）: env `CATALOG_OPEN_CONTRIB`、既定 `"false"`、真値 `("1","true","yes","on")`。true なら全員可（一覧は使わない）。
+- `in_catalog_contrib(username)`（core.py:1937-1940）: `catalog_contrib_users()` の小文字集合に `username.strip().lower()` が含まれるか。
+- 一覧ファイル `config.CATALOG_CONTRIB_FILE`（config.py:210-211、env `CATALOG_CONTRIB_FILE`、既定 `DATA_DIR/catalog_contrib.yaml`）。形: `{"users": [str…], "updated_by": str, "updated_at": str}`（core.py:1929-1931）。
+  - 上限 `CATALOG_CONTRIB_MAX = 500`、1 名 `CATALOG_CONTRIB_NAME_MAX = 100` 文字、制御文字（`ord < 32`）禁止、重複は大文字小文字無視で除去（`_tidy_contrib_users` core.py:1876-1900）。形が違えば一覧ごと空扱いにして print 警告（:1903-1913）。
+  - 管理 API: `GET/POST /api/catalog/contrib-users`（core.py:12830-12850、`admin_required`）。
+- 使用箇所: `POST /api/chat/glossary-save`（core.py:8921）、`POST /api/chat/save-example`（:8967）— 否なら `jsonify({"error": _CATALOG_CONTRIB_DENIED}), 403`。`_CATALOG_CONTRIB_DENIED`（:8221-8225）= 「カタログ（用語集・例文）への登録は、管理者と、管理者が決めた人だけです。…」。チャット画面へは `can_contribute=_may_contribute_catalog()` で登録ボタンの表示可否を渡す（:7797）。
+- 変更はすべて `add_catalog_change(kind, op, db_file, name, user=…, source=…)`（core.py:1567-1585）で `CATALOG_HISTORY_FILE` に追記（`"user": user or "不明"`）。
+
+#### 5-4. その他の認可点
+
+- `_fs_get(token, owner)`（core.py:7313-7318）: メモリ上の生成ファイル（`_MAX_ITEMS = 200`、`secrets.token_urlsafe(16)`）を **`owner == g.user.username`** の場合だけ返す。`GET /api/file/<token>` は不一致で `abort(404)`（:15378-15386）、`POST /api/file/save-to-folder` は 404 JSON（:15359-15367）。
+- `POST /api/models`（core.py:7818-7825）→ `models.choose(user, model)`（brain.py:2301-2313）: 管理者が決めた候補 `available()` に無いモデルは `ValueError` → 400。
+- `POST /api/mail/send`（core.py:8869-8897、`login_required`）: `body["confirm"]` 必須、`draft["from_user"]` を **押した本人 `g.user.username` で上書き**、宛先の可否は `mailer.send` 内（`settings().allows()`）。`POST /api/mail/test` は `admin_required`（:8900）。
+- ロボットの失敗通知先 `_robot_notify_check`（core.py:10356-10373）: 最大 10 件、`mailer.EMAIL_RE`、`mailer.settings().allows(addr)` を満たすものだけ。
+
+---
+
+### 6. ルート一覧と必要権限（core.py の全 `@bp_*` ルート。`create_app` 登録順 core.py:15560-15571）
+
+**公開（デコレータなし）**: `GET|POST /login`（7595）、`POST /logout`（7631）、`GET /static/<path:filename>`（`_static_file` 15828、ETag/304、`_STATIC_MIME` css/js のみ）、`GET /vendor/plotly.min.js`（15389）。
+
+**`login_required`（一般利用者）**
+- 画面: `GET /`（chat.index 7750）、`GET /memory`（11042）、`GET /robots`（11098）、`GET /help`（15078）、`GET /table`（15166）。
+- チャット: `GET/POST /api/models`（7811/7818）、`POST /api/chat/image`（7828）、`GET /api/history`（8034）、`POST /api/chat/open`（8041）、`POST /api/chat/delete`（8056）、`POST /api/chat/send`（8600）、`POST /api/chat/stream`（8708）、`POST /api/chat/rewind`（8761）、`POST /api/mail/send`（8869）、`POST /api/chat/glossary-save`（8907、＋`_may_contribute_catalog`）、`POST /api/chat/save-example`（8958、同）。
+- ロボット: `GET /api/robots`（10709）、`POST /api/robots/extract|detect|save|run|update|delete`（10715/10739/10752/10856/10893/10942）。
+- フィードバック・記憶: `POST /api/feedback`（11001）、`GET /api/memory`（11048）、`POST /api/memory/save|clear|toggle`（11054/11065/11072）。
+- カタログ参照: `GET /api/catalog/table-info`（11585）。
+- 設定: `POST /api/tables/prefs`（14681）、`POST /api/knowledge/prefs`（14698）。
+- 表ビューア: `GET /api/table/rows`（15253）、`GET /api/table/values`（15307）（`db.connect_ro` 読み取り専用）。
+- ファイル: `POST /api/file/save-to-folder`（15359）、`GET /api/file/<token>`（15378）。
+
+**`admin_required`（管理者）**
+- 画面: `GET /catalog`（11241）、`GET /catalog/robots`（12012）、`GET /catalog/memory`（12789）、`GET /catalog/display`（12820）、`GET /import`（13778）、`GET /output`（14008）、`GET /mail`（14489）、`GET /models`（14540）、`GET /knowledge`（14587）、`GET /usage`（14839）。
+- カタログ API: `/api/catalog/builtin/source`（11223）、`suggestions`（11350）、`rename-table`（11363）、`rename-group`（11380）、`relationship`（11398）、`view/preview|export|explain|draft`（11724/11740/11774/11803）、`view`（11842）、`view/delete`（11927）、`robots/stop`（12075）、`robots/test`（12089）、`memory-settings` GET/POST（12798/12806）、`contrib-users` GET/POST（12830/12837）、`chat-display` GET/POST（12852/12859）、`robot-settings` GET/POST（12873/12880）、`layout`（12894）、`primary-key`（12917）、`table`（12943）、`glossary`（13023）、`glossary/verify`（13191）、`examples/verify`（13279）、`tool/try`（13369）、`tool/draft`（13403）、`glossary/draft`（13478）、`draft-table`（13501）、`checks`（13517）、`checks/verify`（13552）、`usage`（13581）、`examples`（13606）、`group`（13654）、`group/check`（13684）、`tool`（13706）、`builtin`（13737）。
+- 取り込み API: `/api/import/dirs` GET/POST（13901/13909）、`browse`（13926）、`/api/scrapers`（13962）、`/api/scrapers/test`（13971）、`/api/output-dir` GET/POST（14015/14021）、`/api/import/upload`（14033）、`preview`（14055）、`run`（14106）、`manage`（14196）、`table`（14202）、`impact`（14223）、`drop-table`（14242）、`/api/jobs/save|run|update|delete`（14287/14412/14433/14462）。
+- メール: `GET/POST /api/mail/settings`（14496/14503）、`POST /api/mail/test`（8900）。
+- モデル: `GET/POST /api/models/admin`（14546/14553）。
+- ナレッジ: `POST /api/knowledge`（14595）、`POST /api/knowledge/<kb_id>`（14609）、`/delete`（14622）、`/test`（14630）、`GET /api/knowledge/<kb_id>/key`（14649）。
+- 利用状況: `GET /api/usage/report`（14846）、`GET /api/usage/chats`（14889）、`GET /api/usage/reports`（14975）、`POST /api/usage/report-build`（14988）、`POST /api/usage/export`（15008）。
+
+---
+
+### 7. 利用者ごとのデータ分離
+
+#### 7-1. 置き場所
+
+- `config.USER_META_DIR = DATA_DIR / "users"`（config.py:437）。`DATA_DIR` は env `DATA_DIR`、既定 `BASE_DIR/data`（config.py:26）。起動時 `DATA_DIR.mkdir(parents=True, exist_ok=True)`（config.py:480、chmod なし）。
+- フォルダ名はすべて `getattr(user, "safe_key", None) or str(user)`（core.py:1029, 1095, 1306, 1632, 9226）。
+
+| ファイル | 関数 | 行 |
+|---|---|---|
+| `users/<key>/chats/<id>.json`, `chats/index.json` | `chats_dir` / `_chat_file` / `_index_path` | core.py:1029-1038, 1116 |
+| `users/<key>/prefs.yaml` | `_prefs_path`；読むキーは `KEYS = ("model","rag_off","rag_settings","tables_off","memory_off")` のみ | core.py:1628-1650 |
+| `users/<key>/memory.yaml` | `_memory_path` | core.py:1951 |
+| `users/<key>/robots.json` | `_robots_path` | core.py:9226-9227 |
+
+#### 7-2. 会話（chats）
+
+- `_ID_RE = re.compile(r"[^0-9a-zA-Z_-]")`、`_safe_id(chat_id)` = 許可外文字を除去し 64 文字に切る（core.py:1022, 1033-1035）→ `..`/`/` を混ぜられない。
+- `load_chat(user, chat_id)`（:1349-1359）は **自分のフォルダ内**しか見ない → 無ければ `None`。
+- 呼び出し側の 404: `POST /api/chat/open`（:8050「この会話は見つかりませんでした。」）、`/api/robots/extract`（:10722）、`/api/robots/save`（:10763）、`/api/feedback`（:11019「その会話は見つかりません。」— コメント「読めない＝自分のものではない」）。`/api/chat/delete` はコメントどおり「自分のフォルダの中しか見ないので、他人のIDを送っても他人のものは消えない」（:8058-8060）。
+- `_load_current()`（:7912-7921）は `session["chat_id"]` → `_hold_chat(cid)`（会話ごとの `RLock`、`config.CHAT_LOCK_WAIT_SEC` 既定 120 秒、超えたら print して続行）→ `chats.load_chat(g.user, cid)`。鍵は `app.teardown_request(_release_chat)`（:15574, :7901-7909）で必ず返す。
+- 鍵のキーは `f"{safe_key}/{_safe_id(chat_id)}"`（:1095）。
+
+#### 7-3. 個人設定・記憶・ロボット
+
+- prefs: `load(user)` は `user is None` で `{}`、未知キーは捨てる（:1639-1650）。
+- memory: `_memory_raw(user)` は `user is None` で空（:1954-1960）。
+- robots: `robot_get(g.user, id)`（:9277-9278）→ 無ければ `/api/robots/run|update|delete` が 404「マイロボットが見つかりません。」（:10862, 10899 ほか）。
+
+#### 7-4. ツール実行からの利用者参照
+
+- `_begin_turn()` で `rag.set_current_user(g.user)`（thread-local `_rag_local`、brain.py:11940-11951）。`who_am_i` ツール（`WHOAMI_TOOL` brain.py:12385、ハンドラ `_who_am_i`）は `_current_user()` から `login_id` / `display_name` / `is_admin` を JSON で AI に返す。
+
+#### 7-5. 生成ファイル（filestore）
+
+- `_fs_put(data, filename, mime, owner=g.user.username, trusted, label)`（core.py:7301-7310）。`OrderedDict`、200 件超で古い順に破棄。所有者照合は §5-4。
+
+#### 7-6. 定期実行ロボット（要求外で動く経路）
+
+- `robots_due()`（core.py:10549-10577）が **全利用者**の `robots.json` を走査。
+- `_robot_owner(dir_name, robot)`（:10536-10546）: `robot["owner"]` の写し `{username, display_name, groups, is_admin}` から `auth.User` を再構成（無ければフォルダ名の一般利用者）。写しは `_owner_snapshot(user)`（:10532-10534）で登録時・`/api/robots/run` 実行時に取り直す（:10877-10883、「管理者でなくなった人のロボットが、いつまでも管理者の道具を使わないように」）。
+- `run_scheduled_robots()`（:10580-10620）: `_flask_app.test_request_context("/robots/scheduled")` の中で `g.user = user` を入れて `_robot_execute` を呼ぶ（画面と同じ権限判断経路を通す）。
+
+---
+
+### 8. 管理者が他人のデータを横断的に見る／触る機能（すべて `admin_required`）
+
+- `GET /api/usage/chats`（core.py:14889-14897）→ `_chat_rows(days, user)`（:14940-）: `USER_META_DIR.glob("*/chats/*.json")` を読み、全利用者の質問文と回答（質問 500 字・回答 1000 字に切詰）を最大 500 件返す。`usage_users()`（:14804-14808）は `chats` フォルダを持つユーザー名一覧。
+- `GET /catalog/memory`（:12789）→ `_memory_overview()`（:12772-12786）: 全利用者の `memory.yaml` 本文そのものを返す。
+- `GET /catalog/robots`（:12012）と `POST /api/catalog/robots/stop`（:12075）→ `robot_admin_stop(dir_name, rid)`（:12026-12048）: 他人のロボットの `schedule.enabled=False`・`mail_auto=False` にする。`dir_name` は `safe_key` と同じ規則で正規化し **元文字列と一致しなければ None**（パス注入防止）。
+- `POST /api/catalog/robots/test`（:12089-12123）→ `_robot_admin_test(admin, owner_dir, robot, mail_to)`（:10502-10529）: 他人のロボットを **管理者の名前で** 1 回実行。結果の会話は管理者のフォルダに入り `session["chat_id"]` にセット、メールは `mail_to`（`_robot_notify_check` 通過分）だけに件名 `[試運転]`、所有者の `robots.json` には書かない。連打防止 `ROBOT_TRY_GAP_MINUTES`。print に `by {g.user.username}` を残す（:12120）。
+- `users_by_model()`（brain.py:2255-）: 全利用者の `prefs.yaml` を読んで「どのモデルを誰が使っているか」（モデル設定画面）。
+- 表の改名（core.py:4247-）: 全利用者の `prefs.yaml` の `tables_off` を書き換える。表の削除下見 `_robots_using(table)`（:9880-）: 全利用者の robots.json を読む。
+- `/usage` 画面の docstring: 「他人の質問文がそのまま見えるので、入口は管理者だけに開ける」（core.py:14750-14754）。
+
+---
+
+### 9. 秘密情報の扱い
+
+#### 9-1. LLM API キー
+
+- `config.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()`（config.py:285）。`OPENAI_BASE_URL`（:280）。
+- 実効値 `llm_api_key()`（brain.py:2076-2078）= `model_settings.yaml` の `api_key`（非空）> env。`llm_api_key_source()`（:2081-2085）は `"screen"` / `"env"` / `""` を返す（「キー本体は決して返さない」）。
+- `data/model_settings.yaml`（`config.MODEL_SETTINGS_FILE` config.py:266-267）。読み書きキー `ADMIN_KEYS = ("models","default","vision","context_overrides","api_key","chat_url","models_url")`（brain.py:2032-2033）。`_write_admin`（:2053-2060）は `yaml.safe_dump` で書くだけで **chmod は行わない**（chmod 0600 を試みるのは `.flask_secret`・`auth_users.yaml`・`knowledge_bases.json` の 3 ファイルのみ: core.py:15435 / auth.py:359 / brain.py:11683）。
+- 保存 `save_admin(data, user)`（brain.py:2432-2515）: `api_key` は「値が来たときだけ更新」。検証: 空白・改行を含めば `ValueError`、長さ `8 <= len <= 500`。`api_key_clear: true` で削除（env に戻る）。変更時 `reset_llm_client()`（:12971-12975）で `_client`/`_models_client` を破棄。print は「APIキーを更新 / APIキーをenvに戻した」の文言だけ（値なし、:2508-2514）。
+- 画面向け `admin_status()`（:2378-2379）: `"api_key_set": bool(llm_api_key())`, `"api_key_source"`。URL は「秘密ではないので値も返す」（`chat_url`, `models_url`）。
+- OpenAI クライアント `client()`（brain.py:12946-12954）: `OpenAI(base_url=…, api_key=llm_api_key() or "not-set")`。`is_configured()`（:12942-12943）= `bool(llm_chat_url() and llm_api_key())`；偽なら `_begin_turn` が `_TurnError("LLMが未設定です。env の OPENAI_* を設定してください。")`（400）。
+- UI: `models.html` の入力欄 `#apiKeyInput` は `type="password" autocomplete="new-password"`（assets.py:1593）。
+
+#### 9-2. LightRAG（ナレッジベース）API キー
+
+- `config.KNOWLEDGE_BASES_FILE`（config.py:400-401、env `KNOWLEDGE_BASES_FILE`、既定 `DATA_DIR/knowledge_bases.json`）。
+- 1 件の形（`kb_add` brain.py:11722-11750）: `{"id": uuid4.hex[:12], "name", "base_url", "api_key", "description", "enabled", "created_at"}`。名前・URL の重複は `RegistryError`。
+- `_kb_write`（:11675-11685）: `.json.tmp` に書いて `os.replace` → `os.chmod(p, 0o600)` 試行（コメント「APIキーを含むので所有者だけに絞る」）。
+- `_kb_redact`（:11688-11692）: `api_key` を落として `has_api_key: bool` を付ける。`kb_list(include_secrets=False)` / `kb_get(kb_id, include_secrets=False)` が既定で伏せる。`kb_update` は `api_key` が空文字なら「変更なし」（:11776-11779）。
+- 実値を返す経路: `GET /api/knowledge/<kb_id>/key`（core.py:14649-14660、`admin_required`）→ `rag.kb_get(kb_id, include_secrets=True)` → `{"ok": True, "api_key": …}`。docstring: 一覧に埋め込まない理由は HTML/キャッシュに残るため、「表示」ボタンで押されたときだけ取りに行く。
+- 送信ヘッダ: `RagClient` が `headers["X-API-Key"] = self.api_key`（brain.py:11494-11502）。
+- UI 入力欄: `#newKey`（assets.py:1228）と編集欄（assets.py:12390）は `type="password" autocomplete="new-password"`。
+- `.gitignore`: `data/*` に加え名指しで `data/knowledge_bases.json`。
+
+#### 9-3. SMTP 認証情報（env のみ）
+
+- config.py:227-231: `SMTP_HOST`（""）、`SMTP_PORT`（25）、`SMTP_SECURITY`（"none"、none/starttls/ssl）、`SMTP_USER`（""）、`SMTP_PASSWORD`（""、strip しない）、`SMTP_SENDER`（""）。
+- `data/mail_settings.yaml` に書けるキーは `SERVER_KEYS = ("host","port","timeout")` と `EDITABLE_KEYS = SERVER_KEYS + ("sender","sender_name","senders","allow_addresses","max_recipients","dry_run","alert_to","alert_enabled","alert_kinds","ok_domains","body_header","show_sender")`（brain.py:6391-6396）。`security`/`user`/`password` は **常に config（env）から**（`settings()` brain.py:6430-6432）。
+- `mail_status()`（:6634-6656）docstring「認証情報は含めない」。`test_connection()` の文言は `'・認証あり' if s.user` の有無だけ（:7030 付近）。
+- env.example:103-106 に `SMTP_USER` / `SMTP_PASSWORD="ここに書く（このファイルは配布しないこと）"`。
+
+#### 9-4. その他
+
+- `env`, `.env`, `env.*`（`env.example` 除く）, `*.bak`, `auth_users.yaml`, `.flask_secret`, `data/*`, `data/users/`, `README.md` は `.gitignore` 済み。
+- `auth_users.yaml`: PBKDF2 ハッシュのみ（平文なし）、chmod 0600 試行。
+- http プロバイダはパスワードを JSON 本文で認証 API に送る（§1-5）。
+
+---
+
+### 10. ログ方針（キーの扱い）
+
+- `logging` / `getLogger` の使用は core.py / brain.py / auth.py に **無い**。すべて `print` で標準出力（waitress 起動時は `flush=True` で起動メッセージ、core.py:15921-15923）。
+- キー値を print する箇所は無い。関連 print: `[models] モデル設定を更新しました（user）… / APIキーを更新`（brain.py:2508-2514）、`[mailer] 設定を更新しました（user）: サーバ=host:port / 差出人=… / 宛先制限=n / テスト送信=…`（:6626-6631）、`[models] {who} のモデルを {model} にしました`（:2311）、`[robot] OK/NG 「name」（user）: message[:80]`（core.py:10887）、`[robot] 管理者の試運転 … by {admin}`（:12120）、`[output] {user} → {path}`（:15374）、`[chat] 古い画像 n 枚を履歴から外しました（user）`。
+- LLM 例外は `_friendly_llm_error(e)`（core.py:8309-8329）で利用者向け文言に変換し、それ以外は `str(e)[:160]` を画面に出す（`render_log` の `kind:"error"`）。生の例外の全文は print しない。
+- ログイン成功・失敗・ログアウトの print は **無い**（`login()` 内に print なし）。
+- CLI `--password` はシェル履歴に残る旨を stderr に警告（core.py:15630 付近）。
+
+---
+
+### 11. デバッガ拒否と起動時の防御（core.py:15484-15540, 15875-15927）
+
+- `_TRUE = ("1","true","yes","on","t","y")`（:15486）。`_DEBUG_ARGS = ("--debugger","--debug")`（:15526）。
+- `_refuse_debugger()`（:15529-15540）: `os.environ["FLASK_DEBUG"]` が `_TRUE` に含まれる、または `sys.argv[1:]` に `_DEBUG_ARGS` のいずれかがあれば `raise SystemExit(_NO_DEBUG_MSG)`。`create_app()` の最初の行で呼ぶ（:15545）。理由（コメント）: Werkzeug デバッガの PIN はユーザー名・MAC アドレス・マシン ID から作る固定値で秘密にならない。
+- `_is_loopback(host)`（:15515-15521）: `str(host or "").strip().lower() in ("127.0.0.1","localhost","::1")`。空文字は False（`app.run(host="")` は 0.0.0.0 と同じ）。
+- 起動定数: `HOST = "0.0.0.0"`（:15881）、`PORT = 8000`（:15882）、`THREADS = 8`（waitress、:15884）、`DEBUG = False`（:15888）。
+- `__main__`（:15890-15927）: 引数 `users`/`refresh`/`selftest` は CLI。`DEBUG and not _is_loopback(HOST)` → `SystemExit(_NO_DEBUG_REMOTE.format(host=HOST))`。`DEBUG` なら `app.run(debug=True, use_reloader=False, threaded=True)`、通常は `waitress.serve(app, host, port, threads=THREADS)`（ImportError 時は `app.run(debug=False)`）。
+- `after_request _no_html_cache`（:15580-15591）: `text/html` に `Cache-Control: no-store`。他のセキュリティヘッダは付けない。
+
+---
+
+### 12. CSRF（事実）
+
+- CSRF トークン・`Origin`/`Referer` 検査は core.py / assets.py に **存在しない**（grep `csrf|X-CSRF|Origin|Referer` に該当なし）。
+- 実質的な緩和要素: `SESSION_COOKIE_SAMESITE="Lax"`（クロスサイトの POST に Cookie が付かない）、API は JSON 本文（`_body()` が dict 以外を空扱い、ブラウザ `api()` は `Content-Type: application/json`）、`/logout`・`/login` はフォーム POST。状態変更 API はすべて POST（GET で状態を変えるルートは無い）。
+
+---
+
+### 13. リクエスト本文の正規化 `_body()`（core.py:7391-7401）
+
+- `b = request.json; return b if isinstance(b, dict) else {}`。JSON だが dict でない（`"文字列"`, `[]`）本文を `{}` に均し、`.get` の `AttributeError`（500）を防ぐ。
+- Werkzeug 3.1.8 の `request.json`: `Content-Type` が JSON でなければ `on_json_loading_failed(None)` → **415 UnsupportedMediaType**（werkzeug/wrappers/request.py:604, 641-642「2.3 から 400 でなく 415」）。JSON 構文エラーは 400 BadRequest。いずれも Werkzeug 既定の HTML 応答。
+- ファイル系は `request.files.get("file")`（画像 core.py:7835、取り込み :14037）。
+
+---
+
+### 14. エラーハンドラ（登録は 3 つのみ・アプリ全体のものは無し）
+
+| 場所 | 例外 | 応答 |
+|---|---|---|
+| `bp_chat.errorhandler(_TurnError)`（core.py:8459-8461） | `_TurnError(message, status=400, **extra)`（:8447-8456） | `jsonify({"error": message, **extra}), status` |
+| `bp_catalog.errorhandler(FileNotFoundError)`（:11137-11140） | `db.path_for` が DB を見つけられない | `jsonify({"error": str(e)}), 400` |
+| `bp_catalog.errorhandler(catalog.MetaUnreadable)`（:11143-11146） | カタログ YAML 破損 | `jsonify({"error": str(e), "meta_broken": True}), 409` |
+
+- それ以外（404/405/413/415/500）は Flask/Werkzeug 既定の HTML。各ルートは個別に `try/except` で `{"error": …}` を 400/404/409/500 で返す（例: `/api/usage/chats` は集計失敗を 500 JSON、:14894-14896）。
+
+---
+
+### 15. レート制限
+
+- 受信側のレートリミッタ（IP/ユーザー単位）は **無い**。ログイン試行制限も無い。
+- 存在する抑制: ロボット「いま試す」の連打防止 `_robot_try_wait` → 409（`ROBOT_TRY_GAP_MINUTES`、core.py:10870-10874）、管理者試運転の同様の間隔と二重実行防止（`_robot_admin_tests` / `_robots_running`、:10510-10519）、会話ロック `CHAT_LOCK_WAIT_SEC`（config.py:465、120 秒）。
+- `LLM_RATE_LIMIT_RETRIES`（config.py:381、既定 3）/ `LLM_RATE_LIMIT_MAX_WAIT`（:385、20 秒）は **送信側**（OpenAI の 429 再試行）で、受信側制限ではない。
+- 上限系: `MAX_CONTENT_LENGTH` 64 MiB、`IMAGE_MAX_MB` 8（config.py:269）・`IMAGE_MAX_COUNT` 4、`IMPORT_MAX_FILE_MB` 100、`SMTP_MAX_RECIPIENTS` 20、`ROBOT_MAX_PER_USER` 5、`USAGE_MAX_DAYS` 3650。
+
+---
+
+### 16. アップロード
+
+- `config.IMPORT_ALLOW_UPLOAD`（config.py:55-56）: env `IMPORT_ALLOW_UPLOAD`、既定 `"false"`、真値 `("1","true","yes","on")`。env.example:75 `# export IMPORT_ALLOW_UPLOAD="false"`。
+- `check_upload(data, filename, trusted=False)`（core.py:4855-4876）: `not trusted and not config.IMPORT_ALLOW_UPLOAD` → `ImportError_("アップロードからの取り込みは無効化されています（IMPORT_ALLOW_UPLOAD）。")`。拡張子は `IMPORT_EXTENSIONS = (".csv",".tsv",".txt",".xlsx",".xlsm")`、サイズ `IMPORT_MAX_FILE_MB`。`trusted=True` はスクレイパー出力（サーバ側生成）で制限を掛けない。
+- `POST /api/import/upload`（core.py:14033-14052、`admin_required`）: ディスクに書かず `_fs_put` でメモリに預ける。画面のアップロード UI は `allow_upload`（:13795、assets.py:973 `{% if allow_upload %}`）で出し分け。
+- `POST /api/chat/image`（:7828-7857、`login_required`）: `models.is_vision(models.current(g.user))` でなければ 400、`mime in llm.IMAGE_MIMES`、`IMAGE_MAX_MB`、空は 400。
+
+---
+
+### 17. help.html「3-22. 認証と権限」（templates/help.html:2009-2064）の検証結果
+
+| 記述 | 判定 | 根拠 |
+|---|---|---|
+| local / http の 2 方式、キー名・成功判定・表示名・グループ・タイムアウト 10 秒を設定 | 一致 | auth.py:48, 74-82 |
+| API が 400/401/403 → 認証失敗、他は認証エラー | 一致 | auth.py:226-232 |
+| PBKDF2-HMAC-SHA256・20 万回・ソルト 16 バイト・反復回数は保存値から・時間差の出ない比較 | 一致 | auth.py:111-129 |
+| 非常口の管理者。パスワード空で無効。同 ID は外部認証に回さない | 一致 | auth.py:295-309, 335-336 |
+| 常設の一般ユーザー（名前は伏せる方針） | 一致 | auth.py:71, 312-322, 338-340 |
+| 署名付き Cookie・ブラウザを閉じると切れる・JS から読めない・同一サイト制限・鍵はファイル保存/自動生成 | 一致 | core.py:7351, 15555-15556, 15425-15437 |
+| 権限判定＝所属グループに管理者グループ名。API は 403・画面は 403 ページ | 一致 | auth.py:185, 257 / core.py:7369-7388 |
+| 利用者管理 CLI・2 回入力・履歴警告・削除でフォルダは残る | 一致（加えて `stop_robots_of` を呼ぶ） | core.py:15603-15700 |
+| 「ナレッジベースの API キーは画面・API の応答から**必ず**落とします（設定済みか否かだけ返す）」 | **不正確** | 一覧は `_kb_redact` で伏せるが、`GET /api/knowledge/<kb_id>/key`（管理者・押下時）が実値を返す（core.py:14649-14660） |
+| カタログ登録は管理者と一覧の人だけ | 一致（＋env `CATALOG_OPEN_CONTRIB=true` で全員可） | core.py:8228-8238 |
+
+関連する他節の差異:
+- 3-23（help.html:2109）「data/model_settings.yaml: 選べるモデル・既定・画像対応・文脈長の上書き」— 実際は `api_key` / `chat_url` / `models_url` も同ファイルに保存（brain.py:2032）。同ファイルは chmod 対象外。
+- 3-23「data/knowledge_bases.json: APIキーを含むため権限を絞り、原子的な置き換え」— 一致（brain.py:11675-11685）。
+- 3-23「data/mail_settings.yaml: 秘密は入れません」— 一致（brain.py:6391-6396）。
+
+---
+
+### 18. 設計図に落とすためのシーケンス素材
+
+**A. ログイン**
+`GET /login` → `login()` → `auth.get_provider()` → `login.html`（`setup_needed` / `fatal`）→ `POST /login`（form: username, password）→ `auth.authenticate()`：`_try_builtin_admin` → 同 ID 遮断 → `_try_builtin_user` → `provider.authenticate`（local: yaml + `verify_password` / http: POST JSON → `_dig`）→ `login_user()`（`session["user"]`, `permanent=False`）→ `302 next|/`。失敗は `flash` → 200 で再描画。
+
+**B. 毎リクエスト**
+`before_request load_user_into_context`（`g.user`）→ ルートのデコレータ（`login_required`/`admin_required`：401 JSON | 302 `/login?next=` | 403 JSON | `_TPL_403`）→ ビュー → `teardown_request _release_chat` → `after_request _no_html_cache`。
+
+**C. チャット 1 ターンの権限**
+`_begin_turn`（`_body`、`llm.is_configured`、`rag.set_current_user(g.user)`、`_load_current` + `_hold_chat`）→ `_advance`：`tools.build_tools(scope, admin=_is_admin())`（ADMIN_TOOLS 除外）→ LLM → `tools.dispatch(..., admin=_is_admin())`（ADMIN_TOOLS 再拒否）→ `_persist`（自分の `chats/`）。登録カード押下 → `/api/chat/glossary-save|save-example` → `_may_contribute_catalog()`（403）→ `add_catalog_change(user=…)`。
+
+**D. 管理者専用の秘密情報操作**
+`GET /api/models/admin` → `admin_status()`（`api_key_set`/`api_key_source` のみ）／`POST` → `save_admin()`（`api_key`|`api_key_clear`）→ `_write_admin`（chmod なし）→ `reset_llm_client()`。`GET /api/knowledge/<id>/key` → `kb_get(include_secrets=True)` → 実値。`_kb_write` → tmp → `os.replace` → chmod 0600。
+
+**E. 定期実行ロボット（要求外）**
+`scheduler.start()`（`create_app` 末尾）→ `run_scheduled_robots()` → `robots_due()`（全 `users/*/robots.json`）→ `_robot_owner()`（`owner` 写し → `auth.User`）→ `app.test_request_context("/robots/scheduled")` + `g.user = user` → `_robot_execute` → 通常と同じ `_is_admin()` / 所有者フォルダへ保存。
+
+**F. 起動**
+`python core.py` → `DEBUG and not _is_loopback(HOST)` 検査 → `create_app()`：`_refuse_debugger()` → `Flask(static_folder=None)` + `DictLoader(TEMPLATES)` → `config.update(SECRET_KEY=_secret_key(), …)` → 12 Blueprint 登録 → hooks → `_warn_if_no_admin()` → `_ensure_default_db()` → `scheduler.start()` → `waitress.serve(threads=8)`。
+
+## データの出口と堅牢性（メール／ファイル出力／取り込み入口／マイロボットの安全／原子的書き込み／同時実行／スケジューラ／プロセスモデル）
+
+対象: `C:\Users\onoke\Desktop\aiagent_rag_bundle\aiagent_minimal_rag_tougou` の `core.py`（15,927行）・`brain.py`（14,366行）・`config.py`（480行）・`auth.py`（363行）。行番号は 2026-09-23 時点のコードで確認したもの。`templates/help.html` 第3部（3-1／3-18／3-21／3-23／3-24／3-27）・第5部（5-9／5-10）を地図に使い、事実はすべてコードで検証した。help と食い違う点は末尾「§11 help.html との差異」にまとめた。
+
+---
+
+### 1. メール送信（`brain.py` 元 mailer.py 区画）
+
+#### 1-1. 定数・モジュール状態
+
+| 識別子 | 値 | 位置 |
+|---|---|---|
+| `EMAIL_RE` | `^[^@\s,;:<>\"]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`（「厳密なRFC準拠より明らかな入力ミスを弾く」方針） | brain.py:6290 |
+| `MAIL_HINTS` | `("mail","メール","eメール","address","アドレス","宛先","email")` | brain.py:6293 |
+| `NAME_HINTS` | `("name","氏名","名前","担当","社員名","person","user","顧客名","得意先")` | brain.py:6294 |
+| `DEPT_HINTS` | `("部署","部門","所属","課","dept","department","division","組織","拠点")` | brain.py:6295 |
+| `_mailer_lock` | `threading.Lock()` | brain.py:6297 |
+| `_sent_log` / `_MAX_LOG` | プロセス内 list／上限 **200** 件（古い順に `pop(0)`） | brain.py:6298-6299, 7039-7043 |
+| `MailError(Exception)` | 送れない理由（そのまま画面へ） | brain.py:6302 |
+| `ALERT_KINDS` | `("failed","degraded","overdue")` | brain.py:6312 |
+| `ALERT_KIND_LABELS` | failed=取り込みが失敗した／degraded=値の型がずれた／overdue=動いていない | brain.py:6313-6317 |
+| `_HOSTNAME_RE` | `^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$` | brain.py:6499 |
+
+#### 1-2. `SmtpSettings`（dataclass, brain.py:6321-6376）
+
+フィールドと既定値（宣言順）:
+
+- `host: str = ""`、`port: int = 25`、`security: str = "none"`（none/starttls/ssl）、`user: str = ""`、`password: str = ""`、`sender: str = ""`、`sender_name: str = ""`
+- `body_header: str = ""`（本文冒頭の断り書き。`{app}` はアプリ名に置換）
+- `show_sender: bool = True`（「送信者: …」行を入れるか）
+- `timeout: int = 20`
+- `allow_addresses: list = []`
+- `senders: list = []`（画面で選べる差出人候補）
+- `max_recipients: int = 20`
+- `dry_run: bool = True`
+- `alert_to: list = []`（取り込み警告の通知先）
+- `alert_enabled: bool = True`
+- `alert_kinds: list = list(ALERT_KINDS)`
+
+メソッド／プロパティ:
+
+- `configured` → `bool(host and sender)`（brain.py:6344-6346）
+- `problems() -> list[str]`（brain.py:6348-6362）: 判定順 ①host 空 ②sender 空 ③`allow_addresses` 空（「送信できる宛先が1件も登録されていません…」）／空でなければ ④`EMAIL_RE.match(sender)` 失敗 ⑤`security` が none/starttls/ssl 以外 ⑥`user` あり かつ `password` 空。
+- `allows(address) -> bool`（brain.py:6364-6373）: **`allow_addresses` が空なら常に `False`**（＝誰にも送れない。「未設定＝全許可」にしない）。空でなければ `address.strip().lower()` が `allow_addresses` の小文字化リストに**完全一致**するか。
+- `restricted` → 常に `True`（brain.py:6375-6378）。
+
+#### 1-3. 設定の重ね方（env → `data/mail_settings.yaml`）
+
+- `SERVER_KEYS = ("host","port","timeout")`、`EDITABLE_KEYS = SERVER_KEYS + ("sender","sender_name","senders","allow_addresses","max_recipients","dry_run","alert_to","alert_enabled","alert_kinds","ok_domains","body_header","show_sender")`（brain.py:6391-6395）。**security/user/password はファイルに入らない**（画面にそのまま出すファイルなので秘密は置かない）。
+- `_read_overrides()`（brain.py:6398-6407）: ファイル無し→`{}`。`yaml.safe_load` 失敗→`print("[mailer] 設定を読めませんでした…")` して `{}`。dict でなければ `{}`。`EDITABLE_KEYS` 以外は捨てる。
+- `_write_overrides(data)`（brain.py:6410-6416）: `_mailer_lock` 下で `p.write_text(yaml.safe_dump(...))` **直接上書き（一時ファイル経由ではない）**。
+- `settings() -> SmtpSettings`（brain.py:6419-6450）:
+  - `sender = ov.sender or config.SMTP_SENDER`、空で `senders` があれば `senders[0]`。
+  - `security = config.SMTP_SECURITY`、`user = config.SMTP_USER`、`password = config.SMTP_PASSWORD`（**env のみ**）。
+  - `dry_run` はキーが存在すれば `bool(ov["dry_run"])`、無ければ `config.SMTP_DRY_RUN`。`show_sender`、`alert_enabled`（無ければ True）、`alert_kinds`（無ければ全種、あれば `ALERT_KINDS` に含まれるものだけ）も同じ「キー有無」判定。
+  - `max_recipients = int(ov.get("max_recipients", config.SMTP_MAX_RECIPIENTS) or 20)`。
+- 関連 env（config.py）:
+
+| env | 既定 | 位置 |
+|---|---|---|
+| `SMTP_SETTINGS_FILE` | `DATA_DIR/mail_settings.yaml` | 189-190 |
+| `SMTP_HOST` | `""` | 191 |
+| `SMTP_PORT` | `25` | 192 |
+| `SMTP_SECURITY` | `"none"` | 193 |
+| `SMTP_USER` / `SMTP_PASSWORD` | `""` / `""` | 194-195 |
+| `SMTP_SENDER` | `""` | 196 |
+| `MAIL_BODY_HEADER` | 空なら固定文（「━━…このメールは {app} が自動で作成・送信しています。…」5行） | 199-204 |
+| `MAIL_SHOW_SENDER` | `true` | 206-207 |
+| `SMTP_SENDER_NAME` | `""`（空なら `APP_TITLE` を From 表示名に） | 209 |
+| `SMTP_TIMEOUT` | `20` | 210 |
+| `_SEND_OK_MAIL_DOMAIN` → `SEND_OK_MAIL_DOMAIN` | **コード内固定 `""` → `[]`**（env では読まない。画面の `ok_domains` が優先） | 221-224 |
+| `SMTP_MAX_RECIPIENTS` | `20` | 227 |
+| `SMTP_DRY_RUN` | `true` | 230-231 |
+
+#### 1-4. 登録してよいドメイン（`send_ok_domains` / `domain_ok`）
+
+- `_parse_domains(value)`（brain.py:6455-6466）: 文字列なら `[;,、\s]+` で分割、先頭 `@`・末尾 `.` を落とし小文字化・重複除去。
+- `send_ok_domains()`（brain.py:6469-6474）: `_read_overrides()` に `ok_domains` キーがあれば `_parse_domains(ov["ok_domains"])`、無ければ `list(config.SEND_OK_MAIL_DOMAIN)`（既定 `[]`）。
+- `domain_ok(address, allowed=None)`（brain.py:6477-6486）: `allowed` 省略時は `send_ok_domains()`。**`allowed` が空なら `True`（制限なし。ただし許可リストへの登録自体は依然必要）**。`dom = address.strip().lower().rsplit("@",1)[-1]`、`dom == d or dom.endswith("." + d)`（サブドメイン許容）。
+- `allowed_domains_label()`（brain.py:6489-6493）: `"@a.co.jp、@b.jp"` または `"すべてのドメイン"`。
+- **`domain_ok` は登録時（`validate_settings`）だけに使い、送信時は `allows()`（完全一致）だけを見る。**
+
+#### 1-5. 設定保存の検証（`validate_settings` / `save_settings`）
+
+- `_validate_server(data)`（brain.py:6502-6519）: host は空を許す（未設定状態として保存可）、非空なら `_HOSTNAME_RE`。port は int 化失敗→エラー、`1..65535`。timeout は `1..300`。
+- `validate_settings(data)`（brain.py:6522-6575）順序: サーバ検査 → `ok_domains`（送られていれば `_parse_domains`、無ければ現行）各ドメインが `_HOSTNAME_RE` かつ `"."` を含む → `senders` 各 `EMAIL_RE` → `sender`（空は通す／`EMAIL_RE`／`senders` があるのにその中に無ければエラー）→ `allow_addresses` 各 `EMAIL_RE` かつ `domain_ok(addr, doms)` → `alert_to` も同じ縛り → `max_recipients` は `1..500`。
+- `_with_current(data)`（brain.py:6578-6595）: 現行値で埋めてから検証。`None` は「指定なし」、空文字・空リストは「消す」として通す。
+- `save_settings(data, user)`（brain.py:6598-6631）: エラーが1つでもあれば `MailError(" / ".join(errors))`。保存形は `body_header` を `[:2000]` に切る、`alert_kinds` は `ALERT_KINDS` に含まれるものだけ、`ok_domains` は正規化。保存後 `print("[mailer] 設定を更新しました（user）: サーバ=host:port / 差出人=… / 宛先制限=N アドレス / テスト送信=dry_run")`。
+- `mail_status()`（brain.py:6634-6655）: 画面向け。`configured, host, port, sender, sender_name, dry_run, body_header, show_sender, app_title, sample_body, senders, allow_addresses, alert_to, alert_enabled, alert_kinds, alert_kind_labels, restricted, timeout, allowed_domains, allowed_domains_label, ok_domains_source("screen"|"config"), max_recipients, problems, settings_file`。**認証情報は含めない**。
+- ルート: `GET /api/mail/settings`（core.py:14496-14500, `@admin_required`, `log: sent_log(20)` を同梱）、`POST /api/mail/settings`（core.py:14503-14511, `MailError`→400）。
+
+#### 1-6. 宛先の検索（`address_tables` / `find_recipients`）
+
+- `address_tables(scope)`（brain.py:6704-6741）: `db.connect_ro` で各DBの `sqlite_master` を列挙。列名が `MAIL_HINTS` に部分一致（大小無視）する列を `mail_columns`。無ければ `_looks_like_email_column`（brain.py:6690-6701: 非NULL 20件をサンプルし、`"@"` と `"."` を含む値が半数以上）。`name_columns`/`dept_columns` は `_display_first` で「id/code/no・`_id`/`_no`/`_code`/番号/コード」末尾の列を後ろへ。
+- `find_recipients(scope, query="", *, limit=50, table=None)`（brain.py:6744-6797）: 検索列 = mail+name+dept+残り列の**先頭12列**（`[:12]`）。`WHERE CAST("col" AS TEXT) LIKE :q`（**値はプレースホルダ**、列名は実在列のみ）。`LIMIT int(limit)`。候補の `email` は「mail 列のうち値に `@` を含む最初のもの」。候補 dict: `{email, name, dept, source:"alias.table", valid: EMAIL_RE, allowed: conf.allows(mail), row: 先頭8列}`。同一 email（小文字）は重複除去。
+
+#### 1-7. 下書きの組み立てと検証
+
+- `_norm_addresses(value)`（brain.py:6807-6820）: 文字列は `[,;\n]` 分割、`email.utils.parseaddr` でアドレス部だけ取り出す。
+- `validate_draft(draft, *, system=False)`（brain.py:6823-6870）判定順:
+  1. `s.problems()` 全部（`system=True` のときは「送信できる宛先」を含む文言だけ除外）
+  2. To 空 → 「宛先(To)が空です。」
+  3. To+Cc+Bcc 各 `EMAIL_RE`
+  4. `total = len(to)+len(cc)+len(bcc) > s.max_recipients` → エラー（文言に `SMTP_MAX_RECIPIENTS`）
+  5. `system=True`: 全宛先が `alert_to`（小文字比較）に含まれること
+     `system=False`: `allow_addresses` 空 → 「送信できる宛先が1件も登録されていません…どこにも送信できません。」／各宛先 `s.allows(addr)` でなければ「… は送信が許可されていません（許可済みは N件）」
+  6. 件名空、本文空
+- `compose_body(draft)`（brain.py:6879-6895）: `[body_header({app}→APP_TITLE)] + [送信者行] + [body]` を `"\n\n"` 結合。送信者行は `show_sender` のとき `from_user`/`from_user_name` から「送信者: 表示名（ログインID: id）」または「送信者: id」。**画面の確認カードと送信本文は同じ関数**。
+- `build_message(draft, attachments)`（brain.py:6898-6922）: `From`（`formataddr((Header(sender_label(),"utf-8"), s.sender))`）、`To`、`Cc`（あれば）、`Reply-To`（あれば）、`Subject`、`Date`（`formatdate(localtime=True)`）、`Message-ID`（`make_msgid()`）、本文 `set_content(compose_body)`。**Bcc はヘッダに書かない**。添付は `{"data","filename","mime"}` ごとに `add_attachment`（mime は `mimetypes.guess_type` → `application/octet-stream`）。
+- `preview(draft, attachments)`（brain.py:6925-6945）戻り: `{from, to, cc, bcc, subject, body, body_lines, attachments:[{filename,size}], errors: validate_draft(draft), dry_run, smtp:"host:port (security)"}`。
+- AI ツール `compose_email`（`_compose_email`, brain.py:10022-10060）: `to_query` があれば `find_recipients(limit=50)` の `valid` な候補を To に足す（候補ゼロなら `_err`）。draft は `{to, cc, bcc, subject, body, reply_to, from_user, from_user_name, attach_filenames}`。`llm_content.status` は `"mail_draft"`／`"mail_draft_invalid"`（`problems` 付き）。`render = {kind:"mail_draft", draft, preview}`。**AIは送信できず、画面の「送信」ボタンだけが出口**（note 文言で明示）。
+
+#### 1-8. `mailer.send()` の検査順序と分岐（brain.py:6964-7016）
+
+```
+send(draft, attachments=None, user=None, *, system=False) -> record
+```
+1. `errors = validate_draft(draft, system=system)` → あれば `MailError`
+2. `s = settings()`、`msg = build_message(draft, attachments)`
+3. `recipients = to + cc + bcc`（`_norm_addresses`）
+4. `record = {at, to, cc, bcc_count, subject, user, attachments:[filename...], dry_run, ok:False, message:""}`
+5. **`s.dry_run` なら**: SMTP に接続せず `ok=True, message="下書きの確認のみ（SMTP_DRY_RUN=true のため送信していません）"`、標準出力に `[mailer] DRY RUN → 宛先／件名／本文（"  | " 付き）`
+6. でなければ `_connect(s)`（brain.py:6952-6961: `ssl`→`SMTP_SSL(context=create_default_context())`、それ以外 `SMTP`、`starttls` なら `starttls(context)`、`user` あれば `login`）。接続失敗 → `record.message="SMTPサーバに接続できません（host:port）: e"` を `_mailer_log` してから `MailError`
+7. `server.send_message(msg, from_addr=s.sender, to_addrs=recipients)`（Bcc はここで宛先に入る）。失敗 → `"送信に失敗しました: e"` を記録して `MailError`。`finally: server.quit()`
+8. `_mailer_log(record)`（`_mailer_lock` 下で 200 件 FIFO）
+- `test_connection()`（brain.py:7019-7036）: `problems()` があれば `{ok:False}`、`_connect` → `noop()`。
+- `sent_log(limit=50)`（brain.py:7046-7048）新しい順。
+
+#### 1-9. 添付の解決（会話の中からだけ）
+
+- `core._attachments_for(chat, names) -> (attachments, missing)`（core.py:8838-8866）:
+  - 候補 `made` = `chat["render_log"]` の `kind=="file"` かつ `data` を持つ項目**のみ**（他の会話・ディスク・`_files` は見ない）。
+  - `names` 空 → `([], [])`。`"all"`（大小無視）を含めば **直近5件** `made[-5:]`。
+  - それ以外は名前ごとに、まず完全一致（大小無視）を新しい順に、無ければ部分一致（`w.lower() in filename.lower()`）。見つからなければ `missing` に積む。
+  - 戻り要素 `{"filename","mime","data"}`。
+- `POST /api/mail/send`（core.py:8869-8897, `@login_required`）: `body.confirm` 偽→400「確認されていません。」→ `_load_current()`（会話の鍵を取る）→ `_attachments_for(chat, draft.attach_filenames)`、`missing` あれば 400 → **`draft["from_user"], draft["from_user_name"] = g.user.username, g.user.display_name`（画面の値を信用しない）** → `mailer.send(draft, files, user=g.user.username)`（`MailError`→400、その他→500）→ `render_log` に `📤 message（件名 / 宛先 / 添付）` を追記 → `_persist(chat)` → `{ok, record}`。
+- `POST /api/mail/test`（core.py:8900-8904, `@admin_required`）→ `test_connection()`。
+
+#### 1-10. `alert_to` / `alert_kinds`（定期取り込みの警告メール）
+
+- `alert_import_problems(current, previous)`（brain.py:7063-7112）: `alert_to` 空または `alert_enabled=False` → `None`。`kinds = set(alert_kinds)` 空 → `None`。両リストを `kind in kinds` で絞り、`id` で `newly`（今回だけ）／`fixed`（前回だけ）を求め、どちらも空なら `None`。件名 `"[DB分析アシスタント] 定期取り込みが失敗しています"`（newly あり）／`"…復旧しました"`。`send(draft, [], user="scheduler", system=True)`。例外は `print("[mailer] 通知を送れませんでした: …")` で握る。
+- 呼び元 `scheduler.tick()`（core.py:6592-6601）: `_state["tick_count"] > 1` のときだけ（起動直後の1周目は送らない）。`_prev_problems` を更新。
+- `core._mail_allowed()`（core.py:11088-11095）: `allow_addresses` を重複除去・小文字順で返す（画面の候補用。マイロボットの通知先候補と管理者試運転の宛先候補）。
+
+#### 1-11. マイロボットからのメール
+
+- `_robot_notify_check(addresses)`（core.py:10353-10367）: 文字列は `[,;\s]+` 分割、**先頭10件**まで、各 `mailer.EMAIL_RE`、`mailer.settings().allows(addr)` でなければ `ValueError`。
+- `_robot_notify_failure(user, robot, message)`（core.py:10370-10395）: `robot["notify_to"]` 空なら何もしない。件名 `[{APP_TITLE}] マイロボット「name」の定期実行が失敗しました`。`mailer.send(draft, [], user=user.username)`。dry_run なら「テスト送信モードのため送っていません」。
+- `_robot_send_mails(chat, user)`（core.py:10304-10347）: `render_log` の `kind=="mail_draft"` かつ `sent_at` 無しを対象。`preview.errors` があれば送らず理由を残す。`_attachments_for` で `missing` → 送らない。`from_user` を実行者で確定 → `mailer.send`。`record.dry_run` なら `checked += 1`（**`sent_at` を付けない**＝手で送れる）、そうでなければ `item["sent_at"] = record["at"]`。`notes` は `kind:"error"` 項目として残す。
+
+---
+
+### 2. ファイル出力（ダウンロード・出力先フォルダ・メモリ上の置き場）
+
+#### 2-1. フォルダ出力の引数（`FOLDER_TOOLS`）
+
+- `FOLDER_TOOLS = {"export_excel","export_csv","export_text","export_pptx","export_docx"}`（brain.py:9361）。
+- `BUILTIN_TOOLS` の該当ツールの `parameters.properties` に **`save_to_folder`（bool）／`folder_stamp`（bool, 既定 true）／`folder_overwrite`（bool, 既定 false）** を機械的に注入（brain.py:9345-9368）。
+- システムプロンプトの指示（brain.py:13439-13443）: 「フォルダに出力して」→ `save_to_folder: true`、「日時なしで」→ `folder_stamp: false`、「置き換えて／上書きで／最新だけ残して」→ `folder_overwrite: true`。`folder_note`（brain.py:13303-13306）は `importer.output_dir() is not None` の有無だけで文言を切り替える（書けるかは書く時に確かめる）。
+
+#### 2-2. `_attach_folder_save(args, res)`（brain.py:12881-12912）
+
+- `dispatch` のハンドラ戻りに一括適用。条件: `res` が dict かつ `args["save_to_folder"]` 真 かつ `render.kind == "file"` かつ `render.data` あり。
+- `importer.save_to_user_folder(_current_user(), render.filename or "file", render.data, stamp=args.get("folder_stamp") is not False, overwrite=bool(args.get("folder_overwrite")))`。`_current_user()` は `_rag_local.user`（brain.py:11950-11951; リクエスト開始時／ロボット実行開始時に `rag.set_current_user(g.user)`）。
+- 成功: `render["saved_to"]=str(path)`, `render["replaced"]=bool`、`llm_content.folder = "フォルダにも保存した: path（前のファイルを置き換えた）"`。失敗: `render["save_error"]`, `folder = "フォルダへの保存は失敗（ダウンロードはできる）: e"`。**失敗してもダウンロードは残る**。
+
+#### 2-3. 出力先フォルダの設定（`OUTPUT_DIR` / `data/output_dir.yaml`）
+
+- config: `OUTPUT_DIR = os.getenv("OUTPUT_DIR","")`（config.py:85）、`OUTPUT_DIR_FILE = os.getenv("OUTPUT_DIR_FILE", DATA_DIR/"output_dir.yaml")`（86-87）。
+- `_read_output_setting()`（core.py:5123-5132）: 無し→`{}`、読めない→`print("[importer] 出力先の設定を読めませんでした…")`→`{}`。
+- `output_dir() -> Path|None`（core.py:5135-5138）: **ファイルに `path` キーがあればその値（空文字でも）、無ければ `config.OUTPUT_DIR`**。空なら `None`（機能自体を出さない）。
+- `check_output_dir(path) -> (bool, str)`（core.py:5141-5169）判定順: 空→「未設定です。」／`is_absolute()` でない→絶対パス要求／`resolve()` 失敗／**禁止対象**: `config.DATA_DIR` と `config.BASE_DIR` について `real == g_ or g_ in real.parents or real in g_.parents`（アプリ／データフォルダの中・同一・**親**も禁止）／`is_dir()` でない／書き込み確認 `real/".書き込み確認_{pid}.tmp"` を書いて消す（`OSError`→「書き込めません」）。
+- `output_dir_status()`（core.py:5172-5184）: `{path, ok, message, source:"画面"|"env"|""}`。
+- `save_output_dir(path, user)`（core.py:5187-5198）: 非空なら `check_output_dir`、`yaml.safe_dump({"path","updated_by","updated_at"})` を **`write_text` 直接**。空文字＝使わない。
+- ルート: `GET /output`（core.py:14007-14011）、`GET /api/output-dir`（14015-14018）、`POST /api/output-dir`（14021-14030、`ImportError_`→400、`print("[output] 出力先フォルダ: …（user）")`）。すべて `@admin_required`。
+
+#### 2-4. 利用者フォルダと命名（`save_to_user_folder`）
+
+- `_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')`（core.py:5120）。
+- `user_folder_name(user)`（core.py:5201-5205）: `username` を `_BAD_NAME_CHARS`→`_`、前後空白と `.` を落とし `[:64]`、空なら `"_"`。日本語はそのまま。
+- `_STAMP_RE = r"[_-]\d{8}[_-]\d{4}(?=\.[^.]+$)|[_-]\d{8}(?=\.[^.]+$)"`（core.py:5209）。
+- `save_to_user_folder(user, filename, data, *, stamp=True, overwrite=False) -> (Path, replaced)`（core.py:5212-5246）:
+  1. `base = output_dir()`、`None` → `ImportError_("出力先フォルダが設定されていません…")`
+  2. `check_output_dir(base)` 不可 → `ImportError_("出力先フォルダに書けません: …")`
+  3. `folder = base.resolve() / user_folder_name(user)`; `folder.mkdir(exist_ok=True)`
+  4. `safe = _BAD_NAME_CHARS.sub("_", filename).strip().strip(".") or "file"`; `stamp=False` なら `_STAMP_RE` で末尾の日時を除去
+  5. `target = folder/safe`。存在時: `overwrite=True` → `replaced=True`（同名を置換）／`False` → `stem_2, stem_3, …` と空くまで連番
+  6. `tmp = folder/f"{safe}.{os.getpid()}.tmp"` に `write_bytes` → `os.replace(tmp, target)`（原子的置換）
+  - **パスは利用者にもAIにも指定させない**（この形に固定）。
+- `POST /api/file/save-to-folder`（core.py:15359-15375, `@login_required`）: `token` → `_fs_get(token, g.user.username)` `None`→404「そのファイルはもう手元にありません…」→ `save_to_user_folder(g.user, filename, data)`（stamp=True/overwrite=False 固定）→ `ImportError_`→400／その他→500 → `print("[output] user → path")` → `{ok, path, replaced}`。
+
+#### 2-5. ファイル名・行数の上限
+
+- `exports.safe_filename(name, ext, default="export")`（brain.py:3390-3395）: `[<>:"/\\|?*\x00-\x1f]`→`_`、既存の `.xlsx|csv|txt|md|zip` 拡張子を除去、**`[:80]`**、`_YYYYMMDD_HHMM.ext`。
+- `EXPORT_MAX_ROWS = env EXPORT_MAX_ROWS 既定 1,000,000`（config.py:317）。Excel は `min(EXPORT_MAX_ROWS, 1_048_575)`（brain.py:10578, 12577; core.py:11757）。`DOCX_MAX_TABLE_ROWS = 40`（brain.py:4704）、`PPTX_MAX_TABLE_ROWS = 12`（brain.py:5168）。シート名は `name[:31]`（core.py:11764 の例）。
+
+#### 2-6. メモリ上のファイル置き場（`_fs_put` / `_fs_get` / `/api/file/<token>`）
+
+- `_MAX_ITEMS = 200`、`_fs_lock = threading.Lock()`、`_files: OrderedDict[str, dict]`（core.py:7293-7295）。ディスクには書かない。
+- `_fs_put(data, filename, mime, owner, trusted=False, label="") -> token`（core.py:7298-7309）:
+  - `token = secrets.token_urlsafe(16)`（URL-safe base64、22文字）
+  - `_files[token] = {"data","filename","mime","owner","trusted":bool,"label"}`
+  - 200 件を超えたら `popitem(last=False)`（**FIFO。時間の期限（TTL）は無い**。再起動で全消失）
+  - `trusted` は「サーバ側処理（スクレイピング）が作ったファイル」の印、`label` は履歴に残す出どころ。
+- `_fs_get(token, owner) -> dict|None`（core.py:7312-7318）: `item["owner"] != owner` なら `None`（**持ち主は生の `username`**、`safe_key` ではない）。
+- `GET /api/file/<token>`（core.py:15378-15386, `@login_required`）: `_fs_get(token, g.user.username)` が `None` → `abort(404)`（403ではなく存在も隠す）。`send_file(BytesIO(data), mimetype, as_attachment=True, download_name=filename)`。
+- `_fs_put` の呼び元: 画像アップロード（core.py:7856）、履歴を開くたびの `_web_log`（core.py:8020-8027: `item["data"]` を持つ項目は**種類を問わず**毎回 put し直す）、ビューのExcel（11768）、利用状況Excel（15071）、取り込みアップロード（14044）、スクレイピング試行の出力（13996、`trusted=True`）。
+- 会話ファイルへの埋め込み: `CHAT_EMBED_FILE_MAX_BYTES = 2*1024*1024`（config.py:441）。`_encode_item`（core.py:1218-1231）: 2MiB 以下は base64 + `_b64: True`、超えると `data` を捨てて `_no_data: True`（再ダウンロード不可）。`_decode_item`（1234-1242）で復元。
+
+---
+
+### 3. 取り込みの入口（許可フォルダ・アップロード・スクレイパー）
+
+#### 3-1. 設定（config.py）
+
+| 名前 | env | 既定 | 位置 |
+|---|---|---|---|
+| `IMPORT_DIRS` | `IMPORT_DIRS`（区切り: Windows `;`/改行、他 `;`/`:`/改行） | `BASE_DIR/import` | 40-45 |
+| `IMPORT_DIRS_FILE` | `IMPORT_DIRS_FILE` | `DATA_DIR/import_dirs.yaml` | 48-49 |
+| `IMPORT_DIRS_EDITABLE` | 同名 | `true` | 51-52 |
+| `IMPORT_ALLOW_UPLOAD` | 同名 | **`false`** | 56-57 |
+| `IMPORT_EXTENSIONS` | 固定 | `(".csv",".tsv",".txt",".xlsx",".xlsm")` | 58 |
+| `IMPORT_MAX_FILE_MB` / `IMPORT_MAX_ROWS` | 同名 | `100` / `1000000` | 59-60 |
+| `IMPORT_SCAN_DEPTH` / `IMPORT_MAX_FILES` | 同名 | `0`（無制限）/ `2000` | 63-65 |
+| `SCRAPER_DIR` | 同名 | `BASE_DIR/scrapers` | 137 |
+| `SCRAPER_TIMEOUT_SEC` / `SCRAPER_MIN_INTERVAL_MIN` | 同名 | `300` / `30` | 139-143 |
+
+#### 3-2. 許可フォルダの管理（core.py 元 importer.py）
+
+- `_read_extra()`（4509-4520）: `import_dirs.yaml` の `dirs`（dict）または list。読めない→警告→`[]`。
+- `configured_dirs()`（4531-4536）: env 分 `{"source":"env","removable":False}`、画面分 `{"source":"ui","removable":True}`。
+- `add_dir(raw)`（4539-4571）検査順: `IMPORT_DIRS_EDITABLE` 偽→拒否／空／`resolve(strict=True)` 失敗→「見つかりません」／`is_dir` でない／`real.parent == real`（ドライブ・FS ルート）→拒否／`next(real.iterdir())` で `PermissionError`・`OSError`／既存（ui）重複／env 重複 → `_write_extra`（4587-4591, `write_text` 直接）。
+- `remove_dir(raw)`（4574-4582）: 文字列一致で除去。
+- `allowed_dirs()`（4594-4605）: `config.IMPORT_DIRS + extra_dirs()` を `resolve()` して重複除去（解決不能は飛ばす）。
+
+#### 3-3. `is_allowed` / `is_within_allowed` / `is_allowed_dir` / `browse`
+
+- `is_noise(name)`（4673-4681）: `~$` 始まり、`.` 始まり、`desktop.ini`、`thumbs.db`。
+- `is_allowed(path)`（4684-4695）: `path.resolve(strict=True)`（`OSError`/`RuntimeError`→False）→ `is_file` かつ `not is_noise` → `suffix.lower() in IMPORT_EXTENSIONS` → `any(real == d or d in real.parents for d in allowed_dirs())`。**`..`・シンボリックリンク経由の脱出は resolve 後の実パスで判定**。
+- `is_within_allowed(path)`（4698-4710）: 同じだが拡張子は問わない（一覧用）。
+- `is_allowed_dir(path)`（4754-4762）: フォルダ版。
+- `browse(path)`（4765-4815）: `path` 無し→許可フォルダ一覧。`is_allowed_dir` でなければ `ImportError_("そのフォルダは開けません（許可されたフォルダの外です）。")`。パンくずは許可ルートより上に遡らない。
+- `check_readable(path)`（4817-4823）: `is_allowed` でなければ拒否、サイズ > `IMPORT_MAX_FILE_MB` 拒否。
+- `list_all_files(depth, limit)`（4713-4740）: `IMPORT_SCAN_DEPTH`／`IMPORT_MAX_FILES` で打ち切り。
+- ルート: `GET /api/import/dirs`（13901-13906）、`POST /api/import/dirs`（13909-13924, `action:"remove"` else add）、`POST /api/import/browse`（13927-13934）。すべて `@admin_required`。
+
+#### 3-4. アップロード（`IMPORT_ALLOW_UPLOAD`）
+
+- `check_upload(data, filename, trusted=False) -> ext`（4855-4870）: `not trusted and not IMPORT_ALLOW_UPLOAD` → `ImportError_("アップロードからの取り込みは無効化されています（IMPORT_ALLOW_UPLOAD）。")`；拡張子が `IMPORT_EXTENSIONS` 外→拒否；`len(data)/MiB > IMPORT_MAX_FILE_MB` →拒否。**`trusted=True`（スクレイパー出力）はアップロード禁止の制限を受けない（形式・サイズ検査は同じ）**。
+- `POST /api/import/upload`（14033-14051, `@admin_required`）: `request.files["file"]` → `check_upload` → `_fs_put(data, filename, "application/octet-stream", g.user.username)` → `{ok, upload: token, name, size, sheets}`。ディスクには置かない。
+- `_read_source(body)`（13939-13957）: `body.upload`（token）があれば `_fs_get(token, g.user.username)`（`None`→「アップロードしたファイルが見つかりません」）→ `read_upload(..., trusted=item["trusted"])`、無ければ `read_table(Path(body.path))`（内部で `check_readable`）。
+- Flask 全体の上限 `MAX_CONTENT_LENGTH = 64*1024*1024`（core.py:15554）が `IMPORT_MAX_FILE_MB=100` より先に効く。
+- 定期取り込みへの登録: `POST /api/jobs/save`（14287-14300）は `upload` トークンのファイルを**登録できない**（「アップロードしたファイルは定期取り込みに登録できません」）。
+
+#### 3-5. スクレイパー（`scrapers/`）
+
+- 定数: `SCRAPER_TIMEOUT_MIN_SEC = 10`、`SCRAPER_TIMEOUT_MAX_SEC = 3600`、`SCRAPER_INTERVAL_MAX_MIN = 10080`（4920-4922）。`scrape_defaults()`（4977-4985）で env 値を範囲に丸める。
+- `_SCRAPER_RUNNER`（4925-4935）: 別プロセスで `runpy.run_path(script, run_name="__scraper__")` → `fetch(out_dir)` を呼ぶ。`fetch` 未定義なら exit 3。
+- `list_scrapers()`（4942-4958）: `SCRAPER_DIR` **直下**の `.py` のみ。`_`・`.` 始まりは除外。
+- `scraper_path(name)`（4961-4974）: `name == Path(name).name`（パス区切り禁止）、`.py` 終わり、`_`/`.` 始まり禁止、`(d/name).resolve(strict=True)` の `parent == d.resolve()` かつ `is_file`。**`..`・リンク経由を拒否**。
+- `run_scraper(name, timeout_sec)`（5030-5108）: `tempfile.mkdtemp(prefix="scrape_")` に出力させる。`subprocess.Popen([sys.executable, "-c", _SCRAPER_RUNNER, script, out_dir], cwd=out_dir, stdin=DEVNULL, stdout/stderr=ファイル, 新プロセスグループ)`（`_scraper_group_kwargs` 4988-4993: Windows `CREATE_NEW_PROCESS_GROUP`、他 `start_new_session=True`）。`proc.wait(timeout)` 超過→`_kill_tree`（4996-5011: Windows `taskkill /PID /T /F`、他 `killpg(SIGKILL)`）→「時間切れ」`ImportError_`。`rc != 0` → 「エラーで終了（終了コード rc）」＋出力末尾 1,500 字（`_scraper_tail`）。出来たファイルは `IMPORT_EXTENSIONS` かつ非 noise、各 `IMPORT_MAX_FILE_MB` 以下。無ければ `ImportError_`。`finally` で `shutil.rmtree` を `(0, 0.5, 2)` 秒待ちで最大3回（**成功失敗によらずサーバに残さない**）。
+- ルート: `GET /api/scrapers`（13962-13968）、`POST /api/scrapers/test`（13971-14002: timeout 範囲外→400、出力を `_fs_put(..., trusted=True, label="スクレイピング: x.py → a.xlsx")`）。`@admin_required`。
+- ジョブ実行 `run_job`（6215-6256）: スクレイピング設定は `_jobs_lock` の**外**で取得（ロックを握ったまま分単位で待たない）。`_scraping: set` + `_scraping_lock`（6188-6189）で同一 `jid` の同時実行を拒否 `{"ok":False,"skipped":True,...}`（設定にも履歴にも残さない）。取得後 `_jobs_lock` 下で `_run_job_locked`。
+
+#### 3-6. 定期取り込み実行時の安全弁（`_run_job_locked`）
+
+- 元ファイルが `importer.is_allowed(path)` でなければ実行しない（core.py:6278）。
+- 設定した列が1つもファイルに無い → 「設定した列が1つも見つかりません（ファイル側の見出し: …）」で中止（6296）。
+- データ行 0（見出しだけ）→ 失敗扱いにして前回の内容を残す（6308-6314）。追記モードなら「何もしていません」。
+
+---
+
+### 4. マイロボットの安全（core.py 元 robots 区画）
+
+#### 4-1. 保存ファイルと壊れたファイルの扱い（`_ROBOTS_BROKEN` → 409）
+
+- 置き場 `_robots_path(user) = config.USER_META_DIR / (user.safe_key or str(user)) / "robots.json"`（9230-9232）。`User.safe_key`（auth.py:97-105）: `isalnum() or "-_.@"` 以外は `_`、`[:64]`、空・`.` 始まりは `_` を前置。
+- ファイル形: `{"robots": [robot, ...], "last_ok": {指紋: ISO時刻}}`。robot は `{id, name, from_chat, from_title, questions[], steps[{name, arguments, produced}], holes[], tables[], folder_out, folder_stamp, folder_overwrite, owner{username, display_name, groups[], is_admin}, mail_auto, mail_table, notify_to[], schedule{_SCHEDULE_KEYS}, created_at, updated_at, last_run, last_status, last_message, history[{at, source, ok, message, chat_id}]}`（登録 10819-10842、書き戻し 10411-10435）。
+- `_robots_raw(user) -> (data, broken)`（9235-9250）: ファイル無し→`({"robots":[]}, False)`。`_read_json` が dict でない／`robots` が list でない → `({"robots":[]}, True)`。**壊れていると黙って空を返さず、書く側で止める**（次の保存で1件だけに上書きされて全消失するのを防ぐ）。
+- `_ROBOTS_BROKEN`（9073-9074）: 「マイロボットの保存ファイル（robots.json）が読めません。壊れている可能性があるため、上書きせずに止めました。管理者に連絡してください。」
+- `ValueError(_ROBOTS_BROKEN)` を上げる箇所: `robot_save`（9292）、`robot_delete`（9325）、`robot_admin_stop`（12032）。
+- HTTP への写像: `POST /api/robots/save` → `409 if str(e) == _ROBOTS_BROKEN else 400`（10850）／`RobotConflict`（同名・同内容）→409 `{"duplicate": true}`（10848）；`POST /api/robots/update` → `ValueError` は一律 409（10938-10939）；`POST /api/robots/delete` → 409（10945-10947）；`POST /api/catalog/robots/stop` → 409（12079-12080）；`POST /api/catalog/robots/test` → `robots_list(owner)` の `ValueError` を 409（12100-12102）。
+- 例外を上げず黙るケース: `_robot_write_back` は `print("[robot] 実行結果を書き戻せませんでした: …")`（10433-10434）、`_robot_claim` は `print` して `None`（10459-10461）、`stop_robots_of` は `print` して `[]`（12055-12057）、`robots_due` は `_read_json` が dict でなければ空扱い（10563-10566）。
+- `_robots_write(user, items, ledger)`（9257-9270）: `last_ok` 台帳を **31日**より古いものを落として `_write_json`（原子的置換）。`robot_delete` は台帳を残す（消して作り直す抜け道を塞ぐ、9330）。
+
+#### 4-2. 本人の写し（owner snapshot）と権限
+
+- `_owner_snapshot(user)`（10532-10535）: `{"username","display_name","groups": list,"is_admin": bool}`。
+- 取得タイミング: 登録時（10829）、`POST /api/robots/run` で現在の写しと違えば取り直して `robot_save(check_dup=False)`（10877-10882）、`POST /api/robots/update` で何か変えたとき（10931-10932）。**定期実行は登録・変更時点の権限で動く**。
+- `_robot_owner(dir_name, robot)`（10538-10548）: 写しから `auth.User(...)` を作る（写しが無ければフォルダ名の一般利用者）。
+- `run_scheduled_robots`（10577-10620）: `_flask_app` が `None` なら何もしない。`app.test_request_context("/robots/scheduled")` の中で `g.user = user` を入れて実行（会話保存・権限判定が画面と同じ経路）。
+- 管理者ツールの門: `_execute` → `tools.dispatch(..., admin=_is_admin())`（core.py:8416）、`_is_admin()` は `g.user.is_admin`（8211-8219）。`dispatch` 側でも `name in ADMIN_TOOLS and not admin` を再検査（brain.py:12850-12851）。`ADMIN_TOOLS` は `{"explore_import_files","analyze_usage"}`（brain.py:9989, 11448, 12558）。
+
+#### 4-3. 二重実行の防止（`_robots_lock` / `_robots_running` / `_robot_claim`）
+
+- `_robots_lock = threading.RLock()`（9070）：robots.json の「読む→差し替える→書き戻す」を直列化。`_robots_running: set`（9072）：`(safe_key or username, robot_id)`。
+- `_robot_execute(user, robot, values, *, source="manual")`（10464-10496）:
+  1. `_robots_lock` 下で `key in _robots_running` → `(None, False, "このマイロボットはいま実行中です…")`；`add`
+  2. `_robot_run(robot, values)`
+  3. `ok and robot.mail_auto` → `_robot_send_mails`
+  4. `not ok and source == "schedule"` → `_robot_notify_failure`
+  5. `_robots_lock` 下で `saved["_last_chat_id"] = chat.id` を保存
+  6. `_robot_write_back(...)`
+  7. `finally`: `_robots_running.discard(key)`
+- `_robot_claim(user, rid)`（10438-10461）: 定期実行の直前に読み直し、`robot_next_scheduled(fresh)` が `None` または未来なら `None`（止められた・変更された）。`schedule.last_run = now, last_status = "running", last_message = "実行中…"` を**先に書く**（実行途中で落ちても次回起動で二重に動かない。「1回抜ける方が安全」）。
+- `_robot_write_back(user, rid, ok, message, source)`（10411-10435）: `_robots_lock` 下。`robot_get` が `None`（実行中に削除）なら書かない。`last_run/last_status("ok"|"error")/last_message`、`history` に `{at, source, ok, message[:400], chat_id}` を追加し **`ROBOT_HISTORY_MAX = 20`** 件に切る（10350）。`source=="schedule"` なら `schedule.last_status/last_message` も更新し `last_run` は claim 時刻を保持。
+- `robots_due(now)`（10551-10574）: 全利用者の robots.json を走査。`min_interval_hours` より短い間隔の設定は飛ばす（`floor_blocked`）。`robot_next_scheduled` が `TypeError/ValueError` を出すロボットは飛ばす（1件の壊れた日時で全員を止めない）。
+- `run_scheduled_robots` のループ: `scheduler.stopping()` で `break`；`_robot_claim` が `None` なら `continue`；`_robot_missing_tables`（9866-9877）があれば `_robot_failed`；`_robot_execute` が `chat None`（手動実行中）なら `_robot_write_back(False, message, "schedule")` で印を残す；例外は `_robot_failed` で通知＋書き戻し。
+
+#### 4-4. 「いま試す」の連打止め（try gap）と管理者の試運転
+
+- `ROBOT_TRY_GAP_MINUTES = 3`（9059。t26 では `core.ROBOT_TRY_GAP_MINUTES = 0` にして回す）。
+- `_robot_try_wait(robot)`（9207-9222）: `history` の新しい順で `source == "manual"` の最後の `at` + 3分がいまより後なら、その時刻を返す。`POST /api/robots/run`（10856-10890）は `409 {"error": "続けて押しています。次に試せるのは HH:MM 以降です（3 分あけてください）。", "next_run": ISO}`。**管理者の最低間隔（`min_interval_hours`）は「いま試す」には効かない**。
+- 管理者の試運転 `_robot_admin_test(admin, owner_dir, robot, mail_to)`（10502-10529）: 別勘定 `_robot_admin_tests: dict`（10499）、キー `(admin, "test:" + id)`。同じ 3 分ギャップ、`_robots_running` の二重チェック。`_robot_run(robot, {}, test={"mail_to", "owner"})` を管理者名で実行 → 結果の会話は**管理者**のマイエージェントに入る。`mail_to` があり `compose_email` 手順があれば `_robot_send_mails(chat, admin)`（自動送信設定に関係なく送る）。**利用者の robots.json には何も書かない**。
+- `_robot_run(..., test=...)` の上書き（9898-9964）: タイトル `"🤖 試運転: name（owner） MM/DD HH:MM"`；`compose_email` 手順は `to = mail_to, cc = [], bcc = []`、件名に `"[試運転] "` 前置、本文冒頭に「これは管理者の試運転です。本来の宛先: …」；`FOLDER_TOOLS` 手順は `save_to_folder = robot.folder_out`、`folder_stamp = robot.folder_stamp is not False`、`folder_overwrite = bool(robot.folder_overwrite)`（元会話の指定より決めごと優先、9956-9964）；手順ごとの所要時間を `chat["timings"]` に残す。
+- ルート `POST /api/catalog/robots/test`（12089-12122, `@admin_required`）: `user` 文字列を `safe_key` と同じ規則で正規化し一致しなければ 404；`compose_email` 手順があれば `mail_to` を `_robot_notify_check` で検査（許可リストのアドレスのみ）、空なら 400；表が無ければ 400；二重・連打なら 409；成功時 `session["chat_id"] = chat.id`。
+
+#### 4-5. 止める操作（`robot_admin_stop` / `stop_robots_of`）
+
+- `robot_admin_stop(dir_name, rid)`（12020-12045）: `schedule.enabled = False`、`mail_auto = False`、`updated_at` 更新。中身は変えない。ルート `POST /api/catalog/robots/stop`（12075-12086）。
+- `stop_robots_of(username) -> list[str]`（12048-12072）: その利用者の全ロボットの定期実行と自動送信を止める（手順は消さない）。呼び元は CLI `python core.py users remove`（`_mu_cmd_remove` 15686-15699）。壊れていれば止められず `[]`。
+
+#### 4-6. 決めごと（`robot_settings`）
+
+- `ROBOT_SETTING_RANGES = {"max_per_user": (1, 200), "min_interval_hours": (0, 720), "max_steps": (1, 100)}`（9054）。
+- 初期値 config: `ROBOT_MAX_PER_USER=5`、`ROBOT_MIN_INTERVAL_HOURS=12`、`ROBOT_MAX_STEPS=20`、`ROBOT_SETTINGS_FILE=DATA_DIR/robot_settings.yaml`（config.py:91-95）。
+- `robot_settings()`（9097-9119）: 画面保存 > env > 既定。読めない／範囲外／数でない値は**落とさず**範囲に寄せる（`_robot_clamp`）か既定に戻す。
+- `save_robot_settings`（9133-9154）: 範囲外は `ValueError`、`write_text` 直接。ルート `GET/POST /api/catalog/robot-settings`（12872-12891, `@admin_required`）。
+- `robot_save`（9281-9318）: 新規は `max_per_user` を超えると `ValueError`。同名は `RobotConflict`、同内容（`_robot_fingerprint`: 道具名・引数（`explanation` 除く）・result_id を「#手順.番号」に正規化・日付の扱い）も `RobotConflict`。台帳 `last_ok[fp]` から前回実行を引き継ぐ。
+
+---
+
+### 5. 原子的書き込み（一時ファイル → `os.replace`）
+
+#### 5-1. `_write_json(p, data)`（core.py:1066-1075）
+
+- `tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")` → `write_text(json.dumps(data, ensure_ascii=False, default=str))` → `os.replace(tmp, p)`。
+- 使用箇所: 会話一覧 `index.json`（1122, 1196）、会話本体 `<id>.json`（1343）、`robots.json`（9270）、利用状況レポート（12766）。
+
+#### 5-2. `_replace_settings_file(tmp, p)`（core.py:1808-1824）
+
+- `for i in range(5): os.replace(tmp, p)`。`PermissionError`（Windows でエディタ・ウイルス対策が開いている瞬間）なら `time.sleep(0.05*(i+1))` して再試行。5回目で失敗したら `tmp.unlink()` してから例外を上げる。
+- 使用箇所: `save_chat_display`（1827-1850, `_chat_display_lock` 下、同じ tmp 命名）、`save_catalog_contrib`（1919-1932, `_catalog_contrib_lock` 下）。**読む側も同じ RLock を通す**（1805, 1859: Windows では読んでいる最中の置き換えが失敗するため）。
+
+#### 5-3. その他の原子的書き込み
+
+| 対象 | 関数 | tmp 名 | ロック | 位置 |
+|---|---|---|---|---|
+| `users/<key>/memory.yaml` | `_memory_save` | `{name}.{pid}.{tid}.tmp` → `os.replace`（再試行なし） | 呼び元が `_memory_lock`（RLock）を取る（2026, 2048） | core.py:1985-1992 |
+| `data/knowledge_bases.json` | `_kb_write` | `p.with_suffix(".json.tmp")` → `os.replace` → `os.chmod(p, 0o600)`（失敗は無視） | `_kb_lock`（11730, 11753, 11786） | brain.py:11676-11685 |
+| 出力先フォルダのファイル | `save_to_user_folder` | `{safe}.{pid}.tmp` → `os.replace` | なし | core.py:5243-5245 |
+
+#### 5-4. 直接上書き（非原子的）と保護手段
+
+| ファイル | 関数 | ロック | 位置 |
+|---|---|---|---|
+| `mail_settings.yaml` | `_write_overrides` | `_mailer_lock` | brain.py:6410-6416 |
+| `model_settings.yaml` | `_write_admin`（`ADMIN_KEYS` のみ） | `_models_lock` | brain.py:2054-2060 |
+| `users/<key>/prefs.yaml` | `prefs._save`（`KEYS` のみ） | `_prefs_lock` | core.py:1653-1658 |
+| `import_jobs.yaml` | `jobs._write` | 呼び元 `save_job`/`delete_job`/`_run_job_locked` が `_jobs_lock` | core.py:5982-5986, 6037-6059 |
+| `import_dirs.yaml` | `_write_extra` | なし | core.py:4587-4591 |
+| `output_dir.yaml` | `save_output_dir` | なし | core.py:5193-5197 |
+| `robot_settings.yaml` | `save_robot_settings` | なし | core.py:9151-9153 |
+| `memory_settings.yaml` | `save_memory_settings` | なし | core.py:1757-1760 |
+| `auth_users.yaml` | `auth.save_users_file`（`chmod 0o600` 試行） | なし（CLI のみ） | auth.py:353-362 |
+| `.flask_secret` | `_secret_key`（生成時のみ、`chmod 0o600`） | なし | core.py:15425-15438 |
+| `統合.db.meta.yaml` | `catalog.save_meta`（空項目は書かない、`_MetaDumper` でブロック文字列） | なし（**書き込み口を管理者画面に限定**、`_meta_cache.pop`） | core.py:2370-2395 |
+| `.profile_cache/*.json` | プロファイル生成 | なし | core.py:2625 |
+| 追記型 `import_history.jsonl` | `add_import_record`（`open("a")`、`_count` をプロセス内で保持、`IMPORT_HISTORY_MAX=5000` の **1.1倍** を超えたら新しい 5,000 行に書き直し） | `_history_lock` | core.py:1400, 1433-1470 |
+| 追記型 `catalog_history.jsonl` | `add_catalog_change`（`CATALOG_HISTORY_MAX=2000` の **1.2倍** で間引き） | `_catalog_history_lock` | core.py:1557, 1570-1593 |
+| 追記型 `feedback.jsonl` | 追記 | `_FB_LOCK` | brain.py:2610, 2637 |
+
+- 改名のロールバック: カタログ側が失敗したら実テーブルを戻し `meta_backup` を `write_text` で書き戻す（core.py:7133-7141）。
+- SQLite 書き込み: `sqlite3.connect(db_path, timeout=30)` ＋ 明示トランザクション（DROP→CREATE→INSERT を1つにまとめる）（core.py:5550-5556）。読み取り `connect_ro` も `timeout=30`（core.py:150）。
+
+---
+
+### 6. 壊れたファイル・不整合の扱い（フォールバック一覧）
+
+| ファイル | 読めない／形が違うとき | 位置 |
+|---|---|---|
+| `robots.json` | `broken=True` → 保存系は `ValueError(_ROBOTS_BROKEN)`（409）、実行系は `print` して黙る（§4-1） | core.py:9235-9250 |
+| `users/<key>/memory.yaml` | `_memory_raw` が `broken=True`；`memory_apply` は書かない、`memory_set_text` は `force=True`（本人操作）のときだけ上書き | core.py:1942-1966, 2019-2033, 2036-2052 |
+| `mail_settings.yaml` | `{}`（env 初期値で動く）＋ `[mailer]` 警告 | brain.py:6398-6407 |
+| `model_settings.yaml` | `{}` ＋ `[models]` 警告 | brain.py:2044-2052 |
+| `robot_settings.yaml` | `{}` ＋ `[robot]` 警告 → 既定値、範囲外は寄せる | core.py:9097-9119 |
+| `memory_settings.yaml` | `{}` ＋ `[memory]` 警告 → 既定値、`max_chars` は `(100, 20000)` に寄せる | core.py:1700-1727 |
+| `chat_display.yaml` | `{}` ＋ `[display]` 警告；真偽でない値は既定 | core.py:1774-1795 |
+| `catalog_contrib.yaml` | `{}` ＋警告；形が違えば一覧ごと空（一部だけ効かせない） | core.py:1862-1875, 1903-1912 |
+| `output_dir.yaml` | `{}` ＋ `[importer]` 警告 → env の `OUTPUT_DIR` | core.py:5123-5132 |
+| `import_dirs.yaml` | `[]` ＋警告 | core.py:4509-4520 |
+| `import_jobs.yaml` | `[]` ＋ `[jobs]` 警告；`id` の無い項目は捨てる | core.py:5970-5979 |
+| `prefs.yaml` | `{}` ＋ `[prefs]` 警告 | core.py:1638-1648 |
+| `knowledge_bases.json` | `[]` ＋ `[rag]` 警告 | brain.py:11664-11673 |
+| `feedback.jsonl` | 壊れた行だけ飛ばす；読むのは末尾 `FEEDBACK_MAX_READ=20000` 行（`deque`） | brain.py:2661-2691 |
+| `chats/index.json` | 無い・形が違う → `_rebuild_index`（実体から作り直し） | core.py:1110-1123, 1165-1181 |
+| `chats/<id>.json` | `_read_json` が `None` → `load_chat` は `None`；読めた会話は `heal_messages` で結果の無い `tool_calls` を落とす | core.py:1264-1291, 1346-1354 |
+| 会話の削除中の書き戻し | `_deleted_chats`（`OrderedDict`, `_DELETED_MAX=500`）に印 → `save_chat` が `{"deleted": True}` を返し、`_persist` は `session["chat_id"]` を外す | core.py:1301-1315, 1327-1331, 7965-7969 |
+
+---
+
+### 7. 同時実行の制御
+
+#### 7-1. ロック一覧
+
+| ロック | 種類 | 守る対象 | 位置 |
+|---|---|---|---|
+| `_index_lock` | RLock | `chats/index.json` の読む→足す→書く（`_upsert_index`, `delete_chat`） | core.py:1080, 1200, 1369 |
+| `_chat_locks` + `_chat_locks_guard` / `lock_for(user, chat_id)` | 会話ごとに RLock（キー `safe_key/chat_id`） | 会話1本の読む→足す→丸ごと書き戻す | core.py:1086-1100 |
+| `_history_lock` | Lock | `import_history.jsonl` 追記・間引き | core.py:1400 |
+| `_catalog_history_lock` | Lock | `catalog_history.jsonl` | core.py:1557 |
+| `_prefs_lock` | Lock | `prefs.yaml` 書き込み | core.py:1618 |
+| `_memory_lock` | RLock | `memory.yaml` 読み書き | core.py:1683 |
+| `_chat_display_lock` | RLock | `chat_display.yaml` 読み書き | core.py:1805 |
+| `_catalog_contrib_lock` | RLock | `catalog_contrib.yaml` 読み書き | core.py:1859 |
+| `_jobs_lock` | RLock | `import_jobs.yaml` の書き換えとジョブ実行（同じ表へ同時に書かない） | core.py:5820 |
+| `_scraping_lock` + `_scraping: set` | Lock | 同一スクレイピング設定の同時実行拒否 | core.py:6188-6189 |
+| `_fs_lock` | Lock | `_files`（200件 FIFO） | core.py:7294 |
+| `_robots_lock` + `_robots_running: set` + `_robot_admin_tests: dict` | RLock | `robots.json` と二重実行・連打 | core.py:9070-9072, 10499 |
+| `_models_lock` | Lock | `model_settings.yaml` 書き込み・`_models_cache`（`_CACHE_SEC=300`） | brain.py:2020 |
+| `_FB_LOCK` | Lock | `feedback.jsonl` 追記 | brain.py:2610 |
+| `_lock`（画像キャッシュ） | Lock | kaleido 画像 `_cache`（`_MAX_CACHE=40`）・`_broken` | brain.py:4586-4590 |
+| `_mailer_lock` | Lock | `mail_settings.yaml` 書き込み・`_sent_log` | brain.py:6297 |
+| `_store_lock` | RLock | SELECT結果の置き場 `_store`（`MAX_ENTRIES=40`, `MAX_CELLS=400_000`。定期実行スレッドと画面が同時に使うため） | brain.py:7391-7393, 7444 |
+| `_kb_lock` | Lock | `knowledge_bases.json` | brain.py:11657 |
+
+- カタログ（`.meta.yaml`）にはファイルロックが無く、**書き込み口を管理者画面に限る**ことで代える。読みはキャッシュをそのまま返すので書き換え禁止、編集時は `load_meta_for_edit` で複製を渡す（help 3-24 と一致、`catalog.save_meta` core.py:2370）。
+
+#### 7-2. 会話の鍵（`_hold_chat` / `_release_chat`）
+
+- `_hold_chat(cid)`（core.py:7881-7898）: `g._chat_lock` が既にあれば何もしない。`chats.lock_for(g.user, cid).acquire(timeout=config.CHAT_LOCK_WAIT_SEC)`（`CHAT_LOCK_WAIT_SEC` env、既定 **120** 秒、config.py:459）。取れれば `g._chat_lock = lk`。**待ちきれなければ止めずに進む**（`print("[chat] 会話 … の順番待ちが 120秒を超えました。そのまま続けます。")`；鍵が返らなくなった会話を二度と使えなくしないため）。
+- `_release_chat`（7901-7908）は `app.teardown_request` に登録（15574）、要求の終わりに必ず `release()`（`RuntimeError` は握る）。
+- 取る場所: `_load_current()`（7919、会話を読んだ時点）、`_persist()` で新規 ID が決まった時点（7935）、8725（巻き戻し）。
+- 会話ファイルの競合: 同一利用者・同一会話を2タブから送ると、この鍵で直列化される（120秒超で後勝ち）。**help 3-27「会話ファイルも後勝ち」より強い保護がある**。
+
+#### 7-3. 裏スレッドと別プロセス
+
+| 名前 | 生成箇所 | 役割 |
+|---|---|---|
+| `aiagent-import-scheduler`（`_THREAD_NAME`） | `scheduler.start()` core.py:6644-6653（daemon） | 60秒ごとの周回（§8） |
+| `aiagent-robot-runner`（`_ROBOT_THREAD_NAME`） | `tick()` core.py:6580-6583（前の周回が生きていれば起こさない＝**最大1本**） | マイロボットの定期実行 |
+| 無名 daemon スレッド | `_schedule_memory` core.py:2156 | 回答後のパーソナライズ書き直し（利用者ごと・回答は待たせない） |
+| `ThreadPoolExecutor(max_workers=min(RAG_FANOUT_WORKERS=8, 登録数))` | brain.py:12029-12031 | ナレッジベースへの並列検索（要求の中で完結） |
+| 子プロセス（新プロセスグループ） | `run_scraper` core.py:5058-5062 | スクレイパー実行（タイムアウトで木ごと kill） |
+
+- `threading.local` は2つ: `results._turn_local`（brain.py:7400、同じ質問の中だけ SQL 結果を使い回す）、`_rag_local`（利用者。`_current_user()`）。SSE の流し込みスレッドで `results.set_turn` / `rag.set_current_user` をやり直す設計。
+- SQLite: 接続は都度作って閉じる。読み取り `connect_ro` `timeout=30`（core.py:150）、分析クエリは `set_progress_handler` で `QUERY_TIMEOUT_SEC=10` 秒（core.py:504-524）、プロファイルは `PROFILE_TIMEOUT_SEC=30`（core.py:2509）。書き込みは `timeout=30`（5551, 5614, 7064, 7133）。
+
+---
+
+### 8. スケジューラの周回と停止（core.py 元 scheduler.py, 6500-6653）
+
+- 設定: `IMPORT_SCHEDULER`（env、既定 `true`、config.py:74-75）、`IMPORT_SCHEDULER_TICK_SEC`（env、既定 `60`、config.py:77）。実際の待ちは `max(5, tick_sec)`（6626）。
+- 状態: `_stop = threading.Event()`（6526）、`_state = {started_at, last_tick, tick_count, last_ran(直近10件), last_error}`（6528-6534）、`_prev_problems: list`（6564）。
+- `is_running()`（6538-6539）: スレッド名で生存確認（フラグに頼らず二重起動を防ぐ）。`stopping()`（6542-6544）: `_stop.is_set()`。`scheduler_status()`（6547-6550）: `{**_state, running, tick_sec, enabled}`。
+- `tick()`（6567-6603）の順序:
+  1. `jobs.due_jobs()`（6090）を順に `jobs.run_job(job)`（同期・このスレッド内）、`_scheduler_log("OK  "/"NG  " …)`
+  2. `_ROBOT_THREAD_NAME` が生きていなければ `_robots_pass` スレッドを起こす（重いロボットが取り込みや他人のロボットを遅らせない）
+  3. `_state.last_tick/tick_count` 更新、`last_ran` は**足す形**で最新10件（別スレッドのロボット記録を消さない）
+  4. `mailer.alert_import_problems(jobs.problems(), _prev_problems)`（`tick_count > 1` のときだけ）、例外は「通知の判定に失敗（続行）」
+- `_robots_pass()`（6606-6615）: `run_scheduled_robots()` の結果を `_state.last_ran` に足す。例外は「マイロボットの定期実行でエラー（続行）」。
+- `_loop()`（6618-6628）: `while not _stop.is_set(): try tick() except → _state.last_error, traceback(limit=3)`（1周こけても止めない）→ `_stop.wait(max(5, tick))`（sleep ではなく wait＝停止合図で即抜け）。
+- `stop(timeout=2.0)`（6631-6641）: `_stop.set()` → 両スレッドを `join(timeout=2.0)`（ロボットが書き戻す前に落とすと次回起動で二重実行になるため少し待つ）。`_scheduler_log` は `_stop` 後は標準出力に触らない（6559-6565）。
+- `start()`（6644-6653）: `IMPORT_SCHEDULER` 偽→False；`is_running()`→False；`_stop.clear()`、daemon スレッド起動、`atexit.register(stop)`。
+- 呼び出し: `create_app()` 末尾で `_flask_app = app; scheduler.start()`（15599-15602）。
+- `jobs.problems()`（6105-6145）: `failed`（`last_status=="error"`）／`degraded`（`last_degraded`）／`overdue`（`interval_minutes>0` かつ `now - last_run > interval*2`）。`INTERVALS` は 手動のみ0／15／60／180／360／1440／10080 分（5823-5831）。
+- 実行の入口は4つ（5798-5806）: 画面「▶ 今すぐ更新」、登録直後の初回、アプリ内スケジューラ、`python core.py refresh`。`refresh_cli`（15772-15812）: `--list` 0、`--job ID` 無ければ 1、対象なし 0、1本でも失敗 1。
+
+---
+
+### 9. プロセスモデル（起動・待ち受け・デバッガ拒否）
+
+- 末尾定数（core.py:15881-15889）: `HOST = "0.0.0.0"`、`PORT = 8000`、`THREADS = 8`、`DEBUG = False`。**env も環境変数も読まない**（他ソフトの `PORT` を拾う事故防止、15850-15854）。
+- `__main__`（15891-15927）: 引数あり → `users`（`users_cli`）／`refresh`（`refresh_cli`）／`selftest`（`_sql_guard_selftest`）／それ以外は使い方を出して終了（サーバもスケジューラも起動しない）。`DEBUG and not _is_loopback(HOST)` → `SystemExit(_NO_DEBUG_REMOTE)`。`create_app()` → `DEBUG` なら `app.run(debug=True, use_reloader=False, threaded=True)`、通常は `waitress.serve(app, host=HOST, port=PORT, threads=THREADS)`。waitress が無ければ Flask 開発サーバ（`debug=False, use_reloader=False, threaded=True`）に落とし警告を出す。
+- `_is_loopback(host)`（15516-15523）: `127.0.0.1` / `localhost` / `::1` のみ（空文字は 0.0.0.0 と同じなので不可）。
+- `_refuse_debugger()`（15530-15540）: `FLASK_DEBUG` が `("1","true","yes","on","t","y")` → `SystemExit(_NO_DEBUG_MSG)`；`sys.argv[1:]` に `--debugger`/`--debug` → 同じ。`create_app()` の最初で呼ぶ（15543-15546）。理由: Werkzeug デバッガの PIN はユーザー名・MAC・マシンIDから作る固定値で守りにならない。
+- `create_app()`（15543-15602）の順序: `_refuse_debugger` → `Flask(static_folder=None)`＋`DictLoader(TEMPLATES)`＋`/static/<path>` は `_static_file`（ETag/304）→ `app.config`: `SECRET_KEY=_secret_key()`、`MAX_CONTENT_LENGTH=64MiB`、`SESSION_COOKIE_HTTPONLY=True`、`SESSION_COOKIE_SAMESITE="Lax"`、`JSON_AS_ASCII=False` → ブループリント登録順 `bp_auth, bp_chat, bp_robots, bp_catalog, bp_import, bp_mail, bp_models, bp_knowledge, bp_usage, bp_help, bp_table, bp_api`（12個）→ `before_request(load_user_into_context)`、`teardown_request(_release_chat)`、`context_processor(inject_globals)` → `_warn_if_no_admin()`（15456-15481）→ `_ensure_default_db()`（15441-15452: `.db` が無ければ `data/データ.db` を空で作り `catalog.save_meta`）→ `after_request` で `text/html` に `Cache-Control: no-store` → `_flask_app = app; scheduler.start()`。
+- `_secret_key()`（15425-15438）: `FLASK_SECRET_KEY` > `BASE_DIR/.flask_secret` > `secrets.token_urlsafe(48)` を生成して保存（`chmod 0o600` 試行）。
+- **ワーカーは必ず1プロセス**（15866-15868）: スケジューラスレッドがワーカー数だけ立ち同じ取り込みを多重実行するため。同時アクセスは `THREADS` で稼ぐ。前段に nginx を置くなら SSE のため `proxy_buffering off;`（15870-15872）。
+- 記録はすべて標準出力（`[scheduler …]`、`[mailer]`、`[robot]`、`[output]`、`[importer]`、`[chats]`、`[app]` などの接頭辞。ログファイル・世代管理なし）。
+
+---
+
+### 10. ファズ／回帰の姿勢（t29 の考え方）
+
+**出典**: リポジトリ内（`help.html`・`README.md`・コード）には t29 の記述は無い。以下はユーザーの自動メモリ `memory/verification-suites.md`（2026-09-22 更新）に記録された運用で、コードからは `python core.py selftest`（`_sql_guard_selftest`, core.py:15897）だけが確認できる。
+
+- 検証スイートはリポジトリ外 `C:\Users\onoke\.claude\projects\C--Users-onoke-Desktop-aiagent-rag-bundle\verify\` に置く（`t1_perm_matrix` … `t24_selfcheck`, `t25_scraper`, `t26_robots`, `t27_output_dir`, `t28_memory`, **`t29_fuzz500`**, `t30_usage_needs`, `t31_chat_display`, t32, t33。t4/t13 は退役）。`run_suites.py` でスイートごとに `reset_iso.py`（本番 `data/` を `verify\iso\data` にコピーして隔離）→実行。
+- 各スイートは環境変数 `DATA_DIR=iso/data`・`IMPORT_DIRS=iso/import`・`IMPORT_SCHEDULER=false`（t25 は `SCRAPER_DIR=iso/scrapers` も）で起動し、Flask の `test_client` にセッションを直接入れて admin／一般を演じる（パスワードは打たない）。Python はアプリ直下の `.venv\Scripts\python.exe`、`PYTHONIOENCODING=utf-8`。
+- **t29（fuzz500）**: 全ルートに壊れた本文・クエリ文字列を投げ、**500 が出ないか**（400/404/409 等の JSON エラーで受け止められるか）を見る。AIを呼ぶ口・メール送信・スクレイピング実行は SKIP。**ルートを足したら SKIP の要否だけ確認する**。
+- t20 [22] は `url_map` で「全ルートを叩いたか」を数える（ルートを足したら t20 にも1行足す）。AIを呼ぶ口は t20 [20] の SKIP 一覧に足す（`WITH_LLM=1` のときだけ叩く）。
+- 関連: t26（マイロボット、冒頭で `core.ROBOT_TRY_GAP_MINUTES = 0`、節7で `core._flask_app = app` を入れて `run_scheduled_robots()` を同期で回す）、t27（出力先フォルダ）、t28（`brain.extract_memory` を差し替えてAI無しでパーソナライズ）。
+- コード側でこの姿勢を支える形: ルートは `_body()` で JSON を受け、`ImportError_`/`MailError`/`ValueError`/`RobotConflict` を 400/404/409 に写像する（§1-9, §2-3, §3, §4-1）；設定ファイルはすべて「読めなければ既定に落として警告」（§6）；スケジューラは1周の例外で止まらない（§8）。
+
+---
+
+### 11. help.html との差異（コードが正）
+
+- help 5-10「プロセス内共有の入れ物とロック」は `_store`（SELECT結果）を「ロック無し」としているが、コードには `_store_lock = threading.RLock()`（brain.py:7444）があり `put/_evict/get` が通る。
+- help 5-10 の `mail_settings.yaml` キー一覧に `body_header` / `show_sender` が無いが、`EDITABLE_KEYS`（brain.py:6391-6395）には含まれる。
+- help 3-27「会話ファイルも後勝ち」: 現行は会話ごとの RLock（`_hold_chat`、待ち 120 秒）で直列化され、待ち切れたときだけ後勝ちになる。
+- help 5-10 落とし穴16「`dirs_edit` の二重 is_admin チェック」は現存（core.py:13909-13913、到達不能だが害なし）。
+- help 3-1「ブループリント12個」「アップロード上限 64MB」「スレッド8」「ポート8000」「起動時の処理順」はコードと一致。help 3-21「200件を超えると古いものから消え、時間の期限は無く、再起動で全部消える」「2MBまで埋め込み」「宛先 To+Cc+Bcc 合計 20」「許可リスト完全一致・空なら誰にも送れない」「既定は試送モード」「SMTP パスワードは env のみ」はコードと一致。

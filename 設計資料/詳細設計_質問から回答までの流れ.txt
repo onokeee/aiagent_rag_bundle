@@ -1,0 +1,1434 @@
+﻿あなたは経験豊富なソフトウェアアーキテクトです。
+社内向け Flask アプリ「AIワークハブ」（SQLite のデータに日本語で質問すると、AI が Function Calling で SQL を書いて実行し、
+表・グラフ・ファイル・メール下書きを返すアプリ）の「利用者が質問を送ってから答えが返るまで」の詳細設計図を作成してください。
+作成日: 2026-09-23。下の事実は 2026-09-23 時点の実装から抽出したものです。
+
+【この資料の扱い方（あなたへの指示）】
+- 下の「実装から抽出した事実」だけを根拠にしてください。事実に無いことを推測で補わないでください。
+  図に描くために不足している情報があれば、その箇所に「仕様に記載なし」と明記してください。
+- 識別子（関数名・ルート・設定名・イベント名・JSONのキー）は原文のまま使い、日本語の説明を添えてください。
+- 図は Mermaid 記法で出力してください（sequenceDiagram / flowchart / stateDiagram-v2 / classDiagram）。
+  Mermaid で表現しにくい表は Markdown の表にしてください。
+- 出力は日本語。各図の前に「この図が示すもの」「読み方」を2〜3行で書いてください。
+- 事実の中に file:line の参照がある場合は、図の注記や表の備考に残してください（あとで実装と突き合わせるため）。
+- この資料は長いです。一度に受け取れない場合は、「## 」で始まる節ごとに順に渡すので、節ごとに図を作り、
+  最後に「全体を統合した図」をまとめてください。渡された節の内容は忘れずに保持してください。
+
+【作ってほしい成果物（この順で）】
+1. 全体シーケンス図（Mermaid sequenceDiagram）
+   参加者: ブラウザ(app.js) / Flask ルート(core.py) / _begin_turn / _stream_advance(エージェントループ) / llm.chat_stream(brain.py)
+   / OpenAI互換API / tools.dispatch(brain.py) / SQLite(読み取り専用) / LightRAG / results(結果の預かり) / _persist(会話の保存)。
+   SSE のイベント（delta / text_end / item / running / end）がどのタイミングで流れるかを必ず入れること。
+2. エージェントループの状態遷移図（Mermaid stateDiagram-v2 または flowchart）
+   分岐: tool_calls の有無、空回答の再試行、_Guard の差し戻しと打ち切り、MAX_AGENT_STEPS の上限、LLM エラー、GeneratorExit。
+3. データ構造図（Mermaid classDiagram か表）
+   chat["messages"]（role: system/user/assistant/tool、tool_calls、tool_call_id）、chat["render_log"] の kind 一覧、
+   ツールが返す {ok, llm_content, render} の形、result_id の付け方と使い回し、SSE の各イベントのペイロード。
+4. ツール実行の詳細フロー（Mermaid flowchart）
+   tools.dispatch の検査順（JSON解析 → ADMIN_TOOLS → 必須引数 → SQL収集 → ハンドラ → 検算の付与 → フォルダ保存）と、
+   run_sql_query の内部（validate_select → connect_ro → 行数の切り詰め → results.put → llm_content と render の作り分け）。
+5. コンポーネント図（Mermaid flowchart）: ファイル（core.py / brain.py / assets.py / config.py / auth.py）と、
+   sys.modules の別名（llm / tools / db / catalog / chats / results / rag / mailer …）の対応。
+6. 表: SSE イベント一覧、ツール一覧（名前・目的・AI向け/画面向けの返し方）、関係する設定値（env 名・既定値・意味）。
+7. 最後に「設計上の要点」を10項目以内で箇条書き（なぜそうしているか、を事実から引用して）。
+
+=====================================================================
+以下、実装から抽出した事実
+=====================================================================
+
+## 質問がブラウザからLLM呼び出しに届くまで（送信 → SSE受信 → `_begin_turn` → システムプロンプト/ツール定義/履歴の確定 → API呼び出し）
+
+対象コード（すべて `C:\Users\onoke\Desktop\aiagent_rag_bundle\aiagent_minimal_rag_tougou`）:
+- `assets.py` … 画面テンプレート・JS（`chat.js` 相当は 5799 行目以降の `(() => { if (!window.CHAT_INIT) return; ... })()`）
+- `core.py` … Flask ルート（`bp_chat`）、`_begin_turn`、エージェントループ、会話保存（chats）、カタログ本文生成（catalog）、SQLガード（db）
+- `brain.py` … `llm`（クライアント・システムプロンプト・履歴切り詰め・API呼び出し）、`tools`（ツール定義/dispatch）、`models`（モデル選択・文脈量）、`rag`、`results`
+- `config.py` … env 由来の設定値
+- `auth.py` … `User`（`username / display_name / groups / is_admin`）
+
+以下、すべてコードで確認した内容のみを記す。行番号は `ファイル:行`。
+
+---
+
+### 1. ブラウザ側（assets.py）
+
+#### 1.1 画面初期化と前提となる状態
+
+- テンプレートが `window.CHAT_INIT` を埋め込む（assets.py:902-918）。キー: `chatId, history, autoDownload, llmReady, isAdmin, folderOut, knowledge, memory, robotSchedVocab, robotMinIntervalHours, schedulerOn, fold, canContribute, mailAllowed, starters`。値は `core.py:7752 chat_index()` が `render_template("chat.html", ...)` で渡す（`chat_id=session.get("chat_id")`, `history=chats.list_chats(g.user)`, `llm_ready=llm.is_configured()`, `memory=memory_payload(g.user)`, `can_contribute=_may_contribute_catalog()`, `auto_download=config.AUTO_DOWNLOAD`(=True) など）。
+- JS のモジュール変数（assets.py:5804-5819）:
+  - `currentChatId = window.CHAT_INIT.chatId || null`
+  - `busy = false`（送信中フラグ）
+  - `viewToken = 0`（表示中ビューの世代。`clearLog()` assets.py:6440 で `viewToken++`）
+  - `replaying = false`（過去会話の再描画中）
+  - `turnCount = 0`（次に送るユーザー発言の番号。`addItem` でユーザー項目を描くたびに `item.turn + 1` に更新）
+  - `modelInfo = { current:'', vision:false, image_max_count:4, image_max_mb:8 }`
+  - `pendingImages = []`（サーバに預けた画像のトークン列）
+- `DOMContentLoaded`（assets.py:7641-）で配線: `#send` click → `send()`; `#input` keydown で `Enter`（Shift なし）→ `preventDefault(); send()`; `loadModels()` → `GET /api/models`（`api(url, undefined, 'GET')`）で `modelInfo` を取得し `renderModel()`; `#modelPick` change → `POST /api/models {model}`。
+- `GET /api/models`（core.py:7810）は `models.status(g.user, refresh=request.args.get("refresh")=="1")`（brain.py:2332）を返す。形: `{"current", "models":[{"id","vision","catalog_fits"}], "vision", "from_env", "image_max_mb", "image_max_count", "scope":{"mode","catalog_chars","limit_chars","fits","note"}}`。
+- 共通の `api()`（assets.py:3550）: `fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})`。GET のときは body/headers を削除。`!res.ok` なら `Error(data.error || '通信に失敗しました (status)')` を投げ、`err.status / err.data` を持たせる。
+
+#### 1.2 画像の添付（送信前にサーバへ預ける）
+
+- 入口: `#input` の `paste`（`clipboardData.files` のうち `type` が `image/` で始まるもの、assets.py:7683）と、document の `drop`（assets.py:7712）→ `attachImages(files)`（assets.py:5881）。
+- `attachImages`: `modelInfo.vision` が false なら toast「いま選ばれているモデルは画像を扱えません。」で終了。`pendingImages.length >= modelInfo.image_max_count` なら toast して break。1枚ずつ `FormData` に `file` を入れて `POST /api/chat/image`（multipart）。応答 JSON をそのまま `pendingImages.push(data)`。
+- サーバ `POST /api/chat/image`（core.py:7828 `upload_image`, `@login_required`）:
+  1. `request.files.get("file")` 無し → 400 `画像が選ばれていません。`
+  2. `models.is_vision(models.current(g.user))` false → 400
+  3. `f.mimetype.lower()` が `llm.IMAGE_MIMES = {"image/png","image/jpeg","image/gif","image/webp"}`（brain.py:13565）に無い → 400
+  4. `len(data) > int(config.IMAGE_MAX_MB*1024*1024)` → 400（`IMAGE_MAX_MB` env 既定 8）
+  5. 空 → 400
+  6. `token = _fs_put(data, filename, mime, g.user.username)`（core.py:7298。プロセス内 `OrderedDict`、`_MAX_ITEMS = 200` 超で古いものから破棄、`secrets.token_urlsafe(16)`）
+  7. 応答 `{"ok":true,"token","filename","mime","size","url":"/api/file/<token>"}`
+- `GET /api/file/<token>`（core.py:15378）は `_fs_get(token, g.user.username)`（core.py:7312。owner が一致しないと None → 404）。
+
+#### 1.3 `send(text)`（assets.py:7481-7502）
+
+1. `if (busy) return;`
+2. `text = (text || $('#input').value).trim()`; 空なら return。入力欄を空にして高さをリセット。`lastRole = null`。
+3. `const images = pendingImages.slice(); pendingImages = []; renderAttachments();`（送信時点で添付を確定）
+4. 自分の発言を先に描く: `addItem({ role:'user', kind:'text', content:text, turn:turnCount, images: images.length ? images : undefined })`, `scrollDown(true)`。
+5. `busyChatId = currentChatId`（この質問が属する会話。新規なら null）
+6. `setBusy(true, '考えています')`
+7. `tokens = images.map(i => i.token)`
+8. `ok = await sendStreaming(text, tokens)`; `if (!ok) await sendAtOnce(text, tokens)`（逐次方式が使えない環境だけ従来方式）
+9. `setBusy(false)`
+
+`setBusy(on, label)`（assets.py:7443）: `busy = on`、`#send` を `disabled = on`、ボタン内を spinner か「送信」に。`on=false` で `thinkTimer` 停止・`busyStart/busyLabel/busyChatId` をクリア・`#thinking` を除去。`on=true` で `#thinking`（`msg msg--assistant` に spinner + `.thinking__label` + `.thinking__time`）を `#logInner` 末尾に追加し 1 秒ごとに経過秒を更新、ラベルは引数 `label`（空なら前回の `busyLabel`）。
+
+#### 1.4 `sendStreaming(text, imageTokens)`（assets.py:7532-7638）
+
+- `myView = viewToken` を控える。`missed = false`。
+- `fetch('/api/chat/stream', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text, images: imageTokens }) })`。fetch が例外 → `return false`。`!res.ok || !res.body` → `return false`（→ `sendAtOnce` にフォールバック。サーバが `_TurnError` の 400 JSON を返した場合もここに該当し、`sendAtOnce` が同じ本文で `/api/chat/send` を再送して同じエラーを受け取り、`api()` の例外として `{role:'assistant',kind:'error',message}` を描く）。
+- 逐次描画用のローカル: `node`（`div.streaming`）と `buf`（本文）。
+  - `openText()`: `node` が無ければ `#thinking` を除去し `lastRole=null`、`slot('assistant')` に `div.streaming` を追加。
+  - `closeText()`: `buf.trim()` が空なら `node.remove()`、あれば `is-done` クラス（点滅カーソル解除）。`buf` が空でなければ `revealCitedSources(buf)`（assets.py:6845。本文中の `[出典n]` 番号で出典カードの折りたたみを確定）と `feedbackRow()`（評価行を末尾へ）。`node=null; buf=''`。
+- SSE の自前パーサ（`EventSource` は POST 不可のため。assets.py:7605-7637）: `res.body.getReader()` + `TextDecoder`。受信文字列を `'\n\n'` で分割し最後の断片は `rest` に持ち越し。各ブロックの行について `'event: '` → `ev`（既定 `'message'`）、`'data: '` → `payload` に連結。`payload` 空なら skip。`JSON.parse` 失敗の行は捨てる。`handle(ev, data)`。読み取り中の例外 → 同一ビューなら `{kind:'error', message:'通信が途切れました: ...'}` を描く。ループ後、同一ビューなら `closeText()`。`return true`。
+
+#### 1.5 イベントごとの画面動作（`handle(event, data)`）
+
+| event | data | UI の処理 |
+|---|---|---|
+| `delta` | `{"text": 文字列}` | `viewToken !== myView` なら `missed=true` で無視。同一ビューなら `openText()`、`buf += data.text`、`node.innerHTML = mdToHtml(buf)`、`scrollDown()` |
+| `text_end` | `{}` | `closeText()` |
+| `running` | `{"name": ツール名, "label": 日本語ラベル}` | `setBusy(true, data.label)`（「考えています」→「SQL実行 (SELECT)」等に差し替え） |
+| `item` | 描画アイテム（`_web_log` 形式。`role, kind, ...`） | 別ビューなら `missed=true`。同一ビューなら `closeText(); lastRole=null; addItem(data); setBusy(true,'考えています'); scrollDown()` |
+| `end` | `{"chat_id", "title"}` | 同一ビューなら `currentChatId = data.chat_id || currentChatId`。別ビューかつ `missed` かつ `currentChatId === data.chat_id` なら `openChat(data.chat_id)`（保存済み完成形を読み直す）。常に `refreshHistory()`（`GET /api/history`）と `scheduleMemoryRefresh()`（3秒→7秒→15秒後に `GET /api/memory` を見て `updated_at` が変わっていれば toast） |
+
+`addItem(item)`（assets.py:6933）は `kind` で分岐: `text`（ユーザーなら `userTurn`、AI なら `mdToHtml` + `catalogLinks`）、`sql`（折りたたみブロック。`item.label || item.tool`、`purpose`、`pre.mono` に `sql`、`explanation` があれば「このSQLがしていること」）、`table`、`chart`（plotly の `figure`）、`file`（`item.url` があり `replaying` でなく `autoDownload` なら `window.location.href = item.url`）、`error`、`sources` など。
+
+#### 1.6 `sendAtOnce(text, imageTokens)`（assets.py:7504-7530、フォールバック）
+
+- `r = await api('/api/chat/send', { text, images: imageTokens })`。同一ビューなら `r.items.slice(1).forEach(addItem)`（先頭は既に描いたユーザー発言）、`currentChatId = r.chat_id || currentChatId`。別ビューで `r.chat_id === currentChatId` なら `openChat(r.chat_id)`。`refreshHistory(); scheduleMemoryRefresh()`。例外は `{kind:'error', message:e.message}`。
+
+---
+
+### 2. サーバ側ルート（core.py, Blueprint `bp_chat` core.py:7671）
+
+#### 2.1 共通部品
+
+- `login_required`（core.py:7358）: `g.user` が None のとき、`/api/` 配下は `401 {"error":"ログインしてください。"}`、それ以外はログイン画面へ redirect。`g.user` は `app.before_request(load_user_into_context)`（core.py:15573 / 定義 7342）が `session["user"]` から `auth.User(**data)` を復元。
+- `_body()`（core.py:7391）: `request.json` が dict でなければ `{}`。
+- `_TurnError(message, status=400, **extra)`（core.py:8450）: `payload = {"error": message, **extra}`。`@bp_chat.errorhandler(_TurnError)`（core.py:8459）で `jsonify(payload), status`。
+- 会話の鍵: `_hold_chat(cid)`（core.py:7881）は `chats.lock_for(g.user, cid)`（core.py:1090。`"{safe_key}/{chat_id}"` ごとの `threading.RLock`）を `config.CHAT_LOCK_WAIT_SEC`（env 既定 120 秒）で取得し `g._chat_lock` に置く。取れなくても止めずに進む。解放は `app.teardown_request(_release_chat)`（core.py:15574 / 7901）。
+- Flask 設定（core.py:15546-15555）: `SECRET_KEY=_secret_key()`, `MAX_CONTENT_LENGTH=64MB`, `SESSION_COOKIE_HTTPONLY=True`, `SESSION_COOKIE_SAMESITE="Lax"`, `JSON_AS_ASCII=False`。
+
+#### 2.2 `POST /api/chat/send`（core.py:8600-8607, endpoint `chat.send`）
+
+```
+chat, scope, text = _begin_turn()
+before = len(chat["render_log"]) - 1
+_advance(chat, scope, text)          # 非ストリーミングのエージェントループ（llm.chat）
+_schedule_memory(g.user, chat)
+return _reply(chat, before)          # _persist → {"ok":True,"items":_web_log(render_log, before),"replace":False,"chat_id","title"}
+```
+
+#### 2.3 `POST /api/chat/stream`（core.py:8708-8763, `stream()`）
+
+1. `chat, scope, text = _begin_turn()`
+2. `if not chat.get("id"): chat["id"] = chats.new_id(); _hold_chat(chat["id"])`（通常は `_begin_turn` 内の `_persist` で既に ID 確定済み）
+3. `session["chat_id"] = chat["id"]`（応答を流し始めるとセッションに書けないため先に確定）
+4. `turn_id = results.current_turn()`; `user = g.user`
+5. `generate()`:
+   - `rag.set_current_user(user)`, `results.set_turn(turn_id)`（別スレッドで流す構成でも同じ利用者・同じターンにする）
+   - `try: yield from _stream_advance(chat, scope, text)`
+   - `except GeneratorExit: aborted = True; raise`（クライアント切断）
+   - `except Exception as e: yield _sse("item", {"role":"assistant","kind":"error","message":_friendly_llm_error(e)})`
+   - `finally: _persist(chat); _schedule_memory(user, chat); if not aborted: yield _sse("end", {"chat_id": chat.get("id"), "title": chat.get("title","")})`
+6. `Response(stream_with_context(generate()), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})`
+
+`_sse(event, data)`（core.py:8620）= `f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"`。イベント名は `delta / text_end / item / running / end` の5種（docstring core.py:8711-8717 と実装が一致）。
+
+---
+
+### 3. `_begin_turn()`（core.py:8535-8597）の手順
+
+`/send` と `/stream` の共通前処理。失敗は `_TurnError`。
+
+1. **検証**（8541-8546）: `text = str(body.get("text") or "").strip()`。空 → `_TurnError("質問を入力してください。")`。`llm.is_configured()`（brain.py:12941 = `llm_chat_url()` と `llm_api_key()` が両方非空）が false → `_TurnError("LLMが未設定です。env の OPENAI_* を設定してください。")`。
+2. **スレッドローカルの準備**（8550, 8554）:
+   - `rag.set_current_user(g.user)`（brain.py:11943）: `_rag_local.user = user`、`_rag_local.sources = 0`（出典番号の通し番号をリセット）。dispatch は利用者を引数に持たないため。
+   - `results.new_turn()`（brain.py:7404）: `_turn_local.turn = "t_" + uuid4().hex[:8]`。result_id の使い回し（`find_by_sql` brain.py:7487）を「同じ質問の中」に限定する区切り。
+3. **会話の読み込み** `chat = _load_current()`（8556 / 定義 core.py:7912）: `session["chat_id"]` があれば `_hold_chat(cid)` → `chats.load_chat(g.user, cid)`（core.py:1349。`render_log` を `_decode_item`、`messages` を `heal_messages` で修復）。無ければ `{"id":None,"title":"","created_at":"","messages":[],"render_log":[]}`。
+4. **画像**（8558-8560）: `images, show = _images_from(body.get("images"))`（core.py:7859）: トークン列の先頭 `config.IMAGE_MAX_COUNT`（既定 4）枚を `_fs_get(token, username)` で引き、`send=[{"mime","b64"}]`（base64 本体のみ）と `show=[{"filename","mime","size","url":"/api/file/<token>"}]`。`images` があり `models.is_vision(models.current(g.user))` が false → `_TurnError("いま選ばれているモデルは画像を扱えません。")`。
+5. **ユーザー発言の追加と保存**（8566-8575）:
+   - `chat["messages"].append(llm.user_message(text, images))`（brain.py:13568）。
+   - `n_img = llm.drop_old_images(chat["messages"])`（brain.py:13639、§7.2）。落とした枚数を print。
+   - `chat["render_log"].append({"role":"user","kind":"text","content":text,"at":chats.now(), **({"images":show} if show else {})})`
+   - `_persist(chat)`（core.py:7926）— ルーターLLMやリアルタイム取り込みの前に保存（別会話へ切り替えて戻ったときに質問が消えて見えないように）。
+6. **スコープ決定** `scope = _auto_scope(text, chat)`（8577 / §3.1）。
+7. **空スコープ判定**（8582-8585）: `not scope and not rag.rag_available(g.user)`（brain.py:11990 = `rag_targets(user)` が非空か）→ `_TurnError("いま調べられるものがありません。サイドバーの SQLite3 か LightRAG で、使うものにチェックを入れてください。")`。※この時点で質問は保存済み。
+8. **リアルタイム取り込み** `_realtime_refresh(scope)`（8586 / §3.2）。
+9. **システムプロンプトを index 0 に**（8590-8596）: `messages[0]` が `role=="system"` でなければ `insert(0, {"role":"system","content":""})`。その後 `messages[0] = {"role":"system","content": llm.build_system_prompt(scope, admin=_is_admin(), model=models.current(g.user), memory=memory_prompt(g.user))}`（毎ターン作り直し。保存時は system を落とす → §10）。
+10. `return chat, scope, text`
+
+#### 3.1 `_auto_scope(question, chat)`（core.py:8464-8517）— DB/表ルーター
+
+1. `scope = build_scope({f.name: [] for f in db.list_db_files()})`（core.py:7417）: 各 DB ファイルについて `{"path": str(f), "alias": alias, "name": f.name, "tables": [全テーブル], "meta": catalog.load_meta(f)}`。alias は `db.aliases_for`（core.py:123）→ `alias_for`（113）: ファイル名 stem の `[^\w]` を `_` に、先頭が数字なら `db_` を付け、`main/temp` は `_db` を付加、衝突時は `_2, _3…`。
+2. `off = set(rag.excluded_tables(g.user))`（brain.py:11972 = prefs の `tables_off`）。あれば各 `s["tables"]` から除き、空になった DB はスコープから外す。
+3. `if not scope: return scope`
+4. `config.SCOPE_MODE`（env `SCOPE_MODE`、既定 `"auto"`、許容 `auto/router/all`、不正値は `auto`）:
+   - `"all"` → そのまま返す（収まらなければ後段の `prompt_for_scope` が要約モードに落ちる）。
+5. `limit = models.inline_limit_for(models.current(g.user))`（§6.3）。`SCOPE_MODE == "auto"` かつ `catalog.inline_length(scope) <= limit`（core.py:3768 = 全文版カタログの総文字数）→ そのまま返す（ルーター省略・全部入り）。
+6. それ以外（`router`、または `auto` で収まらない）: `chat_history = [render_log の role=="user" かつ kind=="text" の content]`; `picked = llm.route_tables(question, scope, chat_history)`（§3.1.1）。
+7. `picked` が truthy のとき:
+   - `chat["table_names"]`（この会話で実際に SQL が触った `"DBファイル名.テーブル名"`。`_persist` が積む）を `rpartition(".")` で割り、スコープ内 DB なら `picked[dbn]` に追加（ピン留め）。
+   - `picked = llm.expand_tables_by_relations(picked, scope)`（§3.1.2）。
+   - 各 `s` について `sel = picked.get(s["name"])`。`sel` があり `off` があれば `off` を再度除外。`sel` が非空なら `s["tables"] = sel`（`picked` に無い DB は全テーブルのまま）。
+8. `picked` が None（判定不能・失敗・`"*"`）→ 絞らずに返す（→ 要約モード）。
+
+##### 3.1.1 `llm.route_tables(question, scope, history)`（brain.py:13149-13210）
+
+- 対応表 `known`: `f"{alias}.{table}"` と `table` 単独（他 DB と重複しないものだけ）を小文字キーで `(db_name, table)` に引く。`alias.table` は必ず引ける。
+- `total`（全テーブル数）`<= 8` → `None`（絞る意味がない）。
+- `cards = "\n".join(db_text_cached(alias, path, tables, full=False))`（要約版カタログ）。
+- `ask`: 直近 `history[-3:]` を `（直前の質問: …）`、最後に `今回の質問: {question}`。
+- `_create(model=config.OPENAI_MODEL, messages=[{"role":"system","content":_ROUTE_TABLE_SYSTEM},{"role":"user","content": cards + "\n\n" + ask}], temperature=0, max_tokens=300)`。`config.OPENAI_MODEL` は config.py:249 で **ハードコード `"gpt-5.6-sol"`**（env では設定しない）。`_ROUTE_TABLE_SYSTEM`（brain.py:13133）は「JSON 配列 `["alias.table", ...]` だけを出力、迷ったら含める、全部要る/判断できないときは `["*"]`」。
+- 応答から `re.search(r"\[.*?\]", content, re.DOTALL)` → `json.loads`。例外は print して `None`。`"*"` を含めば `None`。各要素を `known` で引き `{db_name: sorted(tables)}`。1件も引けなければ `None`。
+
+##### 3.1.2 `llm.expand_tables_by_relations(picked, scope)`（brain.py:13213-13253）
+
+- `base`（元の選択のスナップショット）に対してのみ判定（連鎖させない＝1ホップ）。
+- 各 DB の `meta["relationships"]` を `parse_endpoint_cols(from/to, alias)` で `(alias, table, cols)` に分解。`from` 側テーブルが `base[from_db]` に入っていれば `to` 側テーブルを追加（方向は子 → 参照先のみ）。テーブルは `profile_db(path)["tables"]` に実在するものだけ。
+
+#### 3.2 `_realtime_refresh(scope)`（core.py:8520-8532）
+
+- `jobs.refresh_realtime(scope)`（core.py:6416）: `realtime_jobs()` のうち `db_file` がスコープ内かつ `table` がスコープの `tables` に含まれるものを取り込み直す。スクレイパー型は前回実行から `scrape_wait_minutes(job)`（`scrape_interval_minutes`、未設定なら `importer.scrape_defaults()[1]`＝`config.SCRAPER_MIN_INTERVAL_MIN` env 既定 30 分）経っていなければスキップ。結果を `[realtime] OK/NG db/table: message` で print。例外は握って print（質問は止めない）。
+
+---
+
+### 4. `llm.build_system_prompt(scope, admin, model, memory)`（brain.py:13256-13495）
+
+#### 4.1 前計算
+
+- `inline_cap = models.inline_limit_for(model)`（`model` があるとき。無ければ None → `prompt_for_scope` 側で `inline_limit()` 天井）。
+- `aliases = [s["alias"] for s in scope]`
+- `stale_note`: `jobs.problems_by_table()`（core.py:6148, `{(db_file, table): [problem]}`）のうちスコープ内 DB の分を `- alias.table: message（since 以降）` に並べ、あれば `\n# 状態に問題があるデータ（重要）\n…` の節（回答冒頭に「※ このデータは○月○日以降、正しく更新できていない可能性があります（理由）」を添えさせる指示）。
+- `kbs = rag_targets()`（brain.py:11984 = `kb_enabled()` から利用者が外した id を除いたもの）。
+- `folder_note`: `importer.output_dir()`（core.py:5134）が None でなければ「出力先フォルダは設定済みで使える。」、None なら「いまは管理者が出力先フォルダを設定していないので使えない。…」。
+- `kb_note`: `kbs` があるときだけ `# 社内文書（ナレッジベース）` 節（`search_knowledge_base` と `run_sql_query` の使い分け、KB 一覧 `- name: description`、`report_gap` を1回呼ぶ、`[出典n]` 必須、末尾に「根拠」、言い換えは1〜2回まで、食い違いは両論併記）。
+- `naming`: `len(aliases) > 1` → 「複数のDBが対象です（a, b）。テーブル名は必ず『エイリアス.テーブル名』で修飾…」; 1つ → 「テーブル名はそのまま書く（前に何かを付けて修飾しない）。」; 0 で `kbs` あり → 「いま対象にできるデータがありません。…ナレッジベースの検索で答えられる範囲で答えること。」; どちらも無し → 「対象にできるDBがありません。「データ取り込み」でDBを作るよう案内すること。」
+- `tool_list`: `tools.build_tools(scope, admin=admin)` の各定義を `- name(引数名, …) : description` に。`custom_tools.collect_everywhere(scope)` が非空なら `※ 上記のうち次はこの環境専用に用意されたツールです。…優先して使ってください: name, …` を追記。
+- `intro`: `kbs` あり →「あなたは社内の業務アシスタントです。\n読み取り専用(SELECTのみ)でデータベースにアクセスでき、社内文書のナレッジベースも検索できます。」; 無し →「あなたはSQLiteデータベースの分析アシスタントです。\n読み取り専用(SELECTのみ)でデータベースにアクセスできます。」
+
+#### 4.2 本文ブロックの順序（f-string、上から順）
+
+1. `{intro}`
+2. `# 振る舞い`（実データ根拠、`describe_table` で確認、範囲が曖昧なら確認、日本語・結論先、業務用語の定義に従う、用語/例文登録の提案は1回答1つまで、`example_registered` の扱い、`propose_glossary_term / propose_example`、`SQL式:` はそのまま埋め込む、`verification_warnings` の注記）
+3. `# 可視化の方針（チャットにグラフを描く）`（`plot_comparison / plot_trend / plot_composition / plot_distribution / plot_relationship / plot_kpi / plot_dual_axis` の使い分け、`stacked_bar`、`result_id` の使い回し）
+4. `# SQLで書けないこと（必ず専用ツールを使う）`（STDDEV/VARIANCE/MEDIAN/CORR/PERCENTILE/SQRT/POWER・PIVOT 無し → `pivot_table` / `analyze_stats` / `method="outliers"`）
+5. `# ファイル出力`（`export_excel / export_csv / export_text`、`save_to_folder / folder_stamp / folder_overwrite`、`{folder_note}`、`rows` で表を直接渡す）
+6. `# 「自分」と言われたとき`（`who_am_i` → 名簿表で特定）
+7. `# マイロボット（画面の機能。あなたが登録・実行するものではない）`
+8. `{memory}`（§4.4。空文字なら何も入らない）
+9. `# 利用可能なツール\n{tool_list}`
+10. `{kb_note}{stale_note}`
+11. `# SQLルール`（SQLite 方言・SELECT/WITH のみ・`- {naming}`・1ステートメント・GROUP BY と AS・`strftime`・LIMIT・`open_table`）
+12. `# 選択中のデータカタログ\n{catalog.prompt_for_scope(scope, limit=inline_cap, admin=admin)}`
+13. `現在時刻: {datetime.now().isoformat(timespec="seconds")}`
+
+#### 4.3 カタログ本文 `catalog.prompt_for_scope(scope, limit, admin)`（core.py:3788-3826）
+
+- `scope` 空 → `（対象にできるテーブルがありません。…）`（admin なら「「データ取り込み」でデータを入れるよう案内してください。」、一般利用者向けは「サイドバーの一覧でチェックを入れるか、…管理者に伝えるよう案内…取り込み画面は管理者専用なので、利用者には案内しないこと。」）。
+- `full = "\n".join(db_text_cached(alias, path, tables, full=True))`。`len(full) <= limit`（`limit` None なら `inline_limit()`=`models.prompt_inline_limit()`=`INLINE_LIMIT_MAX` 400,000、読めなければ `config.PROMPT_INLINE_LIMIT_CHARS` 80,000）なら全文。
+- 超えるときは `compact = db_text_cached(..., full=False)` を連結し、末尾に `【重要】対象のDBが多いため、上には各テーブルの説明までしか載せていません。**列名は1つも載っていません。**…必ず describe_table を呼んで確かめること。…` を付ける（要約モード）。
+- `db_text_cached`（core.py:3753）: キー `(alias, path, tables, full, DBのmtime_ns, meta.yamlのmtime_ns, profile cache のmtime_ns)` で `_TEXT_CACHE`（64 件超で全消去）。
+- `db_text(alias, db_path, tables, full)`（core.py:3596）の構成:
+  1. `## 使えるデータ`
+  2. `limited`（表を絞っている）なら `※ 利用者がいま対象にしているのは、下に挙げる表だけです。…`
+  3. 接頭辞 `__` で束ねた「まとまり」のうち同名表を持つ組 → `※ A・B は同じ構成の表を持つまとまりです…UNION ALL で合算すること。…`
+  4. まとまりごとのメモ `【g】\n{description}`
+  5. `full=True`: 各表 `table_text(..., full=True)`（core.py:3500）: `### 表名（N行）`、説明（`ai_draft` なら「（AI推測・未確認）」）、`主キー…`（複合キーは列順と「結合するときはn列すべてを条件にする」）、`列:` 各行 `- 列名 型 [PK] [: 説明] [/ 値: …| / コード値: k=v | / 範囲: min 〜 max]`、`サンプル行 [列…]:` 先頭3行、表固有の業務用語 `glossary_lines`（core.py:2472: `- 用語: 説明` + `    SQL式: … ← この式をそのまま使う` または `    （SQL式は未登録。…）`）。`full=False`: `テーブル一覧:` に `- 表名（N行） : 説明 / 業務用語: a, b`。
+  6. `結合キー（JOINにはこれを使う）:` FK 宣言 `- t.col = t2.col (FK宣言)` と `relationships`（複合キーは `AND` 連結＋注記）。`limited` なら表示表のみに関係するものだけ。
+  7. `テーブルをまたぐ業務用語（…）:`（DB 用語集。`limited` なら表示表だけを引くものに限定）
+  8. `正しいと確認済みの質問とSQLの例:` 各 `Q: … / 補足: … / SQL: …`（`limited` なら表示表だけを触る例文）。
+- 表名に DB 名は付けない（DB は常に1つの前提、core.py:3500 docstring）。
+
+#### 4.4 `memory_prompt(user)`（core.py:2077）
+
+- `memory_enabled(user)`（core.py:2014 = `memory_settings()["enabled"]` かつ user あり かつ prefs の `memory_off` でない）が false → `""`。`memory_text(user)` が空 → `""`。
+- それ以外: `# この利用者について（パーソナライズ。会話から自動で覚え、本人が直すこともある）\n{text}\n- 質問に書かれていない前提・好み・期間はここから補う。…\n- パーソナライズを使って答えたら、回答の末尾に「（パーソナライズ「…」を使いました）」と一言添える。\n- …\n\n`
+- `memory_settings()`（core.py:1692）: 既定は `config.MEMORY_ENABLED`（env 既定 有効）、`config.MEMORY_MODEL`（env 既定 空=回答モデル）、`config.MEMORY_MAX_CHARS`（env 既定 2000）を `config.MEMORY_SETTINGS_FILE`（既定 `data/memory_settings.yaml`）が上書き。
+
+#### 4.5 文脈長の見積もり（brain.py:13504-13560）
+
+- `TOKENS_PER_CHAR_TEXT = 0.55`（日本語主体の本文）、`TOKENS_PER_CHAR_JSON = 0.31`（ツール定義 JSON）。`tokens_for(chars, kind)` = `int(max(0,chars) * ratio)`。
+- `budget(scope, model, admin)`（brain.py:13515）: `context, known = models.context_window(model)`; `limit = models.inline_limit_for(model)`; 実際に `build_system_prompt` を組んで測る。返却キー: `model, context, context_known, limit_chars, catalog_chars, catalog_inlined, tool_tokens, base_tokens, tokens_per_char, now_tokens, now_pct, headroom_pct, at_limit_tokens, at_limit_pct, suggest_max_chars`（= `int((context*0.5 - tool_tokens - tokens_for(fixed_chars)) / 0.55)`）。
+
+---
+
+### 5. `tools.build_tools(entries, admin)`（brain.py:12695-12726）
+
+#### 5.1 素材
+
+- `BUILTIN_TOOLS`（brain.py:7943 で定義 → 9373 `_RETIRED = {"plot_chart"}` を除去 → 12530 で `BUILTIN_TOOLS + KNOWLEDGE_TOOLS + [WHOAMI_TOOL, REPORT_GAP_TOOL]`）。定義順（名前）:
+  `run_sql_query, plot_dual_axis, pivot_table, analyze_stats, export_excel, export_csv, export_text, hypothesis_test, regression, distribution_analysis, forecast, timeseries_analysis, monte_carlo_simulation, scenario_analysis, bootstrap_estimate, clustering, abc_analysis, export_pptx, build_report, export_docx, find_mail_recipients, compose_email, compare_periods, data_quality, detect_anomalies, funnel_analysis, cohort_analysis, market_basket, survival_analysis, explore_import_files, propose_glossary_term, propose_example, show_er_diagram, open_table, analyze_usage, [*_chart_tools() → plot_comparison, plot_trend, plot_composition, plot_distribution, plot_relationship, plot_kpi]（brain.py:9284）, describe_table, search_knowledge_base, who_am_i, report_gap`（`plot_chart` は退役）。
+- `_chart_tools()`（brain.py:7919）: `_CHART_TOOLS`（brain.py:7877）の `(カテゴリ, 説明, 追加引数, required)` から生成。共通 props: `sql, chart_type(enum=charts.types_in(cat)), title, purpose` + 種別ごとの引数（`_CHART_ARGS`）。required 例: `plot_comparison=("sql","chart_type","x","y","title")`, `plot_kpi=("sql","chart_type","value","title")`, 他は `("sql","chart_type","title")`。
+- `_DYNAMIC_TOOLS = {"search_knowledge_base"}`（brain.py:12534）: 固定宣言は使わず毎回組み立て直す。
+- `_MODULES`（brain.py:12539）: `(HANDLERS, SQL_TOOLS, ADMIN_TOOLS)` を `query, stats, reports, mail, business, files, usage, knowledge` の順に並べ、`_HANDLERS`（12551）、`SQL_TOOLS`（12554）、`ADMIN_TOOLS`（12558）を合成。
+  - `SQL_TOOLS` = `SQL_TOOLS_query {run_sql_query, plot_chart, plot_dual_axis, pivot_table, analyze_stats, plot_comparison, plot_trend, plot_composition, plot_distribution, plot_relationship, plot_kpi}` ∪ `SQL_TOOLS_stats {hypothesis_test, regression, distribution_analysis, forecast, timeseries_analysis, bootstrap_estimate, clustering, abc_analysis}` ∪ `SQL_TOOLS_business {compare_periods, funnel_analysis, cohort_analysis, market_basket, detect_anomalies, survival_analysis}`（`data_quality`, `scenario_analysis`, `monte_carlo_simulation` は含まない。reports/mail/files/usage/knowledge は空集合）。
+  - `ADMIN_TOOLS` = `ADMIN_TOOLS_files {"explore_import_files"}` ∪ `ADMIN_TOOLS_usage {"analyze_usage"}`。
+- `custom_tools.builtin_overrides(entries)`（brain.py:7345）: 各 scope entry の `meta["builtin_tools"]`（`.meta.yaml`）を合成。`enabled: false` はどれか1 DB で無効なら無効、`description` は最初に見つかったもの。
+
+#### 5.2 手順
+
+1. `ov = builtin_overrides(entries)`
+2. `for t in BUILTIN_TOOLS`:
+   - `name in _DYNAMIC_TOOLS` → skip
+   - `name in ADMIN_TOOLS and not admin` → skip（`admin = _is_admin()` core.py:8211 = `g.user.is_admin`）
+   - `ov[name]["enabled"] is False` → skip
+   - `ov[name]["description"]` があれば description を差し替え
+   - `name in SQL_TOOLS` なら `_with_explanation(t)`（§5.3）を、それ以外はそのまま `out` に追加
+3. `for t in knowledge_tool_schemas()`（brain.py:12435）: `rag_targets()` が空なら `[]`。あれば `KNOWLEDGE_TOOLS[0]` の深いコピーに、`description += "\n\n登録されているナレッジベース:\n- name: desc…"`、`parameters.properties.knowledge_bases.items.enum = [names]`。overrides の `enabled/description` を適用して追加。
+4. `for tool in custom_tools.collect_everywhere(entries)`（brain.py:7311。全 DB の `.meta.yaml` の `tools:`。`enabled: false` は除外、`selected` を渡すと SQL が名指しする DB（無指定なら置き場 DB）が選択に含まれないものは除外）: `validate_custom_tool(tool, set())` がエラー無し（空）のものだけ `custom_tools.to_schema(tool)`（brain.py:7264 = `{"type":"function","function":{"name","description","parameters":{"type":"object","properties":{name:{type,description}},"required":[…]}}}`）。
+
+#### 5.3 `_with_explanation(t)`（brain.py:12679）
+
+`properties` に `explanation` が無ければ `_EXPLANATION_PARAM`（brain.py:12668、`type: string`、「組み立てたSQLの日本語の解説（3〜5行）…」）を追加。`required` は変更しない（必須にしない）。
+
+#### 5.4 参考: 実行時 `tools.dispatch(name, arguments_json, scope, entries, admin)`（brain.py:12842-12878）
+
+1. `json.loads(arguments_json)` 失敗 → `_err("ツール引数のJSON解析に失敗しました: …")`
+2. `name in ADMIN_TOOLS and not admin` → `_err("'name' は管理者だけが使えます。")`（守りは build_tools と dispatch の2箇所）
+3. `_coerce_lists`（文字列配列の引数に文字列1つが来たら要素1つの配列に）
+4. `_missing_required`（`_HAS_DEFAULT = {"title","filename","chart_type","purpose"}` を除く必須引数が None/空）→ `_err(...必須の引数が指定されていません…)`
+5. `_gather_sqls`（入れ子の `sql` と `result_id` 元 SQL を収集）
+6. `_HANDLERS[name]` があれば `_attach_folder_save(args, _attach_verification(handler(args, scope), sqls, scope))`。無ければユーザー定義ツール `_run_custom`。未知 → `{"ok":False,"llm_content":{"error":"未知のツール: name"},"render":None}`。
+- 戻り値の形: `{"ok": bool, "llm_content": str(JSON), "render": dict|None, ["verify_alerts": [...]]}`。`_err(message)`（brain.py:7543）= `{"ok":False,"llm_content":_json({"error":message}),"render":{"role":"assistant","kind":"error","message":message}}`。
+
+---
+
+### 6. モデルと接続先（brain.py `models` / `llm`）
+
+#### 6.1 `models.current(user)`（brain.py:2288）
+
+- `prefs.get_model(user)`（`data/users/<user>/prefs.yaml` の `model`）が `available()` に含まれればそれ。そうでなければ `default_model()`（brain.py:2071）= `model_settings.yaml` の `default` > `config.OPENAI_MODEL`（`"gpt-5.6-sol"`）。
+- `available()`（brain.py:2228）: `model_settings.yaml` の `models` > `config.OPENAI_MODELS`（env `OPENAI_MODELS`、`;`/`,` 区切り）> `sorted(users_by_model())`。既定モデルが無ければ先頭に挿入。
+- `_read_admin()`（brain.py:2042）: `config.MODEL_SETTINGS_FILE`（env `MODEL_SETTINGS_FILE`、既定 `data/model_settings.yaml`）から `ADMIN_KEYS = ("models","default","vision","context_overrides","api_key","chat_url","models_url")` のみ読む。
+
+#### 6.2 画像対応 `models.is_vision(model)`（brain.py:2110）
+
+`model.lower()` に `_vision_keys()`（`model_settings.yaml` の `vision` リスト > `config.OPENAI_VISION_MODELS` env 既定 `"gpt-4o;gpt-4.1;gpt-5;o4;sol;vision"`）のいずれかが部分一致すれば True。
+
+#### 6.3 文脈量と inline 上限
+
+- `context_window(model)`（brain.py:2179）→ `(tokens, known)`: `context_overrides()`（管理画面登録、完全一致 → 長い順の部分一致）> `config.MODEL_CONTEXT_WINDOWS`（config.py:349、長いキーから部分一致。例 `gpt-5.6: 1_050_000, gpt-5*: 400_000, gpt-4.1*: 1_047_576, gpt-4o*: 128_000, o4/o3: 200_000, o1-mini: 128_000, o1: 200_000, gpt-4-turbo: 128_000, gpt-4-32k: 32_768, gpt-4: 8_192, gpt-3.5-turbo(-16k): 16_385`）> `config.MODEL_CONTEXT_DEFAULT`（env 既定 128000、`known=False`）。
+- `inline_limit_for(model)`（brain.py:2153）: `capacity = int(context * CATALOG_CONTEXT_RATIO(0.5) / TOKENS_PER_CHAR_TEXT(0.55))`; `max(INLINE_LIMIT_MIN=4_000, min(INLINE_LIMIT_MAX=400_000, capacity))`。model 無しなら `prompt_inline_limit()`=400,000。例: 128,000 トークン → 116,363 字。
+
+#### 6.4 接続先・キー・クライアント
+
+- `llm_chat_url()`（brain.py:2100）: `model_settings.yaml` の `chat_url` > `config.OPENAI_BASE_URL`（env、既定 空）`+ "/chat/completions"`。
+- `llm_api_key()`（brain.py:2076）: `model_settings.yaml` の `api_key` > `config.OPENAI_API_KEY`（env）。
+- `llm.client()`（brain.py:12946）: `OpenAI(base_url=_derived_base(llm_chat_url(), "/chat/completions") or None, api_key=llm_api_key() or "not-set")` をプロセス内で1つだけ生成。`reset_llm_client()`（12971）で作り直し。
+
+---
+
+### 7. LLM へ渡す履歴 `llm.history_for_llm(messages, model, tool_defs)`（brain.py:13669-13712）
+
+#### 7.1 手順
+
+1. `head, blocks = _turn_blocks(messages)`（brain.py:13613）: `role=="system"` と最初の user より前のメッセージを `head`、`role=="user"` から次の `user` の手前までを1ブロック（tool_calls と tool 結果が離れないように）。
+2. `len(blocks) <= config.CHAT_KEEP_TURNS_MIN`（env 既定 2）→ `messages` をそのまま返す。
+3. `context, _ = models.context_window(model or config.OPENAI_MODEL)`
+4. `used = Σ tokens_for(_msg_chars(m))`（head）`+ tokens_for(len(json.dumps(tool_defs)), "json")`（tool_defs があるとき）。`_msg_chars`（brain.py:13592）: content 文字列長、配列なら text 部分の長さ＋`image_url.url`（data URI）の長さ、`tool_calls` は JSON 化した長さ。
+5. `left = context - used - config.CHAT_ANSWER_RESERVE_TOKENS`（env 既定 6000）。負なら 0。`room = int(left / 0.55)`（文字）。
+6. ブロックごとの文字数 `sizes`。`total > room` かつ 残りブロック数 `> CHAT_KEEP_TURNS_MIN` の間、古い方から落とす（`cut` を数える）。
+7. `cut == 0` → 元のまま。`cut > 0` → `head` を **コピー**し、`out[0]`（system）の content 末尾に `\n\n※ この会話は長くなったため、古い方の{cut}回ぶんのやり取りは履歴から外れています。そこで話した内容は覚えていないので、必要なら聞き直してください。` を付け、`blocks[cut:]` を連結して返す。保存側 `chat["messages"]` は変更しない（巻き戻し位置がずれないように）。
+
+#### 7.2 `llm.drop_old_images(messages, keep_turns=None)`（brain.py:13639-13666）
+
+- `keep = config.CHAT_KEEP_IMAGE_TURNS`（env 既定 2）。`len(blocks) <= keep` → 0。
+- 古い `blocks[:len-keep]` の `role=="user"` で content が配列のメッセージについて、`image_url` パートがあれば、content を `text + "\n（この質問には画像がN枚ありましたが、会話が長くなったため履歴からは外しました。画像の中身を聞かれたら、貼り直してもらうよう伝えること）"` の **文字列**に差し替える（メッセージ自体は消さない）。戻り値は落とした枚数。これは `chat["messages"]` を直接書き換える（`_begin_turn` 内で `_persist` の前に実行され保存される）。
+
+---
+
+### 8. API 呼び出し（brain.py `llm.chat` / `llm.chat_stream` / `_create`）
+
+#### 8.1 メッセージ列の形（`chat["messages"]` → `history_for_llm` の出力）
+
+```
+[
+  {"role":"system", "content": "<build_system_prompt の文字列（切り詰め時は末尾に注記）>"},          # 常に index 0
+  {"role":"user",   "content": "質問文"}                                                          # 画像なし
+  {"role":"user",   "content": [ {"type":"text","text":"質問文"},
+                                 {"type":"image_url","image_url":{"url":"data:image/png;base64,....","detail":"auto"}} ]},  # 画像あり（llm.user_message）
+  {"role":"assistant","content": "<本文 or 空/None>",
+                      "tool_calls":[{"id":"<call id>","type":"function","function":{"name":"run_sql_query","arguments":"<JSON文字列>"}}, ...]},  # _msg_to_dict（tool_calls が無ければキー自体なし）
+  {"role":"tool", "tool_call_id":"<call id>", "content":"<dispatch の llm_content（JSON文字列）。検算不一致時は verification_warnings を追加>"},
+  ...（assistant/tool を MAX_AGENT_STEPS 回まで繰り返し）
+  {"role":"assistant","content":"最終回答"}
+]
+```
+- `_msg_to_dict(m)`（core.py:8072）: `{"role":"assistant","content": m.content}` に、`m.tool_calls` があれば `tool_calls=[{"id","type":"function","function":{"name","arguments"}}]`。
+- 強制まとめ（`_append_final_answer` core.py:8351）では、履歴末尾に `{"role":"user","content":"ここまでの会話をふまえて、直前の質問に日本語で答えてください。ツールは使えません。…内部の仕組み（ツール名・データベースの構成・システムの状態）を説明してはいけない。"}` を足し、`tool_defs=[]`（tools キーを送らない）で `llm.chat` を呼ぶ。
+- `chats.save_chat`（core.py:1320）は `role=="system"` を除き `heal_messages`（core.py:1264：結果の無い `tool_calls` を持つ assistant を落とす。本文だけは残す）してから保存する。
+
+#### 8.2 `llm.chat(messages, tool_defs, model)`（brain.py:13715-13749、`/api/chat/send` と `_append_final_answer` が使用）
+
+- `kwargs = {"model": model or config.OPENAI_MODEL, "messages": messages, "temperature": config.OPENAI_TEMPERATURE}`（env `OPENAI_TEMPERATURE` 既定 0）
+- `defs = tools.BUILTIN_TOOLS if tool_defs is None else tool_defs`。`defs` が非空なら `tools=defs, tool_choice="auto"`。空リストなら `tools` キーを送らない。
+- `config.OPENAI_TOP_P`（env `OPENAI_TOP_P`、未設定 None）があれば `top_p`、`config.OPENAI_MAX_TOKENS`（env `OPENAI_MAX_TOKENS`、未設定 None）があれば `max_tokens`。
+- `resp = _create(**kwargs)`; `msg = resp.choices[0].message`; `msg.finish_reason = resp.choices[0].finish_reason`（設定できなければ無視）。
+
+#### 8.3 `llm.chat_stream(messages, tool_defs, model)`（brain.py:13784-13829、`/api/chat/stream` が使用）
+
+- `kwargs = {"model", "messages", "tools": tool_defs if tool_defs is not None else tools.BUILTIN_TOOLS, "tool_choice":"auto", "temperature": config.OPENAI_TEMPERATURE, "stream": True}` + 任意 `top_p / max_tokens`。
+- `for chunk in _create(**kwargs)`: `choices` 空は skip; `finish_reason` があれば保持; `delta.content` があれば `out.content += …` し `("text", delta.content)` を yield; `delta.tool_calls` は `index` ごとに `{"id","name","arguments"}` を連結（`_parts`）。最後に `out._finish()`（`_parts` を index 順に `StreamedMessage._Call(id, name, arguments)` へ）→ `("done", StreamedMessage)` を1回 yield。
+- `StreamedMessage`（brain.py:13752）は `content / tool_calls / finish_reason` を持ち、`chat()` の message と同じ属性で扱える。
+
+#### 8.4 `_create(**kwargs)`（brain.py:13087-13130）— 引数の自動調整と 429 対応
+
+- `attempt = _apply_quirks(kwargs)`（`_QUIRKS[model] = {"set":{…},"drop":{…}}` をプロセス内で記憶）。
+- `while fixes < _MAX_FIX (4)`: `client().chat.completions.create(**attempt)`。
+  - 例外がレート制限（`status_code == 429` または `"rate_limit"` を含む）: `waits >= config.LLM_RATE_LIMIT_RETRIES`（env 既定 3）なら `RateLimited("混み合っています（レート制限）。…「続けて」と送ってください。…")`。そうでなければ `_rate_limit_wait(e, waits)`: `retry-after` ヘッダ秒 → `"try again in X(ms|s|m)"` を +0.5 秒 → `2**attempt`、いずれも `config.LLM_RATE_LIMIT_MAX_WAIT`（env 既定 20 秒）で頭打ち。`time.sleep` 後に再試行。
+  - それ以外: `_fix_for(str(e), attempt)`（brain.py:13015）: `reasoning_effort`+`function tools` → `set reasoning_effort="none"`; `reasoning_effort`+`does not support` → 同; `reasoning_effort`+`unrecognized` → `drop reasoning_effort`; `'temperature'`/`'top_p'` + `does not support`/`only the default` → drop; `max_tokens`+`max_completion_tokens` → `set max_completion_tokens=v, drop max_tokens`。該当なし・同じ直しの繰り返し → そのまま raise。`_learn(model, ...)` で記憶し、`attempt` を組み直して再試行。
+- 表ルーター（§3.1.1）・パーソナライズ抽出・AI 下書きも同じ `_create` を通る。
+
+---
+
+### 9. LLM 応答後の分岐（`_stream_advance` core.py:8624-8705 / `_advance` core.py:8241-8293）
+
+`for _ in range(config.MAX_AGENT_STEPS)`（env `MAX_AGENT_STEPS` 既定 10）:
+
+1. `defs = tools.build_tools(scope, admin=_is_admin())`; `model = models.current(g.user)`（毎ステップ再計算）。
+2. `llm.chat_stream(llm.history_for_llm(chat["messages"], model, defs), defs, model=model)`。`("text", 差分)` は `delta` イベントとして即時送出、`("done", msg)` で `msg` 確定。例外 → `{"role":"assistant","kind":"error","message": _friendly_llm_error(e)}` を render_log に積み `item` を送って終了。`_friendly_llm_error`（core.py:8309）: `error parsing tool call` / `out of memory|cudamalloc` / `timed out|timeout` を日本語に言い換え、その他は `LLM呼び出しに失敗しました: {先頭160字}`。
+3. `chat["messages"].append(_msg_to_dict(msg))`; `msg.content` があれば `{"role":"assistant","kind":"text","content"}` を render_log に。
+4. `calls = _extract_calls(msg)`（`[{"id","name","arguments"}]`）。
+   - **calls 無し**: `text_end` を送出。`content.strip()` があれば `_note_if_cut`（`finish_reason == "length"` なら `_CUT_MESSAGE`「（回答がモデルの出力上限で途中まででした。「続けて」と送ると続きを書きます。）」を item で送出）→ 終了（最終回答）。空応答なら `messages.pop()`; 初回は `retried_empty=True; continue`（ツール付きで聞き直し）; 2回目は `_append_final_answer` の結果を item、失敗なら `_EMPTY_MESSAGE` を item → 終了。
+   - **calls あり**: `text_end` 送出。`fresh = [c for c in calls if not guard.seen(c)]`; `previews = _call_previews(fresh, scope, question)`（core.py:8089。SQL ツールは `{"role":"assistant","kind":"sql","tool","call_id","sql","purpose","explanation","question","tables": tables_in_sql(...)}`、ユーザー定義ツールは `render_sql` の SQL、`describe_table` は `🛠 テーブル詳細を確認: \`table\``）を render_log に積み、各々 `item` を送出。
+   - 各 `c`: `guard.seen(c)` なら `_execute(chat,[c],scope,guard)`（実行せず `guard.repeated(c)` の JSON を tool メッセージとして差し戻すだけ、イベント無し）。そうでなければ `running {"name": c["name"], "label": TOOL_LABELS.get(name, name)}` を送出（`TOOL_LABELS` core.py:7673-7720、例 `run_sql_query→"SQL実行 (SELECT)"`, `search_knowledge_base→"社内文書の検索"`, `plot_comparison→"グラフ描画（比較）"`, `export_excel→"Excel作成"`, `describe_table→"テーブル詳細の確認"`, `report_gap→"足りないものの報告"`）→ `_execute` → 新たに増えた render_log を `_web_log` で変換して `item` を送出。
+5. `_execute`（core.py:8407）: `res = tools.dispatch(c["name"], c["arguments"], scope, scope, admin=_is_admin())`; `guard.note(c, res)`; `content = res["llm_content"]`; `alerts = _fresh_alerts(chat, res.get("verify_alerts"))`（render_log の `verify_key` に無いものだけ）; あれば `_merge_alerts`（JSON dict なら `"verification_warnings": [verify.llm_note(a)]` を追加、そうでなければ末尾に `【検算の不一致】…` を連結）; `chat["messages"].append({"role":"tool","tool_call_id": c["id"], "content": content})`; `res["render"]` があれば render_log へ（`kind=="error"` には `call_id` を付ける）; alerts ごとに `verify.render_item(a)` を render_log へ。
+6. `_Guard`（core.py:8131）: `key = (name, arguments.strip())`。`LIMIT = 2`。成功・失敗とも記憶し、同じ呼び出しの2回目以降は差し戻し JSON（成功済み: `{"error":"この呼び出しは既に実行済みです。…","hint":…}`、失敗済み: `{"error":"同じツールを同じ引数で呼び直しています。…","previous_error","hint"}`）。`repeats >= 2` で `stuck` → `_append_final_answer` の結果を item、続けて `_LOOP_MESSAGE`（成功のみの繰り返し）か `_STUCK_MESSAGE`（失敗の連鎖）を item → 終了。
+7. ループを使い切る → `_append_final_answer` + `_LIMIT_MESSAGE`（`（ツールの呼び出しが{MAX_AGENT_STEPS}回に達したので、ここで一区切りにしました。…）`）。
+
+`_web_log(render_log, start)`（core.py:8009）: `render_item_for_web`（core.py:7543。`chart/chart_dual` → plotly `figure` JSON にして `kind="chart"`、`report_doc` の節グラフも `figure` 化、`file` は `sheets` を先頭 20 行に）→ ユーザー text には `turn` 通し番号 → `data`（bytes）を持つ項目は `_fs_put` して `url="/api/file/<token>"` に置換 → `kind=="sql"` に `label`（`TOOL_LABELS`）。
+
+---
+
+### 10. 保存（`_persist` / `chats`）
+
+- `_persist(chat)`（core.py:7926）: `render_log` 空かつ id 無しなら保存しない。id 無しなら `chats.new_id()`（`"%Y%m%d-%H%M%S-" + uuid4().hex[:6]`）を採番して `_hold_chat`。`db_names`（render_log の `kind=="sql"` の SQL から `db.dbs_named_in`）と `table_names`（`"DBファイル名.テーブル名"`、SQL 中に表名が単語境界 `(?<!\w)…(?!\w)` で現れるもの）を更新。`chats.save_chat(...)`。`saved["deleted"]` なら `session["chat_id"]` を外して返す。それ以外 `session["chat_id"] = id`、`title/created_at` を反映。
+- `chats.save_chat`（core.py:1320）: 保存 JSON `{"id","title"(=make_title: 最初のユーザー発言 40 字),"created_at","updated_at","db_names","table_names","tables","messages"(system 除去 + heal_messages),"render_log"(_encode_item: bytes は 2MB 以下なら base64 `_b64`、超えると `_no_data`)}` を `data/users/<safe_key>/chats/<id>.json`（`config.USER_META_DIR = DATA_DIR/"users"`）に一時ファイル経由で書き、`index.json` を更新。
+
+---
+
+### 11. 関連する設定値（config.py、env 名 → 既定）
+
+| 変数 | env | 既定 | 用途 |
+|---|---|---|---|
+| `OPENAI_BASE_URL` | `OPENAI_BASE_URL` | `""` | `+ /chat/completions` がチャット URL の初期値（画面保存値が優先） |
+| `OPENAI_API_KEY` | `OPENAI_API_KEY` | `""` | API キー初期値（画面保存値が優先） |
+| `OPENAI_MODEL` | （env 不可・固定） | `"gpt-5.6-sol"` | 既定モデル／表ルーター・下書き用モデル |
+| `OPENAI_MODELS` | `OPENAI_MODELS` | `[]` | プルダウン候補（`;`/`,` 区切り） |
+| `OPENAI_VISION_MODELS` | `OPENAI_VISION_MODELS` | `gpt-4o;gpt-4.1;gpt-5;o4;sol;vision` | 画像対応判定（部分一致） |
+| `MODEL_SETTINGS_FILE` | `MODEL_SETTINGS_FILE` | `data/model_settings.yaml` | 管理者のモデル設定 |
+| `IMAGE_MAX_MB` / `IMAGE_MAX_COUNT` | 同名 | 8 / 4 | 画像1枚の上限MB／1メッセージの枚数 |
+| `OPENAI_TEMPERATURE` | 同名 | 0 | `temperature` |
+| `OPENAI_TOP_P` / `OPENAI_MAX_TOKENS` | 同名 | None | 設定時のみ送る |
+| `SCOPE_MODE` | `SCOPE_MODE` | `auto` | `auto/router/all` |
+| `MAX_AGENT_STEPS` | 同名 | 10 | 1質問のツール往復上限 |
+| `MAX_RESULT_ROWS` / `SAMPLE_ROWS_FOR_LLM` / `QUERY_TIMEOUT_SEC` | （固定） | 2000 / 40 / 10 | 画面行数／LLM へ返すサンプル行／SQL タイムアウト |
+| `PROMPT_INLINE_LIMIT_CHARS` | 同名 | 80000 | 互換のため読むだけ（現在は `inline_limit_for` が決める） |
+| `MODEL_CONTEXT_WINDOWS` / `MODEL_CONTEXT_DEFAULT` | （表は固定）/ `MODEL_CONTEXT_DEFAULT` | 表 / 128000 | 文脈量 |
+| `LLM_RATE_LIMIT_RETRIES` / `LLM_RATE_LIMIT_MAX_WAIT` | 同名 | 3 / 20 | 429 再試行 |
+| `CHAT_KEEP_IMAGE_TURNS` | 同名 | 2 | 画像を残す直近質問数 |
+| `CHAT_ANSWER_RESERVE_TOKENS` | 同名 | 6000 | 回答・ツール結果用の予約枠 |
+| `CHAT_KEEP_TURNS_MIN` | 同名 | 2 | 必ず残す直近質問数 |
+| `CHAT_LOCK_WAIT_SEC` | 同名 | 120 | 会話ロック待ち上限 |
+| `CHAT_EMBED_FILE_MAX_BYTES` | （固定） | 2MB | 履歴に埋め込むファイル上限 |
+| `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` / `MEMORY_MODEL` | 同名 | 有効 / 2000 / 空 | パーソナライズ |
+| `SCRAPER_MIN_INTERVAL_MIN` | 同名 | 30 | 質問前のスクレイピング再取得の最小間隔 |
+| `CATALOG_OPEN_CONTRIB` | 同名 | false | 登録カードを全員に開くか（`can_contribute`） |
+| `USER_META_DIR` | （`DATA_DIR/users`） | | 会話・prefs の置き場 |
+| `results.MAX_ENTRIES` / `MAX_CELLS` | （brain.py:7391/7393 固定） | 40 / 400,000 | result_id 置き場の上限 |
+
+---
+
+### 12. 一連の流れ（要約：図の骨格）
+
+```
+[ブラウザ] send()
+  ├ pendingImages → 既に POST /api/chat/image で token 化済み
+  ├ addItem(user) / setBusy(true,'考えています')
+  └ sendStreaming: POST /api/chat/stream {text, images:[token]}
+        │ (fetch失敗/!res.ok → sendAtOnce: POST /api/chat/send)
+[Flask] login_required → stream()
+  └ _begin_turn
+      1 検証(text, llm.is_configured)
+      2 rag.set_current_user / results.new_turn
+      3 _load_current(_hold_chat, chats.load_chat)
+      4 _images_from + models.is_vision
+      5 messages += user_message; drop_old_images; render_log += user; _persist (id採番・session.chat_id)
+      6 _auto_scope: build_scope → excluded_tables → SCOPE_MODE → inline_limit_for/inline_length → route_tables(LLM, OPENAI_MODEL) → table_names ピン留め → expand_tables_by_relations
+      7 空スコープ & !rag_available → 400
+      8 _realtime_refresh(jobs.refresh_realtime)
+      9 messages[0] = system(build_system_prompt(scope, admin, model, memory_prompt))
+  └ generate() [SSE]
+      loop ≤ MAX_AGENT_STEPS:
+        build_tools(scope, admin) → history_for_llm(messages, model, defs) → chat_stream(...)
+          → _create(kwargs: model, messages, tools, tool_choice=auto, temperature, stream=True [+top_p, max_tokens, quirks])
+          → delta* → done(StreamedMessage)
+        no tool_calls → text_end → 終了（length なら注記）
+        tool_calls → text_end → item(previews) → running → dispatch → tool message → item(render)*
+      finally: _persist → _schedule_memory → end{chat_id,title}
+```
+
+## LLM呼び出しとエージェントループ（AIワークハブ：質問を送ってから答えが返るまでの内部仕様）
+
+対象コード: `C:\Users\onoke\Desktop\aiagent_rag_bundle\aiagent_minimal_rag_tougou` の `core.py`（Flask ルート・チャットのターン処理・保存・表示変換）、`brain.py`（LLM クライアント・ツール・検算・結果預かり）、`config.py`（設定）、`assets.py`（ブラウザ側 JS）。以下の行番号はすべて 2026-09-23 時点のコードを直接読んで確認したもの。`help.html` 第3部 3-7・第5部 の記述と食い違う点は末尾「§10 既存ドキュメントとの差異」にまとめた。
+
+---
+
+### 1. 設定値（config.py）— env 変数名と既定値
+
+| 定数 | env 変数 | 既定値 | 行 | 用途 |
+|---|---|---|---|---|
+| `OPENAI_BASE_URL` | `OPENAI_BASE_URL` | `""` | config.py:240 | 接続先の初期値（「モデル設定」画面の保存値が優先。実参照は `models.llm_chat_url()` brain.py:2100） |
+| `OPENAI_API_KEY` | `OPENAI_API_KEY` | `""` | config.py:243 | API キー初期値（同上、実参照は `models.llm_api_key()` brain.py:2076） |
+| `OPENAI_MODEL` | （env なし・コード直書き） | `"gpt-5.6-sol"` | config.py:249 | 画面で既定を決めていないときのチャット既定モデル、および裏方処理（表ルーター・AI下書き・パーソナライズ）のモデル |
+| `OPENAI_TEMPERATURE` | `OPENAI_TEMPERATURE` | `0`（float） | config.py:273 | 全チャット呼び出しの temperature |
+| `OPENAI_TOP_P` | `OPENAI_TOP_P` | `None`（未設定なら送らない） | config.py:274-275 | |
+| `OPENAI_MAX_TOKENS` | `OPENAI_MAX_TOKENS` | `None`（未設定なら送らない） | config.py:276-277 | |
+| `MAX_AGENT_STEPS` | `MAX_AGENT_STEPS` | `10` | config.py:306 | 1 質問あたりの「LLM 呼び出し→ツール実行」往復上限 |
+| `MAX_RESULT_ROWS` | （直書き） | `2000` | config.py:307 | 1 クエリの取得・表示上限行数 |
+| `SAMPLE_ROWS_FOR_LLM` | （直書き） | `40` | config.py:309 | ツール結果として LLM に返すサンプル行数 |
+| `LLM_RATE_LIMIT_RETRIES` | `LLM_RATE_LIMIT_RETRIES` | `3` | config.py:389 | 429 でアプリ側が待って投げ直す回数（0 で無効） |
+| `LLM_RATE_LIMIT_MAX_WAIT` | `LLM_RATE_LIMIT_MAX_WAIT` | `20.0`（秒） | config.py:392 | 1 回の待ち時間の頭打ち |
+| `MODEL_CONTEXT_WINDOWS` | （直書き dict） | 例 `"gpt-5.6": 1_050_000`, `"gpt-5": 400_000`, `"gpt-4.1": 1_047_576`, `"gpt-4o": 128_000`, `"o3": 200_000`, `"gpt-4": 8_192` ほか | config.py:349-377 | モデル名の部分一致（長い名前優先）で文脈量を引く |
+| `MODEL_CONTEXT_DEFAULT` | `MODEL_CONTEXT_DEFAULT` | `128000` | config.py:378 | 表に無いモデルの仮の文脈量 |
+| `CHAT_KEEP_IMAGE_TURNS` | `CHAT_KEEP_IMAGE_TURNS` | `2` | config.py:450 | 画像を base64 のまま残す直近の質問数 |
+| `CHAT_ANSWER_RESERVE_TOKENS` | `CHAT_ANSWER_RESERVE_TOKENS` | `6000` | config.py:451 | 回答＋ツール結果のために空ける枠 |
+| `CHAT_KEEP_TURNS_MIN` | `CHAT_KEEP_TURNS_MIN` | `2` | config.py:453 | 文脈超過でも必ず残す直近の質問数 |
+| `CHAT_LOCK_WAIT_SEC` | `CHAT_LOCK_WAIT_SEC` | `120` | config.py:459 | 同一会話の直列化ロックの待ち上限（秒） |
+| `CHAT_HISTORY_LIMIT` | （直書き） | `100` | config.py:435 | 1 人あたり保持する会話数 |
+| `CHAT_HISTORY_DAYS` | `CHAT_HISTORY_DAYS` | `90` | config.py:438 | 保存期間（0 で無期限） |
+| `CHAT_EMBED_FILE_MAX_BYTES` | （直書き） | `2 * 1024 * 1024` | config.py:441 | 履歴 JSON に base64 で埋め込む生成ファイルの上限 |
+| `USER_META_DIR` | （`DATA_DIR / "users"`） | `data/users` | config.py:431 | 会話ファイルの置き場の親 |
+| `MEMORY_ENABLED` | `MEMORY_ENABLED` | `"1"`→True（`0/false/no/off` で False） | config.py:110 | パーソナライズ抽出の初期値 |
+| `MEMORY_MAX_CHARS` | `MEMORY_MAX_CHARS` | `2000` | config.py:111 | |
+| `MEMORY_MODEL` | `MEMORY_MODEL` | `None`（空なら回答モデル） | config.py:113 | |
+| `MEMORY_SETTINGS_FILE` | `MEMORY_SETTINGS_FILE` | `data/memory_settings.yaml` | config.py:115-116 | 管理者画面の保存値（上 3 つを上書き） |
+| `IMAGE_MAX_COUNT` | `IMAGE_MAX_COUNT` | `4` | config.py:271 | 1 メッセージの画像枚数 |
+| `SCOPE_MODE` | `SCOPE_MODE` | `"auto"`（`auto/router/all`） | config.py:297-299 | カタログを LLM に渡す範囲の決め方 |
+
+- `PROMPT_INLINE_LIMIT_CHARS`（env 同名・既定 80000、config.py:340）は互換のため読むだけで、現在は `models.inline_limit_for()` が文脈量から自動算出する（brain.py:2153-2167: `context × CATALOG_CONTEXT_RATIO(0.5, brain.py:2132) ÷ TOKENS_PER_CHAR_TEXT(0.55)` を `INLINE_LIMIT_MIN=4_000`／`INLINE_LIMIT_MAX=400_000`（brain.py:2038-2039）で丸める）。
+
+---
+
+### 2. LLM クライアント（brain.py 旧 llm.py 部分）
+
+#### 2-1. クライアント生成と設定判定
+- `_client: OpenAI | None = None`（brain.py:12931）。プロセス内シングルトン。
+- `is_configured()`（brain.py:12941-12943）: `bool(llm_chat_url() and llm_api_key())`。接続先・キーとも「モデル設定」画面の保存値 > env。
+- `client()`（brain.py:12946-12954）: `OpenAI(base_url=_derived_base(llm_chat_url(), "/chat/completions") or None, api_key=llm_api_key() or "not-set")`。`_derived_base`（brain.py:12935-12938）はフルパス URL の末尾 `/chat/completions` を落として SDK 用 base_url にする。`max_retries` は指定していない（＝ OpenAI SDK 既定の自動再試行 2 回がそのまま効く。コード注記 brain.py:13046-13047「SDKも2回までは自動で投げ直す」）。
+- 使うモデル名は `models.current(user)`（brain.py:2288-2298）: `prefs.get_model(user)` が `available()` に含まれればそれ、無ければ `default_model()`（brain.py:2071-2073: 管理者設定の `default` > `config.OPENAI_MODEL`）。
+
+#### 2-2. `_create(**kwargs)` — 呼び出し口と再試行方針（brain.py:13087-13136）
+`client().chat.completions.create(**attempt)` を包む唯一の入口。`chat()`／`chat_stream()`／`_ask_json()` はすべてここを通る。
+
+**状態（プロセス寿命）**
+- `_QUIRKS: dict[str, dict] = {}`（brain.py:12990）: モデル名 → `{"set": {引数: 値}, "drop": {引数, ...}}`。再起動で消える。
+- `_MAX_FIX = 4`（brain.py:12992）: 1 回の呼び出しで引数を直しに行く上限。
+- `_apply_quirks(kwargs)`（brain.py:12995-13001）: `drop` の引数を外し `set` を上書きしたコピーを返す。
+- `_learn(model, set_=..., drop=...)`（brain.py:13004-13012）: `_QUIRKS` に記録し `print("[llm] {model} の呼び出し方を調整しました: set=... drop=...")`。
+
+**引数エラーの自動修正 `_fix_for(message, kwargs)`（brain.py:13015-13048）** — エラー文（小文字化）を見て `(set_, drop)` を返す。上から順に判定:
+1. `"reasoning_effort"` かつ `"function tools"` → `({"reasoning_effort": "none"}, None)`
+2. `"reasoning_effort"` かつ `"does not support"` → `({"reasoning_effort": "none"}, None)`
+3. `"reasoning_effort"` かつ `"unrecognized"` → `(None, "reasoning_effort")`
+4. `'temperature'` または `'top_p'` が引用符付きで現れ、かつ `"does not support"` か `"only the default"` → `(None, その引数名)`
+5. `"max_tokens"` かつ `"max_completion_tokens"` → `({"max_completion_tokens": kwargs["max_tokens"]}, "max_tokens")`（`max_tokens` が None なら該当せず）
+6. どれにも当たらなければ `None`
+
+**レート制限（429）の判定と待ち時間**
+- `_RETRY_IN = re.compile(r"try again in\s+([\d.]+)\s*(ms|s|m)\b", re.IGNORECASE)`（brain.py:13051）
+- `_is_rate_limit(e)`（brain.py:13054-13055）: `getattr(e, "status_code", None) == 429` または `"rate_limit" in str(e).lower()`
+- `_rate_limit_wait(e, attempt)`（brain.py:13058-13076）— 優先順:
+  1. `e.response.headers["retry-after"]` があれば `min(float(raw), LLM_RATE_LIMIT_MAX_WAIT)`
+  2. エラー文の `try again in X(ms|s|m)` → 秒に換算し `min(sec + 0.5, LLM_RATE_LIMIT_MAX_WAIT)`
+  3. 手がかり無し → `min(2.0 ** attempt, LLM_RATE_LIMIT_MAX_WAIT)`（attempt=1,2,3 → 2 秒・4 秒・8 秒）
+- `class RateLimited(Exception)`（brain.py:13079-13084）: 諦めたときに投げる。文面: `"混み合っています（レート制限）。{waits}回・合計{waited_total:.1f}秒待ちましたが解消しませんでした。少し時間をおいてから「続けて」と送ってください。ここまでに取得したデータは残っています。"`
+
+**`_create` 本体の制御フロー**
+```
+model = str(kwargs.get("model") or "")
+attempt = _apply_quirks(kwargs)          # 学習済みの調整を適用
+fixes = waits = 0; waited_total = 0.0
+while fixes < _MAX_FIX:                   # 最大4回の引数修正
+    try:
+        return client().chat.completions.create(**attempt)
+    except Exception as e:
+        if _is_rate_limit(e):             # 429 は引数修正の回数に数えない
+            if waits >= config.LLM_RATE_LIMIT_RETRIES:   # 既定3
+                raise RateLimited(...) from e
+            waits += 1
+            sec = _rate_limit_wait(e, waits); waited_total += sec
+            print("[llm] レート制限。{sec:.1f}秒待って投げ直します（{waits}/{RETRIES}回目）")
+            time.sleep(sec); continue
+        fixes += 1
+        fix = _fix_for(str(e), attempt)
+        if fix is None: raise             # 直し方が分からないエラーはそのまま上へ
+        set_, drop = fix
+        if set_ and all(attempt.get(k) == v for k, v in set_.items()): raise   # 同じ直しの繰り返し
+        if drop and drop not in attempt: raise
+        _learn(model, set_=set_, drop=drop)
+        attempt = _apply_quirks(kwargs)
+return client().chat.completions.create(**attempt)   # 13136: 修正4回を使い切った後の最後の1投（例外はそのまま上がる）
+```
+- 429 以外の例外（タイムアウト・5xx・接続失敗・ツール呼び出し解析エラー等）は `_fix_for` が None を返すため **再試行せず即 raise**（SDK 内部の 2 回は別）。
+- 429 の待ちは既定で最大 3 回（sleep 3 回）。4 回目の 429 で `RateLimited`。
+
+#### 2-3. `chat(messages, tool_defs=None, model=None)` — 非ストリーミング（brain.py:13715-13749）
+- kwargs: `model=model or config.OPENAI_MODEL`, `messages`, `temperature=config.OPENAI_TEMPERATURE`
+- `defs = tools.BUILTIN_TOOLS if tool_defs is None else tool_defs`。`defs` が真（非空）のときだけ `tools=defs`, `tool_choice="auto"` を付ける。**`[]` を渡すと `tools` キーごと省略**（＝文章でしか答えられない状態。`_append_final_answer` がこれを使う）。
+- `config.OPENAI_TOP_P is not None` なら `top_p`、`config.OPENAI_MAX_TOKENS is not None` なら `max_tokens`。
+- `resp = _create(**kwargs)`; `msg = resp.choices[0].message`; `msg.finish_reason = resp.choices[0].finish_reason` を後付け（`AttributeError/ValueError/TypeError` は握る）。戻り値は SDK の message オブジェクト（`.content`, `.tool_calls[i].id/.function.name/.function.arguments`, `.finish_reason`）。
+
+#### 2-4. `class StreamedMessage`（brain.py:13752-13781）
+- `chat()` の message と同じ属性形にそろえたストリーミング組み立て用オブジェクト。
+- 内部クラス `_Fn(name="", arguments="")`（13759）、`_Call(id="", name="", arguments="")`（13763: `self.type = "function"`, `self.function = _Fn(...)`）。
+- `__init__`（13768-13772）: `content = ""`, `tool_calls = None`, `finish_reason = None`, `_parts: dict[int, dict] = {}`（index → `{"id","name","arguments"}`）。
+- `_finish()`（13774-13781）: `_parts` が空なら `tool_calls = None`、あれば `sorted(self._parts.items())`（index 昇順）で `_Call(p["id"], p["name"], p["arguments"])` のリストにする。
+
+#### 2-5. `chat_stream(messages, tool_defs=None, model=None)` — ストリーミング（brain.py:13784-13829）
+- ジェネレータ。`("text", 差分文字列)` を文字が届くたびに yield、最後に `("done", StreamedMessage)` を 1 回だけ yield。ツール呼び出しは途中経過を出さない。
+- kwargs: `model=model or config.OPENAI_MODEL`, `messages`, `tools=tool_defs if tool_defs is not None else tools.BUILTIN_TOOLS`, `tool_choice="auto"`, `temperature=config.OPENAI_TEMPERATURE`, `stream=True`（＋ `top_p`／`max_tokens` は 2-3 と同条件）。**`chat()` と違い `tool_defs=[]` でも `tools=[]` をそのまま送る**（キーを落とさない）。
+- チャンク処理: `for chunk in _create(**kwargs)`:
+  - `chunk.choices` が空 → skip
+  - `chunk.choices[0].finish_reason` があれば `out.finish_reason` に保存
+  - `delta.content` があれば `out.content += delta.content` して `yield ("text", delta.content)`
+  - `delta.tool_calls` の各 `tc` について: `part = out._parts.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})`; `tc.id` があれば `part["id"] = tc.id`（上書き）; `tc.function.name` があれば `part["name"] += name`; `tc.function.arguments` があれば `part["arguments"] += arguments`（**index で束ね、断片は連結**）
+- ループ後 `out._finish()` → `yield ("done", out)`。
+
+#### 2-6. LLM に渡す履歴の作り方
+- `user_message(text, images=None)`（brain.py:13568-13589）: 画像無しなら `{"role":"user","content":text}`。画像ありなら `content` は配列 `[{"type":"text","text":...}, {"type":"image_url","image_url":{"url":"data:<mime>;base64,<b64>","detail":"auto"}}...]`。`IMAGE_MIMES = {"image/png","image/jpeg","image/gif","image/webp"}`（13565）以外は捨てる。
+- `_turn_blocks(messages)`（13613-13636）: `head`（system と最初の user より前のもの）と `blocks`（`role:user` から次の user の手前まで＝1 質問のかたまり）に分ける。落とすときは必ずこの単位（tool_calls と tool を離さないため）。
+- `drop_old_images(messages, keep_turns=None)`（13639-13666）: `CHAT_KEEP_IMAGE_TURNS`（既定 2）より古いブロックの user 発言の `image_url` パートを、テキスト＋注記 `"（この質問には画像が{n}枚ありましたが、会話が長くなったため履歴からは外しました。画像の中身を聞かれたら、貼り直してもらうよう伝えること）"` の文字列に差し替える（**メッセージ自体は消さない**：巻き戻しの番号がずれるため）。戻り値は落とした枚数。`chat["messages"]` を破壊的に更新する（`_begin_turn` core.py:8568 と `rewind` core.py:8822 から呼ばれる）。
+- `history_for_llm(messages, model=None, tool_defs=None)`（13669-13713）: **保存側 `chat["messages"]` は触らず控えを返す**。
+  1. `len(blocks) <= CHAT_KEEP_TURNS_MIN`（既定 2）なら messages をそのまま返す
+  2. `context, _ = models.context_window(model or config.OPENAI_MODEL)`（brain.py:2179-2196: 管理者登録 `context_overrides()` 完全一致→部分一致 > `config.MODEL_CONTEXT_WINDOWS` 長い名前から部分一致 > `MODEL_CONTEXT_DEFAULT`）
+  3. `used = Σ tokens_for(_msg_chars(m)) for m in head` ＋ `tool_defs` があれば `tokens_for(len(json.dumps(tool_defs)), "json")`
+  4. `left = max(0, context - used - CHAT_ANSWER_RESERVE_TOKENS)`; `room = int(left / TOKENS_PER_CHAR_TEXT)`（`TOKENS_PER_CHAR_TEXT = 0.55` brain.py:13504、`TOKENS_PER_CHAR_JSON = 0.31` 13506、`tokens_for` 13509-13512）
+  5. 古いブロックから `total > room and len(blocks) - cut > CHAT_KEEP_TURNS_MIN` の間 `cut += 1`
+  6. `cut == 0` なら messages をそのまま返す。落とした場合は head のコピーを作り、`head[0]` が system ならその `content` 末尾に `"\n\n※ この会話は長くなったため、古い方の{cut}回ぶんのやり取りは履歴から外れています。そこで話した内容は覚えていないので、必要なら聞き直してください。"` を足し、`blocks[cut:]` を連結して返す。
+
+---
+
+### 3. ツール定義と実行（brain.py 旧 tools/__init__.py 部分）
+
+#### 3-1. 定義の組み立て `build_tools(entries, admin=False)`（brain.py:12695-12724）
+- `ov = custom_tools.builtin_overrides(entries)`（管理者による無効化・説明上書き）
+- `BUILTIN_TOOLS`（最終形は brain.py:12530 = 各モジュールの組み込み ＋ `KNOWLEDGE_TOOLS` ＋ `[WHOAMI_TOOL, REPORT_GAP_TOOL]`。`_RETIRED = {"plot_chart"}` は brain.py:9373-9374 で除外済み）を走査:
+  - `name in _DYNAMIC_TOOLS`（`{"search_knowledge_base"}` 12534）→ skip（後で組み直す）
+  - `name in ADMIN_TOOLS and not admin` → skip（`ADMIN_TOOLS` 12558 = `explore_import_files`(9989) ∪ `analyze_usage`(11448)）
+  - `ov[name]["enabled"] is False` → skip
+  - `ov[name]["description"]` があれば description を差し替え
+  - `name in SQL_TOOLS` なら `_with_explanation(t)`（12679-12692）で `explanation` 引数（`_EXPLANATION_PARAM` 12668-12676、型 string、SQL の日本語解説 3〜5 行）を properties に注入。**required には足さない**
+- `knowledge_tool_schemas()`（12435-12459）: `rag_targets()` が空なら `[]`（＝ナレッジ検索ツールを渡さない）。あれば `KNOWLEDGE_TOOLS[0]` を deep copy し、description 末尾に「登録されているナレッジベース:」一覧を追記、`parameters.properties.knowledge_bases.items.enum` に名前一覧を入れる。これにも `enabled`／`description` の上書きが効く。
+- `custom_tools.collect_everywhere(entries)` の各ユーザー定義ツールは `validate_custom_tool(tool, set())` が空（＝問題なし）のときだけ `to_schema(tool)` で追加。
+- `SQL_TOOLS`（12554）= `SQL_TOOLS_query`(10816: `run_sql_query, plot_chart, plot_dual_axis, pivot_table, analyze_stats, plot_comparison, plot_trend, plot_composition, plot_distribution, plot_relationship, plot_kpi`) ∪ `SQL_TOOLS_stats`(11409: `hypothesis_test, regression, distribution_analysis, forecast, timeseries_analysis, bootstrap_estimate, clustering, abc_analysis`) ∪ `SQL_TOOLS_business`(9673: `compare_periods, funnel_analysis, cohort_analysis, market_basket, detect_anomalies, survival_analysis`)。files/mail/reports/usage/knowledge は空集合。
+- `_MODULES`（12539-12548）の並び順 query → stats → reports → mail → business → files → usage → knowledge は名前衝突時の後勝ちを固定するため不変。`_HANDLERS`（12551）は name → 実処理関数。
+
+#### 3-2. 実行 `dispatch(name, arguments_json, scope, entries=None, admin=False)`（brain.py:12842-12878）
+戻り値は常に `{"ok": bool, "llm_content": str(JSON), "render": dict|None, "verify_alerts"?: [alert]}`。`_err(message)`（7543-7548）は `{"ok": False, "llm_content": _json({"error": message}), "render": {"role":"assistant","kind":"error","message": message}}`。`_json` は `json.dumps(obj, ensure_ascii=False, default=str)`（7539）。
+
+順序:
+1. `json.loads(arguments_json)`（空なら `{}`）。`JSONDecodeError` → `_err("ツール引数のJSON解析に失敗しました: ...")`
+2. `name in ADMIN_TOOLS and not admin` → `_err("'{name}' は管理者だけが使えます。")`（build_tools で渡していなくても守りは 2 箇所）
+3. `_coerce_lists(name, args)`（12784-12799）: スキーマ上「文字列の配列」の引数（`_LIST_PARAMS`）に素の文字列が来たら 1 要素配列にする
+4. `_missing_required(name, args)`（12746-12766）: `_REQUIRED[name]`（スキーマの required、12737）のうち `_HAS_DEFAULT = {"title","filename","chart_type","purpose"}`（12743）を除き、`None` または長さ 0 の str/list/dict/tuple を「欠落」と判定 → `_err("'{name}' の必須の引数が指定されていません: ...（{name} の必須引数は ...）この引数を入れて呼び直してください。列名が分からないときは、先に describe_table か run_sql_query で列を確認すること。")`
+5. `_gather_sqls(args, scope, sqls)`（12802-12820）: 引数の入れ子を再帰で歩き `sql`（非空文字列）と `result_id`（→ `results.get(scope, rid)["sql"]`）を全部集める（検算用）
+6. `handler = _HANDLERS.get(name)` があれば `_attach_folder_save(args, _attach_verification(handler(args, scope), sqls, scope))`。例外は `_err("ツール '{name}' の実行でエラー: {e}")`
+7. ハンドラが無ければ `custom_tools.collect_everywhere(entries)` から同名のユーザー定義ツールを探す。無ければ `{"ok": False, "llm_content": _json({"error": "未知のツール: {name}"}), "render": None}`（render 無し）。あれば `sqls.append(render_sql(tool))`（12561-12563: `tool["sql"].strip()`）→ `_run_custom(tool, args, scope)`（12566）を同じく検証・フォルダ保存で包む
+- `_attach_verification(res, sqls, scope)`（12823-12839）: `res["ok"]` かつ `sqls` 非空のときだけ `verify.alerts_for(sqls, scope)`（core.py:4074-4113）を呼び、不一致があれば `res["verify_alerts"] = alerts`。検算自体の例外は `print("[verify] 検算でエラー（回答は続行）")` で素通り。
+- `_attach_folder_save(args, res)`（12881-12910）: `args["save_to_folder"]` が真で `render.kind == "file"` かつ `data` があるとき `importer.save_to_user_folder(...)` にも書き、`render["saved_to"]/["replaced"]` と `llm_content["folder"]` を足す。
+
+#### 3-3. 代表的なツール結果の形（`run_sql_query`、brain.py:10095-10128）
+- `fetch(args, scope, label=purpose)`（7619-）: `result_id` があれば預かり結果を使い、無ければ `results.find_by_sql(scope, sql)`（同じ質問（turn）・同じ scope・正規化後同一 SQL なら再実行せず流用、7487-）→ 無ければ SQL 実行。戻り `(columns, rows, truncated, result_id, total_rows)`。
+- `llm_content` = `{"columns", "row_count", "rows": 先頭 SAMPLE_ROWS_FOR_LLM(40) 行, "result_id": "r_xxxxxxxx", "note": "全N行中 先頭40行を表示。この結果は result_id '...' で他のツールから使い回せます...", ...source_note(...), "example_registered": bool}`
+- `render` = `{"role":"assistant","kind":"table","columns","rows"(全行・最大 MAX_RESULT_ROWS 2000),"truncated"}`
+- 結果預かり `results.put`（7458-7474）: `rid = "r_" + uuid4().hex[:8]`、エントリ `{scope: scope_key, columns, rows(tuple), truncated, sql, norm_sql, turn: current_turn(), label}`。上限 `MAX_ENTRIES = 40`（7391）・`MAX_CELLS = 400_000`（7393）を `_evict`（7447-7455）で古い順に捨てる。
+- 質問の区切り: `results.new_turn()`（7404-7408、`"t_" + uuid4().hex[:8]` を `threading.local` に置く）、`current_turn()`（7411）、`set_turn(turn_id)`（7415-7422、別スレッドへ引き継ぐ）。
+
+---
+
+### 4. エージェントループ（core.py 旧 web/chat_bp.py 部分）
+
+#### 4-1. 1 問の経路（エンドポイントと前処理）
+- Blueprint `bp_chat = Blueprint("chat", __name__)`（core.py:7671）。ブラウザ既定は `POST /api/chat/stream`（core.py:8708-8760）、フォールバックが `POST /api/chat/send`（8600-8607）。書き直しは `POST /api/chat/rewind`（8761-8830、常に非ストリーミング `_advance`）。
+- ブラウザ側（assets.py:7498-7500）: `sendStreaming(text, tokens)` が `false` を返したときだけ `sendAtOnce` → `/api/chat/send`。`false` になるのは `fetch` が例外を投げたときと `!res.ok || !res.body` のときだけ（assets.py:7537-7545）。途中で切れた場合は `true`（再送しない）。
+- 共通前処理 `_begin_turn()`（core.py:8535-8598）。失敗は `_TurnError(message, status=400, **extra)`（8450-8455）→ errorhandler（8458-8461）が `{"error": message, ...}` を返す。順序:
+  1. `_body()`（7391-7400: `request.json` が dict でなければ `{}`）→ `text = str(body.get("text") or "").strip()`。空 → `_TurnError("質問を入力してください。")`
+  2. `not llm.is_configured()` → `_TurnError("LLMが未設定です。env の OPENAI_* を設定してください。")`
+  3. `rag.set_current_user(g.user)`（brain.py:11943-11947、`threading.local` に利用者を置き出典番号を 0 に戻す）、`results.new_turn()`
+  4. `chat = _load_current()`（7912-7923: `session["chat_id"]` があれば `_hold_chat(cid)` でロック取得後 `chats.load_chat`、無ければ `{"id": None, "title": "", "created_at": "", "messages": [], "render_log": []}`）
+  5. `images, show = _images_from(body.get("images"))`（7859-7874: 預かりトークン→base64、最大 `IMAGE_MAX_COUNT`）。画像ありで `not models.is_vision(models.current(g.user))` → `_TurnError("いま選ばれているモデルは画像を扱えません。")`
+  6. `chat["messages"].append(llm.user_message(text, images))`; `llm.drop_old_images(chat["messages"])`; `chat["render_log"].append({"role":"user","kind":"text","content":text,"at":chats.now(), "images": show（あれば）})`; **`_persist(chat)`（ここで一度保存。ルーター等の重い処理より先）**
+  7. `scope = _auto_scope(text, chat)`（8464-8517: `build_scope` → 利用者が外した表を除外 → `SCOPE_MODE` が `all` ならそのまま／`auto` で `catalog.inline_length(scope) <= models.inline_limit_for(model)` ならそのまま／それ以外は `llm.route_tables(question, scope, chat_history)`（brain.py:13149、`_create` 直呼びの別 LLM 呼び出し）で絞り、`chat["table_names"]` のピン留めと `expand_tables_by_relations` を足す）
+  8. `not scope and not rag.rag_available(g.user)` → `_TurnError("いま調べられるものがありません。サイドバーの SQLite3 か LightRAG で、使うものにチェックを入れてください。")`
+  9. `_realtime_refresh(scope)`（8520-8532、失敗しても続行）
+  10. `chat["messages"][0]` を `{"role":"system","content": llm.build_system_prompt(scope, admin=_is_admin(), model=models.current(g.user), memory=memory_prompt(g.user))}` に**毎ターン作り直す**（無ければ index 0 に挿入）
+  11. `return chat, scope, text`
+- `_is_admin()`（8211-8219）: `g.user.is_admin`。
+
+`/api/chat/send`（8600-8607）:
+```
+chat, scope, text = _begin_turn()
+before = len(chat["render_log"]) - 1      # 今積んだ user 発言を含めて返す
+_advance(chat, scope, text)
+_schedule_memory(g.user, chat)
+return _reply(chat, before)               # 8438-8447: _persist(chat) → {"ok": True, "items": _web_log(render_log, before), "replace": False, "chat_id", "title"}
+```
+
+#### 4-2. 共通部品
+- `_msg_to_dict(m)`（8072-8079）: `{"role":"assistant","content": m.content}` ＋ `m.tool_calls` があれば `"tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]`。`chat()` の message も `StreamedMessage` も同じ扱い。
+- `_extract_calls(m)`（8082-8086）: `[{"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}]`（**arguments は未パースの JSON 文字列のまま**）。`tool_calls` 無しなら `[]`。
+- `_stop_note(reason)`（8207-8208）: `{"role":"assistant","kind":"text","content": reason}`。
+- 停止文言:
+  - `_STUCK_MESSAGE`（8298）: 「（同じ操作の失敗が続いたため、ここで止めました。上のエラーに出ている列名や条件を指定し直すか、質問を「まず集計だけ」「次にグラフ」のように分けて試してください。）」
+  - `_LOOP_MESSAGE`（8302）: 「（同じ調べ物を繰り返していたため、ここで止めました。必要なデータは上に出ています。）」
+  - `_LIMIT_MESSAGE`（8305）: f「（ツールの呼び出しが{config.MAX_AGENT_STEPS}回に達したので、ここで一区切りにしました。続きが必要なら、「続けて」と送るか、質問を分けてください。）」
+  - `_EMPTY_MESSAGE`（8330）: 「（モデルから空の応答が返り、書き直しもできませんでした。もう一度送ってみてください。繰り返すようなら、新しい会話で質問し直してください。）」
+  - `_CUT_MESSAGE`（8334）: 「（回答がモデルの出力上限で途中まででした。「続けて」と送ると続きを書きます。）」
+
+**`class _Guard`（8131-8204）— 同じ呼び出しの見張り**
+- `LIMIT = 2`（8146）: `repeated()` が呼ばれた総回数がこれに達したら打ち切り
+- 属性: `failed: dict[tuple, str]`（失敗した呼び出し→理由）、`done: set[tuple]`（成功した呼び出し）、`repeats = 0`
+- `key(call)`（8154-8155）: `(call["name"], (call.get("arguments") or "").strip())`。引数 JSON 文字列そのままなので空白違いは別キー
+- `seen(call)`（8157-8160）: キーが `failed` または `done` にある（成功・失敗どちらも）
+- `note(call, res)`（8162-8171）: `res["ok"]` なら `done.add`。それ以外は `json.loads(res["llm_content"]).get("error", "")` を理由に `failed[k]`（読めなければ `"同じ内容で失敗しました。"`）
+- `repeated(call)`（8173-8194）: `repeats += 1`。前回成功なら `{"error": "この呼び出しは既に実行済みです。もう一度は実行しません。", "hint": "前回の結果はこの会話の中に残っている。それを使って、いま利用者への回答を書くこと。同じツールを同じ引数で呼び直してはいけない。本当に別の情報が要るなら、引数を変えて呼ぶこと。"}`、失敗なら `{"error": "同じツールを同じ引数で呼び直しています。実行しませんでした。", "previous_error": failed[k], "hint": "引数を直してから呼ぶこと。直せないなら、そのツールは諦めて別の方法（表だけで示す・SQLを見直す・ユーザーに確認する）に切り替える。同じ呼び出しをもう一度行ってはいけない。"}`（いずれも `json.dumps(ensure_ascii=False)` の文字列）
+- `stuck`（8197-8199）: `repeats >= LIMIT`
+- `stop_reason`（8202-8204）: `done` があり `failed` が空なら `_LOOP_MESSAGE`、それ以外 `_STUCK_MESSAGE`
+
+**`_call_previews(calls, scope, question)`（8089-8128）— 実行前に画面へ出す項目**
+- 各 call について `json.loads(arguments)`（`JSONDecodeError` → `{}`）、`custom = custom_tools.collect_everywhere(scope)` から同名ツール検索。
+- 分岐（上から順、該当 1 件のみ）:
+  1. `name in tools.SQL_TOOLS and "sql" in args` → `{"role":"assistant","kind":"sql","tool": name,"call_id": c["id"],"sql": args["sql"],"purpose": args.get("purpose",""),"explanation": args.get("explanation",""),"question": question,"tables": tables_in_sql(args["sql"], scope)}`
+  2. `custom is not None` → 同じ `kind:"sql"` 形で `sql = tools.render_sql(custom)`, `purpose = f"{description[:60]} / 引数: {k=v!r, ...}"`（引数なしは `"（引数なし）"`）, `explanation = custom["description"]`（AI の解説ではなく登録時の説明）, `call_id`, `tables`
+  3. `name == "describe_table"` → `{"role":"assistant","kind":"text","content": f"🛠 テーブル詳細を確認: `{table}`","tables": [{"db": owner["name"], "table": table}]}`（`db` 省略時は `scope[0]`）
+  4. その他のツール → プレビュー無し
+- `tables_in_sql(sql, scope, limit=6)`（7474-7498）: scope の各表名が `alias.table` または裸の表名として SQL に現れるかを正規表現で判定し `[{"db": s["name"], "table": name}]` を最大 6 件。
+
+#### 4-3. `_advance(chat, scope, question)` — 非ストリーミング版（8241-8295）
+```
+guard = _Guard(); retried_empty = False
+for _ in range(config.MAX_AGENT_STEPS):                      # 既定10
+    try:
+        defs  = tools.build_tools(scope, admin=_is_admin())   # 毎回作り直す
+        model = models.current(g.user)
+        msg   = llm.chat(llm.history_for_llm(chat["messages"], model, defs), defs, model=model)
+    except Exception as e:
+        render_log.append({"role":"assistant","kind":"error","message": _friendly_llm_error(e)})
+        return                                                 # 終了5: LLM 例外（最終回答なし）
+    messages.append(_msg_to_dict(msg))
+    if msg.content: render_log.append({"role":"assistant","kind":"text","content": msg.content})
+    calls = _extract_calls(msg)
+    if not calls:
+        if (msg.content or "").strip():
+            _note_if_cut(chat, msg); return                    # 終了1: 正常な最終回答
+        messages.pop()                                         # 空の assistant を履歴から消す
+        if not retried_empty:
+            retried_empty = True; continue                     # 終了2a: ツール付きのまま1回だけ聞き直す（for を1つ消費）
+        if _append_final_answer(chat) is None:
+            render_log.append(_stop_note(_EMPTY_MESSAGE))      # 終了2b
+        return
+    fresh = [c for c in calls if not guard.seen(c)]
+    render_log.extend(_call_previews(fresh, scope, question))  # 未実行の呼び出しだけプレビュー
+    _execute(chat, calls, scope, guard)                        # 全 calls（seen は差し戻し）
+    if guard.stuck:
+        _append_final_answer(chat)
+        render_log.append(_stop_note(guard.stop_reason)); return   # 終了3
+_append_final_answer(chat)
+render_log.append(_stop_note(_LIMIT_MESSAGE))                  # 終了4: 往復上限
+```
+- 空応答の `continue` は for のイテレーションを 1 つ消費する（空応答が 1 回あると実質 9 往復）。
+
+#### 4-4. `_execute(chat, calls, scope, guard=None)`（8406-8435）— ツール実行と検算アラート
+```
+for c in calls:
+    if guard is not None and guard.seen(c):
+        messages.append({"role":"tool","tool_call_id": c["id"],"content": guard.repeated(c)}); continue   # 実行しない
+    res = tools.dispatch(c["name"], c["arguments"], scope, scope, admin=_is_admin())   # entries にも scope を渡す
+    if guard is not None: guard.note(c, res)
+    content = res["llm_content"]
+    alerts  = _fresh_alerts(chat, res.get("verify_alerts") or [])
+    if alerts: content = _merge_alerts(content, alerts)
+    messages.append({"role":"tool","tool_call_id": c["id"],"content": content})      # 差し戻しでも実行でも必ず tool を積む
+    if res.get("render"):
+        item = dict(res["render"])
+        if item.get("kind") == "error": item["call_id"] = c["id"]                    # 画面が失敗→SQL枠を辿るため
+        render_log.append(item)
+    for a in alerts: render_log.append(verify.render_item(a))
+```
+- `_fresh_alerts(chat, alerts)`（8396-8403）: `render_log` 内の `verify_key` 集合に無い `a["key"]` だけ残す（同じ警告を会話内で繰り返さない。key にデータ版が入るのでデータが変われば再度 1 回出る）。
+- `_merge_alerts(content, alerts)`（8383-8393）: `notes = [verify.llm_note(a)]`。`content` が JSON dict なら `data["verification_warnings"] = notes` を足して dumps、そうでなければ `content + "\n\n【検算の不一致】" + json.dumps(notes)`。
+- `verify.llm_note(alert)`（core.py:4125-4141）→ `{"check": name, <left_label>: left, <right_label>: right, "difference": diff, "difference_pct": pct, "instruction": "この2つの数字は一致するはずですが食い違っています。回答では、どちらの数字を使ったのかと、この差異があることを必ず注記してください。差異の理由を推測で断定しないこと。", "difference_detail_sample"?: {"columns", "rows"[:3]}}`
+- `verify.render_item(alert)`（4144-4170）→ `{"role":"assistant","kind":"report","title": f"⚠ 検算: {name}","tables": [...2経路の比較, 差の内訳...],"notes": [...],"verify_key": alert["key"]}`
+- alert の形（4104-4112）: `{"key": "verify||{owner}||{name}||{指紋}||{version}", "name", "left_label", "left", "right_label", "right", "diff", "pct", "tolerance_pct", "drill"}`
+
+#### 4-5. 最終回答の補助
+- `_note_if_cut(chat, msg)`（8338-8348）: `getattr(msg, "finish_reason", None) != "length"` なら None。`"length"` なら `_stop_note(_CUT_MESSAGE)` を render_log に積んで返す。
+- `_append_final_answer(chat)`（8351-8380）: ツール無しで最後にもう 1 回だけ書かせる。
+  - `llm.chat(llm.history_for_llm(chat["messages"], models.current(g.user)) + [{"role":"user","content": "ここまでの会話をふまえて、直前の質問に日本語で答えてください。ツールは使えません。すでに得られた結果があれば、それだけを根拠に簡潔に答えること。必要な情報が得られていない場合は、憶測で埋めず「うまく処理できませんでした。もう一度質問してください」とだけ伝えること。内部の仕組み（ツール名・データベースの構成・システムの状態）を説明してはいけない。"}], [], model=models.current(g.user))` — **第 2 引数 `[]`（= `tools` キーを送らない）**
+  - 例外 → `print("[chat] 最後の回答をまとめられませんでした: ...")` して None。本文空 → None。
+  - 成功時: `messages.append(_msg_to_dict(msg))`（**注入した user 発言は履歴に残さない**）、`render_log.append({"role":"assistant","kind":"text","content": text})` して返す。
+- `_friendly_llm_error(e)`（8309-8327）: `str(e).lower()` を見て
+  1. `"error parsing tool call"` → 「モデルの応答が途中で乱れたため、処理を続けられませんでした。もう一度送ってください（ローカルのモデルではまれに起きます）。」
+  2. `"out of memory"` or `"cudamalloc"` → 「ローカルLLMのメモリが足りず、応答を作れませんでした。少し待ってからもう一度送ってください。」
+  3. `"timed out"` or `"timeout"` → 「モデルの応答が時間内に返りませんでした。もう一度送るか、質問を短く分けてください。」
+  4. それ以外（`RateLimited` も含む）→ `f"LLM呼び出しに失敗しました: {s[:160]}"`
+
+#### 4-6. `_stream_advance(chat, scope, question)` — ストリーミング版（8622-8707）
+- `_sse(event, data)`（8618-8619）: `f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"`
+- SSE イベント（`stream()` docstring 8711-8717 と実装から）:
+
+| event | data | 出る場所 |
+|---|---|---|
+| `delta` | `{"text": 差分}` | `llm.chat_stream` が `("text", …)` を返すたび（8636） |
+| `text_end` | `{}` | 1 回分の本文が終わった時点。tool_calls の有無にかかわらず出す（8654, 8673） |
+| `item` | `_web_log([item])[0]`（描画アイテム 1 件） | LLM エラー（8643）、切れ注記（8658）、最終回答／空応答注記（8666-8671）、SQL プレビュー（8677-8678）、ツールの描画物・検算カード（8689-8690）、打ち切り時の回答と停止注記（8694-8699）、上限時（8702-8706） |
+| `running` | `{"name": ツール名, "label": TOOL_LABELS.get(name, name)}` | 1 ツールを実行する直前（8684-8685）。差し戻し（seen）では出ない |
+| `end` | `{"chat_id", "title"}` | `generate()` の finally、`_persist` 後（8754-8755）。中断時は出ない |
+
+ループ本体は `_advance` と同型で、違いは:
+- LLM 呼び出しが `llm.chat_stream(llm.history_for_llm(messages, model, defs), defs, model=model)` で、`kind == "text"` なら `delta` を yield、`"done"` なら `msg = payload`（8631-8639）。例外時は `kind:"error"` item を積んで yield して return。`msg is None`（done が来なかった）なら return（8646-8647）
+- `calls` が無いときは `text_end` → 本文ありなら `_note_if_cut` の結果を item で流して return。空応答は `messages.pop()` → 1 回目 `continue` → 2 回目 `_append_final_answer` の item か `_EMPTY_MESSAGE` の item
+- `calls` があれば `text_end` → `fresh` のプレビューを render_log に積み 1 件ずつ item → 各 call について: `guard.seen(c)` なら `_execute(chat, [c], scope, guard)`（差し戻しのみ・イベント無し）、そうでなければ `running` → `before = len(render_log)` → `_execute(chat, [c], scope, guard)` → `_web_log(render_log, before)` の新規分を item で流す（**1 呼び出しずつ実行・逐次描画**）
+- `guard.stuck` → `_append_final_answer` の item（あれば）→ `guard.stop_reason` の item → return
+- for を抜けたら `_append_final_answer` の item（あれば）→ `_LIMIT_MESSAGE` の item
+
+#### 4-7. `POST /api/chat/stream`（8708-8760）— GeneratorExit と保存
+```
+chat, scope, text = _begin_turn()
+if not chat.get("id"):
+    chat["id"] = chats.new_id(); _hold_chat(chat["id"])     # 流し始めると session に書けないので先に確定
+session["chat_id"] = chat["id"]
+turn_id = results.current_turn(); user = g.user
+def generate():
+    rag.set_current_user(user); results.set_turn(turn_id)   # threading.local は stream_with_context が引き継がないため入れ直す
+    aborted = False
+    try:
+        yield from _stream_advance(chat, scope, text)
+    except GeneratorExit:                                     # 画面を閉じた／更新した
+        aborted = True; raise
+    except Exception as e:                                    # 途中で落ちても接続は閉じる
+        yield _sse("item", {"role":"assistant","kind":"error","message": _friendly_llm_error(e)})
+    finally:
+        _persist(chat)                                        # 進んだところまで必ず保存
+        _schedule_memory(user, chat)                          # 別スレッド。end は待たない
+        if not aborted:
+            yield _sse("end", {"chat_id": chat.get("id"), "title": chat.get("title", "")})
+return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+```
+- 会話ロック: `_hold_chat(cid)`（7881-7898）は `chats.lock_for(user, cid)`（1090-1101、会話ごとの `RLock`）を `CHAT_LOCK_WAIT_SEC`（120 秒）まで待って取得し `g._chat_lock` に置く。待ちきれなければ print して続行。解放は `app.teardown_request(_release_chat)`（15574、`_release_chat` 7901-7908）。
+- 切断後に保存された内容は、ブラウザ側が `end` を受け取らないため、`missed` フラグ付きで `openChat(chat_id)` により保存済みの完成形を読み直す設計（assets.py:7566-7577）。
+- 切断で `tool_calls` に対する `tool` が欠けた履歴は、保存時／読込時の `heal_messages`（1264-1296）が丸ごと落として 400 を防ぐ。
+
+#### 4-8. 回答後の `_schedule_memory(user, chat)`（2144-2157）— パーソナライズの書き直し
+- 条件: `user is not None` かつ `memory_enabled(user)`（2014-2016: `memory_settings()["enabled"]`（1692-1715、`data/memory_settings.yaml` > config）かつ本人の `prefs.memory_off` が偽）かつ `llm.is_configured()`。
+- `q, a = _last_turn_texts(chat)`（2105-2123: messages を後ろから見て、最後の assistant が `tool_calls` 無し・本文ありのときだけ (直前の user 本文, その回答)。それ以外は `("", "")`）。
+- `not a.strip()` または（`len(q.strip()) < 4` かつ `q` に「忘れ」「覚え」を含まない）→ 何もしない。
+- `model = memory_settings()["model"] or models.current(user)`（管理者の指定 > 回答モデル）。
+- `threading.Thread(target=memory_after_turn, args=(user, chat.get("id") or "", q, a, model), daemon=True).start()`（回答を待たせない）。
+- `memory_after_turn`（2126-2141）: `base = memory_text(user)` → `llm.extract_memory(base, q, a, model=model)`（brain.py:14284-14296: `_ask_json(_MEMORY_SYSTEM(14230), user=…既存本文＋質問[:1000]＋回答[:1500]…, model)`。`_ask_json`（13832-13850）は `_create(model, messages=[system,user], temperature=0)` で **tools 無し**、応答から最初の `{`〜最後の `}` を `json.loads`）→ `memory_apply(user, new_text, question, base=base)`。例外は print のみ。
+
+---
+
+### 5. 表示用変換とファイル配布
+
+#### 5-1. `render_item_for_web(item)`（core.py:7543-7582）
+- `out = {k: jsonable(v) for k, v in item.items() if k not in ("data", "sheets")}`（`jsonable` 7526-7541: bytes → `"<N bytes>"`, NaN/inf → None, dict/list 再帰, その他 str）
+- `kind in ("chart", "chart_dual")`: `fig = charts.build_dual_figure(item)`（chart_dual）／`charts.build_figure(item)` → `out["figure"] = json.loads(fig.to_json())`（**Plotly JSON**）、`out["kind"] = "chart"`（**chart_dual も chart に正規化**）。例外 → `out["kind"] = "error"`, `out["message"] = f"グラフを描けませんでした: {e}"`
+- `kind == "report_doc"`: `out["sections"]` を作り直し、各節の `chart` を `charts.build_figure` で `figure` に変換（失敗は `chart_error`）。`chart` キー自体は落とす
+- `kind == "file"`: `out["sheets"] = [{"name", "columns", "rows": 先頭 20 行, "total": 全行数}]`（プレビュー用）
+- その他の kind はキーをそのまま通す（`data`/`sheets` を除く）
+
+#### 5-2. `_web_log(render_log, start=0)`（8009-8030）
+- `turn = _count_turns(render_log[:start])`（7974-7977: `role=="user" and kind=="text"` の数）から数えて、user/text アイテムに `w["turn"]` を振る（巻き戻しの目盛り）
+- `item.get("data")`（bytes）を持つアイテムは kind を問わず `token = _fs_put(item["data"], item.get("filename","download"), item.get("mime","application/octet-stream"), g.user.username)` → `w["url"] = f"/api/file/{token}"`（**呼ぶたび新しいトークン**）
+- `kind == "sql"` に `w["label"] = TOOL_LABELS.get(item["tool"], item["tool"])`（`TOOL_LABELS` 7673-7719、例 `run_sql_query: "SQL実行 (SELECT)"`, `search_knowledge_base: "社内文書の検索"`, `plot_dual_axis: "2軸グラフ描画 (棒+折れ線)"`, `export_excel: "Excel作成"`, `build_report: "レポート作成"`, `describe_table: "テーブル詳細の確認"`, `compose_email: "メールの下書き"`, `report_gap: "足りないものの報告"` ほか全 45 件）
+
+#### 5-3. ファイル一時置き場（旧 web/filestore.py、7282-7318）
+- `_MAX_ITEMS = 200`（7292）、`_fs_lock = threading.Lock()`、`_files: OrderedDict[str, dict]`（プロセス内メモリ。**ディスクには書かない**）
+- `_fs_put(data, filename, mime, owner, trusted=False, label="")`（7298-7310）: `token = secrets.token_urlsafe(16)`; `_files[token] = {"data","filename","mime","owner","trusted","label"}`; 件数が 200 を超えたら古い順に `popitem(last=False)`。**TTL（時間による失効）は無い。件数上限のみ**
+- `_fs_get(token, owner)`（7312-7318）: `owner` が一致するものだけ返す
+- `GET /api/file/<token>`（15378-15386、`bp_api`、`login_required`）: `_fs_get(token, g.user.username)` が None なら 404。`send_file(BytesIO(data), mimetype, as_attachment=True, download_name=filename)`
+- 画像アップロードも同じ置き場（`_images_from` が `_fs_get` で読む）。
+
+---
+
+### 6. 会話の保存（旧 chats.py、core.py:1000-1379）と `_persist`
+
+#### 6-1. 置き場所と ID
+- `chats_dir(user) = config.USER_META_DIR / <user.safe_key> / "chats"`（1026-1028）→ `data/users/<safe_key>/chats/`
+- 会話ファイル `<safe_id>.json`（`_chat_file` 1036-1037、`_safe_id` 1031-1033 は `[^0-9a-zA-Z_-]` を除去し 64 文字まで）、一覧 `index.json`（`_INDEX_NAME` 1021）
+- `new_id()`（1040-1042）: `datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]`
+- `now()`／`_now()`（1045-1051）: `isoformat(timespec="seconds")`
+- `_write_json`（1066-1076）: `<name>.<pid>.<tid>.tmp` に書いて `os.replace`（原子的差し替え）
+
+#### 6-2. `save_chat(user, chat_id, messages, render_log, db_names=None, tables=None, title="", created_at="", table_names=None)`（1320-1348）
+- `is_deleted(user, chat_id)`（1316、回答中に別タブで削除された会話）なら保存せず `{"id": chat_id, "deleted": True}`
+- 保存 JSON のキー（この順）:
+  - `id`
+  - `title`: 引数 or `make_title(messages)`（1248-1261: 最初の user 発言（配列なら text パート連結）を空白正規化し `_TITLE_MAX = 40`（1023）で切って `…`、無ければ `（無題）`）
+  - `created_at`: 引数 or 今
+  - `updated_at`: 今
+  - `db_names`: list
+  - `table_names`: list（`"DBファイル名.表名"`、表ルーターのピン留め用）
+  - `tables`: dict（`_persist` は常に `{}` を渡す）
+  - `messages`: `heal_messages([m for m in messages if m.get("role") != "system"])`（**system は保存しない**。結果の無い `tool_calls` は丸ごと落とし、本文があれば `{"role":"assistant","content"}` だけ残す）
+  - `render_log`: `[_encode_item(i) ...]`（1217-1232: `at` が無ければ今を `setdefault`; `data` が bytes で `<= CHAT_EMBED_FILE_MAX_BYTES`(2MB) なら base64 文字列＋`"_b64": True`、超えれば `data` を捨て `"_no_data": True`）
+- `_write_json(_chat_file)` → `summary = _summary(chat)`（1184-1192: `{id, title, created_at, updated_at, db_names, n_turns（user 発言数）}`）→ `_upsert_index(user, summary)`（1199-1214: `_index_lock` 下で先頭挿入・`updated_at` 降順・`CHAT_HISTORY_LIMIT`(100) を超えた古い会話は実体ごと削除）→ summary を返す
+- `load_chat`（1351-1361）: `_decode_item`（1235-1243、base64 復号）と `heal_messages` を通す。期限切れ（`CHAT_HISTORY_DAYS`）は一覧取得時 `_drop_expired` が消す。
+
+#### 6-3. `_persist(chat)`（7926-7971）
+1. `render_log` が空で `id` も無ければ何もしない（話すまでファイルを作らない）。既存の会話は空でも保存（巻き戻しで全消ししたときの復活防止）
+2. `id` が無ければ `chats.new_id()` を採番し `_hold_chat`
+3. `db_names` = 既存 ∪ `render_log` の `kind=="sql"` アイテムの `sql` から `db.dbs_named_in(sql)` で集めた DB 名（sorted）
+4. `table_names` = 既存 ∪ 各 DB の `catalog.profile_db(path)["tables"]` の表名を `(?<!\w)表名(?!\w)`（IGNORECASE）で SQL に当てて拾った `"{db}.{table}"`（sorted）。プロファイル失敗は無視
+5. `saved = chats.save_chat(g.user, id, messages, render_log, db_names=..., tables={}, table_names=..., title=..., created_at=...)`
+6. `saved["deleted"]` なら `session["chat_id"]` を外して返す。そうでなければ `session["chat_id"] = id`、`chat["title"], chat["created_at"] = saved["title"], saved["created_at"]`
+
+---
+
+### 7. render_log の kind 一覧（コードで生成箇所を確認したもの）
+
+| kind | 生成箇所 | 主なキー |
+|---|---|---|
+| `text` | core.py:8253/8279/8207(`_stop_note`)/8375, 8121（describe_table プレビュー）, user 発言 8569 | `content`, `tables?`, user 側は `at`, `turn`(表示時), `images?` |
+| `sql` | core.py:8103, 8113（`_call_previews`） | `tool, call_id, sql, purpose, explanation, question, tables[{db,table}]`, 表示時 `label` |
+| `error` | brain.py:7546（`_err`）、core.py:8250/8641（LLM 例外）、7563（グラフ変換失敗） | `message`, ツール失敗は `call_id` |
+| `table` | brain.py:10124 ほか | `columns, rows, truncated` |
+| `chart` | brain.py:10166, 10258, 10312 | 元データ `columns, rows` ＋ chart 指定 → 表示時 `figure`(Plotly JSON) |
+| `chart_dual` | brain.py:10202, 12654 | 表示時に `kind:"chart"` へ正規化 |
+| `report` | brain.py:7764（分析系 `_report_result`）、core.py:4167（検算カード） | `title, tables, notes`, 検算は `verify_key` |
+| `report_doc` | brain.py:11270 | `sections[]`（表示時に節の `chart` → `figure`） |
+| `file` | brain.py:10617, 10664, 10714, 10908, 10997 | `filename, mime, data(bytes)`, `sheets?`, `saved_to?`; 表示時 `url`, `sheets` プレビュー; 保存時 base64 or `_no_data` |
+| `mail_draft` | brain.py:10057 | `draft` |
+| `glossary_term` | brain.py:10431 | 用語登録の提案カード |
+| `example_proposal` | brain.py:10487 | 例文登録の提案カード |
+| `er` | brain.py:10544 | `db` |
+| `table_link` | brain.py:10787 | テーブル全体を開くリンク |
+| `sources` | brain.py:12264, 12289 | `query` ほか（ナレッジ検索の出典） |
+| `gap` | brain.py:12366（`report_gap`） | `gap_kind, label, what` |
+
+- 共通キー: `role`（`user`/`assistant`）、`kind`、`at`（保存時に `_encode_item` が付与。user 発言は積んだ時刻、応答側は保存時刻）。
+- `usage.collect` は kind を数えて sql/chart/table/file/report の件数を出す（help.html 第5部 §9 の記述。本ドキュメントの範囲外のため未検証）。
+
+---
+
+### 8. データ構造の要約
+
+- `messages`（LLM に送る列）: `[{"role": "system", "content": str}, {"role": "user", "content": str | [parts]}, {"role": "assistant", "content": str|None, "tool_calls"?: [{"id", "type": "function", "function": {"name", "arguments": str}}]}, {"role": "tool", "tool_call_id": str, "content": str(JSON)}]`。system は毎ターン index 0 に作り直し、保存しない。
+- `render_log`（画面に描く列）: §7。2 本の対応付けは user 発言の通し番号のみ（`_count_turns`／`_split_at_turn` 7980-8006）。
+- `calls`: `[{"id", "name", "arguments": str}]`。
+- `tools.dispatch` の戻り: `{"ok", "llm_content": str(JSON), "render": dict|None, "verify_alerts"?: [alert]}`。
+- `_reply` の JSON: `{"ok": true, "items": [...], "replace": bool, "chat_id": str, "title": str}`。
+- SSE 1 件: `event: <delta|text_end|running|item|end>\ndata: <JSON>\n\n`。ブラウザは `fetch` + `ReadableStream` で `\n\n` 区切りに分け、`event: `／`data: ` 行を自前で解釈（assets.py:7601-7623）。
+- 保存ファイル `data/users/<safe_key>/chats/<id>.json`: `{id, title, created_at, updated_at, db_names, table_names, tables, messages, render_log}`、一覧 `index.json`: `{"chats": [summary...]}`。
+
+---
+
+### 9. 1 問の時系列（ストリーミング経路）
+
+1. ブラウザ `sendStreaming` → `POST /api/chat/stream {text, images:[token]}`
+2. `_begin_turn`: 検証 → `rag.set_current_user` → `results.new_turn` → 会話ロック＆読込 → user 発言を messages/render_log に積み **保存** → `_auto_scope`（必要なら表ルーター LLM 呼び出し）→ `_realtime_refresh` → system prompt 作り直し
+3. 会話 ID 確定・`session["chat_id"]`・`turn_id` 捕捉 → `Response(stream_with_context(generate()))`
+4. `generate`: threading.local を入れ直し → `_stream_advance`:
+   - 往復ごとに `build_tools` → `history_for_llm` で文脈に収める → `chat_stream` → `_create`（引数自動修正 ≤4 回、429 待ち ≤3 回、その他は即エラー）→ `delta` 逐次 → `text_end`
+   - tool_calls あり: `_call_previews`（未実行分）→ 各 call: `running` → `_execute`（`_Guard` 判定 → `dispatch` → 検算 → tool メッセージ → render）→ `item`
+   - 終了条件: 本文のみ（＋length 注記）／空応答（1 回再試行→ツール無し再回答→`_EMPTY_MESSAGE`）／`_Guard.stuck`（2 回目の同一呼び出しで打ち切り→ツール無し再回答→`_LOOP_MESSAGE`/`_STUCK_MESSAGE`）／`MAX_AGENT_STEPS` 到達（→ツール無し再回答→`_LIMIT_MESSAGE`）／LLM 例外（`_friendly_llm_error`）
+5. finally: `_persist`（db_names/table_names 集計 → `save_chat` → index 更新）→ `_schedule_memory`（別スレッドで `extract_memory`）→ 中断でなければ `end`
+6. teardown で会話ロック解放。ブラウザは `end` で `refreshHistory()`／`scheduleMemoryRefresh()`。
+
+---
+
+### 10. 既存ドキュメント（help.html）との差異・注意点
+- help.html 第5部 §5 は `_append_final_answer` が「tool_defs=None で投げる」と書くが、コードは `[]` を渡す（core.py:8371）。`llm.chat` では `None` = 組み込みツール全部、`[]` = tools キー省略なので意味が逆。正しくは `[]`（ツール無し）。
+- help.html 第5部の kind 一覧に `gap`（brain.py:12366）が無い。
+- `_fs_put` に TTL は無い（件数上限 200 のみ、core.py:7292-7310）。「所有者一致でしか読めない」は `_fs_get` で正しい。
+- `chat_stream` は `tool_defs=[]` でも `tools=[]` を送る（`chat()` はキーを落とす）。`_stream_advance` は常に `build_tools` の結果を渡すため、全ツールを無効化した環境では空配列が送られる。
+- `OPENAI_MODEL` は env ではなく config.py:249 の直書き（`"gpt-5.6-sol"`）。実際のチャットモデルは `models.current(user)`。
+- `_create` の最終行（brain.py:13136）は修正 4 回を使い切った後の追加の 1 投で、そこで出た例外は処理されず上へ上がる。
+
+## ツール実行（tools.dispatch ～ 結果の描画）— 詳細設計の素材
+
+対象コード: `brain.py`（tools / results / custom_tools / rag / llm 相当）と `core.py`（db / verify / チャットのエージェントループ）。行番号は 2026-09-23 時点の実ファイル。`brain.py` は自分自身を `tools` `results` `custom_tools` `rag` `llm` などの名前で `sys.modules` に登録しており（`brain.py:27-37`）、`core.py` も `db` `catalog` `verify` などの名前で登録している（`core.py:41-55`）。したがって本書の `tools.dispatch` は `brain.py` の `dispatch`、`db.run_select` は `core.py` の `run_select` を指す。
+
+---
+
+### 1. 位置づけ — 呼び出し経路と会話メッセージの役割
+
+#### 1-1. dispatch を呼ぶ場所（3経路、実体は `_execute` 1か所）
+
+| 経路 | 関数 | 場所 | 備考 |
+|---|---|---|---|
+| 非ストリーミング送信 `POST /api/chat/send` | `_w_send` → `_begin_turn` → `_advance` → `_execute` | `core.py:8602`, `8241`, `8406` | 1ステップの tool_calls をまとめて `_execute(chat, calls, scope, guard)` |
+| ストリーミング送信 `POST /api/chat/stream` | `stream` → `_begin_turn` → `_stream_advance` → `_execute` | `core.py:8710`, `8622` | 呼び出し1件ずつ `_execute(chat, [c], scope, guard)`。直前に SSE `running` を送る |
+| マイロボット（AIなしの再実行） | `_robot_run` → `_execute(chat, [call], scope)` | `core.py:9898`, `9978` | `guard` を渡さない。`call["id"]` は `"robot_{i}"` |
+
+`_execute`（`core.py:8406-8438`）の中身:
+
+```
+for c in calls:
+    if guard and guard.seen(c):                # 同じ (name, arguments) を既に実行済み
+        messages.append({"role":"tool","tool_call_id":c["id"],"content":guard.repeated(c)})
+        continue                                # 実行しない
+    res = tools.dispatch(c["name"], c["arguments"], scope, scope, admin=_is_admin())   # core.py:8416
+    guard.note(c, res)
+    content = res["llm_content"]
+    alerts = _fresh_alerts(chat, res.get("verify_alerts") or [])
+    if alerts: content = _merge_alerts(content, alerts)
+    messages.append({"role":"tool","tool_call_id":c["id"],"content":content})
+    if res.get("render"):
+        item = dict(res["render"]); if item["kind"]=="error": item["call_id"]=c["id"]
+        render_log.append(item)
+    for a in alerts: render_log.append(verify.render_item(a))
+```
+
+- `dispatch` の第3引数 `scope` と第4引数 `entries` には **同じ scope** が渡る（`core.py:8416`）。
+- `admin` は `_is_admin()`（`core.py:8211`）= `g.user.is_admin`。
+
+#### 1-2. 会話メッセージの role
+
+| role | 生成箇所 | 形 |
+|---|---|---|
+| `system` | `_begin_turn`（`core.py:8586-8592`）が毎質問で index 0 を作り直す | `{"role":"system","content": llm.build_system_prompt(scope, admin, model, memory)}` |
+| `user` | `_begin_turn`（`core.py:8568`）`llm.user_message(text, images)` | テキスト（画像付きあり） |
+| `assistant` | `_msg_to_dict(msg)`（`core.py:8072`） | `{"role":"assistant","content":str|None,"tool_calls":[{"id","type":"function","function":{"name","arguments"}}]}` |
+| `tool` | `_execute`（`core.py:8427`） | `{"role":"tool","tool_call_id":c["id"],"content": llm_content(＋検算)}` |
+
+ロボットは `assistant` を `content: None` ＋ `tool_calls`（id `robot_{i}`、arguments は表を付ける前の `shown_args`）で積む（`core.py:9972-9976`）。
+
+#### 1-3. SSE イベント名（`/api/chat/stream`、`core.py:8618-8760`）
+
+`_sse(event, data)` は `"event: {event}\ndata: {json}\n\n"`。
+
+| event | 内容 | 発生箇所 |
+|---|---|---|
+| `delta` | `{"text": 差分}` 回答文字 | `core.py:8635` |
+| `text_end` | `{}` ひとまとまりの本文終了 | `8647`, `8672` |
+| `item` | 描画アイテム（`_web_log` 済み） | `8642`,`8657`,`8666`,`8670`,`8678`,`8689`,`8694`,`8697`,`8702`,`8705`,`8746` |
+| `running` | `{"name": ツール名, "label": TOOL_LABELS[name]}` ツール実行開始 | `8684` |
+| `end` | `{"chat_id","title"}` | `8752`（切断時は送らない） |
+
+---
+
+### 2. ツール基盤の4つの表と `_MODULES`（`brain.py:12530-12558`）
+
+```
+_MODULES = (
+    (HANDLERS_query,     SQL_TOOLS_query,     ()),
+    (HANDLERS_stats,     SQL_TOOLS_stats,     ()),
+    (HANDLERS_reports,   SQL_TOOLS_reports,   ()),
+    (HANDLERS_mail,      SQL_TOOLS_mail,      ()),
+    (HANDLERS_business,  SQL_TOOLS_business,  ()),
+    (HANDLERS_files,     SQL_TOOLS_files,     ADMIN_TOOLS_files),
+    (HANDLERS_usage,     SQL_TOOLS_usage,     ADMIN_TOOLS_usage),
+    (HANDLERS_knowledge, SQL_TOOLS_knowledge, ADMIN_TOOLS_knowledge),
+)
+_HANDLERS   = {name: fn for m in _MODULES for name, fn in m[0].items()}   # 12551
+SQL_TOOLS   = {name for m in _MODULES for name in m[1]}                    # 12554
+ADMIN_TOOLS = {name for m in _MODULES for name in m[2]}                    # 12558
+```
+
+順序はコメントで「名前が重なったときにどちらが残るかを変えないため、順序は動かさないこと」（辞書内包なので後勝ち）。
+
+| 表 | 件数（AST で静的に数えた実測） | 内訳 |
+|---|---|---|
+| `BUILTIN_TOOLS`（最終形、`brain.py:12530`） | **45** | 静的リテラル 37（`7943-9300`）＋ `_chart_tools()` 6（`9284`）− `_RETIRED` の `plot_chart` 1（`9373-9374`）＋ `KNOWLEDGE_TOOLS` 1 ＋ `WHOAMI_TOOL` ＋ `REPORT_GAP_TOOL` |
+| `_HANDLERS` | **46** | query 19（`10797`: 固定 13 ＋ `_CHART_TOOLS` 6）/ stats 10（`11395`）/ reports 3（`11301`）/ mail 2（`10061`）/ business 7（`9662`）/ files 1（`9982`）/ usage 1（`11442`）/ knowledge 3（`12370`: search_knowledge_base, who_am_i, report_gap）。宣言より1多いのは `plot_chart` |
+| `SQL_TOOLS` | **25** | query 11 = `{"run_sql_query","plot_chart","plot_dual_axis","pivot_table","analyze_stats"}` ＋ `_CHART_TOOLS` 6（`10816`）/ stats 8（`11409`: hypothesis_test, regression, distribution_analysis, forecast, timeseries_analysis, bootstrap_estimate, clustering, abc_analysis）/ business 6（`9673`: compare_periods, funnel_analysis, cohort_analysis, market_basket, detect_anomalies, survival_analysis）。reports / mail / files / usage / knowledge は空集合 |
+| `ADMIN_TOOLS` | **2** | `{"explore_import_files"}`（`9989`）∪ `{"analyze_usage"}`（`11448`） |
+| `TOOL_LABELS`（`core.py:7673`） | **46** | 45 ＋ `plot_chart` |
+
+※ `templates/help.html` 第5部 5-5 の冒頭文（「計43個」「_HANDLERS は44個」）は who_am_i / report_gap 追加前の古い数字で、同じ節の「定数・しきい値」欄の 45 / 46 が現状と一致する。
+
+SQL_TOOLS に入れない理由（コード上のコメント）: `data_quality` は引数で SQL を受けず自分で DB を見る（`9672`）。`scenario_analysis` / `monte_carlo_simulation` は SQL が任意（`11408`）。`analyze_usage`（`11445`）と `search_knowledge_base`（`12375`）は材料が DB でない。
+
+---
+
+### 3. `BUILTIN_TOOLS` の組み立て（import 時に5段で書き換わる）
+
+1. **リテラル**（`brain.py:7943-9300`）: 37 個の静的宣言。途中 `*_chart_tools()`（`9284`）で `_CHART_TOOLS`（`7877`）× `_CHART_ARGS`（`7832`）から `plot_comparison` / `plot_trend` / `plot_composition` / `plot_distribution` / `plot_relationship` / `plot_kpi` を機械生成（`_chart_tools`, `7919`）。各グラフツールの共通引数は `sql` / `chart_type`（enum = `charts.types_in(分類)`）/ `title` / `purpose`。
+2. **`_allow_result_id(BUILTIN_TOOLS)`**（`9305-9342`）: 宣言の木を再帰で走査し、`properties` に `"sql"` があり `"result_id"` が無いノードすべてに `result_id`（`_RESULT_ID`, `7804`）、`rows`（`_INLINE_ROWS`, `7813`）を追加、`columns` が未定義なら `_INLINE_COLUMNS`（`7823`）も追加し、そのノードの `required` から `"sql"` を除去。入れ子（`export_excel.sheets.items`、レポートの節など）にも効く。`pivot_table` の `columns`（列に展開する1列名＝文字列）は上書きしない（上書きすると `_coerce_lists` が配列にし pandas で `unhashable type: 'list'`）。※ `propose_glossary_term` / `propose_example` も `sql` プロパティを持つので同じ追加を受け、`propose_example` の `required` から `sql` が抜ける（実処理側で `sql` 空を `_err` にしている、`10441-10448`）。
+3. **フォルダ保存引数**（`9345-9368`）: `FOLDER_TOOLS = {"export_excel","export_csv","export_text","export_pptx","export_docx"}` の properties に `save_to_folder` / `folder_stamp` / `folder_overwrite`（いずれも boolean）を追加。
+4. **引退フィルタ**（`9373-9374`）: `_RETIRED = {"plot_chart"}` を宣言から除く。実処理 `_plot_chart` は `_HANDLERS`・`SQL_TOOLS`・`TOOL_LABELS` に残る。
+5. **合流**（`12530`）: `BUILTIN_TOOLS = BUILTIN_TOOLS + KNOWLEDGE_TOOLS + [WHOAMI_TOOL, REPORT_GAP_TOOL]`。直後に派生表を凍結: `_REQUIRED = _required_params()`（`12730-12737`: `{ツール名: tuple(required)}`）、`_LIST_PARAMS = _string_list_params()`（`12767-12781`: `{ツール名: {type=="array" かつ items.type=="string" のトップレベル引数名}}`）。
+
+`_DYNAMIC_TOOLS = {"search_knowledge_base"}`（`12534`）は固定宣言を使わず `build_tools` が組み立て直す。
+
+---
+
+### 4. `build_tools(entries, admin=False)`（`brain.py:12695-12727`）— AI に渡す一覧の合成
+
+毎エージェントステップ `_advance` / `_stream_advance` から `tools.build_tools(scope, admin=_is_admin())` で呼ばれる（`core.py:8250`, `8629`）。
+
+1. `ov = custom_tools.builtin_overrides(entries)`（`7345`）: 各 scope 要素の `meta["builtin_tools"]` を合成。`enabled: False` はどれか1つでもあれば無効（安全側）、`description` は最初に見つかったもの。
+2. `BUILTIN_TOOLS` を順に: `_DYNAMIC_TOOLS` はスキップ → `ADMIN_TOOLS and not admin` はスキップ → `ov[name]["enabled"] is False` はスキップ → `ov[name]["description"]` があれば差し替えた浅いコピー → `name in SQL_TOOLS` なら `_with_explanation(t)`（`12679`）で `explanation` 引数（`_EXPLANATION_PARAM`, `12668`、必須にはしない）を追加。
+3. `knowledge_tool_schemas()`（`12435`）: `rag_targets()`（`11984`: `kb_enabled()` − 利用者の除外 id）が空なら渡さない。あれば `KNOWLEDGE_TOOLS[0]` を深いコピーし、description 末尾に「登録されているナレッジベース:\n- 名前: 説明」を連結、`knowledge_bases.items.enum` に名前一覧を設定。ここにも enabled / description の上書きを適用。
+4. `custom_tools.collect_everywhere(entries)` のうち `validate_custom_tool(tool, set())` が空（不備なし）のものを `to_schema(tool)` して追加。
+
+`llm.chat`（`13715`）は `tools=defs, tool_choice="auto"` で送る。`defs == []` のときは `tools` キーごと外す（最終回答の書き直し `_append_final_answer` が使う、`core.py:8351-8380`）。
+
+---
+
+### 5. `dispatch(name, arguments_json, scope, entries=None, admin=False)`（`brain.py:12842-12878`）— 実行の全段
+
+戻り値は常に `{"ok": bool, "llm_content": str, "render": dict|None}`。検算で不一致があったときだけ第4キー `"verify_alerts": [alert]` が付く。
+
+| 段 | 処理 | 失敗時の戻り |
+|---|---|---|
+| 1 | `args = json.loads(arguments_json) if arguments_json else {}` | `json.JSONDecodeError` → `_err("ツール引数のJSON解析に失敗しました: {e}")` |
+| 2 | `if name in ADMIN_TOOLS and not admin` | `_err("'{name}' は管理者だけが使えます。")`（「守りは2箇所で持つ」＝build_tools と dispatch） |
+| 3 | `args = _coerce_lists(name, args)`（`12784`） | 失敗なし（破壊的に同じ dict を書き換える） |
+| 4 | `missing = _missing_required(name, args)`（`12746`） | `_err("'{name}' の必須の引数が指定されていません: {不足を「、」連結}。（{name} の必須引数は {_REQUIRED[name] を「、」連結}）この引数を入れて呼び直してください。列名が分からないときは、先に describe_table か run_sql_query で列を確認すること。")` |
+| 5 | `sqls = []; _gather_sqls(args, scope, sqls)`（`12802`） | — |
+| 6a | `handler = _HANDLERS.get(name)` があれば `return _attach_folder_save(args, _attach_verification(handler(args, scope), sqls, scope))` | `except Exception as e` → `_err(f"ツール '{name}' の実行でエラー: {e}")`（「ツールの例外でアプリを落とさない」） |
+| 6b | 無ければ `custom_tools.collect_everywhere(entries or [])` から `name` 一致を探す。無ければ `{"ok": False, "llm_content": _json({"error": f"未知のツール: {name}"}), "render": None}`（`_err` ではなく render None） | — |
+| 6c | あれば `sqls.append(render_sql(tool))` → `_attach_folder_save(args, _attach_verification(_run_custom(tool, args, scope), sqls, scope))` | `except Exception` → `_err(f"ツール '{name}' の実行でエラー: {e}")` |
+
+補足: `_HANDLERS` を先に引くので、組み込みと同名のユーザー定義ツールは組み込みが勝つ。`builtin_tools.enabled: false` は `build_tools` だけが見て `dispatch` は見ない（履歴から名指しで呼ばれれば実行される）。`ADMIN_TOOLS` のみ2段構え。
+
+#### 5-1. `_coerce_lists(name, args)`（`12784-12799`）
+- `_LIST_PARAMS.get(name)` に載る引数について、値が `str` なら `[v.strip()]`（空文字なら `[]`）に直す。
+- 対象は `BUILTIN_TOOLS` 由来のトップレベル引数のみ（入れ子の `sheets.items.chart.value_columns` などは対象外、ユーザー定義ツールも対象外）。
+- 例（宣言から）: `pivot_table.index`、`analyze_stats.columns/control`、`regression.features`、`clustering.features`、`funnel_analysis.steps/labels`、`compose_email.to/cc/bcc/attach_filenames`、`data_quality.tables`、`search_knowledge_base.knowledge_bases`、`build_report.summary/recommendations/caveats`、`export_docx.summary/caveats`、`distribution_analysis.fit`、`plot_*` の `path/dimensions`、`_INLINE_COLUMNS` が付いた各ツールの `columns`。docstring は「13個ある同じ形の引数すべてに効く」と述べる。
+- 理由（docstring）: `index="地域"` のように素の文字列で来ると1文字ずつに散り「『地』という列がありません」になる。
+
+#### 5-2. `_missing_required(name, args)`（`12746-12764`）
+- `_REQUIRED[name]` を回し、`_HAS_DEFAULT = {"title","filename","chart_type","purpose"}`（`12743`）はスキップ。
+- 値が `None`、または `str/list/dict/tuple` で `len == 0` のものを不足とする。`0` / `False` は正しい値として通す。
+- `_allow_result_id` が `required` から `sql` を抜いているので、`sql` の欠落はここでは検知されず `fetch()` の `AnalysisError` が出す。
+- 実効的に検査される必須引数（`required` − `sql` − `_HAS_DEFAULT`）: run_sql_query=なし / plot_dual_axis=x,bar_y,line_y / pivot_table=index,values / analyze_stats=method / export_excel=sheets / export_csv=files / export_text=body / hypothesis_test=method / regression=target,features / distribution_analysis=target / forecast=time_col,value_col / timeseries_analysis=time_col,value_col / monte_carlo_simulation=formula,variables / scenario_analysis=formula,scenarios / bootstrap_estimate=target / clustering=features / abc_analysis=label_col,value_col / export_pptx=slides / build_report=sections / export_docx=sections / find_mail_recipients=なし / compose_email=subject,body / compare_periods=period_col,value_col / data_quality=なし / detect_anomalies=time_col,value_col / funnel_analysis=steps / cohort_analysis=id_col,period_col / market_basket=transaction_col,item_col / survival_analysis=duration_col / explore_import_files=なし / propose_glossary_term=term,description,how / propose_example=question,summary / show_er_diagram=なし / open_table=table / analyze_usage=method / describe_table=table / plot_comparison=x,y / plot_trend・plot_composition・plot_distribution・plot_relationship=なし / plot_kpi=value / search_knowledge_base=query / who_am_i=なし / report_gap=kind,what。
+
+#### 5-3. `_gather_sqls(node, scope, acc)`（`12802-12820`）
+- dict を再帰: キー `"sql"` で非空文字列 → `acc.append(v)`；キー `"result_id"` で非空 → `_results.get(scope, v)` を引き `entry["sql"]` があれば append；それ以外は値へ再帰（list も辿る）。
+- ハンドラ実行**前**に走る（そのツール自身が新しく預ける result_id は拾わない）。ユーザー定義ツールだけは実行直前に `render_sql(tool)`（`:name` 未置換）を足す。
+
+#### 5-4. `_attach_verification(res, sqls, scope)`（`12823-12839`）
+- `not res.get("ok") or not sqls` → そのまま返す。
+- `verify.alerts_for(sqls, scope)`（`core.py:4074`）を呼び、例外は `print("[verify] 検算でエラー（回答は続行）")` して `res` を返す。alerts があれば `res["verify_alerts"] = alerts`。
+
+#### 5-5. `_attach_folder_save(args, res)`（`12881-12912`）
+- `args.get("save_to_folder")` が真で、`res["render"]["kind"] == "file"` かつ `render["data"]` があるときだけ。
+- `importer.save_to_user_folder(_current_user(), filename or "file", data, stamp=args.get("folder_stamp") is not False, overwrite=bool(args.get("folder_overwrite")))`（`core.py:5212`）: 出力先 `output_dir()`（`core.py:5134`、env `OUTPUT_DIR` 既定 `""`／画面保存値優先）＋ `user_folder_name(user)`（`5201`: 禁止文字 `_BAD_NAME_CHARS` を `_`、64文字）。`stamp=False` なら `_STAMP_RE`（`5209`）で末尾の `_YYYYMMDD_HHMM` を外す。既存ファイルは `overwrite` なら置換、でなければ `_2, _3…`。tmp に書いて `os.replace`。
+- 成功: `render["saved_to"]`, `render["replaced"]`、`llm_content` の JSON に `"folder": "フォルダにも保存した: {path}（前のファイルを置き換えた）"`。失敗: `render["save_error"]`、`"folder": "フォルダへの保存は失敗（ダウンロードはできる）: {e}"`。`llm_content` が JSON でなければ触らない。
+- ロボット実行は `FOLDER_TOOLS` に対し `save_to_folder` / `folder_stamp` / `folder_overwrite` をロボットの設定で上書きする（`core.py:9958-9966`）。
+
+#### 5-6. `_err(message)`（`brain.py:7543`）
+```
+{"ok": False, "llm_content": _json({"error": message}),
+ "render": {"role": "assistant", "kind": "error", "message": message}}
+```
+`_json` は `json.dumps(obj, ensure_ascii=False, default=str)`（`7539`）。
+
+---
+
+### 6. ユーザー定義ツール（`custom_tools`、`brain.py:7147-7370`）
+
+- 定義の形: `{"name","description","parameters":[{"name","type","description","required"}],"sql","render","chart","enabled"}` を各 DB の `.meta.yaml` の `tools:` に保存。収集時に `owner`（alias）と `owner_file`（ファイル名）を付ける。
+- 定数: `RENDER_KINDS = ("table","chart","chart_dual","excel","csv","none")`（`7147`）、`PARAM_TYPES = ("string","integer","number","boolean")`（`7148`）、`_NAME_RE = ^[A-Za-z][A-Za-z0-9_]{0,47}$`（`7151`）、`_BIND_RE = (?<!:):([A-Za-z_][A-Za-z0-9_]*)`（`7153`、`::` は型キャストとして除外）。
+- `collect_everywhere(selected=None)`（`7311`）: `db.list_db_files()` 順に全 DB の meta を読み、dict でないもの・名前空・重複（先勝ち）・`enabled is False` を除外。`selected` があれば `dbs_named_in(sql)`（`core.py:175`）が名指しする DB（名指し無しは置き場 DB とみなす）が1つも選ばれていないツールを外す。
+- `validate_custom_tool(tool, existing_names)`（`7194`）: 名前（正規表現・`builtin_names()`（`7160`、最終 `BUILTIN_TOOLS` から）・既存名と重複）、説明必須、SQL 必須、パラメータ名 `^[A-Za-z_][A-Za-z0-9_]*$`・重複・型、SQL の `:名前` と定義の双方向対応（`bind_names`, `7184`）、`render` の妥当性、`chart` なら `chart.chart_type ∈ charts.CHART_TYPES` と `charts.required_fields(ct)`、`chart_dual` なら `chart.x` / `chart.bar_y` / `chart.line_y`。
+- `to_schema(tool)`（`7264`）: `{"type":"function","function":{"name","description","parameters":{"type":"object","properties":{name:{"type","description"}},"required":[required!=False のもの]}}}`。
+- `coerce_params(tool, args)`（`7285`）: 定義された型へ変換（integer→int, number→float, boolean→`1/0`（`True`/`"true"`/`"1"`/`"yes"`）, それ以外 str）。値 `None` は `None`（NULL バインド）。変換不能は `ValueError("パラメータ '{pn}' を {t} として解釈できません: ...")`。
+- `render_sql(tool)`（`12561`）= `tool["sql"].strip()`（置換しない）。
+- `_run_custom(tool, args, scope)`（`12566-12654`）:
+  1. `coerce_params` の `ValueError` → `_err`。
+  2. `scope = db.widen_scope(sql, scope)`。
+  3. 上限 `cap = min(config.EXPORT_MAX_ROWS, 1_048_575)` if render ∈ {excel, csv} else `None`（＝`run_select` 既定 2,000）。
+  4. `db.run_select(sql, scope, params=params, max_rows=cap)`。失敗 → `_err(f"ツール '{name}' のSQL実行エラー: {e}")`。
+  5. `rid = _results.put(scope, columns, rows[:MAX_RESULT_ROWS], truncated or len(rows)>len(keep), sql=sql, label=f"{name}（ユーザー定義ツール）")`。
+  6. `llm_content = {"tool","columns","row_count","truncated","rows": 先頭 SAMPLE_ROWS_FOR_LLM 行,"result_id","note"}`。
+  7. render 分岐: `none` → `render: None` / `excel`・`csv` → `excel.build_excel([sheet], title=description)` または `exports.build_csv(columns, rows, chart.encoding or DEFAULT_ENCODING)` → `llm_content = {"status":"file_ready","tool","filename","columns","row_count","note"}`、`render = {"kind":"file","filename","mime","data","sheets":[_preview_rows(...)]}`（失敗 `_err("ファイルの作成に失敗しました: ...")`）/ `chart` → `chart.x`,`chart.y` が結果列に無ければ `_err` → `render kind "chart"`（`chart_type` 既定 `"bar"`, x, y, color, barmode, title）/ `chart_dual` → `x`＋`bar_y`＋`line_y` 検査 → `render kind "chart_dual"` / それ以外 → `render kind "table"`（columns, rows, truncated）。
+
+---
+
+### 7. データ取得の共通経路（`brain.py:7539-7800`）
+
+#### 7-1. `fetch(spec, scope, *, label=None, max_rows=None)`（`7619-7690`）
+戻り値 `(columns, rows, truncated, result_id, total_rows)`。判定順:
+
+1. `spec["rows"] is not None` かつ（`rows` が真 または `sql`/`result_id` がどちらも空）→ `_inline_table`（`7565`）。`rows: []` と `sql` が同時に来たら SQL を採る（雛形ごと `rows: []` を付けてくる実測対策）。
+2. `rid = spec["result_id"].strip()`。無ければ `results.find_by_sql(scope, spec["sql"])` で補い、ヒット時 `print("[results] 同じSQLなので実行し直しません（{rid} を使い回します）")`。
+3. `rid` あり: `results.get(scope, rid)` が `None` → `AnalysisError("result_id '{rid}' のデータが見つかりません。古くなって捨てられたか、別の会話の結果です。sql を指定して取り直してください。")`。`max_rows and entry["truncated"] and entry["sql"] and max_rows > len(entry["rows"])` なら元 SQL で `db.run_select(sql, db.widen_scope(sql, scope), max_rows=max_rows)` を取り直し（total は `_total_rows`）。それ以外は預かりをそのまま返す（total `None`）。
+4. `sql` 空 → `AnalysisError("sql と result_id のどちらも指定されていません。...")`。
+5. `scope = db.widen_scope(sql, scope)` → `db.run_select(sql, scope, max_rows=max_rows)` → `keep = rows[:config.MAX_RESULT_ROWS]` → `rid = results.put(scope, columns, keep, truncated or len(rows)>len(keep), sql=sql, label=label)` → `total = _total_rows(sql, scope) if truncated else None`。
+
+`_inline_table`（`7565-7616`）: `rows` が list でなければ `AnalysisError`。`columns` は list/tuple のときだけ採用。dict の配列なら出現順に鍵を集める、配列の配列なら幅を揃え `列1, 列2…` を補う。`cap = max_rows or MAX_RESULT_ROWS` で切り、`results.put(..., sql=None, label=label or "AIが組み立てた表")`。戻り total は `len(raw) if truncated else None`。
+
+`_total_rows(sql, scope)`（`7551`）: `SELECT COUNT(*) FROM ({sql})` を `max_rows=1` で実行、失敗は `None`。
+
+#### 7-2. `source_note` / `render_source_note`（`7693`, `7707`）
+- LLM 向け: `{"source_row_count","source_truncated"}` ＋ 切り詰め時 `{"source_total_rows", "warning": "上限 {cap or MAX_RESULT_ROWS:,} 行で切り詰めました。実際は {total:,} 行あります。この結果は全体の一部です。全体を語るなら、SQL側でGROUP BY で集計するか、条件を絞って取り直してください。"}`。
+- 画面向け: 切り詰め時のみ `{"truncated": True, "source_total_rows": total}`。
+
+#### 7-3. `_select_for` / `_analysis_tool` / `_report_result`
+- `_select_for(args, scope)`（`7720`）: `fetch` → 0行なら `AnalysisError("データが0行でした。抽出条件を見直してください。")`。
+- `_analysis_tool(fn)`（`7770`）: `_select_for` → `fn(args, columns, rows)`。`AnalysisError` → `_err(str(e))`、他 → `_err(f"分析に失敗しました: {e}")`。`args["title"]` があれば上書き。`_report_result(res, source_rows=len(rows), truncated, total, result_id=rid, scope=scope)`。
+- `_report_result(res, *, source_rows, truncated, total, result_id, scope, extra)`（`7728-7767`）: `res = {"title","tables":[{"name","columns","rows"}],"notes","meta"}` を受け、`llm_content = {"status":"analysis_ready","title","notes","tables":[{"name","columns","row_count","rows": 先頭40行, "result_id"?}],"meta", +source_note(source_rows…), +"source_result_id", +extra}`。`scope is not None and rows` のとき各表を `results.put(scope, columns, rows, label=f"{title} / {name}")`。`render = {"kind":"report","title","tables":全表全行,"notes", +render_source_note}`。
+
+---
+
+### 8. SQL 実行の安全機構（`fetch` → `db.run_select`、`core.py:140-560`）
+
+- `validate_select(sql)`（`core.py:294`）: 空 → `ValueError("SQLが空です。")`；`_trim_tail`（前後空白と末尾 `;`）；検査用コピーは `_blank_quoted`（`_QUOTED`, `266`、引用符の中身を空に）→ `_strip_sql_comments` → `_trim_tail`；`";" in probe` → 「複数ステートメントは実行できません」；先頭が `select`/`with` 以外 → 「SELECT文(または WITH ... SELECT)のみ実行できます。」；`_FORBIDDEN`（`252`: insert|update|delete|drop|alter|create|truncate|attach|detach|reindex|vacuum|pragma|grant|revoke|begin|commit|rollback|savepoint|merge）または `_REPLACE_INTO`（`257`）→ 「書き込み・DDL系のキーワード '...' は使用できません」；`_SCHEMA_TABLE`（`262`: sqlite_master/schema/temp_master/temp_schema/sequence/stat*, pragma_*）→ 「SQLiteの管理表 '...' は読めません。…」。実行するのはコメントを残した元 SQL。
+- `run_select(sql, scope, max_rows=None, timeout_s=None, params=None)`（`483`）: `scope` 空 → `ValueError("対象のDBがありません。SQLは実行できません。…sql の代わりに rows で表をそのまま渡して呼び直すこと。…")`。`max_rows = max_rows or config.MAX_RESULT_ROWS`、`timeout_s = timeout_s or config.QUERY_TIMEOUT_SEC`。`use = narrow_scope(safe_sql, scope)`（`209`）。`allowed` = scope 要素の `tables` の和集合（`tables` が空/None の要素が1つでもあれば `None`＝制限なし）。`connect_scope`（`157`: `file::memory:` を main に、各 DB を `?mode=ro` で ATTACH、上限 `MAX_ATTACHED = 10`）。`set_authorizer(_make_authorizer(allowed, _view_closure(...)))`（`395`, `350`: 許可アクション `SQLITE_SELECT/READ/FUNCTION(+RECURSIVE)`、`sqlite_` で始まる表の READ は常に DENY、`allowed` 外の表は DENY、ビュー経由のみ通す）。`set_progress_handler(10000命令ごと, 経過 > timeout_s で中断)`。`sqlite3.Error` は `explain_error(e)`（`460`、`_MISSING_FUNC_HINTS` 24語の対応表、`no such column` → describe_table 案内、`syntax error` → 専用ツール案内）で包み直す。`fetchmany(max_rows + 1)` で `truncated = len(rows) > max_rows`。
+- `widen_scope(sql, scope)`（`185`）: SQL が `alias.` で名指しする DB を `{"path","alias","name","tables": None}` として追加（`MAX_ATTACHED` まで）。`connect_ro(path)`（`144`）は単一 DB の読み取り専用接続（timeout 30 秒、プロファイリング用）。
+
+---
+
+### 9. `results` 置き場（`brain.py:7378-7521`）
+
+| 項目 | 値・処理 |
+|---|---|
+| `MAX_ENTRIES` | 40（`7391`） |
+| `MAX_CELLS` | 400_000（行×max(1,列)の合計、`7393`） |
+| `_store` | プロセス内 `OrderedDict`（`7395`）、`_store_lock = threading.RLock()`（`7444`） |
+| `_turn_local` | `threading.local()`（`7401`） |
+| `new_turn()` | `"t_" + uuid4().hex[:8]` を発行しスレッドローカルへ（`7404`） |
+| `current_turn()` | `getattr(_turn_local, "turn", "")`（`7411`） |
+| `set_turn(turn_id)` | 別スレッドへ引き継ぎ（`7415`） |
+| `normalize_sql(sql)` | `" ".join(sql.split())`、大小文字は揃えない（`7424`） |
+| `scope_key(scope)` | `"|".join(sorted(path))`（`7433`） |
+| `_evict()` | `len > MAX_ENTRIES` の間 `popitem(last=False)`；次に総セル > `MAX_CELLS` かつ `len > 1` の間 古い順に捨てる（`7447`） |
+| `put(scope, columns, rows, truncated=False, sql=None, label=None)` | `rid = "r_" + uuid4().hex[:8]`；エントリ `{"scope","columns","rows":[tuple],"truncated","sql","norm_sql","turn": current_turn(),"label"}`；`_evict()`（`7458`） |
+| `get(scope, rid)` | `entry["scope"] != scope_key(scope)` なら `None`；一致で `move_to_end`（`7477`） |
+| `find_by_sql(scope, sql)` | `current_turn()` 空なら `None`；`turn == 現在 and scope == key and norm_sql == want` を新しい方から探す（`7487`） |
+| `describe(rid)` | `label` または `sql[:80]`（`7511`） |
+| `clear()` | テスト用（`7519`） |
+
+ターンの区切り（core 側）: `_begin_turn` で `rag.set_current_user(g.user)` と `results.new_turn()`（`core.py:8551-8554`）；ストリーミングは `turn_id = results.current_turn()`（`8727`）を `generate()` 内で `results.set_turn(turn_id)`（`8735`）；`rewind`（`8783`）と `_robot_run`（`9905`）でも `new_turn()`。
+
+result_id を新たに発行するツール: `fetch`（全 SQL 系）、`_inline_table`、`_run_custom`、`_pivot_table`（集計後の表、`10249`）、`_analyze_stats` describe/correlation（`10332`）、`_report_result`（scope 付きの分析系: stats 8 ツール・business 7 ツール・analyze_usage・analyze_stats の partial/lag/outliers）、`_search_knowledge_base`（出典の表、`12279`）。`monte_carlo_simulation` / `scenario_analysis` / `explore_import_files` は `_report_result` を scope 無しで呼ぶため表に result_id は付かない。
+
+result_id を消費する: `fetch` を使う全ツール（`run_sql_query`, `plot_*`, `plot_dual_axis`, `pivot_table`, `analyze_stats`, 分析系, `export_excel/csv/text` の各シート/ファイル/節, `export_pptx` の slides, `export_docx`/`build_report` の sections）と `_gather_sqls`。
+
+注意（コードから確認）: 照合は `scope_key` だけで利用者は見ない（DB が1つの構成では全利用者で同一キー）。`_search_knowledge_base` 内ではローカル変数 `results = rag_retrieve_all(...)` がモジュール別名を影にしているため、モジュール関数 `put(...)` を直接呼んでいる（`12225`, `12279`）。
+
+---
+
+### 10. `run_sql_query` / `_run_sql_query(args, scope)`（`brain.py:10095-10127`）
+
+1. `fetch(args, scope, label=args.get("purpose"))`。`AnalysisError` → `_err(str(e))`、他 → `_err(f"SQL実行エラー: {e}")`。
+2. `sample = rows[:config.SAMPLE_ROWS_FOR_LLM]`（40）。
+3. `llm_content = {"columns","row_count": len(rows),"rows": sample,"result_id": rid,"note": (全N行中 先頭M行を表示。この結果は result_id 'r_x' で他のツールから使い回せます（同じSQLを書き直さなくてよい）。 or 短い方), **source_note(len(rows), truncated, total), "example_registered": _example_exists(args["sql"])}`。`_example_exists`（`10084`）は全 DB の `meta["examples"]` に `catalog.find_example`（`core.py:3179`、`_norm_sql` 一致）で同じ SQL があるか。
+4. `render = {"role":"assistant","kind":"table","columns","rows": 全行(最大2,000),"truncated"}`。
+
+---
+
+### 11. `render` / `llm_content` の使い分け（ツール族ごと）
+
+| ツール族（ハンドラ） | llm_content（JSON） | render.kind と主キー |
+|---|---|---|
+| `run_sql_query` | columns / row_count / rows(40) / result_id / note / source_row_count / source_truncated / (source_total_rows, warning) / example_registered | `table`: columns, rows(全行), truncated |
+| `plot_comparison` ほか5種・`plot_chart`（`_plot_chart`, `10140`） | status `"chart_rendered"` / chart_type / columns / row_count / result_id / source_note — 行データなし | `chart`: columns, rows(全行), `_CHART_FIELDS` 33項目（chart_type, x, y, color, size, text, path, nbins, orientation, barmode, title, y2, z, lower, upper, facet, dimensions, source, target, start, end, open, high, low, close, value, agg, max, suffix, valueformat, colorscale, marginal, trendline）, title, +render_source_note。`charts.validate` 失敗は `_err(" / ".join(errs))` |
+| `plot_dual_axis`（`10174`） | status `"dual_axis_chart_rendered"` / columns / row_count / bar_y / line_y / result_id / source_note | `chart_dual`: columns, rows, x, bar_y, line_y, left_title, right_title, title。`bar_y`/`line_y` 空や列不在は `_err` |
+| `pivot_table`（`10216`） | status `"pivot_ready"` / columns / row_count / rows(40) / result_id(集計後) / source_result_id / note / source_note | `table`（truncated False）または `render=="heatmap"` で `chart`（chart_type `"matrix"`, x=cols[0]）。`columns` が複数要素配列なら `_err` |
+| `analyze_stats`（`10266`） describe / correlation | status `"stats_ready"` / method / columns / row_count / rows(40) / result_id(新) / source_result_id / source_note / extra（correlation: method, strong_pairs[:8], caution） | describe → `table`；correlation → `chart`（matrix, colorscale `"RdBu"`） |
+| `analyze_stats` partial / lag / outliers、stats 10 種、business 6 種、`data_quality`、`analyze_usage`、`explore_import_files`（`_report_result`） | status `"analysis_ready"` / title / notes(全文) / tables[{name, columns, row_count, rows(40), result_id?}] / meta / source_note / source_result_id / extra | `report`: title, tables(全行), notes, +render_source_note |
+| `export_excel`（`10568`） | status `"file_ready"` / filename / sheets[{sheet, columns, row_count, truncated, charts}] / note | `file`: filename, mime `XLSX_MIME`, data(bytes), sheets(`_preview_rows` 先頭 `PREVIEW_ROWS=40` 行), note "Nシート" |
+| `export_csv`（`10624`） | status `"file_ready"` / filename / encoding / delimiter / files[{file, columns, row_count, truncated}] / note | `file`: 1件 → `CSV_MIME`、複数 → `exports.build_zip` + `ZIP_MIME`、filename `safe_filename(purpose or "csv_files","zip")` |
+| `export_text`（`10671`） | status `"file_ready"` / filename / format / encoding / sections / chars / note | `file`: mime `MD_MIME`("text/markdown") or `TEXT_MIME`("text/plain"), data, text(本文), sheets(節の全行), note |
+| `export_pptx`（`10878`） | status `"file_ready"` / filename / slides(outline) / note | `file`: mime `PPTX_MIME`, data, note "Nスライド", outline |
+| `export_docx`（`10922`） | status `"file_ready"` / filename / sections(outline) / figures / tables / warning / note | `file`: mime `DOCX_MIME`, data, note "Nセクション / 図f 表t", outline |
+| `build_report`（`11174`） | status `"report_ready"` / title / sections[{heading, rows(total), chart(chart_type)}] / filename / dropped_charts / note | `report_doc`: title, subtitle, summary, sections(表は max_rows 既定20行・chartは全行), conclusion, recommendations, caveats, markdown, +data/filename/mime（format≠none） |
+| `describe_table`（`10211`） | **JSON ではなく素のテキスト**（`catalog.describe_table_text`, `core.py:3826`）。`ok = not text.startswith("エラー")` | `None` |
+| `show_er_diagram`（`10495`） | status `"er_ready"` / db / tables / relationships[:60] / note | `er`: db, title "ER図（テーブルの関係）", er(`catalog.er_payload`) |
+| `open_table`（`10721`） | status `"table_view_opened"` / db / table / rows / columns / note | `table_link`: db, table, title, rows, columns, description |
+| `search_knowledge_base`（`12181`） | tool / query / searched / found / result_id / context / sources(excerpt 抜き) / failures / note；0件時 found 0 / dropped_for_budget / failures / note | `sources`: query, sources, failures, searched（0件時 dropped も） |
+| `who_am_i`（`12294`） | tool / login_id / display_name / is_admin / note | `None` |
+| `report_gap`（`12348`） | tool / recorded true / note | `gap`: gap_kind, label(`GAP_KINDS`), what[:300] |
+| `find_mail_recipients`（`9999`） | status `"recipients"` / message / sources / count / candidates[:50]{email,name,dept,source} / note | 候補あり → `table`（列: メールアドレス・氏名・部署・出所）／無し → `text` |
+| `compose_email`（`10022`） | status `"mail_draft"` or `"mail_draft_invalid"` / to / cc / bcc_count / subject / body_lines / attach_filenames / matched_from_db[:20] / problems / note | `mail_draft`: draft{to,cc,bcc,subject,body,reply_to,from_user,from_user_name,attach_filenames}, preview(`mailer.preview`)。`ok = not view["errors"]` |
+| `propose_glossary_term`（`10346`） | status `"proposed"` / db / table / term / verdict / detail / already_exists / note | `glossary_term`: db, table, term, description, sql, how, verdict, detail, exists, old |
+| `propose_example`（`10441`） | status `"proposed"` / db / question / already_exists / note | `example_proposal`: db, question, sql, summary, columns, rows(5行), total, exists, old_q |
+| ユーザー定義（`_run_custom`） | tool / columns / row_count / truncated / rows(40) / result_id / note（file 系は file_ready 形） | render 設定に応じ `None` / `file` / `chart` / `chart_dual` / `table` |
+| 失敗（`_err`） | `{"error": message}` | `error`: message（`_execute` が `call_id` を足す） |
+| 検算不一致（`verify.render_item`） | （llm_content に `verification_warnings` として混入） | `report`: title "⚠ 検算: {name}", tables, notes, verify_key |
+
+画面への最終変換 `render_item_for_web`（`core.py:7543`）: `data`/`sheets` 以外を `jsonable`（NaN/±inf → None、bytes → `<N bytes>`）；`chart`/`chart_dual` → `charts.build_figure`/`build_dual_figure` の JSON を `figure` に入れ kind を `"chart"` に統一（失敗は kind `"error"`）；`report_doc` → 節の chart を figure に；`file` → sheets を先頭20行＋total に縮める。`_web_log`（`8009`）が `data` を持つアイテムを `_fs_put`（`7298`: `secrets.token_urlsafe(16)`、`_MAX_ITEMS = 200` FIFO）に預けて `url = /api/file/{token}`（`15380`、owner 一致必須）を付け、kind `sql` に `TOOL_LABELS` のラベルを付ける。
+
+---
+
+### 12. 各ツール実処理の要点（追加の分岐・上限）
+
+- **グラフ（`_plot_chart`）**: `fetch(args, scope, label=title)` → `item = {k: args.get(k) for k in _CHART_FIELDS}`、`chart_type` 既定 `"bar"` → `charts.validate(item, columns)`（`brain.py:3795`: 未知種別／`required_fields`（`3791`）の欠落・列不在／`LIST_FIELDS=("path","dimensions")`／任意指定 color,size,text,y2,z,lower,upper,target,facet の存在。`target` は数値なら列名扱いしない）。`CHART_SPECS`（`3712-3774`）は 54 種（比較12・推移11・構成8・分布8・関係12・指標3）。
+- **`pivot_table`**: `analysis.pivot(columns, rows, index, cols=pivot_col, values, aggfunc(既定 "sum", `AGG_FUNCS`: sum/mean/count/median/min/max/std/nunique), margins, percent(`PERCENT_MODES`: row/column/total), rank_by)`。
+- **`analyze_stats`**: `method` ∈ describe/correlation/outliers。outliers は `target` 必須（`_err("outliers には target（外れ値を調べる数値列）が必要です。")`）、`outlier_method` 既定 `"iqr"`（`OUTLIER_METHODS_EXT`: iqr/zscore/modified_zscore/percentile/mahalanobis）、カンマ区切りで複数列。
+- **stats**（`11317-11393`）: `hypothesis_test`（`method` ∈ `TEST_METHODS`: ttest_1samp/ttest_ind/ttest_rel/mannwhitney/wilcoxon/anova/kruskal/chi2…、`alternative` 既定 two-sided）、`regression`（`method` 既定 ols ∈ ols/logistic/poisson）、`distribution_analysis`（bins 既定 20、`fit` ∈ norm/lognorm/expon/gamma/uniform/triang）、`forecast`（periods 既定 6、method 既定 auto ∈ auto+naive/drift/moving_average/linear/holt/holt_winters/arima）、`timeseries_analysis`（window 既定 3）、`bootstrap_estimate`（statistic 既定 mean ∈ mean/median/std/sum/p90、trials 既定 5000）、`clustering`（k 既定 3、"auto" 可）、`abc_analysis`（thresholds 既定 [70, 90]）、`monte_carlo_simulation`（trials 既定 10000、sql 任意→`_select_for`）、`scenario_analysis`（SQL なし）。
+- **business**（`9391-9425`）: `compare_periods`、`funnel_analysis`（steps）、`cohort_analysis`（max_periods 既定 12）、`market_basket`（min_support 既定 1.0、top 既定 25）、`detect_anomalies`（window 既定 7、threshold 既定 3.0、changepoints 既定 True）、`survival_analysis`。`data_quality`（`9513`）: `_MAX_TABLES = 12`、`tables` は `表名` / `alias.表名` どちらでも、問題の深刻度: 0行→高、主キー重複→高、主キー無し→中、列が全て空→中、NULL ≥ 30%→中、空文字 ≥ 10%→低、値1種類→低、参照整合性の孤児→高。
+- **`explore_import_files`**（`9971`）: `file` があれば `_preview`（`9882`: `importer.is_within_allowed`、`rows` 1〜`_MAX_PREVIEW_ROWS=20`（既定5）、`header_row`、`sheet`）、無ければ `_listing`（`9764`: `importer.allowed_dirs()`、`path` は `is_allowed_dir`、`recursive`、`pattern`、`only_not_imported`、`check`（`_MAX_CHECK=20` 件まで `filecheck.inspect_file`）、表示 `_MAX_ROWS=300` 件、対応拡張子 `config.IMPORT_EXTENSIONS = (".csv",".tsv",".txt",".xlsx",".xlsm")`）。`importer.ImportError_` / `PermissionError` / `OSError` を `_err` に。
+- **`analyze_usage`**（`11425`）: `usage.analyze(method, days, user)`、`method` ∈ `usage.METHODS`（summary/users/trend/tools/databases/errors/questions）＋ `"imports"`。
+- **`export_excel`**: シートごと `fetch(sh, scope, label=name, max_rows=min(EXPORT_MAX_ROWS, 1_048_575))`、`chart`（dict）/`charts`（list）を `excel.build_excel(built, title=purpose or filename)` へ（`ValueError` → `_err("Excelのグラフを作れませんでした: ...")`）、`filename = exports.safe_filename(filename, "xlsx")`（`3390`: 禁止文字→`_`、末尾 xlsx/csv/txt/md/zip 除去、80文字、`_%Y%m%d_%H%M` 付加）。
+- **`export_csv`**: `encoding` 既定 `exports.DEFAULT_ENCODING = "utf-8-sig"`（`ENCODINGS`: utf-8-sig/utf-8/cp932）、`delimiter` 既定 `"comma"`（`EXPORT_DELIMITERS`: comma/tab/semicolon）、各ファイル `fetch(..., max_rows=EXPORT_MAX_ROWS)`。
+- **`export_text`**: `format` 既定 `"md"`、節ごと `fetch(..., max_rows=EXPORT_MAX_ROWS)` → `exports.table_to_text(columns, rows, "markdown"|"plain")` を `{{heading}}` の位置に差し込み（無ければ末尾追記）。
+- **`export_pptx`**: `_slide_from_sql`（`10836`）が kind ∈ {table, chart} かつ sql/result_id のスライドだけ `fetch`（0行は `PptxReportError`）、chart は `category_column`（既定 columns[0]）/`value_columns`（既定 残り全列）/scatter を series に変換。`pptx_report.build_pptx(built, title, subtitle, footer)`、`SLIDE_KINDS`（`5151`）= title/agenda/section/message/table/chart/kpi/compare/closing、`PPTX_MAX_TABLE_ROWS = 12`（`5168`）。ファイル名 `pptx_safe_filename`（日時なし）。
+- **`export_docx`**: 節ごと `heading` 必須、`fetch` → 0行 `_err`、`max_rows` 既定 40、`chart` は `charts.validate` → `_chart_image`（`11059`: `figures.for_print(charts.build_figure)`、失敗は None）、`table` 既定 True、`docx_report.build_docx(..., toc=既定 True)`、`DOCX_MAX_TABLE_ROWS = 40`（`4704`）。図0枚かつ chart 指定ありなら `figures.why_unavailable()` を `warning` に。
+- **`build_report`**: `format` 既定 `"md"` ∈ md/docx/pptx/xlsx/none。表 `max_rows` 既定 20（`total`, `truncated` を持つ）、chart 検証失敗は `dropped` に積んで続行。md は `_report_markdown`（`11005`）。xlsx は表のある節をシートに、`_XLSX_CHART_MAP`（`11049`, 17件）でネイティブグラフに寄せる。pptx は `_report_slides`（`11101`）＋ `_PPTX_CHART_MAP`（`11038`, 19件）、docx は `_report_docx_sections`（`11153`）。
+- **`describe_table`**: `describe_table_text(scope, db, table)`（`core.py:3826`）: `alias.table` を剥がす、`db` 省略時は `scope[0]`、表が無い→「エラー: テーブル '...' は ... にありません。存在するテーブル: ...」、対象外→「エラー: ... いまの対象に入っていません。…」、正常は `table_text(alias, tname, profile, meta, full=True)`。
+- **`search_knowledge_base`**: `query` 空 → `_err`；`rag_targets()` 空 → `_err`；`knowledge_bases` に未知名 → `_err`（利用可能名を列挙）；`chunk_top_k` は `max(1, min(指定, 設定の2倍, 100))`；`rag_retrieve_all`（`11999`: `RagClient(base_url, api_key, timeout=config.RAG_RETRIEVE_TIMEOUT)`、`ThreadPoolExecutor(max_workers=min(RAG_FANOUT_WORKERS, KB数))`）；全 KB 失敗 → `_err(rag_all_failed_message)`；`rag_merge_context(results, char_budget=settings["max_context_chars"], start_index=_rag_used_sources())`（`12070`: sha256 で重複除去、第1周は各 KB の先頭チャンクを短い順、以降ラウンドロビン、予算超過は dropped、1件も無いときだけ切り詰めて採る、`[出典n] KB名 / file_path` ラベル、`excerpt` は `RAG_EXCERPT_CHARS = 200`）；出典番号は `_rag_used_sources(len(sources))` でターン内通し；0件かつ dropped 0 なら `feedback_add({"kind":"gap","gap_kind":"doc","auto":True,...})`；出典ありなら `put(scope, ["出典","ナレッジベース","文書","抜粋"], ...)` で result_id。
+- **`who_am_i`**: `_current_user()`（`11950`、`_rag_local.user`）が None → `_err`。
+- **`report_gap`**: `kind` ∉ `GAP_KINDS`（`2623`: data/doc/feature/explain）→ `_err`；`what` 空 → `_err`；`feedback_add`（`2631`、`config.FEEDBACK_FILE` 既定 `DATA_DIR/feedback.jsonl`、env `FEEDBACK_FILE`）に `{"at","user","kind":"gap","gap_kind","auto":True,"detail": what[:300]}`。
+- **mail**: `find_recipients(scope, query, limit=int(limit or 50), table)`（`6732`）；`compose_email` は `to_query` → `find_recipients(limit=50)` で `valid` 候補を `to` に追加（0件は `_err`）、`dict.fromkeys` で重複除去、`mailer.preview(draft)`（`6925`: `errors = validate_draft(draft)`）。送信はしない（画面のボタンのみ）。
+- **`propose_glossary_term`**: `term`/`description` 必須、置き場 DB は `db` 指定 → `table` を持つ DB（複数なら `_err`）、`sql` があれば実データで検証（条件式 → `SELECT COUNT(*)... WHERE {sql}`、計算式 → `SELECT {sql} AS v`、両方失敗 → `_err("SQL式が実データで通りませんでした: ...")`）。
+- **`propose_example`**: `question`/`sql`/`summary` 必須、`run_select(sql, widen_scope, max_rows=5)`（失敗 `_err`）、置き場は SQL が最初に名指しする DB（無ければ scope が1つのときそれ、判定不能は `_err`）。
+
+---
+
+### 13. 検算（相互検証、`core.py:3896-4165`）
+
+- ルール: 各 DB の `.meta.yaml` `checks:` → `normalize`（`3908`）: `{"name"(既定 "検算"), "left":{"label"(既定 "左"),"sql"}, "right":{"label"(既定 "右"),"sql"}, "tolerance_pct"(既定 `DEFAULT_TOLERANCE_PCT = 0.5`、負は 0), "drilldown", "enabled"}`。左右 SQL 空は落とす。
+- `checks_for(scope)`（`3934`）: scope 各要素の `meta`（無ければ `catalog.load_meta`）から有効なもの、`owner = alias`。
+- `tables_in(sql, scope)`（`3951`）: scope の `tables` 名を正規表現（`alias.表` / 素の表名）で照合し `{(alias, table)}`。
+- `run_check(check, scope, use_cache=True)`（`4014`）: キー `(_fingerprint(check), _data_version(check, scope))`（`_data_version` = 関係 DB ファイルの `st_mtime_ns` の組）。`_scalar`（`3972`: 1行1列、None→0.0、`float`）で左右を取り、失敗は `ok_run False, error`。`diff = lv - rv`、`base = max(|lv|,|rv|)`、`pct = |diff|/base*100`（base 0 なら 0.0）、`match = pct <= tolerance_pct`。不一致かつ `drilldown` があれば `run_select(drilldown, scope, max_rows=DRILL_ROWS=8)` を `drill` に（失敗は `drill.error`）。結果は `_verify_cache`（`_CACHE_MAX = 300` 超で全消去、`4059`）。`version` は `_version_key`（md5 8桁）。
+- `alerts_for(sql_texts, scope)`（`4074`）: 空文字を除いた SQL・scope・ルールが無ければ `[]`。`touched = ∪ tables_in(sql)`。各ルールで `involved = tables_in(left.sql + " " + right.sql)` が `touched` と交わるものだけ `run_check`。`not ok_run or match` は無言。alert = `{"key": f"verify||{owner}||{name}||{_check_key}||{version}", "name","left_label","left","right_label","right","diff","pct","tolerance_pct","drill"}`。集めた SQL 自体は実行しない（ユーザー定義の `:name` 入りでも害なし）。
+- LLM への到達: `_execute` → `_fresh_alerts`（`8396`: `render_log` の `verify_key` 既出を除外）→ `_merge_alerts`（`8383`: `llm_content` が JSON dict なら `"verification_warnings": [verify.llm_note(a)]` を追加、そうでなければ末尾に `"\n\n【検算の不一致】" + json`）。`llm_note`（`4125`）= `{"check", <left_label>: left, <right_label>: right, "difference", "difference_pct", "instruction": "この2つの数字は一致するはずですが食い違っています。…必ず注記してください。差異の理由を推測で断定しないこと。", "difference_detail_sample"?: {columns, rows[:3]}}`。
+- 画面への到達: 同じ `_execute` で `verify.render_item(a)`（`4144`）を `render_log` に積む: `{"kind":"report","title":"⚠ 検算: {name}","tables":[{"name":"2つの経路の比較","columns":["経路","値"],"rows":[(left_label,left),(right_label,right),("差",diff),("差の割合", f"{pct}%（許容 {tol}%）")]}, +{"name":"差の内訳（先頭のみ）", drill}],"notes":[...],"verify_key": key}`。同じ会話では `verify_key` 一致で1回だけ、データの版が変われば再度出る。
+- 発火はツール実行後（`dispatch` 6a/6c → `_attach_verification`）。`_attach_verification` 内の例外は握って回答を止めない。
+
+---
+
+### 14. core 側の実行ループ（`_advance` / `_stream_advance` / `_Guard` / プレビュー）
+
+- ループ回数: `config.MAX_AGENT_STEPS`（env `MAX_AGENT_STEPS`、既定 10、`config.py:306`）。各ステップ `defs = tools.build_tools(scope, admin=_is_admin())` → `llm.chat(llm.history_for_llm(messages, model, defs), defs, model)`（`history_for_llm`, `brain.py:13669`: 文脈に収まらない古いターンを落とす。`CHAT_KEEP_TURNS_MIN` 既定 2、`CHAT_ANSWER_RESERVE_TOKENS` 既定 6000）。
+- tool_calls 無し: 本文あり → 最終回答（`_note_if_cut` で `finish_reason=="length"` なら `_CUT_MESSAGE`）。本文も無し → その assistant を pop、1回だけ再試行、それでも空なら `_append_final_answer`（ツール `[]`）か `_EMPTY_MESSAGE`。
+- tool_calls あり: `fresh = [c for c in calls if not guard.seen(c)]` → `_call_previews(fresh, scope, question)`（`core.py:8089`）を `render_log` へ → `_execute`。
+- `_call_previews`: `c["name"] in tools.SQL_TOOLS and "sql" in args` → `{"kind":"sql","tool","call_id","sql","purpose","explanation","question","tables": tables_in_sql(sql, scope)}`（`7474`, 最大6件）；ユーザー定義 → `kind sql`（`sql = tools.render_sql(custom)`、`purpose = 説明[:60] + 引数`, `explanation = description`）；`describe_table` → `kind text` "🛠 テーブル詳細を確認: `table`" ＋ tables。
+- `_Guard`（`8131`）: `key = (name, arguments.strip())`、`failed{key: 理由}` / `done{key}` / `repeats`。`seen` は成功・失敗どちらも。`note` は `ok` なら done、でなければ `json.loads(llm_content)["error"]`（読めなければ "同じ内容で失敗しました。"）。`repeated` は done なら「この呼び出しは既に実行済みです。もう一度は実行しません。」＋hint、failed なら「同じツールを同じ引数で呼び直しています。実行しませんでした。」＋`previous_error`＋hint。`LIMIT = 2`（`8146`）で `stuck` → `_append_final_answer` → `stop_reason`（`_LOOP_MESSAGE` if done and not failed else `_STUCK_MESSAGE`）。上限到達は `_LIMIT_MESSAGE`（`8305`）。
+- ストリーミング版は `llm.chat_stream`（`brain.py:13784`）で `("text", 差分)` を `delta` に流し、`("done", StreamedMessage)` を受けてから上と同じ処理。実行前に `running` を1件ずつ送り、実行後 `_web_log(render_log, before)` の差分を `item` で送る。
+
+---
+
+### 15. `TOOL_LABELS`（`core.py:7673-7719`、46件）
+
+`run_sql_query`=SQL実行 (SELECT) / `search_knowledge_base`=社内文書の検索 / `who_am_i`=ログイン中の利用者 / `plot_chart`=グラフ描画 / `plot_dual_axis`=2軸グラフ描画 (棒+折れ線) / `plot_comparison`=グラフ描画（比較） / `plot_trend`=グラフ描画（推移） / `plot_composition`=グラフ描画（構成） / `plot_distribution`=グラフ描画（分布） / `plot_relationship`=グラフ描画（関係） / `plot_kpi`=グラフ描画（指標） / `pivot_table`=クロス集計 / `analyze_stats`=統計分析 / `export_excel`=Excel作成 / `export_csv`=CSV作成 / `export_text`=テキスト作成 / `export_pptx`=PowerPoint作成 / `export_docx`=Word作成 / `build_report`=レポート作成 / `compare_periods`=期間の比較 / `data_quality`=データ品質チェック / `detect_anomalies`=異常検知 / `funnel_analysis`=ファネル分析 / `cohort_analysis`=コホート分析 / `market_basket`=併売分析 / `survival_analysis`=生存時間分析 / `explore_import_files`=取り込み元ファイルの調査 / `describe_table`=テーブル詳細の確認 / `show_er_diagram`=ER図の表示 / `open_table`=テーブル全体を開く / `hypothesis_test`=仮説検定 / `regression`=回帰分析 / `distribution_analysis`=分布の分析 / `forecast`=予測 / `timeseries_analysis`=時系列分析 / `monte_carlo_simulation`=モンテカルロ・シミュレーション / `scenario_analysis`=シナリオ分析 / `bootstrap_estimate`=信頼区間の推定 / `clustering`=クラスタ分析 / `abc_analysis`=ABC分析 / `find_mail_recipients`=宛先の検索 / `compose_email`=メールの下書き / `analyze_usage`=利用状況の分析 / `propose_glossary_term`=用語登録の提案 / `propose_example`=例文登録の提案 / `report_gap`=足りないものの報告
+
+使用箇所: `_web_log`（kind sql のラベル、`8029`）、SSE `running`（`8685`）、ロボットの手順表示（`9938`, `10635`, `10675`, `10704`, `10801`, `12386`）、ヘルプのツール一覧（`15120`）。
+
+---
+
+### 16. 組み込みツール一覧（`BUILTIN_TOOLS` 45件、宣言順）
+
+| # | 名前 | 一行の目的（宣言 description の要旨） | 宣言 required | SQL_TOOLS | 管理者 | render.kind |
+|---|---|---|---|---|---|---|
+| 1 | `run_sql_query` | 読み取り専用 SELECT を実行し結果表を得る | sql*, purpose | ○ | | table |
+| 2 | `plot_dual_axis` | 棒(左軸)＋折れ線(右軸)の2軸グラフ | sql*, x, bar_y, line_y, title | ○ | | chart_dual |
+| 3 | `pivot_table` | クロス集計（SQLite に PIVOT が無いため） | sql*, index, values | ○ | | table / chart(matrix) |
+| 4 | `analyze_stats` | 基本統計量・相関・外れ値 | sql*, method | ○ | | table / chart / report |
+| 5 | `export_excel` | SELECT 結果を xlsx に（複数シート・ネイティブグラフ） | sheets, filename | | | file |
+| 6 | `export_csv` | CSV（複数は ZIP） | files | | | file |
+| 7 | `export_text` | 本文＋集計表をテキスト(md/txt)に | filename, body | | | file |
+| 8 | `hypothesis_test` | 仮説検定（p値・効果量） | sql*, method | ○ | | report |
+| 9 | `regression` | 回帰分析（ols/logistic/poisson） | sql*, target, features | ○ | | report |
+| 10 | `distribution_analysis` | 分布の形・当てはめ | sql*, target | ○ | | report |
+| 11 | `forecast` | 将来予測（95%幅・MAPE） | sql*, time_col, value_col | ○ | | report |
+| 12 | `timeseries_analysis` | トレンド・季節性・移動平均 | sql*, time_col, value_col | ○ | | report |
+| 13 | `monte_carlo_simulation` | 分布入力で式を試行し結果分布 | formula, variables | | | report |
+| 14 | `scenario_analysis` | 楽観/標準/悲観などの比較 | formula, scenarios | | | report |
+| 15 | `bootstrap_estimate` | ブートストラップ信頼区間 | sql*, target | ○ | | report |
+| 16 | `clustering` | k-means グループ分け | sql*, features | ○ | | report |
+| 17 | `abc_analysis` | ABC（パレート）分析 | sql*, label_col, value_col | ○ | | report |
+| 18 | `export_pptx` | PowerPoint レポート | slides | | | file |
+| 19 | `build_report` | 画面レポート＋ md/docx/pptx/xlsx | title, sections | | | report_doc |
+| 20 | `export_docx` | Word 文書（表紙・目次・図表） | title, sections | | | file |
+| 21 | `find_mail_recipients` | 表から宛先候補を探す | — | | | table / text |
+| 22 | `compose_email` | メール下書き（送信は画面ボタン） | subject, body | | | mail_draft |
+| 23 | `compare_periods` | 2期間の差を分解 | sql*, period_col, value_col | ○ | | report |
+| 24 | `data_quality` | DB を直接見て異常を洗い出す | — | | | report |
+| 25 | `detect_anomalies` | 時系列の異常点・変化点 | sql*, time_col, value_col | ○ | | report |
+| 26 | `funnel_analysis` | 段階ごとの通過・離脱 | sql*, steps | ○ | | report |
+| 27 | `cohort_analysis` | 初回期ごとの残存率 | sql*, id_col, period_col | ○ | | report |
+| 28 | `market_basket` | 併売（支持度・確信度・リフト） | sql*, transaction_col, item_col | ○ | | report |
+| 29 | `survival_analysis` | 生存時間（在籍・故障間隔など） | sql*, duration_col | ○ | | report |
+| 30 | `explore_import_files` | 取り込み元フォルダの一覧と下見（読むだけ） | — | | ○ | report |
+| 31 | `propose_glossary_term` | 用語の登録カードを出す（確定は人） | term, description, how | | | glossary_term |
+| 32 | `propose_example` | 例文の登録カードを出す（確定は人） | question, sql*, summary | | | example_proposal |
+| 33 | `show_er_diagram` | ER 図をチャットに表示 | — | | | er |
+| 34 | `open_table` | 全行ビューア（/table）へのリンク | table | | | table_link |
+| 35 | `analyze_usage` | アプリ自身の利用状況 | method | | ○ | report |
+| 36 | `plot_comparison` | 比較グラフ（12種） | sql*, chart_type, x, y, title | ○ | | chart |
+| 37 | `plot_trend` | 推移グラフ（11種） | sql*, chart_type, title | ○ | | chart |
+| 38 | `plot_composition` | 構成グラフ（8種） | sql*, chart_type, title | ○ | | chart |
+| 39 | `plot_distribution` | 分布グラフ（8種） | sql*, chart_type, title | ○ | | chart |
+| 40 | `plot_relationship` | 関係グラフ（12種） | sql*, chart_type, title | ○ | | chart |
+| 41 | `plot_kpi` | 指標グラフ（indicator/gauge/bullet） | sql*, chart_type, value, title | ○ | | chart |
+| 42 | `describe_table` | 表の列・型・説明・値分布・サンプル | table | | | None |
+| 43 | `search_knowledge_base` | 社内文書（LightRAG）検索（動的宣言） | query | | | sources |
+| 44 | `who_am_i` | 質問者のログイン ID・表示名 | — | | | None |
+| 45 | `report_gap` | 答えきれなかったことを1行申告 | kind, what | | | gap |
+
+`*` = `_allow_result_id` により実際の `required` からは除去（`result_id` / `rows` で代替可）。引退: `plot_chart`（宣言のみ除去、`_HANDLERS`/`SQL_TOOLS`/`TOOL_LABELS` には残る）。
+
+---
+
+### 17. 定数・設定値一覧
+
+| 名前 | 値 | 場所 |
+|---|---|---|
+| `MAX_AGENT_STEPS` | env `MAX_AGENT_STEPS` 既定 10 | `config.py:306` |
+| `MAX_RESULT_ROWS` | 2000（env なし） | `config.py:307` |
+| `QUERY_TIMEOUT_SEC` | 10（env なし） | `config.py:308` |
+| `SAMPLE_ROWS_FOR_LLM` | 40（env なし） | `config.py:309` |
+| `EXPORT_MAX_ROWS` | env `EXPORT_MAX_ROWS` 既定 1000000 | `config.py:317` |
+| `IMPORT_EXTENSIONS` | (".csv",".tsv",".txt",".xlsx",".xlsm") | `config.py:58` |
+| `OUTPUT_DIR` | env `OUTPUT_DIR` 既定 ""（画面保存値優先） | `config.py:85` |
+| `FEEDBACK_FILE` | env `FEEDBACK_FILE` 既定 `DATA_DIR/feedback.jsonl` | `config.py:100` |
+| `CATALOG_OPEN_CONTRIB` | env 既定 "false" | `config.py:170` |
+| `RAG_RETRIEVE_TIMEOUT` / `RAG_FANOUT_WORKERS` / `RAG_RETRIEVE_MODE` / `RAG_CHUNK_TOP_K` / `RAG_TOP_K` / `RAG_MAX_CONTEXT_CHARS` | 180 / 8 / "mix" / 10 / 40 / 12000（同名 env） | `config.py:407-423` |
+| `CHAT_EMBED_FILE_MAX_BYTES` | 2 MiB | `config.py:441` |
+| `results.MAX_ENTRIES` / `MAX_CELLS` | 40 / 400_000 | `brain.py:7391`, `7393` |
+| `PREVIEW_ROWS` | 40 | `brain.py:10552` |
+| `_HAS_DEFAULT` | {"title","filename","chart_type","purpose"} | `brain.py:12743` |
+| `_RETIRED` / `_DYNAMIC_TOOLS` | {"plot_chart"} / {"search_knowledge_base"} | `brain.py:9373`, `12534` |
+| `FOLDER_TOOLS` | export_excel/csv/text/pptx/docx | `brain.py:9361` |
+| `_Guard.LIMIT` | 2 | `core.py:8146` |
+| `MAX_ATTACHED` | 10 | `core.py:154` |
+| `DEFAULT_TOLERANCE_PCT` / `DRILL_ROWS` / `_CACHE_MAX` | 0.5 / 8 / 300 | `core.py:3896-3901` |
+| `_MAX_ITEMS`（ファイル置き場） | 200 | `core.py:7293` |
+| `_MAX_TABLES`（data_quality） | 12 | `brain.py:9429` |
+| `_MAX_ROWS` / `_MAX_PREVIEW_ROWS` / `_MAX_CHECK`（files） | 300 / 20 / 20 | `brain.py:9703-9707` |
+| `RAG_EXCERPT_CHARS` | 200 | `brain.py:12055` |
+| `DOCX_MAX_TABLE_ROWS` / `PPTX_MAX_TABLE_ROWS` | 40 / 12 | `brain.py:4704`, `5168` |
+| MIME | `XLSX_MIME`, `CSV_MIME="text/csv"`, `TEXT_MIME="text/plain"`, `MD_MIME="text/markdown"`, `ZIP_MIME="application/zip"`, `PPTX_MIME`, `DOCX_MIME` | `brain.py:3374-3378`, `10914`, `10918` |
+| `DEFAULT_ENCODING` | "utf-8-sig" | `brain.py:3386` |
+
+---
+
+### 18. 設計上の注意点（コードで確認したもの）
+
+1. `plot_chart` は宣言だけ引退。`_HANDLERS`・`SQL_TOOLS`・`TOOL_LABELS` に残り、`builtin_names()` は引退後の一覧から引くため同名のユーザー定義ツールを作れるが、実行は組み込み側が勝つ。
+2. `builtin_tools.enabled: false` は `build_tools` のみで効き、`dispatch` は判定しない。`ADMIN_TOOLS` だけが2段構え。
+3. `_allow_result_id` が `required` から `sql` を外すため、`_missing_required` は `sql` 欠落を検知しない（`fetch` の `AnalysisError` が担当）。`_HAS_DEFAULT` により `run_sql_query` と `plot_trend/composition/distribution/relationship` は実質必須チェックなし。
+4. `_missing_required` / `_coerce_lists` は `BUILTIN_TOOLS` 由来の表しか見ないので、ユーザー定義ツールには効かない（`required` は `to_schema` で AI に伝えるだけ、欠落は `NULL` バインド）。`_string_list_params` はトップレベル `properties` のみ。
+5. `_gather_sqls` はハンドラ実行前に走る（結果として新たに預けられた result_id は検算対象に含まれない）。
+6. `results._store` はプロセス内グローバルで利用者を区別せず、`scope_key` 一致のみで取り出せる。`MAX_ENTRIES=40` も全利用者で共有。
+7. `verify_alerts` は「3キー」の契約外の第4キーで、`_execute` だけが読む。
+8. `describe_table` の `llm_content` だけ JSON でない（`_Guard.note` が `except (ValueError, TypeError)` で吸収）。
+9. `fetch` は `rows: []` と `sql/result_id` が同時に来たとき SQL を優先する（意図的に空表を渡す手段は無い）。
+10. `_run_custom` / `fetch` は `widen_scope` 後の scope で `results.put` するため、DB 複数構成では広げる前の scope で `get` すると不一致になり得る（DB 1つの現構成では表面化しない）。
+11. `knowledge_tool_schemas()` と `_current_user()` はスレッドローカル（`_rag_local`）に依存。`_begin_turn` / `generate()` / `rewind` / `_robot_run` が `rag.set_current_user` を呼び直しているのはこのため。
+12. `_search_knowledge_base` 内のローカル変数 `results` がモジュール別名を影にしている（同関数内では `put` を直接呼ぶ）。
+13. `propose_glossary_term` / `propose_example` は `ADMIN_TOOLS` に入っておらず誰でもカードを出せる。書き込みの権限判定はカードの確定ボタン側 `_may_contribute_catalog`（`core.py:8228`、`CATALOG_OPEN_CONTRIB` / 管理者 / 「画面」タブの一覧）。
+14. `help.html` 5-5 冒頭の「BUILTIN_TOOLS 43 / _HANDLERS 44」は古く、実測は 45 / 46（who_am_i, report_gap 追加後）。同節の「定数・しきい値」欄はすでに 45 / 46 と記載。
