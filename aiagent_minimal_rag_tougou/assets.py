@@ -913,6 +913,7 @@ window.CHAT_INIT = {
   schedulerOn: {{ scheduler_on|tojson }},
   fold: {{ chat_display|tojson }},
   canContribute: {{ can_contribute|tojson }},
+  mailAllowed: {{ mail_allowed|tojson }},
   starters: {{ starters|tojson }}
 };
 </script>
@@ -1157,6 +1158,7 @@ window.ROBOTS_INIT = {
   allowedDomains: {{ allowed_domains|tojson }},
   minIntervalHours: {{ settings.min_interval_hours|tojson }},
   schedulerOn: {{ scheduler_on|tojson }},
+  mailAllowed: {{ mail_allowed|tojson }},
   agentUrl: {{ url_for('chat.index')|tojson }}
 };
 </script>
@@ -3165,6 +3167,13 @@ details.acc.is-target {
 .robotturn { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
              margin-bottom: 8px; }
 .robotcard + .robotcard { margin-top: 10px; }
+/* 宛先の候補（許可されたアドレス）。押すと入力欄に足す */
+.mailpick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.mailpick__item {
+    border: 1px solid var(--border-2); background: var(--surface); color: var(--text);
+    border-radius: 999px; padding: 2px 10px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.mailpick__item:hover { border-color: var(--muted); background: var(--surface-2); }
 /* 登録ダイアログ・詳細: 手順の中身（SQLなど）は折り返して全部読める */
 .robotstep { margin-top: 6px; }
 .robotstep__sum { white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.5;
@@ -6268,9 +6277,10 @@ async function registerRobot(upto) {
     });
     const notify = el('input', { type: 'text', style: 'width:100%;max-width:420px',
                                  placeholder: '例: yamada@example.co.jp（カンマ区切りで複数可）' });
-    notifyBox.append(el('label', { class: 'field' }, '定期実行が失敗したときに知らせるメール（任意）'), notify,
+    const notifyPick = window.ROBOT.mailPicker(notify, window.CHAT_INIT.mailAllowed || []);
+    notifyBox.append(el('label', { class: 'field' }, '定期実行が失敗したときに知らせるメール（任意）'), notify, notifyPick.node,
         el('div', { class: 'small muted', style: 'margin-top:3px' },
-           '定期実行は無人で動くので、入れておくと失敗に気づけます。管理者が「メール設定」で許可したアドレスだけ指定できます。'));
+           '定期実行は無人で動くので、入れておくと失敗に気づけます。管理者が「メール設定」で許可したアドレスだけ指定できます（入力すると候補が出ます）。'));
     const deliver = sec('届け先',
         folder ? el('div', { class: 'small muted' },
                     'フォルダ出力（実行のたびに、出力先フォルダの自分の名前のフォルダへ置くか）'
@@ -11802,7 +11812,42 @@ function folderLabel(r) {
         + (r.folder_overwrite ? '置き換える' : '番号を付けて残す');
 }
 
-window.ROBOT = { modal, askHoles, folderOptions, folderLabel, scheduleOptions, scheduleLabel, scheduleGap };
+/** 宛先の候補（管理者が「メール設定」で許可したアドレス）。入力欄の下に、いま打っている分に合う候補を並べ、押すと足す。
+ *  複数はカンマ区切り。最後のカンマより後ろを「いま打っている分」として絞る。{node, refresh} を返す。 */
+function mailPicker(input, candidates) {
+    const all = (candidates || []).map(String);
+    const node = el('div', { class: 'mailpick hidden' });
+    const parts = () => input.value.split(/[,、;]/);
+    const refresh = () => {
+        const q = (parts().slice(-1)[0] || '').trim().toLowerCase();
+        const have = new Set(parts().slice(0, -1).map(s => s.trim().toLowerCase()).filter(Boolean));
+        const hits = all.filter(a => a.toLowerCase().includes(q) && !have.has(a.toLowerCase())).slice(0, 12);
+        node.replaceChildren(...hits.map(a => el('button', { type: 'button', class: 'mailpick__item',
+            // click より先に blur が来て消えないよう、mousedown で拾う
+            onmousedown: ev => { ev.preventDefault(); pick(a); } }, a)));
+        if (!hits.length) {
+            node.append(el('span', { class: 'small muted' },
+                all.length ? (q ? '合う宛先がありません（許可されたアドレスだけ指定できます）' : '')
+                           : '管理者がまだ宛先を許可していません（「メール設定」で登録すると候補に出ます）'));
+        }
+        node.classList.toggle('hidden', !node.textContent.trim());
+    };
+    const pick = (a) => {
+        const ps = parts().map(s => s.trim()).filter(Boolean);
+        // 打ちかけ（許可リストに無い最後の分）は、選んだものに置き換える
+        if (ps.length && !all.some(x => x.toLowerCase() === ps[ps.length - 1].toLowerCase())) ps.pop();
+        if (!ps.some(x => x.toLowerCase() === a.toLowerCase())) ps.push(a);
+        input.value = ps.join(', ');
+        input.dispatchEvent(new Event('change'));   // カードはこれで保存する
+        refresh();
+    };
+    input.addEventListener('input', refresh);
+    input.addEventListener('focus', refresh);
+    input.addEventListener('blur', () => setTimeout(() => node.classList.add('hidden'), 150));
+    return { node, refresh };
+}
+
+window.ROBOT = { modal, askHoles, folderOptions, folderLabel, scheduleOptions, scheduleLabel, scheduleGap, mailPicker };
 })();
 
 // ===== マイロボットの画面（window.ROBOTS_INIT がある画面だけ動く） =====
@@ -11910,12 +11955,13 @@ function scheduleRow(r) {
         } catch (e) { notify.value = (r.notify_to || []).join(', '); toast(e.message, 'err', 9000); }
     };
     notify.addEventListener('change', saveNotify);
+    const notifyPick = window.ROBOT.mailPicker(notify, window.ROBOTS_INIT.mailAllowed || []);
     const notifyBox = el('div', { class: 'mt' },
         el('label', { class: 'field' }, '定期実行が失敗したときに知らせるメール（任意）'),
-        notify,
+        notify, notifyPick.node,
         el('div', { class: 'small muted mt' },
            window.ROBOTS_INIT.mailReady
-               ? `${window.ROBOTS_INIT.allowedDomains} のうち、管理者が「メール設定」で許可したアドレスだけ指定できます。`
+               ? `${window.ROBOTS_INIT.allowedDomains} のうち、管理者が「メール設定」で許可したアドレスだけ指定できます（入力すると候補が出ます）。`
                : 'いまメールを送れる設定になっていません（管理者がメール設定を終えると使えます）。'));
     return el('details', { class: 'acc', style: 'margin-top:8px' },
         el('summary', { class: 'small', style: 'cursor:pointer' }, summary),

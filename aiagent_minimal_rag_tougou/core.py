@@ -7795,6 +7795,7 @@ def chat_index():
         robot_min_hours=robot_settings()["min_interval_hours"],
         chat_display=chat_display(),          # 会話の中の枠を畳むか（管理者の決めごと）
         can_contribute=_may_contribute_catalog(),   # 登録カードのボタンを出す人か
+        mail_allowed=_mail_allowed(),         # 知らせ先の候補（管理者が許可した宛先）
         scheduler_on=scheduler.is_running(),
         starters=scope_starters(build_scope({f.name: [] for f in db.list_db_files()})),
         llm_ready=llm.is_configured(),
@@ -11020,6 +11021,16 @@ def memory_toggle():
 bp_robots = Blueprint("robots", __name__)
 
 
+def _mail_allowed() -> list[str]:
+    """管理者が「メール設定」で許可した宛先（画面の候補用）。重複を除き、大文字小文字を無視した順に並べる。"""
+    seen: dict = {}
+    for a in mailer.settings().allow_addresses or []:
+        t = str(a or "").strip()
+        if t and t.lower() not in seen:
+            seen[t.lower()] = t
+    return [seen[k] for k in sorted(seen)]
+
+
 @bp_robots.get("/robots", endpoint="index")
 @login_required
 def robots_page():
@@ -11028,6 +11039,7 @@ def robots_page():
                            sched_vocab=_robot_sched_vocab(), scheduler_on=scheduler.is_running(),
                            mail_ready=not mailer.settings().problems(),
                            allowed_domains=mailer.allowed_domains_label(),
+                           mail_allowed=_mail_allowed(),
                            interval_label=(_hours_label(settings["min_interval_hours"])
                                            if settings["min_interval_hours"] > 0 else ""))
 
