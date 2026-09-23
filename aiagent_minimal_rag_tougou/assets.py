@@ -1934,6 +1934,9 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
             {% if r.schedule.kind != 'manual' %}<span class="badge" style="margin-left:6px">{{ r.schedule.interval_label }}{% if r.schedule.enabled is sameas false %}（止めています）{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at[5:16]|replace('T', ' ') }}{% endif %}</span>{% endif %}
             {% if r.mail_auto %}<span class="badge" style="margin-left:4px">メール自動送信</span>{% endif %}
             {% if r.last_status == 'error' %}<span class="badge badge--warn" style="margin-left:4px">前回失敗</span>{% endif %}
+            <button class="btn btn--sm sbsec__act" data-test-user="{{ o.user }}" data-test-id="{{ r.id }}" data-test-name="{{ r.name }}"
+                    data-test-mail="{{ '1' if r.has_mail_steps else '' }}" data-test-tools="{{ r.tools|join(' → ') }}" data-test-steps="{{ r.n_steps }}"
+                    title="このロボットを管理者の名前で1回動かします（結果は自分のマイエージェントに。メールは自分宛て。利用者には何も残りません）">管理者として試す</button>
             {% if (r.schedule.interval_minutes and r.schedule.enabled is not sameas false) or r.mail_auto %}
             <button class="btn btn--sm btn--danger sbsec__act" data-stop-user="{{ o.user }}" data-stop-id="{{ r.id }}" data-stop-name="{{ r.name }}"
                     title="この利用者のロボットの定期実行と、メールの自動送信を止めます（手順は消しません。本人はあとで再開できます）">止める</button>
@@ -1970,7 +1973,8 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
 
 {% block scripts %}
 <script>
-window.ROBOT_SETTINGS_INIT = { settings: {{ settings|tojson }} };
+window.ROBOT_SETTINGS_INIT = { settings: {{ settings|tojson }}, mailAllowed: {{ mail_allowed|tojson }},
+                               testMailDefault: {{ test_mail_default|tojson }}, agentUrl: {{ url_for('chat.index')|tojson }} };
 </script>
 <script>
 /* 「止める」: 他の利用者の定期実行と自動送信を止める（管理者だけ）。押したら画面を読み直す */
@@ -1983,6 +1987,40 @@ document.addEventListener('DOMContentLoaded', () => {
       await api('/api/catalog/robots/stop', { user: b.dataset.stopUser, id: b.dataset.stopId });
       toast('止めました。'); location.reload();
     } catch (e) { b.disabled = false; toast(e.message, 'err', 9000); }
+  }));
+  /* 「管理者として試す」: 宛先を決めて1回動かし、所要時間を見せる。利用者側には何も残らない */
+  document.querySelectorAll('[data-test-id]').forEach(b => b.addEventListener('click', ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const init = window.ROBOT_SETTINGS_INIT;
+    const hasMail = b.dataset.testMail === '1';
+    const mailTo = el('input', { type: 'text', style: 'width:100%;max-width:420px', value: init.testMailDefault || '',
+                                 placeholder: '例: admin@example.co.jp（カンマ区切りで複数可）' });
+    const pick = window.ROBOT.mailPicker(mailTo, init.mailAllowed || []);
+    const body = el('div', {},
+      el('div', { class: 'small' }, el('b', {}, b.dataset.testName), `（${b.dataset.testUser} の登録・${b.dataset.testSteps}手順）`),
+      el('div', { class: 'small muted', style: 'margin-top:4px' }, `手順: ${b.dataset.testTools}`),
+      el('div', { class: 'small muted', style: 'margin-top:8px;line-height:1.7' },
+         '管理者の名前で1回動かします。結果は自分のマイエージェントの新しい会話に出て、フォルダ出力は自分の名前のフォルダに置かれます。'
+         + '利用者の実行履歴・前回の実行・定期実行の予定には何も残りません。'),
+      hasMail ? el('div', { style: 'margin-top:10px' },
+        el('label', { class: 'field' }, 'メールの宛先（全部このアドレスに差し替えて送ります。件名に [試運転] が付きます）'),
+        mailTo, pick.node) : null);
+    const result = el('div', { class: 'small', style: 'margin-top:10px;white-space:pre-wrap' });
+    const go = el('button', { class: 'btn btn--primary', onclick: async () => {
+      go.disabled = true;
+      result.textContent = '動かしています…';
+      try {
+        const r = await api('/api/catalog/robots/test', { user: b.dataset.testUser, id: b.dataset.testId, mail_to: mailTo.value });
+        result.replaceChildren(
+          el('div', { class: r.run_ok ? '' : 'alert alert--err' }, r.message),
+          el('div', { class: 'mt' }, el('b', {}, '所要時間: '), r.timings_text || ''),
+          el('div', { class: 'mt' }, el('a', { class: 'btn btn--sm', href: init.agentUrl }, '結果の会話を開く（マイエージェント）')));
+        go.textContent = 'もう一度';
+        go.disabled = false;
+      } catch (e) { result.textContent = ''; toast(e.message, 'err', 9000); go.disabled = false; }
+    } }, '動かす');
+    const close = window.ROBOT.modal('管理者として試す', el('div', {}, body, result), [go], { wide: true });
+    if (hasMail) mailTo.focus();
   }));
 });
 </script>
@@ -11821,7 +11859,8 @@ function mailPicker(input, candidates) {
     const refresh = () => {
         const q = (parts().slice(-1)[0] || '').trim().toLowerCase();
         const have = new Set(parts().slice(0, -1).map(s => s.trim().toLowerCase()).filter(Boolean));
-        const hits = all.filter(a => a.toLowerCase().includes(q) && !have.has(a.toLowerCase())).slice(0, 12);
+        // いま打っている分と完全に同じものは、もう入っているので候補に出さない
+        const hits = all.filter(a => a.toLowerCase().includes(q) && !have.has(a.toLowerCase()) && a.toLowerCase() !== q).slice(0, 12);
         node.replaceChildren(...hits.map(a => el('button', { type: 'button', class: 'mailpick__item',
             // click より先に blur が来て消えないよう、mousedown で拾う
             onmousedown: ev => { ev.preventDefault(); pick(a); } }, a)));

@@ -9895,8 +9895,12 @@ def _robots_using(table: str) -> list[dict]:
     return out
 
 
-def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
-    """新しい会話の中で手順を順に実行する。AIは呼ばない。戻り値は (会話, 成否, 一言)。"""
+def _robot_run(robot: dict, values: dict, test: dict | None = None) -> tuple[dict, bool, str]:
+    """新しい会話の中で手順を順に実行する。AIは呼ばない。戻り値は (会話, 成否, 一言)。
+
+    test … 管理者の試運転 {"mail_to": [宛先], "owner": 登録した利用者}。メールの宛先を差し替え、
+           手順ごとの所要時間を会話の末尾に出す（chat["timings"] にも残す）。
+    """
     rag.set_current_user(g.user)
     results.new_turn()
     scope = build_scope({f.name: [] for f in db.list_db_files()})
@@ -9905,10 +9909,15 @@ def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
     # 会話の先頭に「先月＝2026-08 として動きました」を残す（何を見た結果かが後から分かる）
     filled = "、".join(f"{h['label']}＝{_robot_date_text_safe(h, now)}" if h.get("kind") == "date"
                       else f"{h['label']}＝{values.get(h['key'], '') or h.get('sample', '')}" for h in holes)
-    text = (f"マイロボット「{robot.get('name')}」を実行"
-            + (f"（{filled}）" if filled else ""))
+    if test:
+        text = (f"マイロボット「{robot.get('name')}」（{test.get('owner')} の登録）を管理者として試運転"
+                + (f"（{filled}）" if filled else ""))
+    else:
+        text = (f"マイロボット「{robot.get('name')}」を実行"
+                + (f"（{filled}）" if filled else ""))
     chat = {"id": None, "created_at": "",
-            "title": f"🤖 {robot.get('name')} {datetime.now():%m/%d %H:%M}",
+            "title": (f"🤖 試運転: {robot.get('name')}（{test.get('owner')}） {datetime.now():%m/%d %H:%M}" if test
+                      else f"🤖 {robot.get('name')} {datetime.now():%m/%d %H:%M}"),
             "messages": [llm.user_message(text)],
             "render_log": [{"role": "user", "kind": "text", "content": text,
                             "at": chats.now()}]}
@@ -9924,6 +9933,7 @@ def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
     ok, message = True, ""
     steps = robot.get("steps") or []
     data_table = None                     # データを出した手順の、最後の表（本文に付ける用）
+    timings: list[dict] = []              # 手順ごとの所要時間（試運転で負荷を見る）
     for i, step in enumerate(steps, 1):
         label = TOOL_LABELS.get(step.get("name"), step.get("name"))
         try:
@@ -9935,6 +9945,14 @@ def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
                 args = dict(args)
                 args["body"] = _robot_append_table(str(args.get("body") or ""), data_table,
                                                    has_attach=bool(args.get("attach_filenames")))
+            if test and step.get("name") == "compose_email":
+                # 試運転: 宛先は全部、管理者が入れたアドレスに。件名と本文で試運転だと分かるように
+                args = dict(args)
+                orig = [str(x) for k in ("to", "cc", "bcc") for x in (args.get(k) or [])]
+                args["to"], args["cc"], args["bcc"] = list(test.get("mail_to") or []), [], []
+                args["subject"] = "[試運転] " + str(args.get("subject") or "")
+                args["body"] = (f"これは管理者の試運転です。本来の宛先: {', '.join(orig) or '（無し）'}\n\n"
+                                + str(args.get("body") or ""))
             if step.get("name") in tools.FOLDER_TOOLS:
                 # フォルダ出力はロボットの決めごとが優先（元の会話の指定より）
                 args["save_to_folder"] = bool(robot.get("folder_out"))
@@ -9956,12 +9974,14 @@ def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
                                                               "arguments": json.dumps(shown_args, ensure_ascii=False)}}]})
         chat["render_log"].extend(_call_previews([call], scope, text))
         before_log = len(chat["render_log"])
+        t0 = time.perf_counter()
         _execute(chat, [call], scope)
-        if step.get("name") not in _ROBOT_NO_TABLE_TOOLS:
-            tbl = next((it for it in reversed(chat["render_log"][before_log:])
+        any_tbl = next((it for it in reversed(chat["render_log"][before_log:])
                         if it.get("kind") == "table" and it.get("columns")), None)
-            if tbl is not None:
-                data_table = tbl
+        timings.append({"i": i, "label": label, "sec": round(time.perf_counter() - t0, 2),
+                        "rows": len(any_tbl.get("rows") or []) if any_tbl is not None else None})
+        if step.get("name") not in _ROBOT_NO_TABLE_TOOLS and any_tbl is not None:
+            data_table = any_tbl
         content = next((m.get("content") for m in reversed(chat["messages"])
                         if m.get("role") == "tool" and m.get("tool_call_id") == call["id"]), "")
         try:
@@ -9976,10 +9996,20 @@ def _robot_run(robot: dict, values: dict) -> tuple[dict, bool, str]:
             idmap[old] = new
     final = (f"マイロボット「{robot.get('name')}」の {len(steps)} 手順を実行しました。"
              if ok else f"⚠ {message}（それより前の手順の結果は上に出ています）")
+    if test:
+        final += "\n所要時間: " + _robot_timings_text(timings)
     chat["messages"].append({"role": "assistant", "content": final})
     chat["render_log"].append({"role": "assistant", "kind": "text", "content": final})
+    chat["timings"] = timings
     _persist(chat)
     return chat, ok, message or final
+
+
+def _robot_timings_text(timings: list[dict]) -> str:
+    """「手順1 SQL実行 0.8秒・412行 ／ 手順2 Excel 1.2秒 ／ 合計 2.1秒」の形。"""
+    parts = [f"手順{t['i']} {t['label']} {t['sec']:.1f}秒" + (f"・{t['rows']}行" if t.get("rows") is not None else "")
+             for t in timings]
+    return " ／ ".join(parts + [f"合計 {sum(t['sec'] for t in timings):.1f}秒"]) if timings else "（手順なし）"
 
 
 def _robot_folder_defaults(steps: list[dict]) -> dict:
@@ -10459,6 +10489,40 @@ def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
                 except ValueError:
                     pass
         _robot_write_back(user, robot["id"], ok, message, source)
+        return chat, ok, message
+    finally:
+        with _robots_lock:
+            _robots_running.discard(key)
+
+
+#: 管理者の試運転の連打止め {(管理者, ロボットid): 前回の時刻}。利用者の「いま試す」とは別勘定
+_robot_admin_tests: dict = {}
+
+
+def _robot_admin_test(admin, owner_dir: str, robot: dict, mail_to: list[str]):
+    """他の利用者のロボットを、管理者の名前で1回動かす（負荷とデータの確認用）。
+
+    結果の会話は管理者のマイエージェントに入る。メールは全部 mail_to へ（件名に [試運転]）。
+    利用者の robots.json には何も書かない（履歴・前回の実行・定期実行の予定を動かさない）。
+    戻り値は (会話, 成否, 一言)。二重実行・連打で断ったときは会話が None。
+    """
+    from datetime import timedelta
+    key = (getattr(admin, "safe_key", None) or admin.username, "test:" + str(robot["id"]))
+    with _robots_lock:
+        last = _robot_admin_tests.get(key)
+        if last and last + timedelta(minutes=ROBOT_TRY_GAP_MINUTES) > datetime.now():
+            nxt = last + timedelta(minutes=ROBOT_TRY_GAP_MINUTES)
+            return None, False, f"続けて押しています。次に試せるのは {nxt:%H:%M} 以降です（{ROBOT_TRY_GAP_MINUTES} 分あけてください）。"
+        if key in _robots_running:
+            return None, False, "このロボットの試運転はいま動いています。終わってから押してください。"
+        _robots_running.add(key)
+        _robot_admin_tests[key] = datetime.now()
+    try:
+        chat, ok, message = _robot_run(robot, {}, test={"mail_to": list(mail_to), "owner": owner_dir})
+        if ok and mail_to and any(s.get("name") == "compose_email" for s in robot.get("steps") or []):
+            _sent, mail_msg = _robot_send_mails(chat, admin)      # 宛先は管理者自身なので、自動送信の設定に関係なく送る
+            if mail_msg:
+                message = f"{message} {mail_msg}"
         return chat, ok, message
     finally:
         with _robots_lock:
@@ -11950,7 +12014,10 @@ def _robot_overview() -> list[dict]:
 def robot_settings_page():
     return render_template("robot_settings.html", settings=robot_settings(),
                            defaults=_robot_setting_defaults(), ranges=ROBOT_SETTING_RANGES,
-                           note=robot_settings_note(), overview=_robot_overview())
+                           note=robot_settings_note(), overview=_robot_overview(),
+                           # 「管理者として試す」: 宛先の候補と既定（メール設定の「警告を知らせる管理者」の先頭）
+                           mail_allowed=_mail_allowed(),
+                           test_mail_default=next((str(a) for a in (mailer.settings().alert_to or []) if str(a).strip()), ""))
 
 
 def robot_admin_stop(dir_name: str, rid: str) -> dict | None:
@@ -12017,6 +12084,43 @@ def robot_admin_stop_route():
         return jsonify({"error": "そのマイロボットが見つかりません。"}), 404
     print(f"[robot] 管理者が止めました: 「{robot.get('name')}」（{body.get('user')}）（{g.user.username}）")
     return jsonify({"ok": True, "name": robot.get("name")})
+
+
+@bp_catalog.post("/api/catalog/robots/test")
+@admin_required
+def robot_admin_test_route():
+    """他の利用者のロボットを管理者として試運転する。負荷（所要時間）とデータの確認用。"""
+    body = _body()
+    dir_name = str(body.get("user") or "")
+    key = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in dir_name)[:64]
+    if not key or key.startswith(".") or key != dir_name:
+        return jsonify({"error": "そのマイロボットが見つかりません。"}), 404
+    owner = auth.User(username=key)
+    try:
+        robot = next((r for r in robots_list(owner) if r.get("id") == str(body.get("id") or "")), None)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    if robot is None:
+        return jsonify({"error": "そのマイロボットが見つかりません。"}), 404
+    has_mail = any(s.get("name") == "compose_email" for s in robot.get("steps") or [])
+    try:
+        mail_to = _robot_notify_check(body.get("mail_to")) if has_mail else []
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if has_mail and not mail_to:
+        return jsonify({"error": "メールの手順があるので、試運転の宛先（管理者のアドレス）を入れてください。"}), 400
+    missing = _robot_missing_tables(robot)
+    if missing:
+        return jsonify({"error": f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。"}), 400
+    chat, ok, message = _robot_admin_test(g.user, key, robot, mail_to)
+    if chat is None:
+        return jsonify({"error": message}), 409
+    if chat.get("id"):
+        session["chat_id"] = chat["id"]           # 結果の会話をマイエージェントで開けるように
+    print(f"[robot] 管理者の試運転 {'OK' if ok else 'NG'} 「{robot.get('name')}」（{key}）by {g.user.username}: {message[:80]}")
+    return jsonify({"ok": True, "run_ok": ok, "message": message, "chat_id": chat.get("id"),
+                    "title": chat.get("title", ""), "timings": chat.get("timings") or [],
+                    "timings_text": _robot_timings_text(chat.get("timings") or [])})
 
 
 # =============================================================================
