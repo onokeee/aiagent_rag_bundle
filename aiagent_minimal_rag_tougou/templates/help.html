@@ -616,7 +616,206 @@
     <div class="small muted mt">
       安全のための決まり: AIが実行できるのは<b>読み取り（SELECT）だけ</b>で、データの書き換えは
       できません。チェックを外した表・文書には触れません。メールは許可済みの宛先にしか送れず、
-      送信前に必ず人の確認が入ります。
+      送信前に人の確認が入ります（マイロボットの自動送信を除く）。
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">質問から答えまでの流れ（仕組み）</div>
+    <div class="card__desc">
+      AIは社外のサービス（OpenAI 互換のAPI）で、会社のデータはAIの手元にはありません。あるのはこのアプリのサーバだけです。
+      それでもAIが「先月の停止時間は412件」と答えられるのは、<b>Function Calling（道具の呼び出し）</b>という仕組みのためです。
+      AIは「何をどう調べるか」を決め、実際に調べるのはこのアプリです。
+    </div>
+    <svg viewBox="0 0 760 330" style="width:100%;max-width:760px" xmlns="http://www.w3.org/2000/svg"
+         font-size="12" text-anchor="middle">
+      <defs>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0L10 5L0 10z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <!-- 画面 -->
+      <rect x="16" y="120" width="104" height="70" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="68" y="150" fill="var(--text)" font-weight="bold">画面</text>
+      <text x="68" y="168" fill="var(--muted)" font-size="11">質問を送る／答えが並ぶ</text>
+      <!-- アプリ: 準備 -->
+      <rect x="168" y="110" width="160" height="90" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="248" y="138" fill="var(--text)" font-weight="bold">アプリ：準備</text>
+      <text x="248" y="156" fill="var(--muted)" font-size="11">道具の説明書＋カタログ＋</text>
+      <text x="248" y="172" fill="var(--muted)" font-size="11">これまでの会話＋質問</text>
+      <!-- AI -->
+      <rect x="376" y="110" width="130" height="90" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <text x="441" y="138" fill="var(--text)" font-weight="bold">AI</text>
+      <text x="441" y="156" fill="var(--muted)" font-size="11">道具を頼む</text>
+      <text x="441" y="172" fill="var(--muted)" font-size="11">または文章で答える</text>
+      <!-- アプリ: 検査・実行 -->
+      <rect x="554" y="110" width="190" height="90" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="649" y="138" fill="var(--text)" font-weight="bold">アプリ：検査・実行</text>
+      <text x="649" y="156" fill="var(--muted)" font-size="11">SELECT だけか検査して実行</text>
+      <text x="649" y="172" fill="var(--muted)" font-size="11">結果を画面用とAI用に分ける</text>
+      <!-- データ -->
+      <rect x="574" y="250" width="150" height="56" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="649" y="273" fill="var(--text)">データベース・文書</text>
+      <text x="649" y="291" fill="var(--muted)" font-size="11">読み取り専用で開く</text>
+      <!-- 矢印と番号 -->
+      <line x1="120" y1="145" x2="160" y2="145" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="140" y="136" fill="var(--accent)" font-size="11" font-weight="bold">1</text>
+      <line x1="328" y1="145" x2="368" y2="145" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="348" y="136" fill="var(--accent)" font-size="11" font-weight="bold">2</text>
+      <line x1="506" y1="145" x2="546" y2="145" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="526" y="136" fill="var(--accent)" font-size="11" font-weight="bold">3</text>
+      <line x1="649" y1="200" x2="649" y2="242" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="662" y="226" fill="var(--accent)" font-size="11" font-weight="bold">4</text>
+      <path d="M600 110 C 600 70, 480 70, 448 102" fill="none" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="530" y="74" fill="var(--accent)" font-size="11" font-weight="bold">5</text>
+      <text x="530" y="90" fill="var(--muted)" font-size="11">結果（件数・先頭数行・預かり番号）</text>
+      <path d="M400 200 C 380 250, 120 250, 72 198" fill="none" stroke="var(--muted)" marker-end="url(#ar2)"/>
+      <text x="236" y="248" fill="var(--accent)" font-size="11" font-weight="bold">6</text>
+      <text x="236" y="264" fill="var(--muted)" font-size="11">文章は少しずつ、表やグラフは出来た順に</text>
+      <text x="441" y="226" fill="var(--muted)" font-size="11">3〜5 を、文章の答えが出るまで数回くり返す</text>
+    </svg>
+    <div class="tablewrap mt">
+      <table class="data">
+        <thead><tr><th style="width:40px">順</th><th style="width:190px">何が起きるか</th><th>仕組みと、そうしている理由</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>質問が届く</td>
+              <td>送信を押すと質問の文章がアプリに届き、まず会話ファイルに保存されます。答えはあとから少しずつ流れてきます。</td></tr>
+          <tr><td>2</td><td>説明書を組んでAIに送る</td>
+              <td>アプリはAIに渡す「前置き」を組み立てます。振る舞いの決まり（実データ以外を言わない・根拠のSQLを添える）、
+                  <b>道具の説明書</b>、SQLの決まり、<b>データカタログ</b>（表と列の意味・用語集・例文）、その人のパーソナライズ、今日の日付。
+                  道具の説明書は1つにつき「名前」「何をする道具か」「受け取る引数の形」の3点だけです（下の例）。
+                  AIには道具そのものではなく説明書だけを渡すので、AIは説明を読んで「この質問ならこの道具を、この引数で」と自分で決めます。
+                  プログラムの側に「停止時間と聞かれたらこのSQL」という分岐はありません。だから聞き方が変わっても対応できます。
+                  <b>管理者がカタログに書いた内容は毎回そのまま前置きに載る</b>ので、答えの質はカタログの質で決まります。</td></tr>
+          <tr><td>3</td><td>AIの返事は2種類</td>
+              <td>「文章」か「道具を使ってくれという依頼」です。依頼は下の例のような形で、道具の名前と引数（JSON）だけが返ってきます。
+                  <b>AIが書いているのはSQLという文字列だけ</b>で、それを本当に動かすかどうかはアプリが決めます。だからアプリ側で検査ができます。</td></tr>
+          <tr><td>4</td><td>アプリが検査して実行する</td>
+              <td>依頼のSQLをまず画面に出し（「SQL実行」の枠）、「読むだけの1文か」を検査してから、読み取り専用で開いたデータベースで実行します。
+                  文書の検索なら LightRAG に問い合わせます。</td></tr>
+          <tr><td>5</td><td>結果を2つに分けてAIへ返す</td>
+              <td>画面には表そのもの（412行なら412行）を出しますが、AIには<b>列名・件数・先頭の数行・結果の預かり番号</b>だけを返します。
+                  AIが読める量にも費用にも上限があるためです。「この結果をグラフにして」と続けたとき、AIは預かり番号だけを指定するので、
+                  同じSQLを書き直さず、数字がずれません。</td></tr>
+          <tr><td>—</td><td>くり返し</td>
+              <td>結果を見たAIは、次の道具を頼むか（グラフ・Excel・メールの下書き…）、文章で答えるかを決めます。文章で答えたらそこで終わり。
+                  1つの質問でこの往復が数回起きます。往復の回数には上限があり、同じ依頼のくり返しは2回目から実行せず
+                  「もう結果は出ています」と差し戻します（同じ検索を延々くり返して答えを書かない、ということが実際に起きたためです）。</td></tr>
+          <tr><td>6</td><td>画面に届く</td>
+              <td>答えの文章は一文字ずつ、表・グラフ・ファイルは出来た順に並びます。最後に会話が保存され、そのあとパーソナライズの書き直しが1回だけ動きます。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="mt small"><b>道具の説明書の例（SQLを実行する道具）</b></div>
+<pre class="mono small">名前: run_sql_query
+説明: 対象のテーブルに対して読み取り専用の SELECT 文を実行し、結果テーブルを取得する。
+引数: sql（文字列。SELECT または WITH で始めること）
+      purpose（文字列。このクエリで何を確認したいかの短い説明）</pre>
+    <div class="mt small"><b>AIから返ってくる依頼の例</b>（実行結果ではなく「実行してほしい」という依頼です）</div>
+<pre class="mono small">道具: run_sql_query
+引数: {"sql": "SELECT shift_code, AVG(minutes) FROM 停止記録 GROUP BY shift_code",
+       "purpose": "シフト別の平均復旧時間を比べる"}</pre>
+    <div class="mt small"><b>アプリがAIに返す結果の例</b>（画面には全行、AIにはこれだけ）</div>
+<pre class="mono small">列名: shift_code, AVG(minutes)
+件数: 3 行
+先頭の行: ["A", 12.3], ["B", 15.8], ["C", 9.4]
+預かり番号: r_7  ← 次の道具（グラフなど）はこの番号で同じ結果を使う</pre>
+    <div class="small muted mt">
+      まとめ: AIには<b>道具の説明書しか渡さない</b>。AIは<b>どの道具をどう使うかを頼むだけ</b>。調べる・作る・送るは全部このアプリの側。
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card__title">安全性の考え方</div>
+    <div class="card__desc">
+      方針は3つです。<b>AIを信用しない</b>（読むだけ・提案だけ）、<b>本人以外のものは見せない・触らせない</b>（判定はサーバで毎回）、
+      <b>壊れても静かに悪化させない</b>（止まる・黙って上書きしない）。
+    </div>
+    <svg viewBox="0 0 760 320" style="width:100%;max-width:760px" xmlns="http://www.w3.org/2000/svg"
+         font-size="12" text-anchor="middle">
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0L10 5L0 10z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <!-- 左: SQLの3重の鍵 -->
+      <text x="190" y="24" fill="var(--text)" font-weight="bold">AIが書いたSQLが通る道（3重の鍵）</text>
+      <rect x="120" y="40" width="140" height="44" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <text x="190" y="66" fill="var(--text)">AIが書いたSQL</text>
+      <line x1="190" y1="84" x2="190" y2="102" stroke="var(--muted)" marker-end="url(#ar3)"/>
+      <rect x="60" y="106" width="260" height="44" rx="8" fill="var(--surface-2)" stroke="var(--border-2)"/>
+      <text x="190" y="124" fill="var(--text)">鍵1 言葉の検査</text>
+      <text x="190" y="140" fill="var(--muted)" font-size="11">SELECT 1文だけ・書き換えの言葉があれば断る</text>
+      <line x1="190" y1="150" x2="190" y2="168" stroke="var(--muted)" marker-end="url(#ar3)"/>
+      <rect x="60" y="172" width="260" height="44" rx="8" fill="var(--surface-2)" stroke="var(--border-2)"/>
+      <text x="190" y="190" fill="var(--text)">鍵2 読み取り専用で開く</text>
+      <text x="190" y="206" fill="var(--muted)" font-size="11">検査をすり抜けても物理的に書けない</text>
+      <line x1="190" y1="216" x2="190" y2="234" stroke="var(--muted)" marker-end="url(#ar3)"/>
+      <rect x="60" y="238" width="260" height="44" rx="8" fill="var(--surface-2)" stroke="var(--border-2)"/>
+      <text x="190" y="256" fill="var(--text)">鍵3 許可係（authorizer）</text>
+      <text x="190" y="272" fill="var(--muted)" font-size="11">操作を1つずつ判定し、危ないものは拒否</text>
+      <line x1="190" y1="282" x2="190" y2="300" stroke="var(--muted)" marker-end="url(#ar3)"/>
+      <text x="190" y="314" fill="var(--text)">データベース（読むだけ）</text>
+      <!-- 右: 出口と権限 -->
+      <text x="560" y="24" fill="var(--text)" font-weight="bold">外に出る口は3つだけ。全部に見張りがいる</text>
+      <rect x="420" y="40" width="280" height="56" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="560" y="61" fill="var(--text)">メール</text>
+      <text x="560" y="79" fill="var(--muted)" font-size="11">許可リストの宛先だけ。空なら誰にも送れない</text>
+      <rect x="420" y="108" width="280" height="56" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="560" y="129" fill="var(--text)">ファイル</text>
+      <text x="560" y="147" fill="var(--muted)" font-size="11">場所は誰も指定できない。本人のフォルダ＋引換券</text>
+      <rect x="420" y="176" width="280" height="56" rx="8" fill="none" stroke="var(--border-2)"/>
+      <text x="560" y="197" fill="var(--text)">画面と道具</text>
+      <text x="560" y="215" fill="var(--muted)" font-size="11">権限はサーバで毎回判定。AIにも同じ線</text>
+      <rect x="420" y="244" width="280" height="56" rx="8" fill="none" stroke="var(--border-2)" stroke-dasharray="5 4"/>
+      <text x="560" y="265" fill="var(--text)">壊れたとき</text>
+      <text x="560" y="283" fill="var(--muted)" font-size="11">初期値に戻して警告。読めないものに上書きしない</text>
+    </svg>
+    <div class="tablewrap mt">
+      <table class="data">
+        <thead><tr><th style="width:190px">守りたいこと</th><th>どう作ってあるか</th></tr></thead>
+        <tbody>
+          <tr><td>AIがデータを壊せない</td>
+              <td>3重の鍵です。<b>鍵1</b>: AIの書いたSQLを実行前に検査します（SELECT か WITH…SELECT の1文か、<code>;</code> で2文つなげていないか、
+                  DELETE・DROP・PRAGMA・ATTACH などの言葉が無いか）。検査の前に引用符の中身とコメントを取り除くので、文字列の中に言葉を隠しても
+                  効きませんし、文字列の中の言葉で誤って止めることもありません。<b>鍵2</b>: データベースを読み取り専用（<code>mode=ro</code>）で開くので、
+                  検査をすり抜けても書けません。<b>鍵3</b>: SQLite の許可係（authorizer）が操作を1つずつ判定し、危ないものは拒否します。
+                  検査は「間違いを見つける」ためで、本当の守りは鍵2と鍵3です。</td></tr>
+          <tr><td>AIに書き込みの道具を渡さない</td>
+              <td>用語集・例文への登録は、AIは「登録しませんか」というカードを出すだけで、書き込むのは人がボタンを押したときです。
+                  押せるのは管理者と、管理者が「画面」タブで決めた人だけ。カタログは全員のAIに毎回渡るので、変な定義が入ると全員の答えが歪みます。
+                  だから「提案は誰でも、確定は限られた人」にしています。</td></tr>
+          <tr><td>AIが暴走しない</td>
+              <td>1つの質問で道具を頼める回数に上限があります。同じ道具を同じ引数でくり返したら、2回目は実行せず差し戻します。
+                  AIに渡す結果は先頭の数行だけなので、大きな表を丸ごと読ませて費用と時間が膨らむこともありません。</td></tr>
+          <tr><td>本人以外のものを見ない</td>
+              <td>権限は一般利用者と管理者の2段だけ。画面のボタンを隠すのは見やすさのためで、本当の判定はサーバの側で毎回行うので、URLを直接開いても同じです。
+                  AIも同じ線で、管理者だけの道具（取り込み元フォルダの調査・他人の利用状況）は一般利用者のAIには<b>説明書に載せません</b>。
+                  存在を知らなければ頼めません。念のため実行の入口でもう一度確かめます。
+                  会話・マイロボット・パーソナライズは本人のフォルダにあり、他人のものは「存在しない」と同じ扱いです（管理者は全部見られます）。
+                  自動で動くマイロボットは「登録した時点の本人の権限の写し」で動きます。そうしないと、管理者を外れた人のロボットが夜中に管理者の道具を使い続けます。</td></tr>
+          <tr><td>外に漏れない</td>
+              <td>メールは<b>許可リストに載ったアドレスにしか送れません</b>。リストが空なら誰にも送れません（「未設定なら誰にでも」だと設定忘れのまま社外に出るため、逆にしてあります）。
+                  宛先の件数にも上限があり、既定は送ったふりをするテストモードです。添付はその会話でアプリ自身が作ったファイルだけ。
+                  フォルダ出力は管理者が決めた1か所の下の「本人の名前のフォルダ」だけで、利用者もAIも場所を指定できません。アプリ自身のフォルダやデータの置き場は出力先にできません。
+                  作ったファイルの受け取りは一時的な引換券（トークン）付きのURLで、作った本人に紐づきます。利用者のPCからのアップロードは既定で無効です。</td></tr>
+          <tr><td>秘密が画面やログに出ない</td>
+              <td>パスワードや APIキーは、画面に出る設定ファイルには入れず、サーバの環境設定にだけ置きます。画面には「設定済み／空」しか出ません。
+                  ログイン状態を保つ Cookie は JavaScript から読めず（HttpOnly）、他のサイトからの送信には付きません（SameSite）。
+                  開発用のデバッガ（エラー画面からサーバのプログラムを実行できる機能）は、起動時に指定されても入口で止めます。</td></tr>
+          <tr><td>壊れても悪化しない</td>
+              <td>設定ファイルが読めないときは初期値に戻して警告し、<b>読めないファイルには上書きしません</b>（マイロボットの保存ファイルが壊れているとき、
+                  新しい1件で上書きすると残りが全部消えるので、保存を断ります）。ファイルは「別名で書いてから一瞬で差し替える」ので、途中で電源が落ちても
+                  中途半端なファイルは残りません。同時保存は1人ずつ順番に。変な入力（文字列だけ・配列だけ）が来てもエラー画面にせず日本語の断りを返します。
+                  定期実行は「動かす直前に印を付けてから動かす」ので、途中で落ちても同じ回を二度動かしません（メールが2通出るより、1回抜ける方を選び、抜けた回は履歴に残ります）。</td></tr>
+          <tr><td>AIの答えを鵜呑みにしない</td>
+              <td>使ったSQLは必ず会話に残り（畳まれていても押せば開く）、「このSQLがしていること」の日本語が付きます。文書の答えには出典番号が付き、根拠にした文書だけが開きます。
+                  数字は裏で別の方法で検算し、食い違えばAIと画面の両方に警告します。誰がいつ何を変えたか（カタログ・取り込み・ロボットの実行）は記録に残ります。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="small muted mt">
+      まとめ: AIは提案と読み取りだけ。判断と書き込みは人とこのアプリ。メールとファイルの出口は管理者が決めた場所だけ。壊れたら止まって、黙って上書きしない。
     </div>
   </div>
 
