@@ -4342,8 +4342,8 @@ const ER = (() => {
     let suggestions = [];       // 結合候補（「結合を探す」で保存したもの＋過去のSQL由来）。setSuggestions で受け取る
     let showSug = false;        // 候補の赤線を重ねるか
     let sugOnlyIds = new Set(); // 候補のためだけに画面へ出している表（赤枠で描く）
-    function shownNodes() {
-        if (!groupFilter) return data.nodes;
+    /** まとまり表示で、候補とは関係なく出る表: まとまりの表＋関連で繋がる隣の表＋手で足した表 */
+    function baseIds() {
         const ids = new Set(data.nodes
             .filter(n => String(n.table || '').split('__')[0] === groupFilter)
             .map(n => n.id));
@@ -4355,11 +4355,15 @@ const ER = (() => {
             if (ids.has(f) && !ids.has(t)) extra.add(t);
             if (ids.has(t) && !ids.has(f)) extra.add(f);
         });
+        return new Set([...ids, ...extra, ...extraShown]);
+    }
+    function shownNodes() {
+        if (!groupFilter) return data.nodes;
+        const base = baseIds();
         // 候補を表示中は、候補の相手（まだ画面に居ない表）も赤枠で出す。
         // 出さないと、またぎの候補が1本も見えない
         sugOnlyIds = new Set();
         if (showSug) {
-            const base = new Set([...ids, ...extra, ...extraShown]);
             suggestions.forEach(sg2 => {
                 const f = `${sg2.edge.from[0]}.${sg2.edge.from[1]}`;
                 const t = `${sg2.edge.to[0]}.${sg2.edge.to[1]}`;
@@ -4367,8 +4371,22 @@ const ER = (() => {
                 if (base.has(t) && !base.has(f)) sugOnlyIds.add(f);
             });
         }
-        return data.nodes.filter(n => ids.has(n.id) || extra.has(n.id)
-                                      || extraShown.has(n.id) || sugOnlyIds.has(n.id));
+        return data.nodes.filter(n => base.has(n.id) || sugOnlyIds.has(n.id));
+    }
+
+    /** 候補の相手として赤枠で出していた表は、その候補を登録した瞬間に候補が消え、表ごと画面から居なくなる
+        （まとまりの表と直接は繋がっていない表は、候補が無ければ出す理由が無いため）。
+        引いたばかりの線が相手ごと消えると戸惑うので、「＋ 別のまとまりの表」で足したのと同じ扱いで残す。 */
+    function keepPartner(body, wasSugOnly) {
+        if (!groupFilter || !wasSugOnly.size) return;
+        const alias = data?.nodes?.[0]?.alias;
+        const base = baseIds();
+        let kept = false;
+        [body.from_table, body.to_table].forEach(t => {
+            const id = `${alias}.${t}`;
+            if (t && wasSugOnly.has(id) && !base.has(id)) { extraShown.add(id); kept = true; }
+        });
+        if (kept) render();
     }
 
     function render() {
@@ -4780,12 +4798,15 @@ const ER = (() => {
     /* 人の操作から呼ぶ。サーバに保存したうえで、逆の操作を履歴に積む */
     async function mutate(body) {
         if (linking) { toast('前の線の実データを確認しています。終わってから操作してください。'); return; }
+        // 候補のためだけに出している表（赤枠）を控えておく。登録が通ったら keepPartner で残す
+        const wasSugOnly = new Set(sugOnlyIds);
         try {
             const r = await relApi(body);
             // 同じ表ペアに既存の関連がある。複合キーに合流するか、別の関連かを人に選ばせる
             if (r.ask === 'merge_or_new') { showMergeAsk(r, body); return; }
             // 実データを見て「結ぶべきでない／要確認」と判定されたら、理由を出して止める
             if (r.check) { showLinkCheck(r, body); return; }
+            if (body.action === 'add' && (r.added || r.merged)) keepPartner(body, wasSugOnly);
             if (body.action === 'add' && r.added) {
                 const a = r.added;
                 record({ label: `関連を追加（${a.from} → ${a.to}）`,
