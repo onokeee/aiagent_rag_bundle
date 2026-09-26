@@ -166,6 +166,11 @@ def connect_scope(paths_aliases: list[tuple]) -> sqlite3.Connection:
             "テーブル名を『DB名.テーブル名』の形で書けば、実際に使うDBだけを繋ぐので"
             "多くの場合はこの制限に当たりません。")
     conn = sqlite3.connect("file::memory:", uri=True)
+    # 暗黙のトランザクションを使わない（autocommit）。Python の sqlite3 は INSERT の前に勝手に
+    # BEGIN を張り、COMMIT するまで ATTACH した本番 DB の共有ロックを握り続ける。
+    # 「結合を探す」のように一時表へ INSERT しながら長く読む処理がそれをやると、その間
+    # ビューの削除や取り込み（書き込み）が「database is locked」で失敗する
+    conn.isolation_level = None
     for path, alias in paths_aliases:
         # alias は英数字と_のみに正規化済みなので識別子として安全
         conn.execute(f'ATTACH DATABASE ? AS "{alias}"', (_ro_uri(path),))
@@ -3715,7 +3720,11 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
             name = temp_name(c, prefix)
             if name not in temp_made:
                 conn.execute(f"CREATE TEMP TABLE {name} (v {c['kind']})")
+                # 一時表への INSERT だけを1つのトランザクションにまとめる（本番 DB は読まないので
+                # 共有ロックは掛からない。autocommit のまま1行ずつ入れると遅い）
+                conn.execute("BEGIN")
                 conn.executemany(f"INSERT INTO {name} VALUES (?)", [(v,) for v in c["sample"]])
+                conn.execute("COMMIT")
                 temp_made.add(name)
             return name
 
@@ -16136,6 +16145,21 @@ def create_app() -> Flask:
         if res.mimetype == "text/html":
             res.headers["Cache-Control"] = "no-store"
         return res
+
+    @app.errorhandler(sqlite3.OperationalError)
+    def _db_busy(e):
+        """取り込みや「結合を探す」と重なって書けなかったときは、500 ではなく理由を返す。
+
+        書き込み側は 30 秒待ってから database is locked になる。画面には「少し待って
+        もう一度」と出し、次の操作で消せるようにする。それ以外の SQLite のエラーは今までどおり。
+        """
+        if "locked" in str(e).lower():
+            msg = ("いま別の処理（取り込みや「結合を探す」）がデータベースを使っています。"
+                   "少し待ってから、もう一度お試しください。")
+            if request.path.startswith("/api/"):
+                return jsonify({"error": msg}), 503
+            return msg, 503
+        raise e
 
     # 定期取り込みの裏スレッド。Streamlit版と同じく cron 不要。
     # Flask では起動時に1回通るので、誰かがページを開くのを待たずに動き出す。

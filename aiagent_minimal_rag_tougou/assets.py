@@ -5122,7 +5122,9 @@ const ER = (() => {
             if (selected?.type === 'sug') closePanel();
             syncSugBtn();
             render();                       // 候補の相手テーブルが出入りする
-            setTimeout(fit, 20);
+            // 出すときだけ全体に合わせる（候補の相手の表が画面の外に出ることがある）。
+            // 消すときは見ていた位置をそのまま残す
+            if (showSug) setTimeout(fit, 20);
         });
         once('#erDiscover', openDiscover);
         once('#erUndo', undo);
