@@ -91,6 +91,7 @@ OUTPUT_DIR_FILE = Path(os.getenv("OUTPUT_DIR_FILE",
 ROBOT_MAX_PER_USER = int(os.getenv("ROBOT_MAX_PER_USER", "5") or 5)             # 1人あたりの登録上限
 ROBOT_MIN_INTERVAL_HOURS = float(os.getenv("ROBOT_MIN_INTERVAL_HOURS", "12") or 12)  # 定期実行の最短の間隔（時間）。「いま試す」には効かない
 ROBOT_MAX_STEPS = int(os.getenv("ROBOT_MAX_STEPS", "20") or 20)                  # 1つのロボットの手順数
+ROBOT_WORKERS = int(os.getenv("ROBOT_WORKERS", "4") or 4)                        # 定期実行で同時に動かすロボットの数（1 で1本ずつ）
 ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
                                      str(DATA_DIR / "robot_settings.yaml"))).expanduser()
 

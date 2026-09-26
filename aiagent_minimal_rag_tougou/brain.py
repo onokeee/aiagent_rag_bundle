@@ -7387,10 +7387,11 @@ def builtin_overrides(entries: list[dict]) -> dict:
 import uuid
 from collections import OrderedDict
 
-#: 覚えておく結果の数。会話1本で使う量に対して十分な余裕を見た数。
-MAX_ENTRIES = 40
+#: 覚えておく結果の数。置き場は全利用者で共有なので、50人がそれぞれ数件使う想定の数。
+MAX_ENTRIES = 400
 #: 総セル数の上限（行×列の合計）。これを超えたら古いものから捨てる。
-MAX_CELLS = 400_000
+#: 最大でも数百MB。捨てたぶんのメモリは Python が使い回すので、プロセスはピークの大きさで常駐する
+MAX_CELLS = 2_000_000
 
 _store: "OrderedDict[str, dict]" = OrderedDict()
 

@@ -1874,7 +1874,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
   <div class="card">
     <div class="card__title">マイロボットの決めごと</div>
     <div class="card__desc">
-      利用者が保存するマイロボット（気に入った処理の流れを、AIなしで繰り返すもの）の上限と、実行の間隔を決めます。
+      利用者が保存するマイロボット（気に入った処理の流れを、AIなしで繰り返すもの）の上限と、実行の間隔、定期実行で同時に動かす数を決めます。
       全利用者に同じ値が効きます（管理者も同じ）。保存するとすぐ反映されます。
     </div>
     <div class="row mb" style="align-items:flex-end;gap:20px;flex-wrap:wrap">
@@ -1899,13 +1899,21 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
           <span class="small muted">手順（{{ ranges.max_steps[0] }}〜{{ ranges.max_steps[1] }}）</span>
         </div>
       </div>
+      <div>
+        <label class="field">同時に動かす数</label>
+        <div class="row" style="align-items:center;gap:6px">
+          <input type="number" id="rsWorkers" min="{{ ranges.workers[0] }}" max="{{ ranges.workers[1] }}" step="1" style="width:110px">
+          <span class="small muted">本（{{ ranges.workers[0] }}〜{{ ranges.workers[1] }}）</span>
+        </div>
+      </div>
     </div>
     <div class="small muted mb">
       間隔は「前回うまくいった実行」から数えます（失敗した実行はすぐやり直せます）。
       上限に達した利用者は、使わないロボットを削除してから登録します。
       同じ名前・同じ内容のロボットは、決めごとに関係なく二重には登録できません。
-      初期値は {{ defaults.max_per_user }} 件・{{ '%g'|format(defaults.min_interval_hours) }} 時間・{{ defaults.max_steps }} 手順
-      （環境変数 ROBOT_MAX_PER_USER / ROBOT_MIN_INTERVAL_HOURS / ROBOT_MAX_STEPS でも変えられます）。
+      「同時に動かす数」は、時刻が来たロボットを定期実行で何本まで同時に動かすかです。多いほど全員に早く届きますが、そのぶん AI が混みます。
+      初期値は {{ defaults.max_per_user }} 件・{{ '%g'|format(defaults.min_interval_hours) }} 時間・{{ defaults.max_steps }} 手順・{{ defaults.workers }} 本
+      （環境変数 ROBOT_MAX_PER_USER / ROBOT_MIN_INTERVAL_HOURS / ROBOT_MAX_STEPS / ROBOT_WORKERS でも変えられます）。
     </div>
     <div class="row" style="align-items:center;gap:10px">
       <button class="btn btn--primary btn--sm" id="rsSave">保存</button>
@@ -12178,6 +12186,7 @@ function fill(s) {
     $('#rsMax').value = s.max_per_user;
     $('#rsInterval').value = s.min_interval_hours;
     $('#rsSteps').value = s.max_steps;
+    $('#rsWorkers').value = s.workers;
 }
 document.addEventListener('DOMContentLoaded', () => {
     fill(window.ROBOT_SETTINGS_INIT.settings || {});
@@ -12187,7 +12196,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const r = await api('/api/catalog/robot-settings', {
                 max_per_user: $('#rsMax').value, min_interval_hours: $('#rsInterval').value,
-                max_steps: $('#rsSteps').value });
+                max_steps: $('#rsSteps').value, workers: $('#rsWorkers').value });
             fill(r.settings || {});
             if (r.updated_at) $('#rsNote').textContent = `${r.updated_at.replace('T', ' ')} に ${r.updated_by} が保存`;
             toast('保存しました。すぐ効きます。');

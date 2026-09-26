@@ -5158,7 +5158,9 @@ def check_output_dir(path) -> tuple[bool, str]:
                            "指定してください（例: C:\\Users\\<名前>\\Desktop\\出力、\\\\server\\share\\出力）。")
     if not real.is_dir():
         return False, "フォルダがありません（共有のマウントや綴りを確認してください）。"
-    probe = real / f".書き込み確認_{os.getpid()}.tmp"
+    # 並列に動くロボットが同時に確認しても名前が重ならないように（pid だけだと同じ名前になり、
+    # 片方の消す動作がもう片方の書き込みを壊して「権限が無い」と誤って断る）
+    probe = real / f".書き込み確認_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}.tmp"
     try:
         probe.write_bytes(b"ok")
         probe.unlink()
@@ -5240,7 +5242,8 @@ def save_to_user_folder(user, filename: str, data: bytes, *, stamp: bool = True,
             while target.exists():
                 target = folder / f"{stem}_{n}{ext}"
                 n += 1
-    tmp = folder / f"{safe}.{os.getpid()}.tmp"
+    # 同じ利用者の2本のロボットが同時に同じ名前で出しても一時ファイルが重ならないように
+    tmp = folder / f"{safe}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}.tmp"
     tmp.write_bytes(data)
     os.replace(tmp, target)
     return target, replaced
@@ -6266,6 +6269,21 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
         # 消したはずの設定と表が戻ってくる。何も残さずに引き返す
         return {**result, "skipped": True,
                 "message": "実行中に設定が削除されたため、取り込みませんでした。"}
+    # 元ファイルの版（更新時刻とサイズ）は「読む前」に取る。読んでいる最中に差し替わったとき、
+    # 読んだ後の版を記録すると新しい版が「取り込み済み」扱いになり、二度と取り込まれない
+    stamp = "" if is_scraper(job) else _source_stamp(job)
+    if kind == "realtime" and not is_scraper(job):
+        # 鍵を待っている間に、別の質問（や並列に動くロボット）が同じ版を取り込み終えている・
+        # 同じ版で失敗していることがある。版をもう一度見比べ、どちらかなら取り込まない。
+        # 大きなファイルを、同時に来た質問の数だけ続けて読み直さないため。履歴にも残さない
+        fresh = get_job(job.get("id", ""))
+        if fresh is not None and stamp:
+            if stamp == str(fresh.get("source_stamp") or ""):
+                return {**result, "skipped": True,
+                        "message": "別の質問が同じ版を取り込み済みのため、取り込み直しませんでした。"}
+            if stamp == str(fresh.get("failed_stamp") or ""):
+                return {**result, "skipped": True,
+                        "message": "この版は別の質問が試して失敗済みのため、読み直しませんでした。"}
     try:
         if is_scraper(job):
             if fetched is None or fetched.get("error"):
@@ -6347,9 +6365,14 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
         "last_degraded": list(result.get("degraded") or []),
     })
     if result["ok"]:
-        # 取り込んだ時点の元ファイルの版。リアルタイム更新が
+        # 取り込んだ元ファイルの版（読む前に取ったもの）。リアルタイム更新が
         # 「変わったときだけ動く」ための基準になる（経路によらず記録する）
-        saved["source_stamp"] = _source_stamp(job)
+        saved["source_stamp"] = stamp
+        saved.pop("failed_stamp", None)
+    elif kind == "realtime" and stamp:
+        # 失敗した版を覚え、ファイルが変わるまで質問のたびに読み直さない。
+        # 鍵の中で書くので、並んで待っていた質問にも見える
+        saved["failed_stamp"] = stamp
     save_job(saved)
     history.add_import_record(job.get("db_file", ""), job.get("table", ""),
                 result["ok"], result["message"], kind=kind,
@@ -6479,16 +6502,11 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
                                  "table": job.get("table"), "db_file": job.get("db_file"),
                                  "message": saved["last_message"]})
             continue                       # 変わっていない
-        # 版の記録は run_job 側で行う（成功時のみ。失敗したら次の質問で再挑戦）
+        # 版の記録（取り込んだ版・失敗した版）は run_job 側が鍵の中で行う。
+        # 失敗した版は、ファイルが変わるまで再挑戦しない
         res = run_job(job, kind="realtime")
-        saved = get_job(job.get("id", ""))
-        if saved is not None:
-            # 失敗した版を覚える／成功したら忘れる
-            if res.get("ok"):
-                saved.pop("failed_stamp", None)
-            else:
-                saved["failed_stamp"] = stamp
-            save_job(saved)
+        if res.get("skipped"):
+            continue                   # 鍵を待つ間に、別の質問が同じ版を取り込み終えていた（または失敗済み）
         done.append({"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
                      "table": job.get("table"), "db_file": job.get("db_file"),
                      "rows": res.get("rows"),
@@ -9051,10 +9069,12 @@ def save_example():
 _ROBOT_SKIP_TOOLS = {"describe_table", "propose_glossary_term", "propose_example"}
 ROBOT_NAME_MAX = 60
 #: 管理者が決める値（管理者メニュー → マイロボット）。画面・API・env のどこから来ても、この範囲に収める
-ROBOT_SETTING_RANGES = {"max_per_user": (1, 200), "min_interval_hours": (0, 720), "max_steps": (1, 100)}
+ROBOT_SETTING_RANGES = {"max_per_user": (1, 200), "min_interval_hours": (0, 720), "max_steps": (1, 100),
+                        "workers": (1, 16)}
 ROBOT_SETTING_LABELS = {"max_per_user": "1人あたりの登録上限数",
                         "min_interval_hours": "定期実行の最短の間隔（時間）",
-                        "max_steps": "1つのロボットの手順数の上限"}
+                        "max_steps": "1つのロボットの手順数の上限",
+                        "workers": "同時に動かす数"}
 #: 「いま試す」の連打を止める間隔（分）。試運転は管理者の最低間隔の対象外で、次回の予定も動かさない
 ROBOT_TRY_GAP_MINUTES = 3
 #: メールの本文の末尾に付ける結果の表の行数。それより多いぶんは添付を見てもらう
@@ -9081,7 +9101,8 @@ class RobotConflict(ValueError):
 def _robot_setting_defaults() -> dict:
     return {"max_per_user": config.ROBOT_MAX_PER_USER,
             "min_interval_hours": config.ROBOT_MIN_INTERVAL_HOURS,
-            "max_steps": config.ROBOT_MAX_STEPS}
+            "max_steps": config.ROBOT_MAX_STEPS,
+            "workers": config.ROBOT_WORKERS}
 
 
 def _robot_clamp(key: str, value):
@@ -10576,49 +10597,100 @@ def robots_due(now: datetime | None = None) -> list[tuple]:
     return out
 
 
+def _run_scheduled_robot(app, user, robot: dict) -> dict | None:
+    """時刻が来たロボットを1つ、本人の名前で動かす（1周の中の1本。並列でも1本ずつはここを通る）。
+
+    戻り値は画面とログに出す記録。直前に止められた・消された・時刻が変わったときは None。
+    """
+    robot = _robot_claim(user, robot["id"])
+    if robot is None:                 # 直前に止められた・消された・時刻が変わった
+        return None
+    values = dict(_robot_schedule_norm(robot)["values"])
+    for h in robot.get("holes") or []:
+        values.setdefault(h["key"], str(h.get("sample") or ""))
+    ok, message = False, ""
+    try:
+        with app.test_request_context("/robots/scheduled"):
+            g.user = user
+            missing = _robot_missing_tables(robot)
+            if missing:
+                message = _robot_failed(
+                    user, robot, f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。",
+                    "schedule")
+            else:
+                chat, ok, message = _robot_execute(user, robot, values, source="schedule")
+                if chat is None:      # 手で実行中だった。押さえた印のままにせず理由を残す
+                    _robot_write_back(user, robot["id"], False, message, "schedule")
+    except Exception as e:
+        message = f"定期実行でエラー: {e}"
+        try:
+            message = _robot_failed(user, robot, message, "schedule")
+        except Exception:
+            pass
+    print(f"[robot] 定期実行 {'OK' if ok else 'NG'} 「{robot.get('name')}」（{user.username}）: {message[:120]}")
+    return {"user": user.username, "name": robot.get("name") or "（無題）", "ok": ok,
+            "message": message, "at": chats.now()}
+
+
 def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
-    """時刻が来たロボットを、本人の名前で順に実行する（スケジューラの1周分。テストからも呼べる）。
+    """時刻が来たロボットを、本人の名前で実行する（スケジューラの1周分。テストからも呼べる）。
 
     要求の外で動くので、Flask の要求の文脈を作って g.user に本人を入れる
     （手順の実行・会話の保存・権限の判断が、画面から押したときと同じ経路を通る）。
     穴の値は定期実行の設定のもの（無ければ登録時の値）。
+
+    管理者の「同時に動かす数」が 2 以上なら、その本数のスレッドで同時に動かす
+    （同じ時刻に揃った大勢のロボットを1本ずつ動かすと、最後の人に届くのが数十分遅れるため）。
+    1本ごとの実行中の印・robots.json の鍵・会話一覧の鍵は同じものが効くので、同時に動いても壊れない。
+    終了の合図が出たら（プロセスの終了処理に入ったときも）、動いている分は最後まで走らせ、
+    まだ始めていない分は次回に回す。戻りの並びは時刻が来た順（並列でも変わらない）。
     """
     app = _flask_app
-    ran = []
     if app is None:
-        return ran
-    for user, robot in robots_due(now):
-        if scheduler.stopping():          # 終了の合図。次のロボットには進まない
-            break
-        robot = _robot_claim(user, robot["id"])
-        if robot is None:                 # 直前に止められた・消された・時刻が変わった
-            continue
-        values = dict(_robot_schedule_norm(robot)["values"])
-        for h in robot.get("holes") or []:
-            values.setdefault(h["key"], str(h.get("sample") or ""))
-        ok, message = False, ""
-        try:
-            with app.test_request_context("/robots/scheduled"):
-                g.user = user
-                missing = _robot_missing_tables(robot)
-                if missing:
-                    message = _robot_failed(
-                        user, robot, f"表 {'、'.join(missing)} が見つかりません（改名・削除された可能性）。",
-                        "schedule")
-                else:
-                    chat, ok, message = _robot_execute(user, robot, values, source="schedule")
-                    if chat is None:      # 手で実行中だった。押さえた印のままにせず理由を残す
-                        _robot_write_back(user, robot["id"], False, message, "schedule")
-        except Exception as e:
-            message = f"定期実行でエラー: {e}"
-            try:
-                message = _robot_failed(user, robot, message, "schedule")
-            except Exception:
-                pass
-        ran.append({"user": user.username, "name": robot.get("name") or "（無題）", "ok": ok,
-                    "message": message, "at": chats.now()})
-        print(f"[robot] 定期実行 {'OK' if ok else 'NG'} 「{robot.get('name')}」（{user.username}）: {message[:120]}")
-    return ran
+        return []
+    due = robots_due(now)
+    if not due:
+        return []
+    workers = int(robot_settings().get("workers") or 1)
+
+    def one(pair):
+        if scheduler.stopping():          # 終了の合図。まだ始めていない分は次回に回す
+            return None
+        user, robot = pair
+        return _run_scheduled_robot(app, user, robot)
+
+    if workers <= 1 or len(due) == 1:
+        out = [one(p) for p in due]
+    else:
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        n = min(workers, len(due))
+        out = [None] * len(due)
+        running, nxt = {}, 0
+
+        def fill(pool):
+            # 空きが出るたびに1本ずつ渡す。全件を先に積むと、終了の合図（やプロセスの終了処理）が
+            # 出ても、積んだ分を全部走り切るまで止まれない
+            nonlocal nxt
+            while nxt < len(due) and len(running) < n and not scheduler.stopping():
+                try:
+                    fut = pool.submit(one, due[nxt])
+                except RuntimeError:           # 終了処理に入った。残りは次回に回す
+                    return
+                running[fut] = nxt
+                nxt += 1
+
+        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="aiagent-robot-worker") as pool:
+            fill(pool)
+            while running:
+                finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    i = running.pop(fut)
+                    try:
+                        out[i] = fut.result()
+                    except Exception as e:     # 1本の想定外で、他の本の記録を失わない
+                        print(f"[robot] 定期実行で想定外のエラー（続行）: {e}")
+                fill(pool)
+    return [r for r in out if r]
 
 
 def _robot_steps_detail(steps: list[dict], holes: list[dict] | None = None) -> list[dict]:
@@ -15859,8 +15931,8 @@ def _static_file(filename: str):
 # コマンドから直接起動したい場合は、下記も同等に使える（任意）。
 # その場合 HOST / PORT はコマンド側で指定するので、ここの値は使われない。
 #
-#   waitress-serve --host=0.0.0.0 --port=8000 --threads=8 --call core:create_app
-#   gunicorn -w 1 -b 0.0.0.0:8000 'core:create_app()'
+#   waitress-serve --host=0.0.0.0 --port=8000 --threads=32 --call core:create_app
+#   gunicorn -w 1 --threads 32 -b 0.0.0.0:8000 'core:create_app()'
 #
 # ワーカー（プロセス）は必ず 1 にすること。定期取り込みのスレッド（scheduler）が
 # ワーカーの数だけ立ち、同じジョブを多重に実行してしまうため。
@@ -15880,8 +15952,14 @@ def _static_file(filename: str):
 # ポートが他のアプリと重なると起動に失敗する。その場合は PORT を変える。
 HOST = "0.0.0.0"
 PORT = 8000
-# 同時にさばくリクエスト数（waitressのスレッド数）
-THREADS = 8
+# 同時にさばくリクエスト数（waitressのスレッド数）。
+# 回答を流している間は1本を占有するので、「同時に答えを待てる人数」の上限でもある。
+# 50人規模で、ピーク時に10人前後が同時に質問する想定の 32（スレッド自体は軽い）
+THREADS = 32
+# 同時に開いておける接続数（waitressの connection_limit。既定は100）。
+# ブラウザは1人で数本の接続を開いたまま保つので、50人分で100を超えることがある。
+# Windows の select() の上限（512）より下に留める
+CONNECTIONS = 400
 
 # エラー画面に詳細を出すか。本番では必ず False のままにすること。
 # True にすると、ブラウザからサーバ上で任意のコードを実行できてしまう。
@@ -15923,5 +16001,5 @@ if __name__ == "__main__":
             # flush: リダイレクト先がファイルだと serve() が先にブロックして
             # このメッセージがいつまでも書き出されないため
             print(f"[app] http://{HOST}:{PORT} で起動しました"
-                  f"（waitress / threads={THREADS}）", flush=True)
-            serve(app, host=HOST, port=PORT, threads=THREADS)
+                  f"（waitress / threads={THREADS} / connections={CONNECTIONS}）", flush=True)
+            serve(app, host=HOST, port=PORT, threads=THREADS, connection_limit=CONNECTIONS)
