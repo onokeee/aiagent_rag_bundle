@@ -7791,12 +7791,17 @@ def _body() -> dict:
     return b if isinstance(b, dict) else {}
 
 
+#: 静的ファイル（CSS/JS）の版。中身のハッシュを URL に ?v= で付け、更新したら必ず新しい URL になるようにする
+#: （ブラウザが古い app.js を使い続けると、画面に新しいボタンはあるのに押しても何も起きない、が起きる）
+_STATIC_VERSION = hashlib.md5("".join(STATIC_FILES[k] for k in sorted(STATIC_FILES)).encode("utf-8")).hexdigest()[:10]
+
+
 def inject_globals() -> dict:
     """全テンプレートで使う値。"""
     return {"user": g.get("user"), "app_title": config.APP_TITLE,
             "app_tagline": getattr(config, "APP_TAGLINE", ""),
             "memory_feature": bool(memory_settings()["enabled"]),
-            "nav": request.endpoint or ""}
+            "nav": request.endpoint or "", "static_v": _STATIC_VERSION}
 
 
 # --- 分析スコープ（どのDBのどのテーブルを見るか） --------------------------------
@@ -16331,6 +16336,8 @@ def _static_file(filename: str):
     data, mime, etag = ent
     res = Response(data, mimetype=mime)
     res.set_etag(etag)
+    # 使う前に必ずサーバへ確かめさせる（変わっていなければ 304 で軽い）。URL には ?v= で版も付く
+    res.headers["Cache-Control"] = "no-cache"
     return res.make_conditional(request)
 
 

@@ -166,7 +166,7 @@ TEMPLATES = {
 <title>{% block title %}{{ app_title }}{% endblock %}</title>
 {# タブのアイコン。無いとブラウザが /favicon.ico を取りに来て 404 がログに残り続ける #}
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cellipse cx=%2712%27 cy=%275.5%27 rx=%277.5%27 ry=%272.8%27 fill=%27none%27 stroke=%27%23b8552f%27 stroke-width=%271.8%27/%3E%3Cpath d=%27M4.5 5.5v6c0 1.55 3.36 2.8 7.5 2.8s7.5-1.25 7.5-2.8v-6M4.5 11.5v6c0 1.55 3.36 2.8 7.5 2.8s7.5-1.25 7.5-2.8v-6%27 fill=%27none%27 stroke=%27%23b8552f%27 stroke-width=%271.8%27/%3E%3C/svg%3E">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v=static_v) }}">
 </head>
 <body class="{% block body_class %}{% endblock %}">
 {% include "_icons.html" %}
@@ -256,7 +256,7 @@ TEMPLATES = {
 {% block scripts %}{% endblock %}
 {# 統合スクリプト（旧 common/er/manage/各画面JS）。画面の window.* 変数を
    見て自分の画面のぶんだけ動くので、必ずインライン変数より後に読む #}
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js', v=static_v) }}"></script>
 </body>
 </html>
 """,
@@ -1271,7 +1271,7 @@ window.KB_INIT = {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ログイン — {{ app_title }}</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v=static_v) }}">
 </head>
 <body>
 {% include "_icons.html" %}
@@ -5178,8 +5178,11 @@ const ER = (() => {
         return r;
     }
     async function openDiscover() {
+        // 押した瞬間に何か見せる（状態の取得が遅い・失敗したときに「何も起きない」に見せない）
+        showPanel('結合を探す', [el('div', { class: 'small muted' }, '状態を確認しています…')], { kind: 'discover' });
         let st;
-        try { st = await fetchJoinStatus(); } catch (e) { toast(e.message, 'err'); return; }
+        try { st = await fetchJoinStatus(); }
+        catch (e) { showPanel('結合を探す', [el('div', { class: 'alert alert--err small' }, `状態を取れませんでした: ${e.message}`)]); return; }
         if (st.running) { showDiscoverProgress(); return; }
         const stale = (st.new || []).length + (st.changed || []).length;
         const lines = [];
