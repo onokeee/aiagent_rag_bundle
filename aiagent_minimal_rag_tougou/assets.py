@@ -481,7 +481,7 @@ TEMPLATES = {
         <button class="btn btn--sm" id="erDiscover"
                 title="全表の全列を実データで調べて、結合の候補と多重度の推定を保存します。&#10;表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません">結合を探す</button>
         <button class="btn btn--sm" id="erAddTable"
-                title="いま表示しているまとまりに、別のまとまりの表を1つずつ足します。&#10;またぎの関連を引くときに、「すべて」で104表を出さずに済みます">＋ 別のまとまりの表</button>
+                title="いま表示しているまとまりに、別のまとまりの表を1つずつ足します。&#10;またぎの関連を引くときに、「すべて」で104表を出さずに済みます。&#10;足した表が画面の外にあれば、見えている範囲の空いた場所に置きます（拡大率と位置は動かしません）">＋ 別のまとまりの表</button>
         <button class="btn btn--sm" id="erReach"
                 title="いま表示しているまとまりの表から、登録済みの関連を枝葉の先までたどって、届く表をすべて出します（破線の枠）。&#10;（+N）は押すと増える表の数。もう一度押すと、直接つながる表だけの表示に戻ります。&#10;結合候補（未登録の推測）はたどりません。まとまりを切り替えても押した状態は残ります">つながる表をすべて</button>
         {% endif %}
@@ -4353,6 +4353,7 @@ const ER = (() => {
     let showSug = false;        // 候補の青線を重ねるか
     let sugOnlyIds = new Set(); // 候補のためだけに画面へ出している表（青枠で描く）
     let reachAll = false;       // 「つながる表をすべて」: 隣の表で止めず、関連を枝葉の先までたどって出す
+    let pendingPlace = new Set(); // 隠れたタブで出た表（大きさが測れず置けなかった）。次に見えたとき（refit）に置く
     /** いま表示しているまとまりの表の id */
     function groupIds() {
         return new Set(data.nodes
@@ -4450,6 +4451,97 @@ const ER = (() => {
             if (t && wasSugOnly.has(id) && !base.has(id)) { extraShown.add(id); kept = true; }
         });
         if (kept) render();
+    }
+
+    /** いま画面に出ている表の id（描いた結果から取る） */
+    function shownIdSet() { return new Set($$('.ertable', world).map(b => b.dataset.id)); }
+    /** 人の操作で新しく出た表を、見えている範囲へ置く。操作の前に shownIdSet() を控えて渡す。
+        （関連の追加・削除や元に戻す／やり直すの描き直しでは呼ばない。履歴が入れ子になって壊れるため） */
+    function placeNew(before, quiet) {
+        placeIntoView(new Set([...shownIdSet()].filter(id => !before.has(id))), quiet);
+    }
+    /** 新しく画面に出た表（足した表・枝葉までたどって届いた表・候補の相手）が、いま見えている範囲の外に
+        あれば、見えている範囲の中の空いた場所へ置く。空きが無ければ左上（ツールバーの下）に重ねて寄せる。
+        拡大率と位置は動かさない（見ていた場所を見失わないため）。置き直しは表をドラッグしたのと同じ扱いで、
+        1手として積む（Ctrl+Z で元の位置に戻せる。保存すればその位置で残る）。 */
+    function placeIntoView(newIds, quiet) {
+        if (!newIds.size || !groupFilter) return;
+        const r = viewport.getBoundingClientRect();
+        if (!r.width || !r.height) { newIds.forEach(id => pendingPlace.add(id)); return; }   // 隠れたタブでは測れない
+        const k = view.k;
+        const vis = { x: -view.tx / k, y: -view.ty / k, w: r.width / k, h: r.height / k };
+        const pad = 16 / k;                                       // 画面上の 16px
+        const headH = 30 / k;                                     // 見出し（つまんで動かせる部分）の高さ
+        const toWorld = b => ({ x: (b.left - r.left - view.tx) / k, y: (b.top - r.top - view.ty) / k,
+                                w: b.width / k, h: b.height / k });
+        const rectOf = n => {
+            const b = world.querySelector(`.ertable[data-id="${CSS.escape(n.id)}"]`);
+            return { x: n.x, y: n.y, w: b?.offsetWidth || 232, h: b?.offsetHeight || 120 };
+        };
+        const overlap = (a, b, gap) => a.x < b.x + b.w + gap && a.x + a.w + gap > b.x
+                                    && a.y < b.y + b.h + gap && a.y + a.h + gap > b.y;
+        const within = (a, b) => a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h;
+        // 図に被さっている道具（ツールバー・凡例・右下のパネル）。その下は「見えていない」扱いにし、置き場所からも外す
+        const tbEl = root.querySelector('.er__toolbar');
+        const overlays = [tbEl, root.querySelector('.er__legend'), panel]
+            .filter(e => e && e.getClientRects().length)
+            .map(e => ({ ...toWorld(e.getBoundingClientRect()), overlay: true }));
+        const shown = shownNodes();
+        // 一部でも見えている表はそのまま。まったく見えない表（道具にすっぽり隠れている表も）だけ置き直す
+        const moving = shown.filter(n => {
+            if (!newIds.has(n.id)) return false;
+            const b = rectOf(n);
+            return !overlap(b, vis, 0) || overlays.some(o => within(b, o));
+        });
+        if (!moving.length) return;
+        const occupied = [...shown.filter(n => !moving.includes(n)).map(rectOf), ...overlays];
+        const step = 24 / k;                                      // 画面上の 24px 刻みで空きを探す
+        // 寄せ先の左上はツールバーの下
+        const tb = tbEl && tbEl.getClientRects().length ? toWorld(tbEl.getBoundingClientRect()) : null;
+        const originY = tb ? tb.y + tb.h + pad : vis.y + pad;
+        const before = {}, after = {};
+        let packed = 0;
+        moving.forEach(n => {
+            const box = rectOf(n);
+            // 見えている範囲より大きい表は、範囲に収まる分（見出しを含む左上）だけで空きを探す
+            const cw = Math.min(box.w, vis.w - 2 * pad), ch = Math.min(box.h, vis.h - 2 * pad);
+            let spot = null;
+            for (let y = vis.y + pad; y + ch <= vis.y + vis.h - pad && !spot; y += step) {
+                for (let x = vis.x + pad; x + cw <= vis.x + vis.w - pad; x += step) {
+                    const cand = { x, y, w: cw, h: ch };
+                    if (!occupied.some(o => overlap(cand, o, pad))) { spot = { x, y, w: box.w, h: box.h }; break; }
+                }
+            }
+            // 空きが無ければ左上（ツールバーの下）に寄せる。体は重なってもよいが、見出しだけは他の表の見出しや
+            // 道具と重ねない（見出しをつまめば動かせるように）。見出しの高さ刻みで左上から順に探す
+            if (!spot) {
+                const sx = Math.max(step, headH), sy = Math.max(step, headH);
+                const nx = Math.max(1, Math.floor((vis.w - 2 * pad - cw) / sx));
+                const ny = Math.max(1, Math.floor((vis.y + vis.h - pad - headH - originY) / sy));
+                const heads = occupied.map(o => (o.overlay ? o : { x: o.x, y: o.y, w: o.w, h: Math.min(o.h, headH) }));
+                for (let t = 0; t < nx * ny && !spot; t++) {
+                    const c = { x: vis.x + pad + (t % nx) * sx, y: originY + (Math.floor(t / nx) % ny) * sy, w: cw, h: headH };
+                    if (!heads.some(h => overlap(c, h, 0))) spot = { x: c.x, y: c.y, w: box.w, h: box.h };
+                }
+                // 見出しの置き場すら無いときは、順にずらして重ねる
+                if (!spot) spot = { x: vis.x + pad + (packed % nx) * sx, y: originY + (packed % ny) * sy, w: box.w, h: box.h };
+                packed++;
+            }
+            occupied.push(spot);
+            before[n.id] = { x: n.x, y: n.y };
+            after[n.id] = { x: Math.round(spot.x), y: Math.round(spot.y) };
+        });
+        const apply = m => {
+            data.nodes.forEach(n => { if (m[n.id]) { n.x = m[n.id].x; n.y = m[n.id].y; } });
+            $$('.ertable', world).forEach(b => {
+                const p = m[b.dataset.id];
+                if (p) { b.style.left = `${p.x}px`; b.style.top = `${p.y}px`; }
+            });
+            drawEdges(); syncHistoryUi();
+        };
+        record({ label: `見える位置に置く（${moving.length}表）`, undo: () => apply(before), redo: () => apply(after) },
+               { keepFuture: !!quiet });
+        apply(after);
     }
 
     function render() {
@@ -4749,10 +4841,12 @@ const ER = (() => {
 
     /* --- 履歴 ---------------------------------------------------------------- */
 
-    function record(entry) {
+    function record(entry, opts) {
         past.push(entry);
         if (past.length > HIST_MAX) past.shift();
-        future = [];                      // 新しい操作をしたら「やり直す」先は消える
+        // 新しい操作をしたら「やり直す」先は消える。ただし人の操作でない置き直し（結合を探すの完了・
+        // タブを開いたときの置き残し）は、やり直す先を残す（位置の絶対値を持つので、置き直し後も有効）
+        if (!(opts && opts.keepFuture)) future = [];
         syncHistoryUi();
     }
 
@@ -5177,6 +5271,7 @@ const ER = (() => {
                 gsel.addEventListener('change', () => {
                     groupFilter = gsel.value || null;
                     extraShown.clear();          // 足した表はまとまりごとの一時的なもの
+                    pendingPlace.clear();        // 切り替え後は全体に合わせるので、置き残しは捨てる
                     syncAddBtn();
                     render(); setTimeout(fit, 20);
                 });
@@ -5188,6 +5283,7 @@ const ER = (() => {
         }
         extraShown.clear();
         reachAll = false;
+        pendingPlace.clear();
         syncAddBtn();
         svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
         render();
@@ -5208,19 +5304,23 @@ const ER = (() => {
         once('#erSave', saveLayout);
         once('#erAddTable', ev => { ev.stopPropagation(); openAddTable(); });
         once('#erSuggest', () => {
+            const before = shownIdSet();
             showSug = !showSug;
             if (selected?.type === 'sug') closePanel();
             syncSugBtn();
             render();                       // 候補の相手テーブルが出入りする
-            // 拡大率と位置は動かさない。出すときに全体へ合わせていたが、
-            // 見ていた場所を見失うので、出すときも消すときもそのまま残す
+            // 拡大率と位置は動かさない（見ていた場所を見失うため）。出てきた相手の表が画面の外なら、
+            // 見えている範囲へ置く
+            if (showSug) placeNew(before);
         });
         once('#erDiscover', openDiscover);
         once('#erReach', () => {
+            const before = shownIdSet();
             reachAll = !reachAll;
             render();                       // 枝葉の表が出入りする
             // 拡大率と位置は動かさない（結合候補と同じ。動くと見ていた場所を見失う）。
-            // 届いた表が画面の外にあるときは、縮小して探してもらう
+            // 届いた表が画面の外にあるときは、見えている範囲へ置く
+            if (reachAll) placeNew(before);
         });
         once('#erUndo', undo);
         once('#erRedo', redo);
@@ -5336,8 +5436,12 @@ const ER = (() => {
                 else toast(`結合を探すのに失敗しました: ${p.error}`, 'err', 9000);
                 return;
             }
+            // 候補を取り直す前に「いま出ている表」を控える（取り直しの描き直しで相手の表が増えるため。
+            // 候補を出したままなら、控えるのが後だと増えた表に気づけない）
+            const before = shownIdSet();
             await refreshSuggestions();
             showSug = true; syncSugBtn(); render();   // 拡大率と位置は動かさない（見ていた場所を見失わないため）
+            placeNew(before, true);                    // 相手の表が画面の外なら見えている範囲へ（隠れたタブなら次に見えたとき）
             const msg = p.message || `候補 ${suggestions.length} 件`;
             if (mine()) {
                 showPanel('結合を探しました', [
@@ -5386,8 +5490,10 @@ const ER = (() => {
             list.replaceChildren(...cands
                 .filter(n => !needle || String(n.table).toLowerCase().includes(needle))
                 .map(n => el('button', { class: 'mlist__item', onclick: () => {
+                    const before = shownIdSet();
                     extraShown.add(n.id);
-                    render(); setTimeout(fit, 20);
+                    render();
+                    placeNew(before);           // 画面の外なら見えている範囲へ置く。拡大率と位置は動かさない
                     closeAddPop();
                 } }, el('span', { class: 'mlist__desc' }, n.table))));
             if (!list.children.length) {
@@ -5443,9 +5549,14 @@ const ER = (() => {
         syncHistoryUi();
     }
 
-    // refit はタブを開いたときに呼ばれる。初めて見えたとき（隠れたまま fit できなかったとき）だけ合わせ、
-    // 2回目以降のタブ切り替えでは見ていた拡大率と位置をそのまま残す
-    return { init, refit: () => { if (needFit) fit(); }, mutate, setUsage, setSuggestions, setJoinStatus, dropTable };
+    /** タブを開いたときに呼ばれる。初めて見えたとき（隠れたまま fit できなかったとき）だけ全体に合わせ、
+        2回目以降のタブ切り替えでは見ていた拡大率と位置をそのまま残す。
+        隠れている間に出た表（結合を探すの完了など）が置けずに残っていれば、ここで見えている範囲へ置く */
+    function refit() {
+        if (needFit) { fit(); pendingPlace.clear(); return; }
+        if (pendingPlace.size) { const ids = new Set(pendingPlace); pendingPlace.clear(); placeIntoView(ids, true); }
+    }
+    return { init, refit, mutate, setUsage, setSuggestions, setJoinStatus, dropTable };
 })();
 
 // ===== 元 manage.js =====
