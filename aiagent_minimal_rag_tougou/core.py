@@ -3569,6 +3569,7 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
     """
     S = max(100, int(config.LINK_CHECK_SAMPLE_ROWS))
     PS = max(S, int(config.JOIN_PARENT_SAMPLE_ROWS))
+    U = S * 50                                     # 一意性の先頭確認に読む行数（既定 10万行）
     T = config.LINK_CHECK_TIMEOUT_SEC
     started = time.time()
     saved = load_join_candidates(path) or {}
@@ -3611,9 +3612,17 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
             info = {"table": tn, "col": cn, "kind": kind, "n": 0, "capped": False, "unique": None,
                     "has_null": None, "sample": [], "pset": None, "pfull": None, "is_pk": False}
             try:
-                reset()
-                sample = [r[0] for r in conn.execute(
-                    f'SELECT DISTINCT {q(cn)} FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL LIMIT {S}')]
+                rows_t = int(ptables[tn].get("row_count") or 0)
+                stat = (ptables[tn].get("col_stats") or {}).get(cn) or {}
+                if isinstance(stat.get("values"), list):
+                    # 値の種類が少ない列（20以下）は表の一覧の控えに値が載っているので、表を読まない
+                    raw = [v[0] if isinstance(v, (list, tuple)) else v for v in stat["values"]]
+                    sample = [v for v in raw if v is not None]
+                    info["has_null"] = any(v is None for v in raw)
+                else:
+                    reset()
+                    sample = [r[0] for r in conn.execute(
+                        f'SELECT DISTINCT {q(cn)} FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL LIMIT {S}')]
                 info["n"], info["capped"] = len(sample), len(sample) >= S
                 info["sample"] = sample
                 if info["n"] < 5 or any(len(str(v)) > 100 for v in sample[:50]):
@@ -3631,14 +3640,22 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
                         info["unique"] = True if pk_src == "declared" else None
                     if info["unique"] is None and _declared_unique(conn, "c", tn, cn):
                         info["unique"] = True
+                    if info["unique"] is None and not info["capped"] and info["n"] * 2 < rows_t:
+                        info["unique"] = False     # 値の種類が行数の半分未満＝必ず重複がある（読まずに確定）
                     if info["unique"] is None:
+                        # まず先頭 U 行で重複を探す（大半の列はここで「一意でない」と確定し、全行の並べ替えを避ける）
                         reset()
-                        dup = conn.execute(f'SELECT 1 FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL '
-                                           f'GROUP BY {q(cn)} HAVING COUNT(*) > 1 LIMIT 1').fetchone()
-                        info["unique"] = dup is None
-                    reset()
-                    info["has_null"] = conn.execute(
-                        f'SELECT 1 FROM "c".{q(tn)} WHERE {q(cn)} IS NULL LIMIT 1').fetchone() is not None
+                        dup = conn.execute(
+                            f'SELECT 1 FROM (SELECT {q(cn)} AS v FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL LIMIT {U}) '
+                            'GROUP BY v HAVING COUNT(*) > 1 LIMIT 1').fetchone()
+                        if dup is not None or rows_t <= U:
+                            info["unique"] = dup is None
+                        else:
+                            reset()
+                            dup = conn.execute(f'SELECT 1 FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL '
+                                               f'GROUP BY {q(cn)} HAVING COUNT(*) > 1 LIMIT 1').fetchone()
+                            info["unique"] = dup is None
+                    # 空欄の有無は、候補になりそうな組でだけ調べる（後段）
                 if info["unique"]:
                     reset()
                     info["pset"] = {str(r[0]) for r in conn.execute(
@@ -3676,6 +3693,9 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
                     continue                   # 連番の主キーどうし（1..N が両方にある）は偶然の一致。結合ではない
                 if subset and ch["table"] not in subset and pa["table"] not in subset:
                     continue                   # 調べ直す表に関わらない組は保存済みを引き継ぐ
+                if (pa["kind"] == "INTEGER" and ch["n"] < 1000 and ch["n"] < 0.5 * min(pa["n"], S)
+                        and not (ch["col"].lower() == pa["col"].lower() and ch["col"].lower() not in ("id", "no", "code"))):
+                    continue                   # 参照率が5割に届き得ない（後段の規則で必ず落ちる）ので SQL を出さない
                 if pa["pfull"]:
                     ov = -1.0                  # 大きな親は標本で絞らず実データで直接引く（索引つきなので速い）
                 else:
@@ -3691,11 +3711,25 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
         temp_made: set = set()
 
         def temp_of(c, prefix):
+            """標本の一時表。読んであった標本を入れるだけで表は読み直さない。列の型を宣言して比較の型を揃える。"""
             name = temp_name(c, prefix)
+            if name not in temp_made:
+                conn.execute(f"CREATE TEMP TABLE {name} (v {c['kind']})")
+                conn.executemany(f"INSERT INTO {name} VALUES (?)", [(v,) for v in c["sample"]])
+                temp_made.add(name)
+            return name
+
+        def full_of(c):
+            """子の列の全種類（索引つき）。参照率の計算で親の標本を引くのに使う（組ごとに子の表を読み直さない）。"""
+            if c["pfull"]:
+                return c["pfull"]
+            name = temp_name(c, "jcf")
             if name not in temp_made:
                 reset()
                 conn.execute(f'CREATE TEMP TABLE {name} AS SELECT DISTINCT {q(c["col"])} AS v '
-                             f'FROM "c".{q(c["table"])} WHERE {q(c["col"])} IS NOT NULL LIMIT {S}')
+                             f'FROM "c".{q(c["table"])} WHERE {q(c["col"])} IS NOT NULL')
+                reset()
+                conn.execute(f"CREATE INDEX {name}_i ON {name}(v)")
                 temp_made.add(name)
             return name
 
@@ -3704,8 +3738,21 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
                 tc = temp_of(ch, "jc")
                 src = (f"SELECT v FROM {pa['pfull']}" if pa["pfull"]
                        else f'SELECT {q(pa["col"])} FROM "c".{q(pa["table"])}')
+                # 型が違う組は、引く側を相手の型に合わせる（そのままだと索引が使えず、相手を毎回全走査して
+                # 1組 100ms 近くかかる。合わせれば 0.1ms）
+                sv = "s.v" if ch["kind"] == pa["kind"] else f"CAST(s.v AS {pa['kind']})"
+                sc = "s.v" if ch["kind"] == pa["kind"] else f"CAST(s.v AS {ch['kind']})"
+                if pa["pfull"]:
+                    # 大きな親は組を絞っていない（全列と組む）ので、まず先頭100種類だけ引く。
+                    # 半分も親に無ければ9割一致はあり得ないので、ここで落とす
+                    reset()
+                    pre = conn.execute(
+                        f"SELECT COUNT(*) FROM (SELECT v FROM {tc} LIMIT 100) s WHERE {sv} IN ({src})").fetchone()[0]
+                    if pre < 50:
+                        tell("組の確認", i, len(pairs))
+                        continue
                 reset()
-                matched = conn.execute(f"SELECT COUNT(*) FROM {tc} s WHERE s.v IN ({src})").fetchone()[0]
+                matched = conn.execute(f"SELECT COUNT(*) FROM {tc} s WHERE {sv} IN ({src})").fetchone()[0]
                 rate = matched / ch["n"]
                 # 同じ列名は手がかりにするが、id のような汎用の名前は数えない
                 same_name = ch["col"].lower() == pa["col"].lower() and ch["col"].lower() not in ("id", "no", "code")
@@ -3713,12 +3760,15 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
                     tell("組の確認", i, len(pairs))
                     continue
                 tp = temp_of(pa, "jp")
+                src_c = full_of(ch)
                 reset()
-                hit = conn.execute(
-                    f'SELECT COUNT(*) FROM {tp} s WHERE s.v IN (SELECT {q(ch["col"])} FROM "c".{q(ch["table"])})'
-                ).fetchone()[0]
+                hit = conn.execute(f"SELECT COUNT(*) FROM {tp} s WHERE {sc} IN (SELECT v FROM {src_c})").fetchone()[0]
                 n_p = min(pa["n"], S)
                 cov = hit / n_p if n_p else 0.0
+                if ch["has_null"] is None:         # 空欄の有無は候補になりそうな組でだけ調べる
+                    reset()
+                    ch["has_null"] = conn.execute(
+                        f'SELECT 1 FROM "c".{q(ch["table"])} WHERE {q(ch["col"])} IS NULL LIMIT 1').fetchone() is not None
                 if ch["n"] <= 10 and n_p >= 10 and cov < 0.5:
                     tell("組の確認", i, len(pairs))
                     continue                   # 区分値と ID の偶然の一致
