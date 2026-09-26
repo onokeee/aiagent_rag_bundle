@@ -477,7 +477,7 @@ TEMPLATES = {
           {% endif %}{% endfor %}
         </select>
         <button class="btn btn--sm" id="erSuggest"
-                title="登録されていない結合の候補を赤い線で重ねます（「結合を探す」で保存した候補。無ければ列名からの推測）。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
+                title="「結合を探す」で作った結合の候補（と、過去のSQLで使われたのに未登録の結合）を赤い線で重ねます。まだ探していなければ空です。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
         <button class="btn btn--sm" id="erDiscover"
                 title="全表の全列を実データで調べて、結合の候補と多重度の推定を保存します。&#10;表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません">結合を探す</button>
         <button class="btn btn--sm" id="erAddTable"
@@ -4339,7 +4339,7 @@ const ER = (() => {
         自動的に描かれない（edgePath 側で特別扱いしなくてよい）。 */
     let groupFilter = null;   // 元DBグループ（表名の「__」より前）での絞り込み。null=全部
     let extraShown = new Set(); // まとまり表示に手で足した表（またぎ関連を引くため）
-    let suggestions = [];       // 結合候補（列名からの推測）。setSuggestions で受け取る
+    let suggestions = [];       // 結合候補（「結合を探す」で保存したもの＋過去のSQL由来）。setSuggestions で受け取る
     let showSug = false;        // 候補の赤線を重ねるか
     let sugOnlyIds = new Set(); // 候補のためだけに画面へ出している表（赤枠で描く）
     function shownNodes() {
@@ -5169,7 +5169,8 @@ const ER = (() => {
         const b = $('#erDiscover');
         if (!b) return;
         const stale = joinStatus ? (joinStatus.new || []).length + (joinStatus.changed || []).length : 0;
-        b.textContent = joinStatus?.exists && stale ? `結合を探す（表が増えました ${stale}）` : '結合を探す';
+        b.textContent = joinStatus && !joinStatus.exists ? '結合を探す（まだ探していません）'
+            : (joinStatus?.exists && stale ? `結合を探す（表が増えました ${stale}）` : '結合を探す');
     }
     async function fetchJoinStatus() {
         const r = await api(`/api/catalog/joins/status?db=${encodeURIComponent(CAT.db)}`, undefined, 'GET');

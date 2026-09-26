@@ -2743,197 +2743,6 @@ def drift_warnings(profile: dict, meta: dict) -> list[str]:
     return warns
 
 
-#: 列の値の標本。DBファイルの更新時刻が変わるまで使い回す
-#: （候補APIは関連を触るたびに呼ばれるので、毎回700列を読み直さない）。
-_suggest_cache: dict = {}
-
-
-def _suggest_values(db_path, profile: dict) -> tuple[dict, dict]:
-    """(列ごとの値の標本, 単独主キーの全値) を返す。
-
-    標本は列あたり最大200個。主キー側は照合の分母になるので全部持つ
-    （このアプリの表は大きくても数千行）。
-    """
-    key = (str(db_path), Path(db_path).stat().st_mtime_ns)
-    hit = _suggest_cache.get(key)
-    if hit:
-        return hit
-    samples: dict = {}
-    pk_values: dict = {}
-    conn = db.connect_ro(db_path)
-    try:
-        for tname, t in profile["tables"].items():
-            pks = [c["name"] for c in t["columns"] if c["pk"]]
-            for c in t["columns"]:
-                if c["type"] not in ("TEXT", "INTEGER"):
-                    continue
-                try:
-                    if len(pks) == 1 and c["name"] == pks[0]:
-                        rows = conn.execute(
-                            f'SELECT DISTINCT "{c["name"]}" FROM "{tname}" '
-                            f'WHERE "{c["name"]}" IS NOT NULL LIMIT 20000').fetchall()
-                        pk_values[(tname, c["name"])] = {str(r[0]) for r in rows}
-                    rows = conn.execute(
-                        f'SELECT DISTINCT "{c["name"]}" FROM "{tname}" '
-                        f'WHERE "{c["name"]}" IS NOT NULL LIMIT 200').fetchall()
-                    samples[(tname, c["name"])] = {str(r[0]) for r in rows}
-                except Exception:
-                    continue
-    finally:
-        conn.close()
-    _suggest_cache.clear()          # DBは1つ。古い版を抱えない
-    _suggest_cache[key] = (samples, pk_values)
-    return samples, pk_values
-
-
-def join_suggestions(profile: dict, meta: dict, db_path=None) -> list[dict]:
-    """結合候補。列名のヒューリスティックに加えて、db_path があれば
-    実データの値の重なりで裏を取る（一致率を根拠に添え、0%は出さない。
-    さらに、列名が違っても値がほぼ一致する列は候補として拾い上げる）。"""
-    ptables = profile.get("tables", {})
-    existing = set()
-    for rel in (meta.get("relationships") or []):
-        pr = rel_pairs(rel, "@own")
-        if pr:  # 複合キーは列ペアごとに「既存」とみなす（片列の候補を出さない）
-            (fa, ftb), (ta, ttb), pairs = pr
-            for fc, tc in pairs:
-                existing.add((f"{ftb}.{fc}".lower(), f"{ttb}.{tc}".lower()))
-        else:
-            existing.add((str(rel.get("from", "")).lower(), str(rel.get("to", "")).lower()))
-    for tname, t in ptables.items():
-        for fk in t.get("fks", []):
-            existing.add((f"{tname}.{fk['from']}".lower(), f"{fk['table']}.{fk['to']}".lower()))
-
-    sugs = []
-    for tname, t in ptables.items():
-        for col in t.get("columns", []):
-            cname = col["name"]
-            low = cname.lower()
-            if not low.endswith("_id") and not low.endswith("id"):
-                continue
-            base = low[:-3] if low.endswith("_id") else None
-            if not base:
-                continue
-            # 候補テーブル名: base / base+"s" / base+"es"
-            for cand in (base, base + "s", base + "es"):
-                target = next((n for n in ptables if n.lower() == cand), None)
-                if not target or target == tname:
-                    continue
-                tcols = ptables[target]["columns"]
-                pk = next((c["name"] for c in tcols if c["pk"]), None)
-                # 複合主キーの相手に1列だけで結合する候補は誤りになるので出さない
-                if len([c for c in tcols if c["pk"]]) > 1:
-                    continue
-                to_col = pk or next((c["name"] for c in tcols if c["name"].lower() in ("id", low)), None)
-                if not to_col:
-                    continue
-                frm, to = f"{tname}.{cname}", f"{target}.{to_col}"
-                if (frm.lower(), to.lower()) in existing:
-                    continue
-                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
-                             "reason": f"列名 '{cname}' → テーブル '{target}' の推測"})
-                break
-
-    # 同じ名前の列が、別の表の「単独の主キー」になっている（equip_code →
-    # equipment.equip_code のようなマスタ参照の型）。*_id の規約が無いデータでは
-    # こちらが本命になる。まとまり違いの同型表（兄弟）同士は誤りなので出さない。
-    def _suffix(name):
-        return name.split("__", 1)[1] if "__" in name else name
-
-    def _group(name):
-        return name.split("__", 1)[0] if "__" in name else ""
-
-    pk_owner: dict = {}
-    for tname, t in ptables.items():
-        pks = [c["name"] for c in t["columns"] if c["pk"]]
-        if len(pks) == 1:
-            pk_owner.setdefault(pks[0].lower(), []).append((tname, pks[0]))
-
-    seen = {(s["from"].lower(), s["to"].lower()) for s in sugs}
-    for tname, t in ptables.items():
-        for col in t.get("columns", []):
-            cands = [(tt, tc) for tt, tc in pk_owner.get(col["name"].lower(), [])
-                     if tt != tname and _suffix(tt) != _suffix(tname)]
-            if not cands:
-                continue
-            # 同じまとまりに相手がいればそれだけ。いなければ「またぎ」の候補に
-            # なるが、相手が多すぎる（同名の主キーが4表以上）ものは曖昧すぎる
-            # ので出さない（equip の部品コード → 全拠点の部品表、のような総当たり）
-            same = [c for c in cands if _group(c[0]) == _group(tname)]
-            if not same and len(cands) > 3:
-                continue
-            for target, to_col in (same or cands):
-                frm, to = f"{tname}.{col['name']}", f"{target}.{to_col}"
-                if (frm.lower(), to.lower()) in existing or (frm.lower(), to.lower()) in seen:
-                    continue
-                seen.add((frm.lower(), to.lower()))
-                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
-                             "reason": f"同じ名前の列 '{col['name']}' が "
-                                       f"'{target}' の主キー"})
-
-    if db_path is None:
-        return sugs
-
-    samples, pk_values = _suggest_values(db_path, profile)
-
-    def _overlap(frm: str, to: str):
-        ft, fc = frm.split(".")
-        tt, tc = to.split(".")
-        s_ = samples.get((ft, fc))
-        p_ = pk_values.get((tt, tc)) or samples.get((tt, tc))
-        if not s_ or not p_:
-            return None
-        return len(s_ & p_) / len(s_)
-
-    # 名前ベースの候補に一致率を添える。値が全く重ならない候補は、
-    # JOINしても1行も繋がらない＝間違いなので出さない
-    checked = []
-    for sg in sugs:
-        r = _overlap(sg["from"], sg["to"])
-        if r is not None:
-            if r == 0:
-                continue
-            sg = {**sg, "reason": sg["reason"] + f"／値の一致 {r * 100:.0f}%"}
-        checked.append(sg)
-    sugs = checked
-    seen = {(s_["from"].lower(), s_["to"].lower()) for s_ in sugs}
-
-    # 列名が違っても、値がほぼすべて相手の主キーに存在する列（9割以上）。
-    # 名前の手がかりが無いぶん厳しめに見る。小さすぎる集合は偶然一致する
-    # （例: 2値のコード）ので、両側とも5種類以上あるときだけ。
-    for tname, t in ptables.items():
-        for col in t.get("columns", []):
-            frm_key = (tname, col["name"])
-            s_ = samples.get(frm_key)
-            if not s_ or len(s_) < 5:
-                continue
-            hits = []
-            for (tt, tc), p_ in pk_values.items():
-                if tt == tname or _suffix(tt) == _suffix(tname) or len(p_) < 5:
-                    continue
-                frm, to = f"{tname}.{col['name']}", f"{tt}.{tc}"
-                if (frm.lower(), to.lower()) in existing or (frm.lower(), to.lower()) in seen:
-                    continue
-                r = len(s_ & p_) / len(s_)
-                if r >= 0.9:
-                    hits.append((r, tt, tc))
-            if not hits:
-                continue
-            # 名前の手がかりが無い発見は、相手が1つに絞れるときだけ出す。
-            # 日付列は全拠点のカレンダーに一致してしまうので、同じまとまりの
-            # カレンダーが無ければ「どれと繋ぐべきか」を機械では決められない
-            same = [h for h in hits if _group(h[1]) == _group(tname)]
-            if not same and len(hits) > 1:
-                continue
-            for r, tt, tc in (same or hits):
-                frm, to = f"{tname}.{col['name']}", f"{tt}.{tc}"
-                seen.add((frm.lower(), to.lower()))
-                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
-                             "reason": f"列名は違うが値が一致"
-                                       f"（{r * 100:.0f}%が '{tt}.{tc}' に存在）"})
-    return sugs
-
-
 def coverage(profile: dict, meta: dict) -> dict:
     """メタ情報の充実度。カタログページの案内表示に使う。"""
     ptables = profile.get("tables", {})
@@ -3705,6 +3514,33 @@ def saved_join_suggestions(path, profile: dict, meta: dict) -> list[dict] | None
         out.append({"from": c["from"], "to": c["to"], "cardinality": card_norm(c.get("cardinality")) or CARD_DEFAULT,
                     "reason": c.get("reason", "")})
     return out
+
+
+def rename_join_candidates(path, old: str, new: str) -> int:
+    """表の改名に合わせて、保存した候補・列の記録・定義の指紋の表名を付け替える。付け替えた候補の数を返す。
+
+    改名しても列と型は同じなので指紋は変わらず、探し直さずに済む（まとまりの改名も表ごとにここを通る）。
+    """
+    saved = load_join_candidates(path)
+    if not saved:
+        return 0
+
+    def fix(ref):
+        tb, _, col = str(ref or "").partition(".")
+        return f"{new}.{col}" if tb == old else ref
+
+    n = 0
+    for c in saved.get("candidates") or []:
+        if old in (c.get("tables") or []):
+            c["from"], c["to"] = fix(c.get("from")), fix(c.get("to"))
+            c["tables"] = [new if x == old else x for x in (c.get("tables") or [])]
+            n += 1
+    saved["columns"] = {fix(k): v for k, v in (saved.get("columns") or {}).items()}
+    fp = saved.get("fingerprints") or {}
+    if old in fp:
+        fp[new] = fp.pop(old)
+    _write_json(config.JOIN_CANDIDATES_FILE, saved)
+    return n
 
 
 def _col_kind(ctype: str) -> str | None:
@@ -7695,8 +7531,10 @@ def rename_table(path: Path, old: str, new: str) -> dict:
         raise
 
     catalog.forget(path)
+    # 「結合を探す」の保存も付け替える（探し直さなくて済むように）
+    joins_hit = catalog.rename_join_candidates(path, old, new)
     return {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
-            "memo_moved": moved_memo, "memo_kept": kept_memo}
+            "memo_moved": moved_memo, "memo_kept": kept_memo, "joins": joins_hit}
 
 
 def rename_group(path: Path, old_key: str, new_key: str) -> dict:
@@ -11957,7 +11795,7 @@ def _ref(ep: tuple, own_alias: str) -> str:
 @bp_catalog.get("/api/catalog/suggestions")
 @admin_required
 def catalog_suggestions():
-    """結合候補（列名からの推測）。関連を足したり消したりするたびに
+    """結合候補（「結合を探す」で保存したものと、過去のSQL由来）。関連を足したり消したりするたびに
     画面が取り直す（読み込み時の一覧のままだと、消した関連が候補に
     戻らず、引いた関連の候補線が残って二重になる）。"""
     path = db.path_for(request.args.get("db") or "")
@@ -11967,10 +11805,13 @@ def catalog_suggestions():
 
 
 def _join_suggestions_merged(path, profile: dict, meta: dict) -> list[dict]:
-    """ER図に出す候補。「結合を探す」で保存した候補があればそれ、無ければ列名からの推測。過去のSQL由来を足す。"""
-    saved = catalog.saved_join_suggestions(path, profile, meta)
-    base = saved if saved is not None else catalog.join_suggestions(profile, meta, path)
-    return base + sqlusage.suggestions_for(db.alias_for(path), profile, meta)
+    """ER図に出す候補。「結合を探す」で保存した候補と、過去のSQLで使われたのに未登録の結合。
+
+    列名からの推測（〜_id の規約・同名の主キー・先頭200種類の値の重なり）は廃止した。大きな表では
+    連番の ID に小さな整数がたまたま収まって雑な候補が混ざり、画面を開くたびに全列を読み直していたため。
+    """
+    saved = catalog.saved_join_suggestions(path, profile, meta) or []
+    return saved + sqlusage.suggestions_for(db.alias_for(path), profile, meta)
 
 
 @bp_catalog.post("/api/catalog/joins/discover")

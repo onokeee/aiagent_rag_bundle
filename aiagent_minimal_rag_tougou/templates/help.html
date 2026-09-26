@@ -1607,43 +1607,13 @@
   </div>
 
   <div class="card mt">
-    <div class="card__title">3-13. 結合候補の判定ロジック</div>
+    <div class="card__title">3-13. 結合候補の出どころ</div>
     <div class="card__desc">
-      ER図の「結合候補」ボタンで出る赤い点線は、次の3つの規則で作られます。
-      すでに登録済みの関連と、データベースの外部キー宣言にあるものは候補から除きます。
-    </div>
-    <div class="tablewrap">
-      <table class="data">
-        <thead><tr><th style="width:200px">規則</th><th>条件</th></tr></thead>
-        <tbody>
-          <tr><td>① 列名からの推測</td>
-              <td><code>〜_id</code> で終わる列について、<code>〜</code> / <code>〜s</code> / <code>〜es</code>
-                  という名前の表を探します。相手の主キーが<b>複合キーなら候補にしません</b>
-                  （1列だけで結ぶと誤りになるため）。結合先は相手の主キー、無ければ
-                  <code>id</code> か同名の列。</td></tr>
-          <tr><td>② 同じ名前の主キー</td>
-              <td>相手の<b>単独主キー</b>と同じ名前の列を探します。
-                  ただし「まとまり違いの同じ形の表どうし」（例: 拠点別の同名表）は除外。
-                  同じまとまりの中に候補があればそちらを優先し、
-                  <b>手がかりが無いまま候補が4つ以上あるときは曖昧すぎるとして出しません</b>。</td></tr>
-          <tr><td>③ 値の一致からの発見</td>
-              <td>列名が違っても、実データの値が重なっていれば候補にします。
-                  自分側の値が<b>5種類以上</b>、相手側（単独主キー）も<b>5種類以上</b>で、
-                  <b>一致率90%以上</b>が条件。さらに、同じまとまりに相手がいなければ
-                  <b>相手が1つに絞れるときだけ</b>出します（日付列が全拠点のカレンダーに
-                  一致してしまうような氾濫を防ぐため）。</td></tr>
-          <tr><td>①②への一致率の付与</td>
-              <td>名前から作った候補にも実データを当て、一致率を注記します。
-                  <b>1件も重ならない候補は削除</b>します（結合しても1行も繋がらない＝間違い）。</td></tr>
-          <tr><td>値の読み方</td>
-              <td>対象は型がTEXTかINTEGERの列。1列あたり<b>最大200種類</b>を標本として読み、
-                  単独主キーだけは<b>最大2万件</b>を全件読みます。結果はデータベースの更新時刻をキーに
-                  キャッシュ（関連を触るたびに全列を読み直さないため）。</td></tr>
-          <tr><td>実績からの候補</td>
-              <td>上記とは別に、過去の分析SQLで実際にJOINされたのに未登録の組み合わせを、
-                  使用回数の多い順に<b>8件まで</b>提示します。</td></tr>
-        </tbody>
-      </table>
+      ER図の「結合候補」ボタンで出る赤い点線は、<b>「結合を探す」で作った候補</b>（3-14 の「結合を探す」を参照）と、
+      過去の分析SQLで実際に JOIN されたのに未登録の組み合わせ（使用回数の多い順に8件まで）です。
+      すでに登録済みの関連と、データベースの外部キー宣言にあるものは除きます。まだ探していなければ候補は出ません。
+      以前の「列名からの推測」（<code>〜_id</code> の規約・同名の主キー・先頭200種類の値の重なり）は廃止しました。
+      大きな表では連番の ID に小さな整数がたまたま収まって雑な候補が混ざり、画面を開くたびに全列を読み直していたためです。
     </div>
   </div>
 
@@ -1708,6 +1678,7 @@
                   まとまり違いの同型表は結ばず、相手が複数あるときは同じまとまりの相手だけ、それでも 4 つ以上なら曖昧として出しません。
                   結果は表の定義（列名と型）の指紋と一緒に <code>data/join_candidates.json</code> に保存し、以後の「結合候補」はこれを出します。
                   表が増えたり列が変わったりすると「表が増えました」と出て、増えた表に関わる組だけ探し直せます。
+                  表やまとまりを改名しても、保存した候補は新しい名前に付け替わります（列と型は同じなので探し直しは要りません）。
                   裏で動き、進み具合（列の調べ／組の確認）を出します。どのクエリも 5 秒で切り上げ、間に合わない列や組は飛ばします。</td></tr>
           <tr><td>ER図の座標</td>
               <td>保存があればそれ、無ければ4列グリッドに自動配置。保存は送られたノードだけを
@@ -2114,7 +2085,7 @@
               <td>メール設定。<b>そのまま画面に出す前提なので秘密は入れません</b>
                   （SMTPのユーザー・パスワード・暗号化方式は起動環境の設定のみ）。</td></tr>
           <tr><td class="mono small">data/join_candidates.json</td>
-              <td>「結合を探す」の結果（候補・多重度の推定・列ごとの一意性・表の定義の指紋）。無ければ列名からの推測で候補を出す。</td></tr>
+              <td>「結合を探す」の結果（候補・多重度の推定・列ごとの一意性・表の定義の指紋）。探していなければ候補は出ない（過去のSQLで使われた結合だけ）。</td></tr>
           <tr><td class="mono small">data/robot_settings.yaml</td>
               <td>マイロボットの決めごと（1人あたりの上限・定期実行の最短の間隔・手順数の上限・同時に動かす数）。無ければ env の初期値。</td></tr>
           <tr><td class="mono small">data/memory_settings.yaml</td>
@@ -3557,51 +3528,7 @@ for m in re.finditer(r&quot;__&quot;, memo):
        and not memo[m.end():m.end()+1].strip(&quot; *、。」）&quot;):  # &quot;__&quot; の直後が区切り文字か行末
         continue                                          # 「人事_勤怠__*」= まとまり全体を指す言い方
     out.append(memo[m.start()-14 : m.start()+16] の改行を空白に潰したもの)</pre><div class="mt">実在表の位置を先に塗り、そこから外れた <code>__</code> だけを「表名のつもりで書かれた別物」として拾う。警告に出すのは表名ではなく前後14/16文字のスニペット（何が悪いか機械には特定できないので、人が現物を探せる形で見せる）。</div></td></tr>
-      <tr><td>_suggest_values — 値の標本の取り方</td><td><div class="mt">結合候補の裏取り用に、実データから2種類の集合を作る。</div><pre class="mono small">_suggest_cache: dict = {}    # {(パス文字列, mtime_ns): (samples, pk_values)}
-
-def _suggest_values(db_path, profile) -&gt; (samples, pk_values):
-    key = (str(db_path), Path(db_path).stat().st_mtime_ns)
-    if key in _suggest_cache: return それ
-    for tname, t in profile[&quot;tables&quot;].items():
-        pks = [c[&quot;name&quot;] for c in t[&quot;columns&quot;] if c[&quot;pk&quot;]]     # ← profile の宣言PK
-        for c in t[&quot;columns&quot;]:
-            if c[&quot;type&quot;] not in (&quot;TEXT&quot;, &quot;INTEGER&quot;): continue  # ← 完全一致
-            if len(pks) == 1 and c[&quot;name&quot;] == pks[0]:
-                pk_values[(tname, c[&quot;name&quot;])] = {str(r[0]) for r in
-                    SELECT DISTINCT col FROM t WHERE col IS NOT NULL LIMIT 20000}
-            samples[(tname, c[&quot;name&quot;])] = {str(r[0]) for r in
-                    SELECT DISTINCT col FROM t WHERE col IS NOT NULL LIMIT 200}
-    _suggest_cache.clear()       # DBは1つ。古い版を抱えない
-    _suggest_cache[key] = (samples, pk_values)</pre><div class="mt">・値はすべて <code>str()</code> に揃えてから集合にする。型が違う列（INTEGER の 1 と TEXT の &quot;1&quot;）でも比較が成立する。<br>・標本は列あたり<b>最大200個の distinct 値</b>。主キー側は「照合の分母になるので全部持つ（このアプリの表は大きくても数千行）」として 20000。<br>・<code>pk_values</code> に入るのは<b>単独主キーの列だけ</b>。複合主キーの表は親候補にならない。<br>・判定に使うのは <code>profile</code> の <code>c[&quot;pk&quot;]</code>＝<b>DB宣言の主キー</b>で、<code>effective_pk</code>（人が指定した <code>primary_key</code>）ではない。<br>・キャッシュは DBファイルの mtime_ns。候補APIは関連を触るたびに呼ばれるので、毎回700列を読み直さないための措置。1件だけ持つ（<code>clear()</code> してから入れる）。</div></td></tr>
-      <tr><td>join_suggestions — 結合候補の判定</td><td><div class="mt"><code>join_suggestions(profile, meta, db_path=None)</code> は <code>{from, to, cardinality: &quot;0..*:1&quot;, reason}</code> のリストを返す。<code>db_path</code> を渡すと実データで裏を取る。カタログ画面と <code>/api/catalog/suggestions</code> が呼び、戻りに <code>sqlusage.suggestions_for()</code>（過去に実際に使われたのに未登録の結合、上位8件）を連結して表示する。</div><div class="mt"><b>0. 既存の結合を集める（<code>existing</code>）</b></div><div class="mt">・<code>meta[&quot;relationships&quot;]</code> … <code>rel_pairs(rel, &quot;@own&quot;)</code> が解ければ<b>列ペアごとに</b> <code>(&quot;表.列&quot;.lower(), &quot;表.列&quot;.lower())</code> を入れる（複合キーの片列だけの候補を出さないため）。解けなければ生の <code>from</code>/<code>to</code> 文字列を lower して入れる。<br>・profile の FK … <code>(&quot;表.from&quot;.lower(), &quot;相手表.to&quot;.lower())</code>。</div><div class="mt"><b>1. <code>*_id</code> の命名規約から（<code>列名 &#x27;X&#x27; → テーブル &#x27;T&#x27; の推測</code>）</b></div><pre class="mono small">low = 列名.lower()
-if not low.endswith(&quot;_id&quot;) and not low.endswith(&quot;id&quot;): continue
-base = low[:-3] if low.endswith(&quot;_id&quot;) else None
-if not base: continue                        # ← &quot;id&quot; 止まりはここで落ちる
-for cand in (base, base+&quot;s&quot;, base+&quot;es&quot;):     # 表名と大小無視で完全一致
-    target = 一致する表名 (自表は除く)
-    相手の宣言PK列が2つ以上 → skip（1列だけで結合する候補は誤りになる）
-    to_col = 相手の最初のPK列 ?? 相手の列で名前が &quot;id&quot; か low と一致するもの
-    existing にあれば skip
-    候補を積んで break</pre><div class="mt"><b>2. 同名列が他表の単独主キー（<code>同じ名前の列 &#x27;X&#x27; が &#x27;T&#x27; の主キー</code>）</b></div><div class="mt"><code>_suffix(name)</code> = <code>__</code> の後ろ、<code>_group(name)</code> = <code>__</code> の前。</div><pre class="mono small">pk_owner = {pk列名.lower(): [(表, pk列), ...]}   # 単独主キーの表だけ
-for 表, 列:
-    cands = pk_owner[列名.lower()] から
-            自表と、_suffix が同じ表（＝拠点違いの同型表・兄弟）を除いたもの
-    same = cands のうち _group が自表と同じもの
-    if not same and len(cands) &gt; 3: continue   # 相手が4つ以上は曖昧すぎる
-    for target in (same or cands): 候補を積む</pre><div class="mt"><code>equip_code → equipment.equip_code</code> のようなマスタ参照の型。「<code>*_id</code> の規約が無いデータではこちらが本命になる」。兄弟を除くのは <code>東京__defects.equip_code → 大阪__defects.equip_code</code> のような誤りを出さないため。4つ以上を切るのは「equip の部品コード → 全拠点の部品表、のような総当たり」を避けるため。</div><div class="mt"><b><code>db_path is None</code> ならここで返す。</b></div><div class="mt"><b>3. 名前ベース候補への裏取り</b></div><pre class="mono small">def _overlap(frm, to):
-    s_ = samples[(from表, from列)]
-    p_ = pk_values[(to表, to列)] or samples[(to表, to列)]
-    if not s_ or not p_: return None            # 標本が無い＝判定できない
-    return len(s_ &amp; p_) / len(s_)</pre><div class="mt">・<code>None</code>（どちらかの標本が無い）→ 理由に何も足さずそのまま残す。<br>・<code>0</code>（1つも重ならない）→ <b>候補ごと捨てる</b>。「JOINしても1行も繋がらない＝間違い」。<br>・それ以外 → 理由に <code>／値の一致 87%</code> を追記。</div><div class="mt"><b>4. 名前の手がかりが無い発見（<code>列名は違うが値が一致（87%が &#x27;T.C&#x27; に存在）</code>）</b></div><pre class="mono small">for 表, 列:
-    s_ = samples[(表, 列)];  if len(s_) &lt; 5: continue     # 小さすぎる集合は偶然一致する
-    hits = [(r, 相手表, 相手列)
-            for (相手表, 相手列), p_ in pk_values.items()
-            if 相手表 != 自表 and _suffix が違う and len(p_) &gt;= 5
-               and (frm, to) が existing にも seen にも無い
-               and (r := len(s_ &amp; p_) / len(s_)) &gt;= 0.9]
-    same = hits のうち _group が自表と同じもの
-    if not same and len(hits) &gt; 1: continue   # 相手を1つに絞れないなら出さない
-    for h in (same or hits): 候補を積む</pre><div class="mt">しきい値が 0.9 と「両側5種類以上」なのは「名前の手がかりが無いぶん厳しめに見る。小さすぎる集合は偶然一致する（例: 2値のコード）」から。同じまとまりに相手がいなければ複数ヒットを捨てるのは「日付列は全拠点のカレンダーに一致してしまうので、同じまとまりのカレンダーが無ければ『どれと繋ぐべきか』を機械では決められない」から。</div></td></tr>
+      <tr><td>join_suggestions / _suggest_values（廃止）</td><td>2026-09-26 に「結合を探す」（<code>discover_joins</code>）へ置き換え。列名からの推測と先頭200種類の標本による裏取りは行わない。候補は <code>data/join_candidates.json</code>（<code>saved_join_suggestions</code>）と <code>sqlusage.suggestions_for</code>（過去のSQL）だけで、<code>_join_suggestions_merged</code> が合流させる。</td></tr>
       <tr><td>関連の端点表記と正規化</td><td><div class="mt">関連1件は YAML 上 <code>{from: &quot;...&quot;, to: &quot;...&quot;, cardinality: &quot;0..*:1&quot;}</code> の3フィールドだけ（cardinality は「子側:親側」で、各側は 0..1／1／0..*／1..*。旧表記 N:1／1:N／1:1／N:M は <code>card_norm</code> が読み替え、画面で選べる10通りは <code>CARD_CHOICES</code>、AI向けの日本語は <code>card_text</code>）。端点は文字列で、4通りの書き方を受ける。</div><div class="mt"><b><code>parse_endpoint(end, default_alias)</code></b></div><div class="mt"><code>.</code> で分割して 3要素 → <code>(alias, table, column)</code>、2要素 → <code>(default_alias, table, column)</code>、それ以外 → <code>None</code>。</div><div class="mt"><b><code>parse_endpoint_cols(end, default_alias)</code> — 複合キー対応</b></div><pre class="mono small">m = re.match(r&quot;^(.+?)\.\(([^()]*)\)$&quot;, raw)      # 括弧形式か
 マッチしたら: cols = 括弧内を &quot;,&quot; で分割して strip、空要素は落とす
               cols が空 → None
