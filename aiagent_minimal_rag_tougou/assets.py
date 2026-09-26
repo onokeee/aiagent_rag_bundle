@@ -477,7 +477,9 @@ TEMPLATES = {
           {% endif %}{% endfor %}
         </select>
         <button class="btn btn--sm" id="erSuggest"
-                title="列名から推測した「登録されていない結合の候補」を赤い線で重ねます。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
+                title="登録されていない結合の候補を赤い線で重ねます（「結合を探す」で保存した候補。無ければ列名からの推測）。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
+        <button class="btn btn--sm" id="erDiscover"
+                title="全表の全列を実データで調べて、結合の候補と多重度の推定を保存します。&#10;表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません">結合を探す</button>
         <button class="btn btn--sm" id="erAddTable"
                 title="いま表示しているまとまりに、別のまとまりの表を1つずつ足します。&#10;またぎの関連を引くときに、「すべて」で104表を出さずに済みます">＋ 別のまとまりの表</button>
         {% endif %}
@@ -713,6 +715,7 @@ window.CAT = {
   examplesMax: {{ examples_max|tojson }},
   er: {{ er|tojson }},
   suggestions: {{ suggestions|tojson }},
+  joinStatus: {{ join_status|tojson }},
   tables: {{ tables|tojson }},
   dbGlossary: {{ db_glossary|tojson }},
   examples: {{ examples|tojson }},
@@ -4423,6 +4426,7 @@ const ER = (() => {
        ドラッグで決めた大きさ（width/height）は次に開くときも保つ。 */
     function showPanel(title, bodyChildren, opts) {
         panel.classList.remove('hidden');
+        panel.dataset.kind = (opts && opts.kind) || '';     // 何のパネルか（進み具合の描き直しの判定に使う）
         panel.classList.toggle('er__panel--wide', !!(opts && opts.wide));
         panel.classList.remove('er__panel--max');
         const body = el('div', { class: 'er__panel__body' }, ...(bodyChildren || []));
@@ -5120,6 +5124,7 @@ const ER = (() => {
             render();                       // 候補の相手テーブルが出入りする
             setTimeout(fit, 20);
         });
+        once('#erDiscover', openDiscover);
         once('#erUndo', undo);
         once('#erRedo', redo);
         once('#erArrange', arrange);
@@ -5155,6 +5160,88 @@ const ER = (() => {
         b.textContent = suggestions.length ? `結合候補(${suggestions.length})` : '結合候補';
         b.disabled = !suggestions.length;
         b.classList.toggle('btn--primary', showSug && suggestions.length > 0);
+    }
+
+    /* --- 結合を探す（全表の全列を実データで調べて候補を保存する） --------------------- */
+    let joinStatus = null;
+    function setJoinStatus(s) { joinStatus = s || null; syncDiscoverBtn(); }
+    function syncDiscoverBtn() {
+        const b = $('#erDiscover');
+        if (!b) return;
+        const stale = joinStatus ? (joinStatus.new || []).length + (joinStatus.changed || []).length : 0;
+        b.textContent = joinStatus?.exists && stale ? `結合を探す（表が増えました ${stale}）` : '結合を探す';
+    }
+    async function fetchJoinStatus() {
+        const r = await api(`/api/catalog/joins/status?db=${encodeURIComponent(CAT.db)}`, undefined, 'GET');
+        joinStatus = r; syncDiscoverBtn();
+        return r;
+    }
+    async function openDiscover() {
+        let st;
+        try { st = await fetchJoinStatus(); } catch (e) { toast(e.message, 'err'); return; }
+        if (st.running) { showDiscoverProgress(); return; }
+        const stale = (st.new || []).length + (st.changed || []).length;
+        const lines = [];
+        lines.push(el('div', { class: 'small muted mb' },
+            '全表の全列を実データで調べ、値が重なる列の組を結合の候補にします。多重度も推定します。'
+            + '表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません。'));
+        if (st.exists) {
+            lines.push(el('div', { class: 'small mb' },
+                `前回: ${String(st.computed_at || '').replace('T', ' ')}（候補 ${st.count} 件、${st.seconds ?? '?'} 秒）`));
+            if (stale) lines.push(el('div', { class: 'alert alert--info small mb' },
+                `定義が増えた・変わった表: ${[...(st.new || []), ...(st.changed || [])].slice(0, 8).join('、')}`
+                + (stale > 8 ? ` ほか（計 ${stale}）` : '')));
+        }
+        const start = async (scope) => {
+            try {
+                const r = await api('/api/catalog/joins/discover', { db: CAT.db, scope });
+                if (!r.started) { toast(r.message || '始められませんでした。'); return; }
+                showDiscoverProgress();
+            } catch (e) { toast(e.message, 'err'); }
+        };
+        const btns = [];
+        if (st.exists && stale) btns.push(el('button', { class: 'btn btn--sm btn--primary', onclick: () => start('stale') },
+                                          `増えた表だけ探す（${stale}）`));
+        btns.push(el('button', { class: 'btn btn--sm' + (st.exists && stale ? '' : ' btn--primary'), onclick: () => start('all') },
+                     st.exists ? 'すべて探し直す' : '探す'));
+        lines.push(el('div', { class: 'row', style: 'gap:8px' }, ...btns));
+        showPanel('結合を探す', lines);
+    }
+    let discoverTimer = null;
+    function showDiscoverProgress() {
+        clearTimeout(discoverTimer);
+        // 進み具合のパネルは、出ている間だけ描き直す。閉じられたり別の線を選ばれたりしたら戻さず、静かに待つ
+        const mine = () => !panel.classList.contains('hidden') && panel.dataset.kind === 'discover';
+        const progressPanel = (p) => showPanel('結合を探しています…', [
+            el('div', { class: 'small' }, `${p.phase || ''} ${p.done ?? 0} / ${p.total ?? 0}`),
+            el('div', { class: 'small muted mt' }, '閉じても裏で続きます。終わると知らせが出て、候補が赤い点線で重なります。')], { kind: 'discover' });
+        progressPanel({});
+        const tick = async () => {
+            let st;
+            try { st = await fetchJoinStatus(); } catch (e) { toast(e.message, 'err'); return; }
+            const p = st.progress || {};
+            if (st.running) {
+                if (mine()) progressPanel(p);
+                discoverTimer = setTimeout(tick, 1500);
+                return;
+            }
+            if (p.error) {
+                if (mine()) showPanel('結合を探す', [el('div', { class: 'alert alert--err small' }, `失敗しました: ${p.error}`)]);
+                else toast(`結合を探すのに失敗しました: ${p.error}`, 'err', 9000);
+                return;
+            }
+            await refreshSuggestions();
+            showSug = true; syncSugBtn(); render(); setTimeout(fit, 20);
+            const msg = p.message || `候補 ${suggestions.length} 件`;
+            if (mine()) {
+                showPanel('結合を探しました', [
+                    el('div', { class: 'small' }, msg),
+                    el('div', { class: 'small muted mt' }, '赤い点線が候補です。線をクリックすると根拠と推定した多重度を確かめて登録できます。')]);
+            } else {
+                toast(`結合を探しました: ${msg}`);
+            }
+        };
+        discoverTimer = setTimeout(tick, 800);
     }
 
     /** 結合候補を受け取る（カタログ画面が読み込み時に呼ぶ）。 */
@@ -5250,7 +5337,7 @@ const ER = (() => {
         syncHistoryUi();
     }
 
-    return { init, refit: fit, mutate, setUsage, setSuggestions, dropTable };
+    return { init, refit: fit, mutate, setUsage, setSuggestions, setJoinStatus, dropTable };
 })();
 
 // ===== 元 manage.js =====
@@ -10446,6 +10533,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(r => ER.setUsage(r.edges || {}))
         .catch(() => {});          // 取れなくてもER図自体は使える
     ER.setSuggestions(CAT.suggestions || []);
+    ER.setJoinStatus(CAT.joinStatus || null);
 });
 // 画面インラインの window.MANAGE.refresh はグローバルの loadManage を
 // 参照していたので、この関数スコープ版に繋ぎ直す。

@@ -3607,6 +3607,383 @@ def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
     return {"level": level, "issues": issues}
 
 
+# =============================================================================
+# 結合を探す（全表の全列を実データで調べ、候補と多重度の推定を保存する）
+#
+# 「結合候補」は列名からの推測だったが、取り込んだ表には主キーの宣言も英語の列名規約も無く、
+# 本番では候補が出なかった。表の定義が変わらなければ候補は変わらないので、管理者が押したときに
+# 全列を調べて保存し、以後は保存した候補を出す。表が増えたら、増えた表に関わる組だけ調べ直す。
+#
+#   列ごとに1回: 型・値の種類の標本・一意か（宣言か実データ）・空欄の有無
+#   組の絞り込み: 親になれるのは一意な列。型が合い、標本どうしが少しでも重なる組だけ残す
+#   実データで確認: 子の標本を親の列全体に引く（線の検査と同じ道具）。9割以上一致で候補
+#   多重度の推定: 親側は 1（子に空欄があれば 0..1）。子側は親の参照率が 95% 以上なら 1..*、
+#                 それ以外は 0..*。子の列まで一意なら 1:1 系
+#   どのクエリも LINK_CHECK_TIMEOUT_SEC の上限つき。間に合わない列・組は飛ばす
+# =============================================================================
+_discover_lock = threading.Lock()
+_discover_state: dict = {"running": False, "phase": "", "done": 0, "total": 0,
+                         "started_at": None, "finished_at": None, "error": None, "message": ""}
+
+
+def _tbl_suffix(name: str) -> str:
+    return name.split("__", 1)[1] if "__" in name else name
+
+
+def _tbl_group(name: str) -> str:
+    return name.split("__", 1)[0] if "__" in name else ""
+
+
+def table_fingerprints(profile: dict) -> dict:
+    """表ごとの定義の指紋（列名と型）。行数は含めない（データが変わっても定義は同じ）。"""
+    import hashlib
+    out = {}
+    for tname, tb in (profile.get("tables") or {}).items():
+        sig = "|".join(f"{c['name']}:{c.get('type') or ''}" for c in tb.get("columns", []))
+        out[tname] = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12]
+    return out
+
+
+def load_join_candidates(path) -> dict | None:
+    p = config.JOIN_CANDIDATES_FILE
+    if not p.exists():
+        return None
+    data = _read_json(p)
+    if not isinstance(data, dict) or data.get("db") != Path(path).name:
+        return None
+    return data
+
+
+def _existing_pairs(profile: dict, meta: dict) -> set:
+    """登録済みの関連（列ペアごと）と FK 宣言を、小文字の (from, to) で。"""
+    out = set()
+    for rel in (meta.get("relationships") or []):
+        pr = rel_pairs(rel, "@own")
+        if pr:
+            (fa, ftb), (ta, ttb), pairs = pr
+            for fc, tc in pairs:
+                out.add((f"{ftb}.{fc}".lower(), f"{ttb}.{tc}".lower()))
+        else:
+            out.add((str(rel.get("from", "")).lower(), str(rel.get("to", "")).lower()))
+    for tname, tb in (profile.get("tables") or {}).items():
+        for fk in tb.get("fks", []):
+            out.add((f"{tname}.{fk['from']}".lower(), f"{fk['table']}.{fk['to']}".lower()))
+    return out
+
+
+def join_candidates_status(path, profile: dict) -> dict:
+    """保存した候補の状態と、定義が変わった表（新しい・変わった・消えた）。"""
+    saved = load_join_candidates(path)
+    now = table_fingerprints(profile)
+    if not saved:
+        return {"exists": False, "computed_at": None, "seconds": None, "count": 0,
+                "new": sorted(now), "changed": [], "removed": [], "running": _discover_state["running"]}
+    old = saved.get("fingerprints") or {}
+    return {"exists": True, "computed_at": saved.get("computed_at"), "seconds": saved.get("seconds"),
+            "count": len(saved.get("candidates") or []),
+            "new": sorted(x for x in now if x not in old),
+            "changed": sorted(x for x in now if x in old and old[x] != now[x]),
+            "removed": sorted(x for x in old if x not in now),
+            "running": _discover_state["running"]}
+
+
+def saved_join_suggestions(path, profile: dict, meta: dict) -> list[dict] | None:
+    """保存した候補を、いまの定義と登録済みの関連で絞って返す。保存が無ければ None（従来の推測に任せる）。"""
+    saved = load_join_candidates(path)
+    if not saved:
+        return None
+    now = table_fingerprints(profile)
+    old = saved.get("fingerprints") or {}
+    existing = {frozenset(p) for p in _existing_pairs(profile, meta)}   # 向きを問わない（登録時に反転することがある）
+    out = []
+    for c in saved.get("candidates") or []:
+        ft, tt = (c.get("tables") or [None, None])[:2]
+        if ft not in now or tt not in now or old.get(ft) != now[ft] or old.get(tt) != now[tt]:
+            continue                                  # 定義が変わった表の候補は出さない（探し直す）
+        if frozenset((str(c.get("from", "")).lower(), str(c.get("to", "")).lower())) in existing:
+            continue
+        out.append({"from": c["from"], "to": c["to"], "cardinality": card_norm(c.get("cardinality")) or CARD_DEFAULT,
+                    "reason": c.get("reason", "")})
+    return out
+
+
+def _col_kind(ctype: str) -> str | None:
+    t = str(ctype or "").upper()
+    if "INT" in t:
+        return "INTEGER"
+    if any(k in t for k in ("CHAR", "TEXT", "CLOB")):
+        return "TEXT"
+    return None
+
+
+def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, progress=None) -> dict:
+    """全表の全列を実データで調べ、結合の候補と多重度の推定を保存して返す。
+
+    tables を渡すと、その表に関わる組だけを調べ直し、他の候補は保存済みのものを引き継ぐ。
+    progress(phase, done, total) を呼びながら進む。戻りは保存した内容（候補の一覧つき）。
+
+    絞り込みの規則（偶然の一致を候補にしないため）:
+      ・親になれるのは値が一意な列。値の種類が標本（JOIN_PARENT_SAMPLE_ROWS）を超える大きな親は、
+        標本の重なりで絞らず全種類を索引つきの一時表に持って直接引く（偏った参照を見逃さない）
+      ・連番の主キーどうし（1..N が両方にある）は結ばない
+      ・整数の親は、子の値の種類が 1,000 未満なら親の参照率が半分以上のときだけ
+        （月・数量のような小さな整数が連番のキーに収まるだけの組を除く）
+      ・型が違う組（文字と整数）も、値が一致すれば候補にする（SQLite の比較は型を揃える）
+      ・相手が複数なら同じまとまりの相手だけ。それでも4つ以上なら曖昧として出さない
+    """
+    S = max(100, int(config.LINK_CHECK_SAMPLE_ROWS))
+    PS = max(S, int(config.JOIN_PARENT_SAMPLE_ROWS))
+    T = config.LINK_CHECK_TIMEOUT_SEC
+    started = time.time()
+    saved = load_join_candidates(path) or {}
+    saved_cols = saved.get("columns") or {}
+    subset = set(tables or [])
+    ptables = profile.get("tables") or {}
+
+    def skip_error(e) -> bool:
+        """時間切れ（interrupted）と、取り込みと重なって待ちきれなかった locked は、その列・組を飛ばす。"""
+        s = str(e).lower()
+        return "interrupt" in s or "locked" in s
+
+    def tell(phase, done, total):
+        if progress:
+            progress(phase, done, total)
+
+    q = lambda s: '"' + str(s).replace('"', '""') + '"'
+    cols: list[dict] = []
+    skipped_timeout = 0
+    conn = db.connect_scope([(str(path), "c")])
+    try:
+        conn.execute("PRAGMA busy_timeout = 30000")   # 取り込みのコミットと重なっても待つ（connect_ro と同じ 30 秒）
+        reset = _make_timeout(conn, T)
+        temp_names: dict = {}                          # (種別, 表, 列) → 一時表の名前。連番なので衝突しない
+
+        def temp_name(c, prefix):
+            key = (prefix, c["table"], c["col"])
+            if key not in temp_names:
+                temp_names[key] = f"{prefix}{len(temp_names)}"
+            return temp_names[key]
+
+        # --- 列ごとの調べ ------------------------------------------------------------
+        todo = [(tn, c) for tn, tb in ptables.items() if (tb.get("row_count") or 0) > 0
+                for c in tb.get("columns", []) if _col_kind(c.get("type"))]
+        tell("列の調べ", 0, len(todo))
+        for i, (tn, c) in enumerate(todo, 1):
+            cn = c["name"]
+            kind = _col_kind(c.get("type"))
+            key = f"{tn}.{cn}"
+            info = {"table": tn, "col": cn, "kind": kind, "n": 0, "capped": False, "unique": None,
+                    "has_null": None, "sample": [], "pset": None, "pfull": None, "is_pk": False}
+            try:
+                reset()
+                sample = [r[0] for r in conn.execute(
+                    f'SELECT DISTINCT {q(cn)} FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL LIMIT {S}')]
+                info["n"], info["capped"] = len(sample), len(sample) >= S
+                info["sample"] = sample
+                if info["n"] < 5 or any(len(str(v)) > 100 for v in sample[:50]):
+                    cols.append(info)      # 値が少なすぎる・長い文章の列は結合の相手にしない
+                    tell("列の調べ", i, len(todo))
+                    continue
+                pk_cols, pk_src = effective_pk(profile, meta, tn)
+                info["is_pk"] = pk_src in ("declared", "override") and pk_cols == [cn]
+                prev = saved_cols.get(key) if (subset and tn not in subset) else None
+                if prev and prev.get("unique") is not None:
+                    info["unique"], info["has_null"] = prev["unique"], prev.get("has_null")
+                else:
+                    if info["is_pk"]:
+                        # 人が指定した主キーは重複していることがある。宣言だけ読まずに確定する
+                        info["unique"] = True if pk_src == "declared" else None
+                    if info["unique"] is None and _declared_unique(conn, "c", tn, cn):
+                        info["unique"] = True
+                    if info["unique"] is None:
+                        reset()
+                        dup = conn.execute(f'SELECT 1 FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL '
+                                           f'GROUP BY {q(cn)} HAVING COUNT(*) > 1 LIMIT 1').fetchone()
+                        info["unique"] = dup is None
+                    reset()
+                    info["has_null"] = conn.execute(
+                        f'SELECT 1 FROM "c".{q(tn)} WHERE {q(cn)} IS NULL LIMIT 1').fetchone() is not None
+                if info["unique"]:
+                    reset()
+                    info["pset"] = {str(r[0]) for r in conn.execute(
+                        f'SELECT DISTINCT {q(cn)} FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL LIMIT {PS}')}
+                    if len(info["pset"]) >= PS:
+                        # 値の種類が標本を超える大きな親。標本の重なりでは偏った参照（新しい親だけを参照する
+                        # 明細など）を見逃すので、全種類を索引つきの一時表に持ち、組の絞り込みを飛ばして直接引く
+                        name = temp_name(info, "jpf")
+                        reset()
+                        conn.execute(f'CREATE TEMP TABLE {name} AS SELECT DISTINCT {q(cn)} AS v '
+                                     f'FROM "c".{q(tn)} WHERE {q(cn)} IS NOT NULL')
+                        reset()
+                        conn.execute(f'CREATE INDEX {name}_i ON {name}(v)')
+                        info["pfull"] = name
+            except sqlite3.OperationalError as e:
+                if not skip_error(e):
+                    raise
+                skipped_timeout += 1           # 時間内に調べきれなかった分は、分かったところまでで使う
+            cols.append(info)
+            tell("列の調べ", i, len(todo))
+
+        # --- 組の絞り込み ----------------------------------------------------------------
+        parents = [c for c in cols if c["unique"] and c["pset"] and c["n"] >= 5]
+        pairs = []
+        for ch in cols:
+            if ch["n"] < 5:
+                continue
+            csam = {str(v) for v in ch["sample"]}
+            for pa in parents:
+                if pa["table"] == ch["table"]:
+                    continue
+                if _tbl_suffix(pa["table"]) == _tbl_suffix(ch["table"]):
+                    continue                   # まとまり違いの同型表（兄弟）は結ばない
+                if ch["is_pk"] and pa["is_pk"] and ch["kind"] == "INTEGER" and pa["kind"] == "INTEGER":
+                    continue                   # 連番の主キーどうし（1..N が両方にある）は偶然の一致。結合ではない
+                if subset and ch["table"] not in subset and pa["table"] not in subset:
+                    continue                   # 調べ直す表に関わらない組は保存済みを引き継ぐ
+                if pa["pfull"]:
+                    ov = -1.0                  # 大きな親は標本で絞らず実データで直接引く（索引つきなので速い）
+                else:
+                    ov = len(csam & pa["pset"]) / len(csam)
+                    if ov == 0:
+                        continue
+                pairs.append((ov, ch, pa))
+        pairs.sort(key=lambda x: -x[0])
+
+        # --- 実データで確認・多重度の推定 ---------------------------------------------------
+        tell("組の確認", 0, len(pairs))
+        found: dict = {}                       # 子の列 → [候補]
+        temp_made: set = set()
+
+        def temp_of(c, prefix):
+            name = temp_name(c, prefix)
+            if name not in temp_made:
+                reset()
+                conn.execute(f'CREATE TEMP TABLE {name} AS SELECT DISTINCT {q(c["col"])} AS v '
+                             f'FROM "c".{q(c["table"])} WHERE {q(c["col"])} IS NOT NULL LIMIT {S}')
+                temp_made.add(name)
+            return name
+
+        for i, (ov, ch, pa) in enumerate(pairs, 1):
+            try:
+                tc = temp_of(ch, "jc")
+                src = (f"SELECT v FROM {pa['pfull']}" if pa["pfull"]
+                       else f'SELECT {q(pa["col"])} FROM "c".{q(pa["table"])}')
+                reset()
+                matched = conn.execute(f"SELECT COUNT(*) FROM {tc} s WHERE s.v IN ({src})").fetchone()[0]
+                rate = matched / ch["n"]
+                # 同じ列名は手がかりにするが、id のような汎用の名前は数えない
+                same_name = ch["col"].lower() == pa["col"].lower() and ch["col"].lower() not in ("id", "no", "code")
+                if rate < 0.9 and not (same_name and rate >= 0.5):
+                    tell("組の確認", i, len(pairs))
+                    continue
+                tp = temp_of(pa, "jp")
+                reset()
+                hit = conn.execute(
+                    f'SELECT COUNT(*) FROM {tp} s WHERE s.v IN (SELECT {q(ch["col"])} FROM "c".{q(ch["table"])})'
+                ).fetchone()[0]
+                n_p = min(pa["n"], S)
+                cov = hit / n_p if n_p else 0.0
+                if ch["n"] <= 10 and n_p >= 10 and cov < 0.5:
+                    tell("組の確認", i, len(pairs))
+                    continue                   # 区分値と ID の偶然の一致
+                if pa["kind"] == "INTEGER" and ch["n"] < 1000 and cov < 0.5 and not same_name:
+                    tell("組の確認", i, len(pairs))
+                    continue                   # 月・数量のような小さな整数が、連番のキーの一部にたまたま収まるだけ
+                to_end = "0..1" if ch["has_null"] else "1"
+                if ch["unique"]:
+                    from_end = "1" if cov >= 0.95 else "0..1"
+                else:
+                    from_end = "1..*" if cov >= 0.95 else "0..*"
+                card = f"{from_end}:{to_end}"
+                if card not in CARD_CHOICES:       # 例: 子が一意で空欄あり → "1:0..1"。画面で選べる向きに寄せる
+                    card = card_flip(card) if card_flip(card) in CARD_CHOICES else "0..1:0..1"
+                reason = (f"値の一致 {rate * 100:.0f}%（標本 {ch['n']:,} 種類）・親の参照率 {cov * 100:.0f}%"
+                          + ("・同じ列名" if same_name else "")
+                          + (f"・型が違う（{ch['kind']}→{pa['kind']}）" if ch["kind"] != pa["kind"] else ""))
+                found.setdefault(f"{ch['table']}.{ch['col']}", []).append({
+                    "from": f"{ch['table']}.{ch['col']}", "to": f"{pa['table']}.{pa['col']}",
+                    "tables": [ch["table"], pa["table"]], "cardinality": card,
+                    "match": round(rate, 3), "coverage": round(cov, 3), "reason": reason,
+                    "_frompk": bool(ch.get("is_pk"))})
+            except sqlite3.OperationalError as e:
+                if not skip_error(e):
+                    raise
+                skipped_timeout += 1
+            tell("組の確認", i, len(pairs))
+    finally:
+        conn.close()
+
+    # 相手が複数あるとき: 同じまとまりの相手だけ。それでも4つ以上なら曖昧。まとまりに無ければ1つに絞れるときだけ
+    # （日付列が全拠点のカレンダーに一致する、など「どれと繋ぐべきか」を機械では決められないものは出さない）
+    cands = []
+    for key, lst in found.items():
+        # 同じ相手の表に複数の列で当たるときは、一致率・参照率・同じ列名の順で1本に絞る
+        best: dict = {}
+        for x in sorted(lst, key=lambda x: (-x["match"], -x["coverage"], "同じ列名" not in x["reason"])):
+            best.setdefault(x["tables"][1], x)
+        lst = list(best.values())
+        same = [x for x in lst if _tbl_group(x["tables"][1]) == _tbl_group(x["tables"][0])]
+        if len(same) > 3:
+            continue
+        pick = same or (lst if len(lst) == 1 else [])
+        cands.extend(pick)
+    # 両方が一意で双方向に一致した組（1対1）は1本にする。外部キーを持つ側（主キーでない列）を子にする
+    seen_pairs = set()
+    uniq = []
+    for c in sorted(cands, key=lambda x: (-x["match"], x.get("_frompk", False), x["from"])):
+        k = frozenset((c["from"].lower(), c["to"].lower()))
+        if k in seen_pairs:
+            continue
+        seen_pairs.add(k)
+        c.pop("_frompk", None)
+        uniq.append(c)
+    # 調べ直した表に関わらない候補は保存済みから引き継ぐ
+    if subset:
+        keep = [c for c in (saved.get("candidates") or [])
+                if not (set(c.get("tables") or []) & subset)
+                and all(x in ptables for x in (c.get("tables") or []))]
+        uniq = keep + uniq
+    columns = {k: v for k, v in saved_cols.items() if k.split(".", 1)[0] in ptables}
+    for c in cols:
+        columns[f"{c['table']}.{c['col']}"] = {"kind": c["kind"], "n": c["n"], "capped": c["capped"],
+                                               "unique": c["unique"], "has_null": c["has_null"]}
+    out = {"db": Path(path).name, "computed_at": datetime.now().isoformat(timespec="seconds"),
+           "seconds": round(time.time() - started, 1), "fingerprints": table_fingerprints(profile),
+           "scope": sorted(subset) if subset else "all", "skipped_timeout": skipped_timeout,
+           "columns": columns, "candidates": uniq}
+    _write_json(config.JOIN_CANDIDATES_FILE, out)
+    return out
+
+
+def start_discover(path, profile: dict, meta: dict, tables: list | None) -> bool:
+    """裏のスレッドで discover_joins を回す。動いていれば False。"""
+    with _discover_lock:
+        if _discover_state["running"]:
+            return False
+        _discover_state.update({"running": True, "phase": "準備", "done": 0, "total": 0,
+                                "started_at": datetime.now().isoformat(timespec="seconds"),
+                                "finished_at": None, "error": None, "message": ""})
+
+    def progress(phase, done, total):
+        _discover_state.update({"phase": phase, "done": done, "total": total})
+
+    def run():
+        try:
+            res = discover_joins(path, profile, meta, tables, progress)
+            _discover_state["message"] = (f"候補 {len(res['candidates'])} 件（{res['seconds']} 秒"
+                                          + (f"・時間内に調べきれなかった列や組 {res['skipped_timeout']}" if res.get("skipped_timeout") else "")
+                                          + "）")
+        except Exception as e:
+            _discover_state["error"] = f"{e}"
+            print(f"[joins] 結合を探す処理でエラー: {e}")
+        finally:
+            _discover_state.update({"running": False, "finished_at": datetime.now().isoformat(timespec="seconds")})
+
+    threading.Thread(target=run, name="aiagent-join-discover", daemon=True).start()
+    return True
+
+
+
 def child_parent(entries: list[dict], edge: dict) -> tuple:
     """この関連の (子, 親)。参照整合性の検査はこの向きでしか意味を持たない。
 
@@ -11522,8 +11899,8 @@ def catalog_index():
         db_glossary=catalog.db_glossary(meta),
         examples=meta.get("examples") or [],
         checks=verify.normalize(meta.get("checks")),
-        suggestions=(catalog.join_suggestions(profile, meta, target)
-                     + sqlusage.suggestions_for(db.alias_for(target), profile, meta)),
+        suggestions=_join_suggestions_merged(target, profile, meta),
+        join_status=catalog.join_candidates_status(target, profile),
         er=_er_payload(target, profile, meta),
         # ツールはDBに紐づけずに作るので、一覧も全DB分を出す（組み込みと同じ扱い）
         custom=custom_tools.collect_everywhere(),
@@ -11586,8 +11963,46 @@ def catalog_suggestions():
     path = db.path_for(request.args.get("db") or "")
     profile = catalog.profile_db(path)
     meta = catalog.load_meta(path)
-    return jsonify({"suggestions": catalog.join_suggestions(profile, meta, path)
-                                   + sqlusage.suggestions_for(db.alias_for(path), profile, meta)})
+    return jsonify({"suggestions": _join_suggestions_merged(path, profile, meta)})
+
+
+def _join_suggestions_merged(path, profile: dict, meta: dict) -> list[dict]:
+    """ER図に出す候補。「結合を探す」で保存した候補があればそれ、無ければ列名からの推測。過去のSQL由来を足す。"""
+    saved = catalog.saved_join_suggestions(path, profile, meta)
+    base = saved if saved is not None else catalog.join_suggestions(profile, meta, path)
+    return base + sqlusage.suggestions_for(db.alias_for(path), profile, meta)
+
+
+@bp_catalog.post("/api/catalog/joins/discover")
+@admin_required
+def joins_discover():
+    """「結合を探す」を裏で始める。scope: all（全表）/ stale（定義が増えた・変わった表だけ）。"""
+    body = _body()
+    path = db.path_for(body.get("db") or "")
+    profile = catalog.profile_db(path)
+    meta = catalog.load_meta(path)
+    st = catalog.join_candidates_status(path, profile)
+    if st["running"]:
+        return jsonify({"error": "いま調べている最中です。終わるまで待ってください。"}), 409
+    scope = str(body.get("scope") or "all")
+    tables = None if (scope != "stale" or not st["exists"]) else (st["new"] + st["changed"])
+    if tables == []:
+        return jsonify({"ok": True, "started": False, "message": "定義の変わった表はありません。"})
+    started = catalog.start_discover(path, profile, meta, tables)
+    if not started:
+        return jsonify({"error": "いま調べている最中です。終わるまで待ってください。"}), 409
+    print(f"[joins] 結合を探す: {'全表' if tables is None else str(len(tables)) + ' 表'}（{g.user.username}）")
+    return jsonify({"ok": True, "started": True, "tables": tables})
+
+
+@bp_catalog.get("/api/catalog/joins/status")
+@admin_required
+def joins_status():
+    """保存した候補の状態（いつ・何件・定義の変わった表）と、いま調べている進み具合。"""
+    path = db.path_for(request.args.get("db") or "")
+    profile = catalog.profile_db(path)
+    return jsonify({"ok": True, **catalog.join_candidates_status(path, profile),
+                    "progress": dict(catalog._discover_state)})
 
 
 @bp_catalog.post("/api/catalog/rename-table")

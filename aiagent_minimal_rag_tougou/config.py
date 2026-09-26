@@ -327,6 +327,10 @@ PROFILE_STATS_MAX_ROWS = 2_000_000  # これ以上の行数のテーブルは列
 # 間に合わなければ「確認しきれなかった」と返して人が決める（env では変えず、ここで決める）
 LINK_CHECK_TIMEOUT_SEC = 5          # 1本のクエリの上限（秒）
 LINK_CHECK_SAMPLE_ROWS = 2000       # 見積もりに使う「値の種類」の標本数（相手の表は1回読むだけ）
+# ER図の「結合を探す」。全表の全列を実データで調べた候補の保存先と、親側の標本数
+# （子の標本 LINK_CHECK_SAMPLE_ROWS と親の標本の重なりで組を絞るので、親は多めに持つ）
+JOIN_CANDIDATES_FILE = DATA_DIR / "join_candidates.json"
+JOIN_PARENT_SAMPLE_ROWS = 20000
 
 # --- プロンプト組み立て -----------------------------------------------------
 # 選択スコープのカタログ全文がこの文字数以下なら、すべて system prompt にインライン。
