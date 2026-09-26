@@ -1682,7 +1682,13 @@
                   <b>阻止</b>=値が1件も一致しない。<b>警告</b>=一致しない値が30%以上／型が違う／
                   主キー同士を結んでいる／参照先の値が一意でない／区分値とIDを結んでいる疑い
                   （相手の値が10種類以上あるのに自分は10種類以下で、相手の半分未満しか使っていない）。
-                  <b>情報</b>=親に無い値が少しある。警告は確認のうえ強行できますが、阻止は保存できません。</td></tr>
+                  <b>情報</b>=親に無い値が少しある。警告は確認のうえ強行できますが、阻止は保存できません。
+                  大きな表でも止まらないよう、一致率と参照率は「値の種類」の標本（既定 2,000 種類。相手の表は1回読むだけ）で見積もり、
+                  標本の範囲で一致が無いときは全体に1件でもあるかを確かめてから阻止にします。
+                  親の一意性はデータベースが宣言した主キー・UNIQUE 索引があれば読まずに確定し、無ければ全行で数えます
+                  （時間内に終わらなければ先頭 10 万行で概算し、その旨を添えます）。1本のクエリは 5 秒で切り上げ、
+                  間に合わなければ、そこまでの判定に「確認が時間内に終わりませんでした」の警告を添えて人が決めます（登録後、データ品質の検査で親に無い値を数えられます）。
+                  検査中は「実データを確認しています…」と出て、次の線は終わってから引けます。</td></tr>
           <tr><td>主キーの決め方</td>
               <td>人が指定した主キー（実在する列だけに絞る）→ データベースの宣言 → 無し、の順。
                   人が指定した場合はプロンプトに「（人が指定）」と明記し、複合キーなら
@@ -2176,6 +2182,7 @@
           <tr><td>取り込みの行数／ファイル容量</td><td>1,000,000行／100MB</td><td>変更可</td></tr>
           <tr><td>取得日時の列名</td><td>取得日時</td><td>変更可</td></tr>
           <tr><td>スケジューラの巡回間隔</td><td>60秒</td><td>変更可</td></tr>
+          <tr><td>ER図の実データ検査: 値の標本数／1クエリの上限</td><td>2,000種類／5秒</td><td>固定（config.py の定数）</td></tr>
           <tr><td>マイロボット: 1人あたりの上限／定期実行の最短の間隔／手順数／同時に動かす数</td><td>5件／12時間／20手順／4本</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>パーソナライズ: 機能／書き直しのモデル／本文の上限</td><td>使う／回答と同じ／2,000字</td><td>管理者メニュー（初期値は変更可）</td></tr>
           <tr><td>画面: SQLの枠／社内文書の検索／提案カードを畳む</td><td>畳む／畳む／畳む</td><td>管理者メニュー（初期値は変更可）</td></tr>
@@ -3600,7 +3607,7 @@ return a, b, card</pre><div class="mt"><code>card_flip(card)</code> は両端を
        pr = rel_pairs(r, alias)
        if (pr[0], pr[1]) == ((a別名,a表),(b別名,b表)):  same.append((i, r))
        elif (pr[0], pr[1]) == ((b別名,b表),(a別名,a表)): # 逆向きの既存
-           a, b = b, a; card = card_flip(card)（既定のままなら CARD_DEFAULT）; same.append((i, r))</pre><div class="mt">逆向きでも拾って既存の向きに合わせる（1つの関連の中で向きが混ざらないように）。</div><div class="mt">・入れ替えの結果 <code>a</code> が他DBになったら 400（<code>外部キーを持つのは X.T です</code>）。<br>・既存の同じ列ペアがあれば 400（<code>すでに登録されています</code>）。<br>・<code>same</code> があり <code>mode</code> が <code>&quot;merge&quot;</code>/<code>&quot;new&quot;</code> のどちらでもなければ、<b>保存せず</b> <code>{ok: false, ask: &quot;merge_or_new&quot;, existing: [...]}</code> を返して画面に選ばせる。「既存の線に列を足して複合キーにするのか、独立した別の関連なのかは人にしか決められない」。<br>・<code>link_check(a, b, lookup, _path_of)</code> で実データを見る。<code>mode == &quot;merge&quot;</code> のときは補正が入る（下記）。<code>level == &quot;block&quot;</code>、または <code>&quot;warn&quot;</code> で <code>force</code> が無ければ <b>200</b> で <code>{ok: false, check}</code> を返す（「画面の api() は非2xxだと本文を捨てて例外にするため」200 で返している）。<br>・保存。<br>・merge … 合流先は <code>same[0]</code>、ただし <code>merge_from</code>/<code>merge_to</code> が来ていればそれで特定。<code>pairs = 既存のpairs + [(a列, b列)]</code> にして <code>format_endpoint</code> で from/to を書き直す。<b><code>cardinality</code> は書き換えない。</b><br>・それ以外 … <code>{from, to, cardinality}</code> を append。</div><div class="mt"><b>merge のときの警告補正</b></div><pre class="mono small">tgt_pairs = rel_pairs(same[0][1], alias)[2] + [(a[2], b[2])]
+           a, b = b, a; card = card_flip(card)（既定のままなら CARD_DEFAULT）; same.append((i, r))</pre><div class="mt">逆向きでも拾って既存の向きに合わせる（1つの関連の中で向きが混ざらないように）。</div><div class="mt">・入れ替えの結果 <code>a</code> が他DBになったら 400（<code>外部キーを持つのは X.T です</code>）。<br>・既存の同じ列ペアがあれば 400（<code>すでに登録されています</code>）。<br>・<code>same</code> があり <code>mode</code> が <code>&quot;merge&quot;</code>/<code>&quot;new&quot;</code> のどちらでもなければ、<b>保存せず</b> <code>{ok: false, ask: &quot;merge_or_new&quot;, existing: [...]}</code> を返して画面に選ばせる。「既存の線に列を足して複合キーにするのか、独立した別の関連なのかは人にしか決められない」。<br>・<code>link_check(a, b, lookup, _path_of)</code> で実データを見る（値の種類の標本 <code>config.LINK_CHECK_SAMPLE_ROWS</code>＝2,000 と、1クエリ <code>config.LINK_CHECK_TIMEOUT_SEC</code>＝5秒の制限つき。どちらも config.py の定数で env では変えない。相手の表は非相関の IN 副問い合わせで1回読むだけ（相関 EXISTS は大きな表で自動索引が付かない）。標本の一時表は CREATE TABLE AS で型親和性を引き継ぐ。読まずに一意と確定するのは DB 宣言の主キー（effective_pk の出所が declared）と部分索引でない UNIQUE のみ。間に合わなければ、そこまでの判定を残して warn「確認が時間内に終わりませんでした」）。<code>mode == &quot;merge&quot;</code> のときは補正が入る（下記）。<code>level == &quot;block&quot;</code>、または <code>&quot;warn&quot;</code> で <code>force</code> が無ければ <b>200</b> で <code>{ok: false, check}</code> を返す（「画面の api() は非2xxだと本文を捨てて例外にするため」200 で返している）。<br>・保存。<br>・merge … 合流先は <code>same[0]</code>、ただし <code>merge_from</code>/<code>merge_to</code> が来ていればそれで特定。<code>pairs = 既存のpairs + [(a列, b列)]</code> にして <code>format_endpoint</code> で from/to を書き直す。<b><code>cardinality</code> は書き換えない。</b><br>・それ以外 … <code>{from, to, cardinality}</code> を append。</div><div class="mt"><b>merge のときの警告補正</b></div><pre class="mono small">tgt_pairs = rel_pairs(same[0][1], alias)[2] + [(a[2], b[2])]
 parent_cols = [p[1] for p in tgt_pairs]
 if tuple_unique(親のパス, 親の表, parent_cols):
     kept = [i for i in check[&quot;issues&quot;] if &quot;一意ではありません&quot; not in i[&quot;title&quot;]]

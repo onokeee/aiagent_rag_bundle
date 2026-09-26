@@ -3374,6 +3374,7 @@ def tuple_unique(path, table: str, cols: list) -> bool:
     try:
         conn = db.connect_scope([(str(path), "p")])
         try:
+            _make_timeout(conn, config.LINK_CHECK_TIMEOUT_SEC)   # 大きな表で画面を止めない（間に合わなければ False＝安全側）
             q = lambda x: '"' + str(x).replace('"', '""') + '"'
             sql = (f"SELECT 1 FROM p.{q(table)} GROUP BY "
                    + ", ".join(q(c) for c in cols)
@@ -3383,6 +3384,23 @@ def tuple_unique(path, table: str, cols: list) -> bool:
             conn.close()
     except Exception:
         return False
+
+
+def _declared_unique(conn, alias: str, table: str, col: str):
+    """その列に単独の UNIQUE 索引が宣言されているか。無ければ False、調べられなければ None。"""
+    q = lambda s: '"' + str(s).replace('"', '""') + '"'
+    try:
+        for row in conn.execute(f"PRAGMA {q(alias)}.index_list({q(table)})").fetchall():
+            name, uniq = row[1], row[2]
+            partial = row[4] if len(row) > 4 else 0
+            if not uniq or partial:            # WHERE 付きの部分索引は表全体の一意ではない
+                continue
+            cols = [r[2] for r in conn.execute(f"PRAGMA {q(alias)}.index_info({q(name)})").fetchall()]
+            if cols == [col]:
+                return True
+        return False
+    except sqlite3.Error:
+        return None
 
 
 def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
@@ -3442,67 +3460,142 @@ def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
             "1対1の関連（同じIDを持つ2つのテーブル）なら正しいですが、"
             "「たまたま両方IDという名前」なら結ぶべきではありません。")
 
-    # --- 実データで分かること（読み取り専用で数える） ---------------------------------
+    # --- 実データで分かること（読み取り専用・標本・時間制限つき） ----------------------------
+    # 50万行級の表を丸ごと突き合わせると、1回の検査で両方の表を何度も読むことになり、
+    # 十数秒〜分単位かかって画面が止まったように見える。そこで
+    #   (1) 一致率・参照率は「値の種類」の標本（先頭 LINK_CHECK_SAMPLE_ROWS 種類）で見積もる。
+    #       相手の表は非相関の IN 副問い合わせで1回読むだけ（相関 EXISTS だと大きな表では
+    #       自動索引が作られず、標本1件ごとに相手を全走査してしまう）。
+    #       標本の一時表は CREATE TABLE AS で作り、元の列の型親和性を引き継ぐ（型無しだと
+    #       INTEGER の子と TEXT の親が一致しなくなる）
+    #   (2) 標本は「先頭から見つかった種類」なので偏ることがある。標本の範囲で一致が無いときは、
+    #       全体に1件でもあるかを確かめてから「阻止」にする
+    #   (3) 親の一意性は、DB が宣言した主キー・UNIQUE 索引があれば読まずに確定。無ければ全行で数え、
+    #       時間内に終わらなければ先頭の行で概算してその旨を添える（人が画面で指定した主キーは数える）
+    #   (4) 1本ごとに時間制限。途中で切れても、そこまでの判定は残して「確認しきれなかった」を添える
+    S = max(100, int(config.LINK_CHECK_SAMPLE_ROWS))
+    U = S * 50                                     # 一意性の概算に読む行数（既定 10万行）
+    T = config.LINK_CHECK_TIMEOUT_SEC
+    pk_src_p = effective_pk(prof_p, meta_p, pt)[1] if prof_p else "none"
+    cs = ps = None
+    matched = parent_hit = any_hit = None
+    unique, unique_note, unique_partial = None, "", False
+    approx = timed_out = False
+
+    def interrupted(e) -> bool:
+        return "interrupt" in str(e).lower()
+
     try:
         pc_path, pp_path = path_of(ca), path_of(pa)
         conn = db.connect_scope([(pc_path, "c"), (pp_path, "p")] if pc_path != pp_path
                                 else [(pc_path, "c")])
         # どこで落ちても閉じる。外側の except が拾うので、finally が無いと接続が残る
         try:
+            reset = _make_timeout(conn, T)
             pal = "c" if pc_path == pp_path else "p"
             q = lambda s: '"' + str(s).replace('"', '""') + '"'
             C = f'"c".{q(ct)}', q(cc)
             P = f'"{pal}".{q(pt)}', q(pc)
-
-            n_child = conn.execute(f"SELECT COUNT(*) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
-            n_parent = conn.execute(f"SELECT COUNT(*) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
-            n_parent_distinct = conn.execute(
-                f"SELECT COUNT(DISTINCT {P[1]}) FROM {P[0]} WHERE {P[1]} IS NOT NULL").fetchone()[0]
-            # 子の値のうち親に存在するもの / しないもの
-            matched = conn.execute(
-                f"SELECT COUNT(*) FROM {C[0]} c0 WHERE c0.{C[1]} IS NOT NULL "
-                f"AND EXISTS (SELECT 1 FROM {P[0]} p0 WHERE p0.{P[1]} = c0.{C[1]})").fetchone()[0]
-            # 子の「異なる値」の数と、親の値のうち子から参照されている数（親側のカバー率）。
-            # 「status(1,2,3,9) → product_id(1〜40)」のような偶然の一致は、子の値は全部
-            # 親に見つかるのに、親の値はほとんど参照されない。本物の外部キーなら親の多くが
-            # 参照される。値の一致だけでは見抜けないので、この角度を足す。
-            n_child_distinct = conn.execute(
-                f"SELECT COUNT(DISTINCT {C[1]}) FROM {C[0]} WHERE {C[1]} IS NOT NULL").fetchone()[0]
-            parent_hit = conn.execute(
-                f"SELECT COUNT(DISTINCT p0.{P[1]}) FROM {P[0]} p0 "
-                f"WHERE EXISTS (SELECT 1 FROM {C[0]} c0 WHERE c0.{C[1]} = p0.{P[1]})").fetchone()[0]
+            try:
+                # 子・親それぞれの「値の種類」の標本（元の列の型親和性を引き継ぐ）
+                reset()
+                conn.execute(f"CREATE TEMP TABLE lc_c AS SELECT DISTINCT {C[1]} AS v FROM {C[0]} "
+                             f"WHERE {C[1]} IS NOT NULL LIMIT {S}")
+                cs = [r[0] for r in conn.execute("SELECT v FROM lc_c")]
+                reset()
+                conn.execute(f"CREATE TEMP TABLE lc_p AS SELECT DISTINCT {P[1]} AS v FROM {P[0]} "
+                             f"WHERE {P[1]} IS NOT NULL LIMIT {S}")
+                ps = [r[0] for r in conn.execute("SELECT v FROM lc_p")]
+                approx = len(cs) >= S or len(ps) >= S
+                # 子の標本のうち親にあるもの（親は IN 副問い合わせで1回読む）
+                reset()
+                matched = conn.execute(
+                    f"SELECT COUNT(*) FROM lc_c s WHERE s.v IN (SELECT {P[1]} FROM {P[0]})").fetchone()[0]
+                if matched == 0 and approx and cs:
+                    reset()
+                    any_hit = conn.execute(
+                        f"SELECT 1 FROM {C[0]} c0 WHERE c0.{C[1]} IN (SELECT {P[1]} FROM {P[0]}) LIMIT 1"
+                    ).fetchone() is not None
+                # 親の標本のうち子から参照されているもの。「status(1,2,3,9) → product_id(1〜40)」のような
+                # 偶然の一致は、子の値は全部親に見つかるのに親の値はほとんど参照されない
+                reset()
+                parent_hit = conn.execute(
+                    f"SELECT COUNT(*) FROM lc_p s WHERE s.v IN (SELECT {C[1]} FROM {C[0]})").fetchone()[0]
+                # 親の一意性
+                if ((pk_src_p == "declared" and pc in pk_p and pk_p == {pc})
+                        or _declared_unique(conn, pal, pt, pc)):
+                    unique = True
+                else:
+                    try:
+                        reset()
+                        dup = conn.execute(f"SELECT 1 FROM {P[0]} WHERE {P[1]} IS NOT NULL "
+                                           f"GROUP BY {P[1]} HAVING COUNT(*) > 1 LIMIT 1").fetchone()
+                        unique = dup is None
+                    except sqlite3.OperationalError as e:
+                        if not interrupted(e):
+                            raise
+                        # 全行では間に合わない。先頭 U 行で概算し、その旨を添える
+                        reset()
+                        dup = conn.execute(
+                            f"SELECT 1 FROM (SELECT {P[1]} AS v FROM {P[0]} WHERE {P[1]} IS NOT NULL LIMIT {U}) "
+                            "GROUP BY v HAVING COUNT(*) > 1 LIMIT 1").fetchone()
+                        unique = dup is None
+                        unique_partial = True
+                        unique_note = f"（先頭 {U:,} 行で確認。全体は {T:g} 秒で確認しきれませんでした）"
+            except sqlite3.OperationalError as e:
+                if not interrupted(e):
+                    raise
+                timed_out = True                   # ここまでの判定は残す
         finally:
             conn.close()
 
-        if n_child and n_parent and matched == 0:
-            add("block", "値が1件も一致しません",
-                f"{ct}.{cc} の {n_child:,} 件は、{pt}.{pc} の {n_parent:,} 件のどれとも一致しません。"
-                "この2列で JOIN しても結果は必ず0行になります。別の意味の列です。")
-        elif n_child and matched:
-            miss = n_child - matched
-            rate = miss / n_child * 100
-            if rate >= 30:
+        n_c, n_p = len(cs or []), len(ps or [])
+        note = f"（値の種類が多いため、先頭 {S:,} 種類の標本で見積もり）" if approx else ""
+        if matched is not None and n_c and n_p:
+            if matched == 0 and any_hit is not True:
+                if not approx or any_hit is False:
+                    add("block", "値が1件も一致しません",
+                        f"{ct}.{cc} の値（{n_c:,} 種類）は、{pt}.{pc} の値（{n_p:,} 種類）のどれとも一致しません{note}。"
+                        "この2列で JOIN しても結果は必ず0行になります。別の意味の列です。")
+                else:
+                    add("warn", "標本の値が親に見つかりません",
+                        f"{ct}.{cc} の先頭 {n_c:,} 種類の値は {pt}.{pc} に1つもありません{note}。"
+                        "全体に一致があるかは確認しきれませんでした。列の取り違えの可能性があります。")
+            elif matched == 0:
                 add("warn", "一致しない値が多すぎます",
-                    f"{ct}.{cc} の {n_child:,} 件のうち {miss:,} 件（{rate:.0f}%）が {pt}.{pc} に存在しません。"
+                    f"{ct}.{cc} の先頭 {n_c:,} 種類の値はどれも {pt}.{pc} に無く、全体でも一致はわずかです{note}。"
                     "外部キーなら親に無い値はごく少数のはずです。列の取り違えの可能性があります。")
-            elif miss:
-                add("info", "親に無い値があります",
-                    f"{ct}.{cc} の {miss:,} 件（{rate:.1f}%）が {pt}.{pc} に存在しません"
-                    "（未登録・削除済みの参照。数が少なければ通常の範囲です）。")
-            # 子の値の種類が極端に少なく、親のごく一部にしか当たらない → 区分値とIDの偶然の一致
-            if n_parent_distinct >= 10 and n_child_distinct <= 10                     and parent_hit / n_parent_distinct < 0.5:
-                add("warn", "区分値とIDを結んでいる可能性があります",
-                    f"{ct}.{cc} は値の種類が {n_child_distinct} 種類しかなく"
-                    f"（{', '.join(str(v) for v in _sample_values(prof_c, ct, cc)[:6])} など）、"
-                    f"{pt}.{pc} の {n_parent_distinct:,} 種類のうち {parent_hit} 種類にしか当たりません。"
-                    "ステータスや区分のような「コード値」の列を、番号がたまたま重なるIDの列に"
-                    "結ぼうとしていませんか。")
-        if n_parent and n_parent_distinct < n_parent:
-            dup = n_parent - n_parent_distinct
+            else:
+                miss = n_c - matched
+                rate = miss / n_c * 100
+                if rate >= 30:
+                    add("warn", "一致しない値が多すぎます",
+                        f"{ct}.{cc} の値 {n_c:,} 種類のうち {miss:,} 種類（{rate:.0f}%）が {pt}.{pc} に存在しません{note}。"
+                        "外部キーなら親に無い値はごく少数のはずです。列の取り違えの可能性があります。")
+                elif miss:
+                    add("info", "親に無い値があります",
+                        f"{ct}.{cc} の値 {miss:,} 種類（{rate:.1f}%）が {pt}.{pc} に存在しません{note}"
+                        "（未登録・削除済みの参照。数が少なければ通常の範囲です）。")
+                # 子の値の種類が極端に少なく、親のごく一部にしか当たらない → 区分値とIDの偶然の一致
+                if parent_hit is not None and n_p >= 10 and n_c <= 10 and parent_hit / n_p < 0.5:
+                    add("warn", "区分値とIDを結んでいる可能性があります",
+                        f"{ct}.{cc} は値の種類が {n_c} 種類しかなく"
+                        f"（{', '.join(str(v) for v in cs[:6])} など）、"
+                        f"{pt}.{pc} の {n_p:,} 種類のうち {parent_hit} 種類にしか当たりません。"
+                        "ステータスや区分のような「コード値」の列を、番号がたまたま重なるIDの列に"
+                        "結ぼうとしていませんか。")
+        if unique is False:
             add("warn", "参照先（1側）の値が一意ではありません",
-                f"{pt}.{pc} は {n_parent:,} 件中 {dup:,} 件が重複しています。"
+                f"{pt}.{pc} に同じ値の行があります{unique_note}。"
                 "「1側」は本来ユニークです。重複したまま JOIN すると行が増えて集計が膨らみます。"
                 "多重度を多対多（0..*:0..*）にするか、参照先を主キー列に変えてください。")
+        elif unique_partial:
+            add("info", "参照先の一意性は先頭の行だけ確認しました",
+                f"{pt}.{pc} は先頭 {U:,} 行では重複がありませんが、全体は {T:g} 秒で確認しきれませんでした。")
+        if timed_out:
+            add("warn", "実データの確認が時間内に終わりませんでした",
+                f"表が大きく、{T:g} 秒で確認しきれなかった項目があります。"
+                "ここまでの判定と列の意味を確かめたうえで登録してください（登録後、データ品質の検査で親に無い値を数えられます）。")
     except Exception as e:
         add("info", "実データでの確認ができませんでした", str(e)[:120])
 

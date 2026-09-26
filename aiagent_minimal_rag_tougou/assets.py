@@ -4015,6 +4015,7 @@ const ER = (() => {
     // 多重度は "from側:to側"。from は外部キーを持つ子、to は参照される親。
     // 値は 0..1 / 1 / 0..* / 1..*（下限＝相手が無くてもよいか、上限＝1つか多か）。
     // 組み合わせは順不同で10通り。親側に小さい方を置いた向きで並べる
+    let linking = false;   // 線を結んだ直後の実データ検査中（次の線は待ってもらう）
     const CARDS = ['0..*:1', '1..*:1', '0..*:0..1', '1..*:0..1',
                    '1:1', '0..1:1', '0..1:0..1',
                    '0..*:0..*', '0..*:1..*', '1..*:1..*'];
@@ -4670,6 +4671,7 @@ const ER = (() => {
     }
 
     async function undo() {
+        if (linking) { toast('前の線の実データを確認しています。終わってから操作してください。'); return; }
         const e = past.pop();
         if (!e) return;
         try { await e.undo(); future.push(e); toast(`元に戻しました: ${e.label}`); }
@@ -4678,6 +4680,7 @@ const ER = (() => {
     }
 
     async function redo() {
+        if (linking) { toast('前の線の実データを確認しています。終わってから操作してください。'); return; }
         const e = future.pop();
         if (!e) return;
         try { await e.redo(); past.push(e); toast(`やり直しました: ${e.label}`); }
@@ -4742,16 +4745,37 @@ const ER = (() => {
 
     /* 関連API を1回叩いて図を反映する（履歴には積まない。undo/redo からも使う） */
     async function relApi(body) {
-        const r = await api('/api/catalog/relationship', { db: CAT.db, ...body });
-        // 保存せずに聞き返す応答（実データ判定で停止／複合キーの合流確認）には
-        // 図データが入らない。ここで返さないと図を空で置き換えて壊してしまう
-        if (r.check || r.ask) return r;
-        applyEr(r.er); closePanel();
-        return r;
+        const adding = body.action === 'add';
+        if (adding) {
+            // 大きな表では実データの検査に数秒かかる。待っていることを見せ、終わるまで次の操作は待ってもらう
+            // （元に戻す／やり直す・候補の登録もここを通るので、1か所で済ませる）
+            linking = true;
+            showPanel('実データを確認しています…', [
+                el('div', { class: 'small muted' }, '結んだ2列の値の重なりと一意性を見ています。大きな表では数秒かかります。')]);
+        }
+        try {
+            // 実データの検査が長引いても画面が固まらないよう、60秒で諦めて理由を出す（サーバ側は5秒で切り上げる作り）
+            const r = await Promise.race([
+                api('/api/catalog/relationship', { db: CAT.db, ...body }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error(
+                    'サーバの応答が60秒ありません。表が大きく検査に時間がかかっています。少し待ってから画面を更新してください。')), 60000)),
+            ]);
+            // 保存せずに聞き返す応答（実データ判定で停止／複合キーの合流確認）には
+            // 図データが入らない。ここで返さないと図を空で置き換えて壊してしまう
+            if (r.check || r.ask) return r;
+            applyEr(r.er); closePanel();
+            return r;
+        } catch (e) {
+            if (adding) closePanel();                 // 「確認しています」を出したままにしない
+            throw e;
+        } finally {
+            if (adding) linking = false;
+        }
     }
 
     /* 人の操作から呼ぶ。サーバに保存したうえで、逆の操作を履歴に積む */
     async function mutate(body) {
+        if (linking) { toast('前の線の実データを確認しています。終わってから操作してください。'); return; }
         try {
             const r = await relApi(body);
             // 同じ表ペアに既存の関連がある。複合キーに合流するか、別の関連かを人に選ばせる
@@ -4919,6 +4943,7 @@ const ER = (() => {
             if (!target || !box) return;
             const toNode = data.nodes.find(n => n.id === box.dataset.id);
             if (toNode.id === fromNode.id && target.dataset.col === fromCol) return;
+            if (linking) { toast('前の線の実データを確認しています。終わってから引いてください。'); return; }
             mutate({
                 action: 'add',
                 from_table: fromNode.table, from_column: fromCol,
