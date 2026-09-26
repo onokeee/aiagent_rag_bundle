@@ -4789,6 +4789,13 @@ const ER = (() => {
                          // 一度通した線なので、やり直しでは確認（warn）を飛ばす。block は元々通らない
                          redo: () => relApi({ action: 'add', from: a.from, to: a.to,
                                               cardinality: a.cardinality, force: true }) });
+                // 多重度は主キーの並びからの推定なので、登録した線をそのまま選択状態にして
+                // 10通りのパネルを開く。違っていれば1回押すだけで直せる
+                const added = data.edges.find(e2 => e2.kind === 'meta' && e2.from_ref === a.from && e2.to_ref === a.to);
+                if (added) {
+                    selectEdge(added);
+                    toast(`関連を登録しました（多重度 ${normCard(added.cardinality)}＝${cardJa(added.cardinality)}。違えば右のパネルで選び直せます）`);
+                }
             } else if (r.merged) {
                 const m = r.merged;
                 record({ label: `複合キーに列を追加（${m.pair[0]} = ${m.pair[1]}）`,
