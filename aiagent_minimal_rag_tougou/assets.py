@@ -477,11 +477,13 @@ TEMPLATES = {
           {% endif %}{% endfor %}
         </select>
         <button class="btn btn--sm" id="erSuggest"
-                title="「結合を探す」で作った結合の候補（と、過去のSQLで使われたのに未登録の結合）を赤い線で重ねます。まだ探していなければ空です。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
+                title="「結合を探す」で作った結合の候補（と、過去のSQLで使われたのに未登録の結合）を青い点線で重ねます。まだ探していなければ空です。&#10;線をクリックすると内容を確かめて登録できます。&#10;画面に出ている表どうしの候補だけが描かれます">結合候補</button>
         <button class="btn btn--sm" id="erDiscover"
                 title="全表の全列を実データで調べて、結合の候補と多重度の推定を保存します。&#10;表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません">結合を探す</button>
         <button class="btn btn--sm" id="erAddTable"
                 title="いま表示しているまとまりに、別のまとまりの表を1つずつ足します。&#10;またぎの関連を引くときに、「すべて」で104表を出さずに済みます">＋ 別のまとまりの表</button>
+        <button class="btn btn--sm" id="erReach"
+                title="いま表示しているまとまりの表から、登録済みの関連を枝葉の先までたどって、届く表をすべて出します（破線の枠）。&#10;（+N）は押すと増える表の数。もう一度押すと、直接つながる表だけの表示に戻ります。&#10;結合候補（未登録の推測）はたどりません。まとまりを切り替えても押した状態は残ります">つながる表をすべて</button>
         {% endif %}
       </div>
       <div class="er__viewport" id="erViewport">
@@ -2242,6 +2244,8 @@ STATIC_FILES = {
     --warn-weak: #f8f2e6;
     --err:       #a63d33;
     --err-weak:  #faedeb;
+    --sug:       #2f6db5;   /* ER図の結合候補（未登録の推測）。使用回数の強調（accent の橙）と見分けるため青系 */
+    --sug-weak:  #d3e2f5;   /* 候補の相手の表の見出し。縮小しても普通の見出しと区別がつく濃さ */
     /* 影はほとんど使わない。境界は線で示す方が静かに見える */
     --shadow:    0 1px 2px rgba(31,30,29,.04);
     --shadow-lg: 0 4px 24px rgba(31,30,29,.10);
@@ -2274,6 +2278,8 @@ STATIC_FILES = {
         --warn-weak: #322a1c;
         --err:       #d98376;
         --err-weak:  #38241f;
+        --sug:       #7fb3ec;
+        --sug-weak:  #263a52;
         --sidebar-bg:#1f1e1c;
         --nav-hover: #322f2b;
         --shadow:    0 1px 2px rgba(0,0,0,.30);
@@ -3484,13 +3490,16 @@ table.qa th { white-space: nowrap; }
 .sqlnote:empty { display: none; }
 .sqlnote__head { font-weight: 600; color: var(--text); opacity: .75; }
 
-/* ER図: まとまり表示中に、関連で繋がっている「隣のまとまりの表」を破線で出す */
-.ertable--other { outline: 2px dashed var(--border-2); outline-offset: 2px; opacity: .92; }
+/* ER図: まとまり表示中に、関連で繋がっている「隣のまとまりの表」を破線で出す。
+   縮小すると破線は見えなくなるので、見出しの色も変えて箱ごと灰色に見えるようにする */
+.ertable--other { outline: 2px dashed var(--muted); outline-offset: 2px; }
+.ertable--other .ertable__head { background: var(--border-2); }
 
-/* ER図: 結合候補の相手として画面に出している表（候補線と同じ赤系） */
-.ertable--sug { outline: 2px dashed var(--err); outline-offset: 2px; opacity: .95; }
-/* 候補線の多重度の文字も赤系に */
-.er__edgelabel--sug { fill: var(--err); }
+/* ER図: 結合候補の相手として画面に出している表（候補線と同じ青系） */
+.ertable--sug { outline: 2px dashed var(--sug); outline-offset: 2px; }
+.ertable--sug .ertable__head { background: var(--sug-weak); }
+/* 候補線の多重度の文字も青系に（選んだときも橙にせず青のまま。.is-selected の規則より後ろ・同じ強さで上書き） */
+.er__edgelabel--sug, .er__edgelabel--sug.is-selected { fill: var(--sug); }
 
 /* まとまりのメモ行。右列（表示名・キー）が縦に長いので、.row 既定の下揃えだと
    左のメモが押し下げられて上に空白ができる。ここは上揃えで固定する */
@@ -4267,7 +4276,7 @@ const ER = (() => {
             if (count !== null) counts.push([p.mid, count]);
         });
 
-        // 結合候補（未登録）。赤い点線で重ね、クリックで登録カードを開く。
+        // 結合候補（未登録）。青い点線で重ね、クリックで登録カードを開く。
         // 画面に両端が出ている候補だけが描かれる（edgePath が null を返すため）
         if (showSug) suggestions.forEach((sg, i) => {
             const p = edgePath(sg.edge);
@@ -4288,7 +4297,8 @@ const ER = (() => {
             const path = document.createElementNS(NS, 'path');
             path.setAttribute('d', p.d);
             path.setAttribute('fill', 'none');
-            path.setAttribute('stroke', 'var(--err)');
+            // 青の点線。使用回数の強調（橙の実線）と同じ赤系だと見分けがつかなかった
+            path.setAttribute('stroke', 'var(--sug)');
             path.setAttribute('stroke-width', on ? 2.6 : 1.6);
             path.setAttribute('stroke-dasharray', '3 3');
             path.setAttribute('pointer-events', 'none');
@@ -4340,41 +4350,94 @@ const ER = (() => {
     let groupFilter = null;   // 元DBグループ（表名の「__」より前）での絞り込み。null=全部
     let extraShown = new Set(); // まとまり表示に手で足した表（またぎ関連を引くため）
     let suggestions = [];       // 結合候補（「結合を探す」で保存したもの＋過去のSQL由来）。setSuggestions で受け取る
-    let showSug = false;        // 候補の赤線を重ねるか
-    let sugOnlyIds = new Set(); // 候補のためだけに画面へ出している表（赤枠で描く）
-    /** まとまり表示で、候補とは関係なく出る表: まとまりの表＋関連で繋がる隣の表＋手で足した表 */
-    function baseIds() {
-        const ids = new Set(data.nodes
+    let showSug = false;        // 候補の青線を重ねるか
+    let sugOnlyIds = new Set(); // 候補のためだけに画面へ出している表（青枠で描く）
+    let reachAll = false;       // 「つながる表をすべて」: 隣の表で止めず、関連を枝葉の先までたどって出す
+    /** いま表示しているまとまりの表の id */
+    function groupIds() {
+        return new Set(data.nodes
             .filter(n => String(n.table || '').split('__')[0] === groupFilter)
             .map(n => n.id));
-        // 関連で繋がっている「隣のまとまりの表」も一緒に出す。
-        // 出さないと、まとまりをまたぐ関連が見えず、この表示からは消せも引けもしない
+    }
+    /** ids と登録済みの関連で直接つながっている、ids 以外の表。
+        隣のまとまりの表も一緒に出さないと、まとまりをまたぐ関連が見えず、この表示からは消せも引けもしない */
+    function neighbours(ids) {
         const extra = new Set();
         (data.edges || []).forEach(e => {
             const f = `${e.from[0]}.${e.from[1]}`, t = `${e.to[0]}.${e.to[1]}`;
             if (ids.has(f) && !ids.has(t)) extra.add(t);
             if (ids.has(t) && !ids.has(f)) extra.add(f);
         });
+        return extra;
+    }
+    /** ids から登録済みの関連を向きに関係なく枝葉の先までたどって届く、ids 以外の表。
+        関連が輪になっていても、一度見た表は二度たどらない */
+    function reachable(ids) {
+        const adj = new Map();
+        const link = (a, b) => { if (!adj.has(a)) adj.set(a, []); adj.get(a).push(b); };
+        (data.edges || []).forEach(e => {
+            const f = `${e.from[0]}.${e.from[1]}`, t = `${e.to[0]}.${e.to[1]}`;
+            if (f !== t) { link(f, t); link(t, f); }
+        });
+        const seen = new Set(ids), out = new Set(), queue = [...ids];
+        while (queue.length) {
+            const cur = queue.shift();
+            (adj.get(cur) || []).forEach(n => {
+                if (!seen.has(n)) { seen.add(n); out.add(n); queue.push(n); }
+            });
+        }
+        return out;
+    }
+    /** まとまり表示で、候補とは関係なく出る表: まとまりの表＋関連で繋がる表（隣だけ／枝葉まで）＋手で足した表 */
+    function baseIds() {
+        const ids = groupIds();
+        const extra = reachAll ? reachable(ids) : neighbours(ids);
         return new Set([...ids, ...extra, ...extraShown]);
+    }
+    /** 候補を表示中に、候補の相手として足す表（base に居ない側）。
+        出さないと、またぎの候補が1本も見えない */
+    function sugPartners(base) {
+        const out = new Set();
+        if (!showSug) return out;
+        suggestions.forEach(sg2 => {
+            const f = `${sg2.edge.from[0]}.${sg2.edge.from[1]}`;
+            const t = `${sg2.edge.to[0]}.${sg2.edge.to[1]}`;
+            if (base.has(f) && !base.has(t)) out.add(t);
+            if (base.has(t) && !base.has(f)) out.add(f);
+        });
+        return out;
+    }
+    /** まとまり表示で画面に出る表の id を、枝葉までたどる／たどらないを指定して数える（画面は触らない） */
+    function visibleIds(reach) {
+        const ids = groupIds();
+        const base = new Set([...ids, ...(reach ? reachable(ids) : neighbours(ids)), ...extraShown]);
+        return new Set([...base, ...sugPartners(base)]);
+    }
+    /** 「つながる表をすべて」ボタン。押すと画面に何表増えるか（1段の表示との差）を添える。
+        候補の相手として既に出ている表は数えず、届いた表の候補の相手は数える。
+        まとまり表示のときだけ出し、増える表が無く、押してもいなければ押せなくする */
+    function syncReachBtn() {
+        const b = $('#erReach');
+        if (!b) return;
+        b.style.display = groupFilter ? '' : 'none';
+        if (!groupFilter) return;
+        const near = visibleIds(false);
+        const more = [...visibleIds(true)].filter(id => !near.has(id)).length;
+        // 押す前は「押すと何表増えるか」、押している間は「何表を足して出しているか」
+        b.textContent = !more ? 'つながる表をすべて'
+            : (reachAll ? `つながる表をすべて（${more}表を追加中）` : `つながる表をすべて（+${more}）`);
+        b.disabled = !more && !reachAll;
+        b.classList.toggle('btn--primary', reachAll);
     }
     function shownNodes() {
         if (!groupFilter) return data.nodes;
         const base = baseIds();
-        // 候補を表示中は、候補の相手（まだ画面に居ない表）も赤枠で出す。
-        // 出さないと、またぎの候補が1本も見えない
-        sugOnlyIds = new Set();
-        if (showSug) {
-            suggestions.forEach(sg2 => {
-                const f = `${sg2.edge.from[0]}.${sg2.edge.from[1]}`;
-                const t = `${sg2.edge.to[0]}.${sg2.edge.to[1]}`;
-                if (base.has(f) && !base.has(t)) sugOnlyIds.add(t);
-                if (base.has(t) && !base.has(f)) sugOnlyIds.add(f);
-            });
-        }
+        // 候補を表示中は、候補の相手（まだ画面に居ない表）も青枠で出す
+        sugOnlyIds = sugPartners(base);
         return data.nodes.filter(n => base.has(n.id) || sugOnlyIds.has(n.id));
     }
 
-    /** 候補の相手として赤枠で出していた表は、その候補を登録した瞬間に候補が消え、表ごと画面から居なくなる
+    /** 候補の相手として青枠で出していた表は、その候補を登録した瞬間に候補が消え、表ごと画面から居なくなる
         （まとまりの表と直接は繋がっていない表は、候補が無ければ出す理由が無いため）。
         引いたばかりの線が相手ごと消えると戸惑うので、「＋ 別のまとまりの表」で足したのと同じ扱いで残す。 */
     function keepPartner(body, wasSugOnly) {
@@ -4391,6 +4454,7 @@ const ER = (() => {
 
     function render() {
         world.replaceChildren(...shownNodes().map(tableEl));
+        syncReachBtn();                      // 表や関連が変わるたびに「+N」を数え直す
         // 隣のまとまりから来ている表は、見た目で区別する（枠を破線に）
         if (groupFilter) {
             $$('.ertable', world).forEach(b => {
@@ -4798,7 +4862,7 @@ const ER = (() => {
     /* 人の操作から呼ぶ。サーバに保存したうえで、逆の操作を履歴に積む */
     async function mutate(body) {
         if (linking) { toast('前の線の実データを確認しています。終わってから操作してください。'); return; }
-        // 候補のためだけに出している表（赤枠）を控えておく。登録が通ったら keepPartner で残す
+        // 候補のためだけに出している表（青枠）を控えておく。登録が通ったら keepPartner で残す
         const wasSugOnly = new Set(sugOnlyIds);
         try {
             const r = await relApi(body);
@@ -5033,16 +5097,20 @@ const ER = (() => {
         }, { passive: false });
     }
 
+    /** 隠れたタブで fit を求められた（大きさが測れない）ので、次に見えたときに合わせる印 */
+    let needFit = false;
     function fit() {
         const nodes = shownNodes();
         if (!nodes.length) return;
+        const r = viewport.getBoundingClientRect();
+        if (!r.width || !r.height) { needFit = true; return; }
+        needFit = false;
         const boxes = nodes.map(n => {
             const b = world.querySelector(`.ertable[data-id="${CSS.escape(n.id)}"]`);
             return { x: n.x, y: n.y, w: b?.offsetWidth || 232, h: b?.offsetHeight || 120 };
         });
         const minX = Math.min(...boxes.map(b => b.x)), minY = Math.min(...boxes.map(b => b.y));
         const maxX = Math.max(...boxes.map(b => b.x + b.w)), maxY = Math.max(...boxes.map(b => b.y + b.h));
-        const r = viewport.getBoundingClientRect();
         // 下限0.05: 100表を超える全体表示でも一応ひと目で収まるように
         view.k = Math.min(1.2, Math.max(0.05,
             Math.min((r.width - 80) / (maxX - minX), (r.height - 80) / (maxY - minY))));
@@ -5119,6 +5187,7 @@ const ER = (() => {
             groupFilter = gsel.value || null;
         }
         extraShown.clear();
+        reachAll = false;
         syncAddBtn();
         svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
         render();
@@ -5143,11 +5212,16 @@ const ER = (() => {
             if (selected?.type === 'sug') closePanel();
             syncSugBtn();
             render();                       // 候補の相手テーブルが出入りする
-            // 出すときだけ全体に合わせる（候補の相手の表が画面の外に出ることがある）。
-            // 消すときは見ていた位置をそのまま残す
-            if (showSug) setTimeout(fit, 20);
+            // 拡大率と位置は動かさない。出すときに全体へ合わせていたが、
+            // 見ていた場所を見失うので、出すときも消すときもそのまま残す
         });
         once('#erDiscover', openDiscover);
+        once('#erReach', () => {
+            reachAll = !reachAll;
+            render();                       // 枝葉の表が出入りする
+            // 拡大率と位置は動かさない（結合候補と同じ。動くと見ていた場所を見失う）。
+            // 届いた表が画面の外にあるときは、縮小して探してもらう
+        });
         once('#erUndo', undo);
         once('#erRedo', redo);
         once('#erArrange', arrange);
@@ -5246,7 +5320,7 @@ const ER = (() => {
         const mine = () => !panel.classList.contains('hidden') && panel.dataset.kind === 'discover';
         const progressPanel = (p) => showPanel('結合を探しています…', [
             el('div', { class: 'small' }, `${p.phase || ''} ${p.done ?? 0} / ${p.total ?? 0}`),
-            el('div', { class: 'small muted mt' }, '閉じても裏で続きます。終わると知らせが出て、候補が赤い点線で重なります。')], { kind: 'discover' });
+            el('div', { class: 'small muted mt' }, '閉じても裏で続きます。終わると知らせが出て、候補が青い点線で重なります。')], { kind: 'discover' });
         progressPanel({});
         const tick = async () => {
             let st;
@@ -5263,12 +5337,12 @@ const ER = (() => {
                 return;
             }
             await refreshSuggestions();
-            showSug = true; syncSugBtn(); render(); setTimeout(fit, 20);
+            showSug = true; syncSugBtn(); render();   // 拡大率と位置は動かさない（見ていた場所を見失わないため）
             const msg = p.message || `候補 ${suggestions.length} 件`;
             if (mine()) {
                 showPanel('結合を探しました', [
                     el('div', { class: 'small' }, msg),
-                    el('div', { class: 'small muted mt' }, '赤い点線が候補です。線をクリックすると根拠と推定した多重度を確かめて登録できます。')]);
+                    el('div', { class: 'small muted mt' }, '青い点線が候補です。線をクリックすると根拠と推定した多重度を確かめて登録できます。')]);
             } else {
                 toast(`結合を探しました: ${msg}`);
             }
@@ -5369,7 +5443,9 @@ const ER = (() => {
         syncHistoryUi();
     }
 
-    return { init, refit: fit, mutate, setUsage, setSuggestions, setJoinStatus, dropTable };
+    // refit はタブを開いたときに呼ばれる。初めて見えたとき（隠れたまま fit できなかったとき）だけ合わせ、
+    // 2回目以降のタブ切り替えでは見ていた拡大率と位置をそのまま残す
+    return { init, refit: () => { if (needFit) fit(); }, mutate, setUsage, setSuggestions, setJoinStatus, dropTable };
 })();
 
 // ===== 元 manage.js =====
