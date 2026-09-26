@@ -165,7 +165,10 @@ def connect_scope(paths_aliases: list[tuple]) -> sqlite3.Connection:
             f"（この問い合わせは{len(paths_aliases)}個を必要としています）。SQLiteの制限です。"
             "テーブル名を『DB名.テーブル名』の形で書けば、実際に使うDBだけを繋ぐので"
             "多くの場合はこの制限に当たりません。")
-    conn = sqlite3.connect("file::memory:", uri=True)
+    # 取り込み（書き込み）と重なったときに 5 秒（SQLite の既定）で諦めないよう、
+    # 読み取り用の接続（connect_ro）と同じ 30 秒待つ。同じ待ち時間にしないと、
+    # 表の一覧の作り直しは耐えるのに、利用者の問い合わせだけが「database is locked」になる
+    conn = sqlite3.connect("file::memory:", uri=True, timeout=30)
     # 暗黙のトランザクションを使わない（autocommit）。Python の sqlite3 は INSERT の前に勝手に
     # BEGIN を張り、COMMIT するまで ATTACH した本番 DB の共有ロックを握り続ける。
     # 「結合を探す」のように一時表へ INSERT しながら長く読む処理がそれをやると、その間
@@ -1077,7 +1080,8 @@ def _write_json(p: Path, data) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
-    os.replace(tmp, p)
+    # 置き換えは、読み取り中の別スレッドに当たると Windows で失敗するので少し待って数回やり直す
+    config.replace_atomic(tmp, p)
 
 
 #: 会話一覧（index.json）の「読む → 足す → 書き戻す」を直列にする。会話ごとの鍵では
@@ -1468,7 +1472,7 @@ def _trim_if_needed(p: Path) -> None:
         return
     lines = [x for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
     keep = lines[-limit:]
-    p.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    config.write_text_atomic(p, "\n".join(keep) + "\n")
     _count = len(keep)
 
 
@@ -1595,7 +1599,7 @@ def _trim(p: Path) -> None:
     lines = p.read_text(encoding="utf-8").splitlines()
     if len(lines) > config.CATALOG_HISTORY_MAX * 1.2:
         keep = lines[-config.CATALOG_HISTORY_MAX:]
-        p.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        config.write_text_atomic(p, "\n".join(keep) + "\n")
 
 
 # ==========================================================================
@@ -1620,7 +1624,10 @@ import yaml
 
 import config
 
-_prefs_lock = threading.Lock()
+#: 好み（prefs.yaml）の「読む → 直す → 丸ごと書き戻す」を直列にする鍵。
+#: 読むところまで鍵に入れないと、別々の項目（モデルと対象外の表）を同時に保存したとき
+#: 後から書いた方が、先に書かれた項目を消してしまう。入れ子で取れるよう RLock。
+_prefs_lock = threading.RLock()
 
 # ここに挙げたキーだけを読み書きする（余計なものが混ざっても無視する）
 # rag_off      … 検索対象から外したナレッジベースのid（外したものを持つ理由は
@@ -1659,18 +1666,64 @@ def _save(user, data: dict) -> None:
     p = _prefs_path(user)
     p.parent.mkdir(parents=True, exist_ok=True)
     with _prefs_lock:
-        p.write_text(yaml.safe_dump({k: data[k] for k in KEYS if k in data},
-                                    allow_unicode=True, sort_keys=False),
-                     encoding="utf-8")
+        config.write_text_atomic(p, yaml.safe_dump({k: data[k] for k in KEYS if k in data},
+                                                   allow_unicode=True, sort_keys=False))
 
 
 def set_value(user, key: str, value) -> None:
-    """1項目だけ更新する。他の項目は触らない。"""
+    """1項目だけ更新する。他の項目は触らない。
+
+    読む → 直す → 書くを鍵の中でまとめて行う（別の項目を同時に保存しても消えない）。
+    """
     if user is None or key not in KEYS:
         return
-    data = load(user)
-    data[key] = value
-    _save(user, data)
+    with _prefs_lock:
+        data = load(user)
+        data[key] = value
+        _save(user, data)
+
+
+def rename_in_tables_off(old: str, new: str) -> int:
+    """全利用者の「対象から外した表」の名前を付け替える（表の改名の後始末）。
+
+    利用者本人の保存と重なっても消えないよう、prefs と同じ鍵の中で読み書きする
+    （生の prefs.yaml を直接書き換えると、その保存を取りこぼす）。
+    """
+    root = config.USER_META_DIR
+    if not root.exists():
+        return 0
+    hit = 0
+    with _prefs_lock:
+        for pf in sorted(root.glob("*/prefs.yaml")):
+            who = pf.parent.name                  # load/_save はフォルダ名の文字列でも引ける
+            data = load(who)
+            off = data.get("tables_off")
+            if isinstance(off, list) and old in off:
+                data["tables_off"] = [new if t == old else t for t in off]
+                _save(who, data)
+                hit += 1
+    return hit
+
+
+def drop_from_tables_off(name: str) -> int:
+    """消えた表を、全利用者の「対象から外した表」から取り除く（表の削除の後始末）。
+
+    残すと、同じ名前で取り込み直したときに、その人だけ最初から対象外になってしまう。
+    """
+    root = config.USER_META_DIR
+    if not root.exists():
+        return 0
+    hit = 0
+    with _prefs_lock:
+        for pf in sorted(root.glob("*/prefs.yaml")):
+            who = pf.parent.name
+            data = load(who)
+            off = data.get("tables_off")
+            if isinstance(off, list) and name in off:
+                data["tables_off"] = [t for t in off if t != name]
+                _save(who, data)
+                hit += 1
+    return hit
 
 
 # ==========================================================================
@@ -1754,9 +1807,8 @@ def save_memory_settings(values: dict, user: str | None = None) -> dict:
             raise ValueError(f"「本文の上限（文字）」は {lo}〜{hi} の範囲で入力してください。")
         cur["max_chars"] = v
     p = config.MEMORY_SETTINGS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
-                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    config.write_text_atomic(p, yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
+                                               allow_unicode=True, sort_keys=False))
     return memory_settings()
 
 
@@ -1811,24 +1863,12 @@ _chat_display_lock = threading.RLock()
 
 
 def _replace_settings_file(tmp, p) -> None:
-    """一時ファイルを本体に置き換える。
+    """一時ファイルを本体に置き換える（中身は config.replace_atomic と同じ1本）。
 
-    Windows では、別のプログラム（エディタ・ウイルス対策）が開いている瞬間に
-    PermissionError になることがあるので、少しだけ待って数回やり直す。
-    それでも駄目なら一時ファイルを消してから例外をそのまま上げる。
+    Windows では、別のプログラム（エディタ・ウイルス対策・読み取り中の別スレッド）が
+    開いている瞬間に PermissionError になることがあるので、少し待って数回やり直す。
     """
-    for i in range(5):
-        try:
-            os.replace(tmp, p)
-            return
-        except PermissionError:
-            if i == 4:
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-                raise
-            time.sleep(0.05 * (i + 1))
+    config.replace_atomic(tmp, p)
 
 
 def save_chat_display(values: dict, user: str | None = None) -> dict:
@@ -1994,7 +2034,7 @@ def _memory_save(user, data: dict) -> None:
     tmp.write_text(yaml.safe_dump({"text": data.get("text") or "",
                                    "updated_at": data.get("updated_at") or ""},
                                   allow_unicode=True, sort_keys=False), encoding="utf-8")
-    os.replace(tmp, p)
+    config.replace_atomic(tmp, p)
 
 
 def _memory_clean(text) -> str:
@@ -2307,16 +2347,91 @@ def load_meta(db_path) -> dict:
     return _read_yaml(meta_path(db_path))
 
 
+#: カタログ（meta.yaml）の「読む → 直す → 丸ごと書く」を、ファイルごとに直列にする鍵。
+#: 鍵が無いと、2人が同時に保存したとき（管理者が表の説明を保存しているあいだに、
+#: 別の人がチャットから用語を登録する等）、後から書いた方が相手の変更を消してしまう。
+_meta_locks: dict[str, threading.RLock] = {}
+_meta_locks_guard = threading.Lock()
+#: このスレッドが編集のために取った鍵（load_meta_for_edit → save_meta の対）
+_meta_held = threading.local()
+#: 鍵を待つ上限。これを超えたら「いま別の人が保存しています」と返す（ずっと待たせない）
+META_LOCK_WAIT_SEC = 20
+
+
+class MetaBusy(Exception):
+    """カタログが別の保存で使われていて、待ち時間内に取れなかった。"""
+
+
+def _meta_lock(target) -> threading.RLock:
+    key = str(target).lower()          # Windows は大文字小文字を区別しない
+    with _meta_locks_guard:
+        lk = _meta_locks.get(key)
+        if lk is None:
+            lk = _meta_locks[key] = threading.RLock()
+        return lk
+
+
+def _meta_held_stack() -> list:
+    st = getattr(_meta_held, "stack", None)
+    if st is None:
+        st = _meta_held.stack = []
+    return st
+
+
+def release_meta_locks() -> None:
+    """このスレッドが取ったまま放していない鍵を、全部放す。
+
+    保存まで進まずに終わった（入力の検査で 400、印のずれで 409 など）ときの後始末。
+    画面からの保存は create_app の後始末でここを通る。
+    """
+    st = _meta_held_stack()
+    while st:
+        _key, lk = st.pop()
+        try:
+            lk.release()
+        except RuntimeError:
+            pass
+
+
+def release_meta_lock(db_path) -> None:
+    """このファイルの鍵を1つだけ放す（保存しないで終わる経路の後始末）。
+
+    呼び出し元がさらに外側で鍵を持っていることがあるので、全部は放さない。
+    """
+    key = str(meta_path(db_path)).lower()
+    st = _meta_held_stack()
+    for i in range(len(st) - 1, -1, -1):
+        if st[i][0] == key:
+            _key, lk = st.pop(i)
+            try:
+                lk.release()
+            except RuntimeError:
+                pass
+            return
+
+
 def load_meta_for_edit(db_path) -> dict:
     """編集するためにカタログを読む。控えとは切り離した複製を返す。
 
     画面からの保存は「読む → 一部を書き換える → save_meta」という流れで、
     そのまま控えを渡すと保存前の途中状態が他の画面へ漏れる。
     ここで複製しておけば、保存が終わるまで控えは元のままでいられる。
+
+    読んだ時点でこのファイルの鍵を取り、save_meta で放す（放し忘れは
+    リクエストの後始末 release_meta_locks で必ず放す）。
     """
     import copy
-    # 書くために読むので strict。壊れていたら空として通さず、その場で止める
-    return copy.deepcopy(_read_yaml(meta_path(db_path), strict=True))
+    target = meta_path(db_path)
+    lk = _meta_lock(target)
+    if not lk.acquire(timeout=META_LOCK_WAIT_SEC):
+        raise MetaBusy("いま別の人がカタログを保存しています。少し待ってから、もう一度お試しください。")
+    _meta_held_stack().append((str(target).lower(), lk))
+    try:
+        # 書くために読むので strict。壊れていたら空として通さず、その場で止める
+        return copy.deepcopy(_read_yaml(target, strict=True))
+    except Exception:
+        release_meta_locks()          # 読めなかったので、鍵は持ったままにしない
+        raise
 
 
 def merge_caveats(description, caveats) -> str:
@@ -2375,8 +2490,32 @@ def section_stamp(meta: dict, kind: str) -> str:
 
 
 def save_meta(db_path, meta: dict) -> None:
-    """カタログを保存する（内容をまるごと書く）。呼べるのは管理者の画面だけ。"""
+    """カタログを保存する（内容をまるごと書く）。呼べるのは管理者の画面だけ。
+
+    load_meta_for_edit で取った鍵を、書き終えたところで放す。
+    読まずにいきなり保存する経路（作り直しなど）では、ここで短く取って放す。
+    """
     target = meta_path(db_path)
+    st = _meta_held_stack()
+    held = next((i for i in range(len(st) - 1, -1, -1) if st[i][0] == str(target).lower()), None)
+    if held is None:
+        lk = _meta_lock(target)
+        if not lk.acquire(timeout=META_LOCK_WAIT_SEC):
+            raise MetaBusy("いま別の人がカタログを保存しています。少し待ってから、もう一度お試しください。")
+        st.append((str(target).lower(), lk))
+        held = len(st) - 1
+    try:
+        _save_meta_locked(target, meta)
+    finally:
+        _key, lk = st.pop(held)
+        try:
+            lk.release()
+        except RuntimeError:
+            pass
+
+
+def _save_meta_locked(target, meta: dict) -> None:
+    """save_meta の本体（鍵を持っている前提で書く）。"""
     # 保存したら控えを捨てる。更新時刻でも気づけるが、
     # 同じ秒内に読み書きが続くと取りこぼすことがあるため明示的に消す。
     _meta_cache.pop(str(target), None)
@@ -2391,15 +2530,13 @@ def save_meta(db_path, meta: dict) -> None:
             continue
         cleaned[k] = v
 
-    target.parent.mkdir(parents=True, exist_ok=True)
     if not cleaned:
-        target.write_text("", encoding="utf-8")
+        config.write_text_atomic(target, "")
         return
-    target.write_text(
+    config.write_text_atomic(
+        target,
         yaml.dump(cleaned, Dumper=_MetaDumper, allow_unicode=True, sort_keys=False,
-                  default_flow_style=False),
-        encoding="utf-8",
-    )
+                  default_flow_style=False))
 
 
 class _MetaDumper(yaml.SafeDumper):
@@ -2629,7 +2766,7 @@ def profile_db(db_path, force: bool = False) -> dict:
         "tables": tables,
     }
     config.PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(profile, ensure_ascii=False, default=str), encoding="utf-8")
+    config.write_text_atomic(cache, json.dumps(profile, ensure_ascii=False, default=str))
     return profile
 
 
@@ -3411,7 +3548,13 @@ def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
                 f"表が大きく、{T:g} 秒で確認しきれなかった項目があります。"
                 "ここまでの判定と列の意味を確かめたうえで登録してください（登録後、データ品質の検査で親に無い値を数えられます）。")
     except Exception as e:
-        add("info", "実データでの確認ができませんでした", str(e)[:120])
+        # 確認できなかったときは「問題なし」にしない（警告にして、人に確かめてもらう）。
+        # 情報どまりだと level が ok のまま通り、値が1件も一致しない線でも黙って登録できてしまう
+        # （取り込み中で database is locked のときに実際に起きる）
+        add("warn", "実データでの確認ができませんでした",
+            f"{str(e)[:120]}\n"
+            "取り込みや「結合を探す」と重なった可能性があります。少し待ってから引き直すと確認できます。"
+            "この線で本当に JOIN できるかは確認できていません。")
 
     level = "ok"
     if any(i["level"] == "block" for i in issues):
@@ -5016,9 +5159,7 @@ def remove_dir(raw: str) -> bool:
 
 def _write_extra(items: list[str]) -> None:
     p = config.IMPORT_DIRS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({"dirs": items}, allow_unicode=True, sort_keys=False),
-                 encoding="utf-8")
+    config.write_text_atomic(p, yaml.safe_dump({"dirs": items}, allow_unicode=True, sort_keys=False))
 
 
 def allowed_dirs() -> list[Path]:
@@ -5623,10 +5764,9 @@ def save_output_dir(path: str, user: str | None = None) -> dict:
         if not ok:
             raise ImportError_(msg)
     p = config.OUTPUT_DIR_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({"path": path, "updated_by": user or "",
-                                 "updated_at": datetime.now().isoformat(timespec="seconds")},
-                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    config.write_text_atomic(p, yaml.safe_dump({"path": path, "updated_by": user or "",
+                                                "updated_at": datetime.now().isoformat(timespec="seconds")},
+                                               allow_unicode=True, sort_keys=False))
     return output_dir_status()
 
 
@@ -5675,7 +5815,7 @@ def save_to_user_folder(user, filename: str, data: bytes, *, stamp: bool = True,
     # 同じ利用者の2本のロボットが同時に同じ名前で出しても一時ファイルが重ならないように
     tmp = folder / f"{safe}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}.tmp"
     tmp.write_bytes(data)
-    os.replace(tmp, target)
+    config.replace_atomic(tmp, target)
     return target, replaced
 
 
@@ -6152,7 +6292,9 @@ def run_count(db_path: Path, table: str, timestamp_col: str) -> int:
 def drop_table(db_path: Path, table: str) -> str:
     if db_path.parent.resolve() != config.DATA_DIR.resolve():
         raise ImportError_("data/ の外は操作できません。")
-    conn = sqlite3.connect(db_path)
+    # 他の書き込みと重なったときの待ち時間は、取り込みと同じ 30 秒にする
+    # （既定の 5 秒だと、少し混んだだけで「database is locked」で落ちる）
+    conn = sqlite3.connect(db_path, timeout=30)
     try:
         # ビューと表で必要な文が違う。両方撃つのは誤り: SQLite は種類が違うと
         # IF EXISTS でも例外にする（実テーブルに DROP VIEW IF EXISTS を撃つと
@@ -6182,7 +6324,7 @@ def create_view(db_path: Path, name: str, sql: str, replace: bool = False) -> No
     """
     if db_path.parent.resolve() != config.DATA_DIR.resolve():
         raise ImportError_("data/ の外は操作できません。")
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)      # 待ち時間は取り込みと同じ
     try:
         row = conn.execute(
             "SELECT type FROM sqlite_master WHERE name = ?", (name,)).fetchone()
@@ -6414,9 +6556,7 @@ def _read() -> list[dict]:
 
 def _write(items: list[dict]) -> None:
     p = config.IMPORT_JOBS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({"jobs": items}, allow_unicode=True, sort_keys=False),
-                 encoding="utf-8")
+    config.write_text_atomic(p, yaml.safe_dump({"jobs": items}, allow_unicode=True, sort_keys=False))
 
 
 def list_jobs() -> list[dict]:
@@ -7410,12 +7550,15 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
         prof = catalog.profile_db(path)
         if not any(t.startswith(pref + "__") for t in prof["tables"]):
             meta = catalog.load_meta_for_edit(path)
-            if pref in (meta.get("groups") or {}):
-                meta["groups"].pop(pref)
-                if not meta["groups"]:
-                    meta.pop("groups", None)
-                catalog.save_meta(path, meta)
-                done["groups"] = [{"db": path.name, "text": pref}]
+            try:
+                if pref in (meta.get("groups") or {}):
+                    meta["groups"].pop(pref)
+                    if not meta["groups"]:
+                        meta.pop("groups", None)
+                    catalog.save_meta(path, meta)      # 鍵はここで放される
+                    done["groups"] = [{"db": path.name, "text": pref}]
+            finally:
+                catalog.release_meta_lock(path)        # 保存しなかったときの後始末
     return done
 
 
@@ -7549,33 +7692,23 @@ def rename_table(path: Path, old: str, new: str) -> dict:
                     data.pop("groups", None)
         catalog.save_meta(path, data)
 
-        # 定期取り込みの設定
+        # 定期取り込みの設定（予定の保存と同じ鍵の中で読み書きする。鍵の外でやると、
+        # ちょうど動いた定期実行の記録（最後に走った時刻）と取り合いになり、
+        # どちらかが消える／改名が元に戻る）
         jobs_hit = 0
-        items = jobs._read()
-        for j in items:
-            if j.get("db_file") == path.name and j.get("table") == old:
-                j["table"] = new
-                if j.get("name"):
-                    j["name"] = _rename_in_text(str(j["name"]), old, new)
-                jobs_hit += 1
-        if jobs_hit:
-            jobs._write(items)
+        with _jobs_lock:
+            items = jobs._read()
+            for j in items:
+                if j.get("db_file") == path.name and j.get("table") == old:
+                    j["table"] = new
+                    if j.get("name"):
+                        j["name"] = _rename_in_text(str(j["name"]), old, new)
+                    jobs_hit += 1
+            if jobs_hit:
+                jobs._write(items)
 
-        # 利用者ごとの「対象から外した表」
-        prefs_hit = 0
-        root = Path(config.USER_META_DIR)
-        if root.exists():
-            for pf in root.glob("*/prefs.yaml"):
-                try:
-                    d = yaml.safe_load(pf.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    continue
-                off = d.get("tables_off")
-                if isinstance(off, list) and old in off:
-                    d["tables_off"] = [new if t == old else t for t in off]
-                    pf.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False),
-                                  encoding="utf-8")
-                    prefs_hit += 1
+        # 利用者ごとの「対象から外した表」（好みの保存と同じ鍵を通す）
+        prefs_hit = prefs.rename_in_tables_off(old, new)
     except Exception:
         # カタログ側で失敗したら、実表とカタログを元に戻す
         conn = sqlite3.connect(path, timeout=30)
@@ -7585,7 +7718,7 @@ def rename_table(path: Path, old: str, new: str) -> dict:
         finally:
             conn.close()
         if meta_backup is not None:
-            meta_file.write_text(meta_backup, encoding="utf-8")
+            config.write_text_atomic(meta_file, meta_backup)
         catalog.forget(path)
         raise
 
@@ -8077,8 +8210,13 @@ def login():
                     flash("ユーザー名またはパスワードが違います。", "error")
                 else:
                     login_user(user)
+                    # ログイン後の行き先は、このアプリの中の道だけ許す。
+                    # "//どこか" や "/\\どこか" は、ブラウザが外のサイトとして扱う
+                    # （社内の画面に見せかけて外へ飛ばせるので弾く）
                     nxt = request.args.get("next") or url_for("chat.index")
-                    return redirect(nxt if nxt.startswith("/") else url_for("chat.index"))
+                    safe = (nxt.startswith("/") and not nxt.startswith("//")
+                            and not nxt.startswith("/\\") and "\\" not in nxt[:2])
+                    return redirect(nxt if safe else url_for("chat.index"))
 
     return render_template("login.html", setup_needed=setup_needed)
 
@@ -8368,8 +8506,17 @@ def _load_current() -> dict:
     """いま開いている会話。無ければ新規の空会話。
 
     読んだ時点でこの会話の鍵を取る。書き戻すまで他の送信を待たせるため。
+
+    どの会話に書くかは、画面が本文の chat_id で指定してくる（null は「新しい会話」）。
+    セッションの目印はブラウザに1つしか持てないので、これが無いとタブを2つ開いた
+    ときに「最後に開いた会話」へ書き込んでしまう（巻き戻しでは別の会話を削る）。
+    指定が無い本文（古い画面・ロボットからの実行）は、今までどおりセッションを見る。
     """
-    cid = session.get("chat_id")
+    body = _body()
+    if "chat_id" in body:
+        cid = str(body.get("chat_id") or "") or None
+    else:
+        cid = session.get("chat_id")
     if cid:
         _hold_chat(cid)
         chat = chats.load_chat(g.user, cid)
@@ -9009,6 +9156,7 @@ def _begin_turn():
     results.new_turn()
 
     chat = _load_current()
+    was_new = not chat.get("id")          # この質問で会話ファイルができるのか（取り消すときに使う）
 
     images, show = _images_from(body.get("images"))
     if images and not models.is_vision(models.current(g.user)):
@@ -9029,27 +9177,49 @@ def _begin_turn():
                                **({"images": show} if show else {})})
     _persist(chat)
 
-    scope = _auto_scope(text, chat)
-    # DBが1つも無くても、ナレッジベースがあれば文書には答えられる。
-    # 両方無いときだけ止める（この構成では何も調べようがないため）。
-    # ※ この時点で質問は保存済みなので、ここで止まると「答えの無い質問」が
-    #   1件残る。DBもKBも無い環境だけの稀な話なので、消す処理までは足さない。
-    if not scope and not rag.rag_available(g.user):
-        raise _TurnError("いま調べられるものがありません。"
-                         "サイドバーの SQLite3 か LightRAG で、"
-                         "使うものにチェックを入れてください。")
-    _realtime_refresh(scope)
+    try:
+        scope = _auto_scope(text, chat)
+        # DBが1つも無くても、ナレッジベースがあれば文書には答えられる。
+        # 両方無いときだけ止める（この構成では何も調べようがないため）。
+        if not scope and not rag.rag_available(g.user):
+            raise _TurnError("いま調べられるものがありません。"
+                             "サイドバーの SQLite3 か LightRAG で、"
+                             "使うものにチェックを入れてください。")
+        _realtime_refresh(scope)
 
-    # システムプロンプトはスコープが決まってから。ユーザー発言より後に組むが、
-    # 置き場所は必ず先頭（index 0）なので、並び順は崩れない。
-    if not chat["messages"] or chat["messages"][0].get("role") != "system":
-        chat["messages"].insert(0, {"role": "system", "content": ""})
-    chat["messages"][0] = {"role": "system",
-                           "content": llm.build_system_prompt(
-                               scope, admin=_is_admin(),
-                               model=models.current(g.user),
-                               memory=memory_prompt(g.user))}
+        # システムプロンプトはスコープが決まってから。ユーザー発言より後に組むが、
+        # 置き場所は必ず先頭（index 0）なので、並び順は崩れない。
+        if not chat["messages"] or chat["messages"][0].get("role") != "system":
+            chat["messages"].insert(0, {"role": "system", "content": ""})
+        chat["messages"][0] = {"role": "system",
+                               "content": llm.build_system_prompt(
+                                   scope, admin=_is_admin(),
+                                   model=models.current(g.user),
+                                   memory=memory_prompt(g.user))}
+    except _TurnError:
+        # 始められなかったので、先に保存した質問を取り消す。
+        # 残すと「答えの無い質問」が履歴に積まれ、次の質問でLLMにも送られる
+        _undo_user_turn(chat, was_new)
+        raise
     return chat, scope, text
+
+
+def _undo_user_turn(chat: dict, was_new: bool) -> None:
+    """積んだばかりのユーザー発言を、保存した分ごと取り消す。"""
+    if chat["messages"] and chat["messages"][-1].get("role") == "user":
+        chat["messages"].pop()
+    if chat["render_log"] and chat["render_log"][-1].get("role") == "user":
+        chat["render_log"].pop()
+    if not chat.get("id"):
+        return
+    if was_new:
+        # この質問で初めて出来た会話。空の会話を履歴に残さない
+        chats.delete_chat(g.user, chat["id"])
+        if session.get("chat_id") == chat["id"]:
+            session.pop("chat_id", None)
+        chat["id"] = None
+    else:
+        _persist(chat)
 
 
 @bp_chat.post("/api/chat/send", endpoint="send")
@@ -9386,6 +9556,10 @@ def glossary_save():
         path = db.path_for(body.get("db") or "")
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 400
+    # 表に紐づける用語は、その表が今もあるときだけ受ける（消した表の用語だけが残らないように）
+    if table and table not in catalog.profile_db(path)["tables"]:
+        return jsonify({"error": f"「{table}」は見つかりませんでした。"
+                                 "消された・名前が変わった可能性があります。画面を読み直してください。"}), 400
 
     meta = catalog.load_meta_for_edit(path)
     entry = {"description": desc, "sql": sql}
@@ -9606,9 +9780,8 @@ def save_robot_settings(values: dict, user: str | None = None) -> dict:
             raise ValueError(f"「{ROBOT_SETTING_LABELS[k]}」は {lo}〜{hi} の範囲で入力してください。")
         cur[k] = _robot_clamp(k, v)
     p = config.ROBOT_SETTINGS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
-                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+    config.write_text_atomic(p, yaml.safe_dump({**cur, "updated_by": user or "", "updated_at": chats.now()},
+                                               allow_unicode=True, sort_keys=False))
     return robot_settings()
 
 
@@ -13480,7 +13653,12 @@ def primary_key():
     table = str(body.get("table") or "").strip()
     if not table:
         return jsonify({"error": "テーブルが指定されていません。"}), 400
-    profile, meta = catalog.profile_db(path), catalog.load_meta_for_edit(path)
+    profile = catalog.profile_db(path)
+    # 無い表の主キーを受け取らない（消した表の設定だけが残らないように）
+    if table not in profile["tables"]:
+        return jsonify({"error": f"「{table}」は見つかりませんでした。"
+                                 "消された・名前が変わった可能性があります。画面を読み直してください。"}), 400
+    meta = catalog.load_meta_for_edit(path)
     tm = meta.setdefault("tables", {}).setdefault(table, {})
     declared = catalog.declared_pk(profile, table)
     cols = body.get("columns") or []
@@ -13507,6 +13685,11 @@ def save_table():
     cols_in = body.get("columns") or {}
     if not isinstance(cols_in, dict):
         return jsonify({"error": "列の形式が正しくありません。"}), 400
+    # 無い表の説明を受け取らない。受け取ると、消した表の説明だけがカタログに残り、
+    # AIには「あるはずのデータ」として渡り続ける（開いたままの画面から保存されたときに起きる）
+    if table not in catalog.profile_db(path)["tables"]:
+        return jsonify({"error": f"「{table}」は見つかりませんでした。"
+                                 "消された・名前が変わった可能性があります。画面を読み直してください。"}), 400
     meta = catalog.load_meta_for_edit(path)
     tables = meta.setdefault("tables", {})
     tm = tables.setdefault(table, {})
@@ -13585,26 +13768,41 @@ def save_glossary():
     conflict = _stale(body, meta, "glossary", "用語集")
     if conflict:
         return conflict
-    rows = _rows(body, "terms")
-    if rows is None:
-        return jsonify({"error": "用語の形式が正しくありません。"}), 400
-    gl = {}
-    for row in rows:
-        term = (row.get("term") or "").strip()
-        desc = (row.get("description") or "").strip()
-        sql = (row.get("sql") or "").strip()
-        if term and (desc or sql):
-            gl[term] = {"description": desc, "sql": sql}
-    # 誰が何を変えたかを残す（チャットからの登録と同じ記録に揃える）
-    before_gl = (catalog.table_glossary(meta, body["table"]) if body.get("table")
-                 else catalog.db_glossary(meta))
-    _log_glossary_diff(path.name, body.get("table") or None, before_gl, gl)
-    if body.get("table"):
-        catalog.set_table_glossary(meta, body["table"], gl)
-    elif gl:
-        meta["glossary"] = gl
+    # 用語集の画面は、置き場所（全体・表ごと）をまとめて scopes で送ってくる。
+    # 1か所ずつ送ると、途中で誰かがチャットから登録したときに残りが 409 で弾かれ、
+    # 半分だけ保存された状態になる（印は用語集ぜんぶに1つなので避けられない）。
+    # チャットからの登録は1か所だけなので、従来の terms / table でも受ける。
+    if isinstance(body.get("scopes"), dict):
+        groups = []
+        for tname, rows in body["scopes"].items():
+            r = _rows({"terms": rows}, "terms")
+            if r is None:
+                return jsonify({"error": "用語の形式が正しくありません。"}), 400
+            groups.append((str(tname) or None, r))
     else:
-        meta.pop("glossary", None)
+        rows = _rows(body, "terms")
+        if rows is None:
+            return jsonify({"error": "用語の形式が正しくありません。"}), 400
+        groups = [(body.get("table") or None, rows)]
+
+    for tname, rows in groups:
+        gl = {}
+        for row in rows:
+            term = (row.get("term") or "").strip()
+            desc = (row.get("description") or "").strip()
+            sql = (row.get("sql") or "").strip()
+            if term and (desc or sql):
+                gl[term] = {"description": desc, "sql": sql}
+        # 誰が何を変えたかを残す（チャットからの登録と同じ記録に揃える）
+        before_gl = (catalog.table_glossary(meta, tname) if tname
+                     else catalog.db_glossary(meta))
+        _log_glossary_diff(path.name, tname, before_gl, gl)
+        if tname:
+            catalog.set_table_glossary(meta, tname, gl)
+        elif gl:
+            meta["glossary"] = gl
+        else:
+            meta.pop("glossary", None)
     catalog.save_meta(path, meta)
     # 続けて保存できるよう、新しい印を返す（画面は次の保存でこれを送る）
     return jsonify({"ok": True, "stamp": catalog.section_stamp(meta, "glossary")})
@@ -14471,7 +14669,12 @@ def dirs_edit():
     body = _body()
     try:
         if body.get("action") == "remove":
-            importer.remove_dir(body.get("path", ""))
+            # 外せなかった（env で決めたフォルダ・一覧に無いフォルダ）ときに
+            # 「外しました」と答えない。画面は ok を見て消えたものとして描く
+            if not importer.remove_dir(body.get("path", "")):
+                return jsonify({"error": "このフォルダは外せませんでした"
+                                         "（env で決めたフォルダ、または一覧にありません）。",
+                                "dirs": importer.dir_status()}), 400
         else:
             importer.add_dir(body.get("path", ""))
     except importer.ImportError_ as e:
@@ -15986,7 +16189,7 @@ def _secret_key() -> str:
     if _SECRET_FILE.exists():
         return _SECRET_FILE.read_text(encoding="utf-8").strip()
     key = secrets.token_urlsafe(48)
-    _SECRET_FILE.write_text(key, encoding="utf-8")
+    config.write_text_atomic(_SECRET_FILE, key)
     try:
         os.chmod(_SECRET_FILE, 0o600)
     except OSError:
@@ -16107,7 +16310,10 @@ def create_app() -> Flask:
                      view_func=_static_file)
     app.config.update(
         SECRET_KEY=_secret_key(),
-        MAX_CONTENT_LENGTH=64 * 1024 * 1024,
+        # 1回の送信の上限。取り込みの上限（IMPORT_MAX_FILE_MB。既定100MB）より小さいと、
+        # 上限内のファイルなのに Flask が先に断り、日本語の案内ではなく素の英語エラーになる。
+        # 余白（フォームの他の項目や複数選択）として 16MB 足しておく
+        MAX_CONTENT_LENGTH=(config.IMPORT_MAX_FILE_MB + 16) * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         JSON_AS_ASCII=False,
@@ -16145,6 +16351,24 @@ def create_app() -> Flask:
         if res.mimetype == "text/html":
             res.headers["Cache-Control"] = "no-store"
         return res
+
+    @app.teardown_request
+    def _release_locks(exc):
+        """カタログの鍵を持ったまま終わっていたら放す。
+
+        保存まで進まずに返る経路（入力の検査で 400、印のずれで 409、途中の例外）が
+        あるので、リクエストの終わりで必ず放す。放さないと、以後その DB の保存が
+        20 秒待ちののち「別の人が保存しています」になり続ける。
+        """
+        catalog.release_meta_locks()
+
+    @app.errorhandler(catalog.MetaBusy)
+    def _meta_busy(e):
+        """カタログの鍵が待ち時間内に取れなかった（誰かの保存が長引いている）。"""
+        msg = str(e) or "いま別の人がカタログを保存しています。少し待ってから、もう一度お試しください。"
+        if request.path.startswith("/api/"):
+            return jsonify({"error": msg}), 503
+        return msg, 503
 
     @app.errorhandler(sqlite3.OperationalError)
     def _db_busy(e):

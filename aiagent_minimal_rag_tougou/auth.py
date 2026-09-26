@@ -351,10 +351,14 @@ def load_users_file(path: Path | None = None) -> dict:
 
 
 def save_users_file(data: dict, path: Path | None = None) -> None:
+    # 一時ファイルに書いてから置き換える（書いている途中で落ちても、
+    # 利用者の一覧が途中までのファイルになってログインできなくなることを避ける）。
+    # ログイン関係は config.py に依存しない決まりなので、ここに書いている
     p = Path(path or AUTH_USERS_FILE)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-                 encoding="utf-8")
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    os.replace(tmp, p)
     try:                       # 他ユーザーから読めないようにする（Windowsでは無視される）
         os.chmod(p, 0o600)
     except OSError:

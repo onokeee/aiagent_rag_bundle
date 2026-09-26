@@ -2054,11 +2054,9 @@ def _read_admin() -> dict:
 
 def _write_admin(data: dict) -> None:
     p = config.MODEL_SETTINGS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
     with _models_lock:
-        p.write_text(yaml.safe_dump({k: data[k] for k in ADMIN_KEYS if k in data},
-                                    allow_unicode=True, sort_keys=False),
-                     encoding="utf-8")
+        config.write_text_atomic(p, yaml.safe_dump({k: data[k] for k in ADMIN_KEYS if k in data},
+                                                   allow_unicode=True, sort_keys=False))
 
 
 def _vision_keys() -> list[str]:
@@ -6410,11 +6408,9 @@ def _read_overrides() -> dict:
 
 def _write_overrides(data: dict) -> None:
     p = config.SMTP_SETTINGS_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
     with _mailer_lock:
-        p.write_text(yaml.safe_dump({k: data[k] for k in EDITABLE_KEYS if k in data},
-                                    allow_unicode=True, sort_keys=False),
-                     encoding="utf-8")
+        config.write_text_atomic(p, yaml.safe_dump({k: data[k] for k in EDITABLE_KEYS if k in data},
+                                                   allow_unicode=True, sort_keys=False))
 
 
 def settings() -> SmtpSettings:
@@ -10710,7 +10706,9 @@ def _export_text(args: dict, scope: list[dict]) -> dict:
             body = body.rstrip() + "\n\n" + block
         summary.append({"heading": heading, "columns": columns, "row_count": len(rows),
                         "truncated": truncated})
-        preview.append({"name": heading, "columns": columns, "rows": rows})
+        # 会話に残すのは先頭だけ（Excel・CSV と同じ）。全行を残すと、会話ファイルが
+        # 何十MBにもなって開くのが遅くなる。ファイルの中身（data）には全行ある
+        preview.append(_preview_rows(columns, rows, name=heading))
 
     try:
         data = exports.build_text(body, enc)
@@ -11690,11 +11688,10 @@ def _kb_read() -> list[dict]:
 
 
 def _kb_write(items: list[dict]) -> None:
+    # 一時ファイルの名前は書き手ごとに変える（同じ名前だと、2人が同時に保存したときに
+    # 互いの一時ファイルを踏んで、片方が消える）
     p = _kb_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    config.write_text_atomic(p, json.dumps(items, ensure_ascii=False, indent=2))
     try:
         os.chmod(p, 0o600)          # APIキーを含むので所有者だけに絞る
     except OSError:

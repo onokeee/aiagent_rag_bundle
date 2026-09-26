@@ -445,7 +445,9 @@ USER_META_DIR = DATA_DIR / "users"
 CHAT_HISTORY_LIMIT = 100
 # 保存期間（日）。最後に使った日からこれを過ぎた会話は自動削除する。
 # 既定は3か月。0 にすると期限で消さない（本数の上限だけが効く）。
-CHAT_HISTORY_DAYS = int(os.getenv("CHAT_HISTORY_DAYS", "90") or 0)
+# env に空で書かれていたとき（CHAT_HISTORY_DAYS= のような書き方）は、
+# 「期限なし」ではなく既定の90日に戻す（空欄は「指定していない」の意味なので）
+CHAT_HISTORY_DAYS = int(os.getenv("CHAT_HISTORY_DAYS", "").strip() or "90")
 # 作成したファイル(Excel/CSV等)を履歴に埋め込む上限。超えるものは本体を保存せず、
 # 過去の会話を開いたときは「再ダウンロードできない」旨だけ表示する。
 CHAT_EMBED_FILE_MAX_BYTES = 2 * 1024 * 1024
@@ -488,3 +490,45 @@ APP_INPUT_PLACEHOLDER = "データについて質問してください…"
 
 # 起動時にデータ用フォルダを用意
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# --- 設定ファイルの書き込み（途中の状態を残さない） --------------------------------
+# カタログ・利用者の好み・取り込みの予定・マイロボット・各種設定は、どれも
+# 「読む → 直す → 丸ごと書き直す」形です。直接上書きすると、書いている途中で落ちた
+# （停電・強制終了・ディスク満杯）ときに途中までのファイルが残り、次に読んだ側が
+# 「空」や「壊れている」と見なします（カタログが壊れると、利用者には空のカタログが見え、
+# 管理者の保存は以後ずっと断られます）。書き込みはすべてここを通します。
+
+def replace_atomic(tmp, target) -> None:
+    """一時ファイルを本体に置き換える（置き換えは一瞬で、途中の状態が無い）。
+
+    Windows では、別のプログラム（エディタ・ウイルス対策・読み取り中の別スレッド）が
+    開いている瞬間に PermissionError になることがあるので、少し待って数回やり直す。
+    それでも駄目なら一時ファイルを片付けてから例外をそのまま上げる（黙って捨てない）。
+    """
+    import os as _os
+    import time as _time
+    tmp, target = Path(tmp), Path(target)
+    for i in range(5):
+        try:
+            _os.replace(tmp, target)
+            return
+        except PermissionError:
+            if i == 4:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            _time.sleep(0.05 * (i + 1))
+
+
+def write_text_atomic(target, text: str) -> None:
+    """設定・カタログのファイルを、一時ファイル経由で書く。"""
+    import os as _os
+    import threading as _threading
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{_os.getpid()}.{_threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    replace_atomic(tmp, target)

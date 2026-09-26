@@ -7567,7 +7567,8 @@ async function rewindTo(item, text, wrap) {
     }
     setBusy(true, send ? 'やり直し中' : '巻き戻し中');
     try {
-        const r = await api('/api/chat/rewind', { turn: item.turn, text: send });
+        // 巻き戻す会話を指定する（添えないと、別のタブで開いた会話を削ってしまう）
+        const r = await api('/api/chat/rewind', { turn: item.turn, text: send, chat_id: currentChatId });
         clearLog();
         lastRole = null;
         replaying = true;                    // 再描画なのでファイルの自動保存は走らせない
@@ -7882,7 +7883,8 @@ async function send(text) {
 async function sendAtOnce(text, imageTokens) {
     const myView = viewToken;               // この送信が属するビュー
     try {
-        const r = await api('/api/chat/send', { text, images: imageTokens });
+        // どの会話に書くかを必ず添える（タブを2つ開いていても、打った画面の会話に入る）
+        const r = await api('/api/chat/send', { text, images: imageTokens, chat_id: busyChatId });
         if (viewToken === myView) {
             lastRole = null;
             r.items.slice(1).forEach(addItem);  // 先頭は今出したユーザー発言
@@ -7914,12 +7916,27 @@ async function sendStreaming(text, imageTokens) {
     try {
         res = await fetch('/api/chat/stream', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, images: imageTokens }),
+            body: JSON.stringify({ text, images: imageTokens, chat_id: busyChatId }),
         });
     } catch (e) {
         return false;
     }
-    if (!res.ok || !res.body) return false;
+    if (!res.ok) {
+        // サーバが理由を答えている（始められなかった）。従来方式へ切り替えると
+        // 同じ質問をもう一度送ることになるので、ここで理由を出して終わる
+        let msg = '送信できませんでした。しばらくしてからもう一度お試しください。';
+        try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+        } catch (e) { /* JSON でなければ既定の文言 */ }
+        if (viewToken === myView) {
+            $('#thinking')?.remove();
+            addItem({ role: 'assistant', kind: 'error', message: msg });
+            scrollDown();
+        }
+        return true;
+    }
+    if (!res.body) return false;           // 逐次表示が使えない環境（従来方式へ）
 
     let node = null;          // いま書き込んでいる回答の入れ物
     let buf = '';             // 表示中の本文
@@ -9165,15 +9182,18 @@ async function saveGlossary() {
         if (!byScope.has(r.scope)) byScope.set(r.scope, []);
         byScope.get(r.scope).push(r);
     });
+    // 置き場所（全体・表ごと）を1回でまとめて送る。1か所ずつ送ると、途中で誰かが
+    // チャットから登録したときに残りが 409 で弾かれ、半分だけ保存された状態になる
+    const scopes = {};
+    for (const scope of new Set([...glInitialScopes, ...byScope.keys()])) {
+        scopes[scope || ''] = (byScope.get(scope) || []).map(r =>
+            ({ term: r.term.trim(), description: r.description.trim(), sql: r.sql.trim() }));
+    }
     try {
-        for (const scope of new Set([...glInitialScopes, ...byScope.keys()])) {
-            const terms = (byScope.get(scope) || []).map(r =>
-                ({ term: r.term.trim(), description: r.description.trim(), sql: r.sql.trim() }));
-            // 印は「用語集ぜんぶ」に対して1つ。1件目で通れば以降は自分の書き込みで
-            // 変わるので、応答で受け取った新しい印に差し替えながら続ける
-            const gr = await api('/api/catalog/glossary',
-                { db: CAT.db, table: scope || null, terms, stamp: CAT.stamps?.glossary });
-            if (gr.stamp) CAT.stamps.glossary = gr.stamp;
+        const gr = await api('/api/catalog/glossary',
+            { db: CAT.db, scopes, stamp: CAT.stamps?.glossary });
+        if (gr.stamp) CAT.stamps.glossary = gr.stamp;
+        Object.entries(scopes).forEach(([scope, terms]) => {
             const obj = {};
             terms.forEach(t => { obj[t.term] = { description: t.description, sql: t.sql }; });
             if (scope) {
@@ -9182,7 +9202,7 @@ async function saveGlossary() {
             } else {
                 CAT.dbGlossary = obj;
             }
-        }
+        });
     } catch (e) { toast(e.message, 'err'); return; }
     glInitialScopes = new Set(byScope.keys());
 
