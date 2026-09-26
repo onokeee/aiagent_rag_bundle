@@ -9612,9 +9612,18 @@ def _data_quality(args: dict, scope: list[dict]) -> dict:
             kind = "FK宣言" if edge.get("kind") == "fk" else "カタログの結合定義"
             ref_rows.append([f"{ca}.{ct}.{cc}", f"{pa}.{pt}.{pc}", miss, kind])
             if miss:
-                issues.append(("高", f"{ca}.{ct}.{cc} の {miss} 件が "
-                                     f"{pa}.{pt} に存在しません。"
-                                     "内部結合すると、この件数ぶん落ちます。"))
+                # 親側の多重度が 0..（親の無い子を許す定義）なら、異常ではなく注意にとどめる
+                card = catalog.card_norm(edge.get("cardinality")) or catalog.CARD_DEFAULT
+                ends = card.split(":")
+                parent_val = ends[1] if (pa, pt, pc) == tuple(edge["to"]) else ends[0]
+                if parent_val.startswith("0"):
+                    issues.append(("低", f"{ca}.{ct}.{cc} の {miss} 件は {pa}.{pt} に存在しません"
+                                         f"（多重度 {card}: {pa}.{pt} の無い {ct} を許す定義）。"
+                                         "内部結合すると、この件数ぶん落ちます。"))
+                else:
+                    issues.append(("高", f"{ca}.{ct}.{cc} の {miss} 件が "
+                                         f"{pa}.{pt} に存在しません。"
+                                         "内部結合すると、この件数ぶん落ちます。"))
 
     if not tbl_rows:
         # 実在する名前を例として出す。架空の例を出すと、AIがそれを真似て再び失敗する
@@ -10529,6 +10538,10 @@ def _show_er_diagram(args: dict, scope: list[dict]) -> dict:
     rels = [{"from": e.get("from_ref") or ".".join(str(x) for x in e["from"]),
              "to": e.get("to_ref") or ".".join(str(x) for x in e["to"]),
              "cardinality": e.get("cardinality") or "",
+             # 既定（多対1）以外にだけ意味を添える（全件に付けると1回で数千字増える）
+             **({"meaning": catalog.card_text(e.get("cardinality"), e["from"][1], e["to"][1])}
+                if (catalog.card_norm(e.get("cardinality")) or catalog.CARD_DEFAULT) != catalog.CARD_DEFAULT
+                else {}),
              "kind": "FOREIGN KEY宣言" if e.get("kind") == "fk" else "カタログ登録",
              **({"note": f"複合キー（{len(e['pairs'])}列すべてを同時に結合条件にする）"}
                 if len(e.get("pairs") or []) > 1 else {})}
@@ -10540,7 +10553,9 @@ def _show_er_diagram(args: dict, scope: list[dict]) -> dict:
             "tables": [n["table"] for n in own],
             "relationships": rels[:60],
             "note": "ER図はユーザーの画面に表示済み。関係を文章で説明し直す必要はない。"
-                    "結合の一覧は上の relationships のとおり。",
+                    "結合の一覧は上の relationships のとおり。多重度は「子側:親側」で、"
+                    f"{catalog.CARD_DEFAULT} は多対1（子は必ず親を1つ持つ。親には子が無いこともある）。"
+                    "それ以外の関連には meaning に意味を添えている。",
         }),
         "render": {"role": "assistant", "kind": "er", "db": target.name,
                    "title": "ER図（テーブルの関係）", "er": payload},

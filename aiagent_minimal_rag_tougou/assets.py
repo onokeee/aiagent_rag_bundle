@@ -488,7 +488,7 @@ TEMPLATES = {
       </div>
       <div class="er__legend">
         <b>IPA表記</b>　<u>下線</u>＝主キー　<u style="text-decoration-style:dashed">破線</u>＝外部キー
-        線の両端の <b>1</b>・<b>*</b>＝多重度　実線＝登録済み／短い破線＝FOREIGN KEY
+        線の両端の <b>0..1</b>・<b>1</b>・<b>0..*</b>・<b>1..*</b>＝多重度（0..＝相手の無い行あり）　実線＝登録済み／短い破線＝FOREIGN KEY
         複数の列から出た線が1本に合流＝複合キー（その組で1つの結合。「複合キー(n列)」の印つき）
         <span id="erUsageLegend" class="hidden">　｜　<b>利用状況</b>:
           線の色が濃いほど分析でよく使われた結合　薄い灰色＝未使用（検算されていない経路）。
@@ -4012,9 +4012,32 @@ const ER = (() => {
     let usage = null;
 
     const NS = 'http://www.w3.org/2000/svg';
-    const CARDS = ['N:1', '1:N', '1:1', 'N:M'];
-    //: 多重度の読み方。N は「多」、N:M は両側とも多（多対多）
-    const CARD_JA = { 'N:1': '多対1', '1:N': '1対多', '1:1': '1対1', 'N:M': '多対多' };
+    // 多重度は "from側:to側"。from は外部キーを持つ子、to は参照される親。
+    // 値は 0..1 / 1 / 0..* / 1..*（下限＝相手が無くてもよいか、上限＝1つか多か）。
+    // 組み合わせは順不同で10通り。親側に小さい方を置いた向きで並べる
+    const CARDS = ['0..*:1', '1..*:1', '0..*:0..1', '1..*:0..1',
+                   '1:1', '0..1:1', '0..1:0..1',
+                   '0..*:0..*', '0..*:1..*', '1..*:1..*'];
+    const MULT_JA = { '1': 'ちょうど1件', '0..1': '0件か1件', '0..*': '0件以上', '1..*': '1件以上' };
+    // 古い保存（N:1 / 1:N / 1:1 / N:M）も読めるように揃える。読めなければ既定の多対1
+    function normCard(c) {
+        const m = { N: '0..*', M: '0..*', '*': '0..*' };
+        const p = String(c || '').split(':').map(x => m[x.trim()] || x.trim());
+        return (p.length === 2 && p.every(x => x in MULT_JA)) ? p.join(':') : '0..*:1';
+    }
+    // 種類の名前（多対1・1対1・多対多・1対多）。上限だけで決まる
+    function cardJa(c) {
+        const [f, t] = normCard(c).split(':');
+        const many = x => x.endsWith('*');
+        if (many(f) && !many(t)) return '多対1';
+        if (!many(f) && !many(t)) return '1対1';
+        return many(f) && many(t) ? '多対多' : '1対多';
+    }
+    // 両端の意味を日本語で。ft/tt は from側・to側の表名
+    function cardNote(c, ft, tt) {
+        const [f, t] = normCard(c).split(':');
+        return `「${tt}」1件につき「${ft}」は${MULT_JA[f]}。「${ft}」1件につき「${tt}」は${MULT_JA[t]}`;
+    }
 
     /* --- 描画 ---------------------------------------------------------------- */
 
@@ -4214,14 +4237,15 @@ const ER = (() => {
             svg.append(path);
 
             // 多重度は線の両端に置く（IPA表記なので矢印は使わない）
-            // 多重度は cardinality（"N:1" など）から組み立てる。
+            // 多重度は cardinality（"0..*:1" など。旧 "N:1" も normCard が読み替える）から組み立てる。
             // ラベル文字列（"* ─ 1"）を切り分ける形だと、区切りが罫線（─ U+2500）
             // なのに ASCII の "-" で切っていて必ず失敗し、
             // どの関連も既定の「* ─ 1」に見えていた（1:N も 1:1 も N:M も同じ形）。
-            const [l, r] = String(e.cardinality || 'N:1').split(':')
-                .map(x => (x.trim() === '1' ? '1' : '*'));
-            marks.push([p.a, l, p.a.x < p.b.x ? 14 : -14, on],
-                       [p.b, r, p.b.x > p.a.x ? -14 : 14, on]);
+            const [l, r] = normCard(e.cardinality).split(':');
+            // 「0..*」は「1」より幅があるので、線の端から少し離す
+            const off = x => (x.length > 1 ? 22 : 14);
+            marks.push([p.a, l, p.a.x < p.b.x ? off(l) : -off(l), on],
+                       [p.b, r, p.b.x > p.a.x ? -off(r) : off(r), on]);
 
             // 複合キーの線は、列の組で1つの結合だと分かる印を中ほどに置く
             if ((e.pairs || []).length > 1) {
@@ -4265,11 +4289,11 @@ const ER = (() => {
             path.setAttribute('stroke-dasharray', '3 3');
             path.setAttribute('pointer-events', 'none');
             svg.append(path);
-            // 実線と同じIPA表記で多重度を描く（N・Mは「*」）
-            const [cl, cr] = String(sg.cardinality || 'N:1').split(':')
-                .map(x => (x === '1' ? '1' : '*'));
-            marks.push([p.a, cl, p.a.x < p.b.x ? 14 : -14, on, true],
-                       [p.b, cr, p.b.x > p.a.x ? -14 : 14, on, true]);
+            // 実線と同じIPA表記で多重度を描く
+            const [cl, cr] = normCard(sg.cardinality).split(':');
+            const offS = x => (x.length > 1 ? 22 : 14);
+            marks.push([p.a, cl, p.a.x < p.b.x ? offS(cl) : -offS(cl), on, true],
+                       [p.b, cr, p.b.x > p.a.x ? -offS(cr) : offS(cr), on, true]);
         });
         marks.forEach(([pt, text, dx, on, sug]) => {
             if (!text) return;
@@ -4458,7 +4482,7 @@ const ER = (() => {
             el('div', { class: 'small mono mb' }, `${sg.from}\n${sg.to}`),
             el('div', { class: 'small muted mb' }, `推測の根拠: ${sg.reason || ''}`),
             el('div', { class: 'small muted mb' },
-                `多重度: ${sg.cardinality}（${CARD_JA[sg.cardinality] || ''}。登録後に変更できます）`),
+                `多重度: ${normCard(sg.cardinality)}（${cardJa(sg.cardinality)}。登録後に変更できます）`),
             el('div', { class: 'alert alert--info small mb' },
                 'まだ登録されていない推測です。登録すると実データで妥当性を確かめたうえで、'
                 + 'AIがJOINに使う関連になります。'),
@@ -4507,17 +4531,25 @@ const ER = (() => {
                     + `変更するには、右上のプルダウンで ${e.owner} に切り替えてください。`)
                 : el('div', {},
                     el('div', { class: 'small muted mb' },
-                        `多重度（現在 ${e.cardinality}＝${CARD_JA[e.cardinality] || ''}）`),
-                    el('div', { class: 'row mb' }, CARDS.map(c =>
+                        `多重度（現在 ${normCard(e.cardinality)}＝${cardJa(e.cardinality)}: `
+                        + `${cardNote(e.cardinality, e.from[1], e.to[1])}）`),
+                    // 10通りを並べる。左の値が子（外部キー側）、右の値が親。表名は長いので見出しに1回だけ出す
+                    el('div', { class: 'small muted mb' }, `左 = ${e.from[1]}（子）、右 = ${e.to[1]}（親）`),
+                    // 旧表記 1:N を読み替えた "1:0..*" など、10通りに無い向きは選択状態にならないので注記する
+                    CARDS.includes(normCard(e.cardinality)) ? '' : el('div', { class: 'alert alert--info small mb' },
+                        `いまの多重度（${normCard(e.cardinality)}）は選択肢に無い向きです（子側が1・親側が多）。`
+                        + '子と親が逆に登録されている形なので、下から選び直してください。'),
+                    el('div', { class: 'mb', style: 'display:grid;gap:4px' }, CARDS.map(c =>
                         el('button', {
-                            class: 'btn btn--sm' + (c === e.cardinality ? ' btn--primary' : ''),
-                            title: CARD_JA[c],
+                            class: 'btn btn--sm' + (c === normCard(e.cardinality) ? ' btn--primary' : ''),
+                            style: 'justify-content:flex-start;text-align:left;white-space:normal;height:auto',
+                            title: cardNote(c, e.from[1], e.to[1]),
                             // index ではなく from/to で指す。表やビューを消すと
                             // 関連の配列が詰まり、index は別の関連を指してしまう
                             onclick: () => mutate({ action: 'update', index: e.index,
                                                     from: e.from_ref, to: e.to_ref,
                                                     cardinality: c }),
-                        }, `${c}（${CARD_JA[c]}）`))),
+                        }, `${c.split(':')[0]} ─ ${c.split(':')[1]}（${cardJa(c)}）`))),
                     comp ? el('div', { class: 'mb' },
                         el('div', { class: 'small muted mb' },
                             '列の組（「外す」でその列だけ複合キーから抜けます）'),
@@ -4906,9 +4938,9 @@ const ER = (() => {
         };
         const a = solePk(fromNode, fromCol), b = solePk(toNode, toCol);
         if (a && b) return '1:1';
-        if (b) return 'N:1';
-        if (a) return '1:N';
-        return 'N:M';
+        if (b) return '0..*:1';
+        if (a) return '1:0..*';
+        return '0..*:0..*';
     }
 
 
@@ -6540,7 +6572,7 @@ function openErModal(item) {
                     svgEl,
                     el('div', { class: 'er__world', id: 'erWorld' })),
                 el('div', { class: 'er__legend' },
-                    el('b', {}, 'IPA表記'), '　下線＝主キー　線の両端の 1・*＝多重度　',
+                    el('b', {}, 'IPA表記'), '　下線＝主キー　線の両端の 0..1・1・0..*・1..*＝多重度　',
                     '実線＝登録済み／短い破線＝FOREIGN KEY　長い破線＝DBをまたぐ関連'),
                 el('div', { class: 'er__panel hidden', id: 'erPanel' }))));
     back.append(box);

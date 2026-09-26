@@ -2195,9 +2195,11 @@ def set_model(user, model: str) -> None:
 #           description: キャンセル以外の、実際に売上になる受注   # 自然言語だけでもよい
 #           sql: status != '9'                                  # あればAIはこの式をそのまま使う
 #   relationships:
-#     - { from: orders.customer_id, to: customers.id, cardinality: "N:1" }
+#     - { from: orders.customer_id, to: customers.id, cardinality: "0..*:1" }
+#       # cardinality は「子側:親側」。各側は 0..1 / 1 / 0..* / 1..*（旧 N:1 等も読める）。
+#       # '1:1' は必ず引用符で囲む（裸だと YAML が 61 と読む）
 #       # to には "他DBエイリアス.テーブル.列" の3要素形式も書ける
-#     - { from: "明細.(工場CD, 受注NO)", to: "受注.(工場CD, 受注NO)", cardinality: "N:1" }
+#     - { from: "明細.(工場CD, 受注NO)", to: "受注.(工場CD, 受注NO)", cardinality: "0..*:1" }
 #       # 複合キーは括弧で列をまとめる（from/to の列数は同じ・対応順）
 #   glossary:                   # テーブルをまたぐ業務用語だけをここに書く
 #     稼働率: { description: 実働時間÷所定時間 }
@@ -2694,6 +2696,12 @@ def drift_warnings(profile: dict, meta: dict) -> list[str]:
                 warns.append(f"結合定義の '{end}' に対応するテーブルがありません。")
         if eps[0] and eps[1] and len(eps[0][2]) != len(eps[1][2]):
             warns.append(f"結合定義 '{rel.get('from')} → {rel.get('to')}' の列数が合っていません。")
+        raw_card = rel.get("cardinality")
+        if raw_card not in (None, "") and card_norm(raw_card) is None:
+            # 手書きの YAML で '1:1' を引用符なしで書くと 61（六十進）に読まれる、など。
+            # 黙って多対1にすると AI への説明とデータ品質の判定が変わるので知らせる
+            warns.append(f"結合定義 '{rel.get('from')} → {rel.get('to')}' の多重度 '{raw_card}' は読めないため、"
+                         f"多対1（{CARD_DEFAULT}）として扱っています（YAML では '1:1' のように引用符で囲んでください）。")
     # 例文・検算・用語のSQLが、存在しないテーブルを使っていないか。
     # 削除の掃除が中断された（アプリ停止・強制終了）ときの取り残しはここで見つける
     def _missing(sql: str):
@@ -2822,7 +2830,7 @@ def join_suggestions(profile: dict, meta: dict, db_path=None) -> list[dict]:
                 frm, to = f"{tname}.{cname}", f"{target}.{to_col}"
                 if (frm.lower(), to.lower()) in existing:
                     continue
-                sugs.append({"from": frm, "to": to, "cardinality": "N:1",
+                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
                              "reason": f"列名 '{cname}' → テーブル '{target}' の推測"})
                 break
 
@@ -2859,7 +2867,7 @@ def join_suggestions(profile: dict, meta: dict, db_path=None) -> list[dict]:
                 if (frm.lower(), to.lower()) in existing or (frm.lower(), to.lower()) in seen:
                     continue
                 seen.add((frm.lower(), to.lower()))
-                sugs.append({"from": frm, "to": to, "cardinality": "N:1",
+                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
                              "reason": f"同じ名前の列 '{col['name']}' が "
                                        f"'{target}' の主キー"})
 
@@ -2920,7 +2928,7 @@ def join_suggestions(profile: dict, meta: dict, db_path=None) -> list[dict]:
             for r, tt, tc in (same or hits):
                 frm, to = f"{tname}.{col['name']}", f"{tt}.{tc}"
                 seen.add((frm.lower(), to.lower()))
-                sugs.append({"from": frm, "to": to, "cardinality": "N:1",
+                sugs.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
                              "reason": f"列名は違うが値が一致"
                                        f"（{r * 100:.0f}%が '{tt}.{tc}' に存在）"})
     return sugs
@@ -3024,9 +3032,9 @@ def col_node_id(alias: str, table: str, column: str) -> str:
 
 def edge_label(cardinality: str | None) -> str:
     """IPA表記の関連ラベル。線は列ノード同士を結ぶので、列名はラベルに出さず
-    多重度だけを示す（始点側 ─ 終点側）。例: "* ─ 1"
+    多重度だけを示す（始点側 ─ 終点側）。例: "0..* ─ 1"
     """
-    tail, head = _CARD_ENDS.get(cardinality or "N:1", ("*", "1"))
+    tail, head = (card_norm(cardinality) or CARD_DEFAULT).split(":")
     return f"{tail} ─ {head}"
 
 
@@ -3076,7 +3084,7 @@ def collect_edges(entries: list[dict]) -> list[dict]:
                     "pairs": [[a[2], b[2]]],
                     "from_ref": format_endpoint(a[0], a[1], [a[2]], alias),
                     "to_ref": format_endpoint(b[0], b[1], [b[2]], alias),
-                    "label": edge_label("N:1"), "cardinality": "N:1",
+                    "label": edge_label(CARD_DEFAULT), "cardinality": CARD_DEFAULT,
                     "kind": "fk", "owner": alias, "index": None,
                 })
         for i, rel in enumerate(e["meta"].get("relationships") or []):
@@ -3087,7 +3095,7 @@ def collect_edges(entries: list[dict]) -> list[dict]:
             if (not valid(fa, ftb, [p_[0] for p_ in pairs])
                     or not valid(ta, ttb, [p_[1] for p_ in pairs])):
                 continue
-            card = rel.get("cardinality") or "N:1"
+            card = card_norm(rel.get("cardinality")) or CARD_DEFAULT
             # 線は先頭の列ペアに係留する（複合キーでも線は1本）
             a = (fa, ftb, pairs[0][0])
             b = (ta, ttb, pairs[0][1])
@@ -3256,16 +3264,59 @@ def er_payload(path, profile: dict | None = None,
 # 関連の向きと多重度（ER図とデータ検査が共有する規則）
 # =============================================================================
 
-# IPA表記の多重度ラベル: 線の両端に "1" と "*" を置く
-_CARD_ENDS = {
-    "N:1": ("*", "1"),   # from(多側) ─ to(1側)
-    "1:N": ("1", "*"),
-    "1:1": ("1", "1"),
-    "N:M": ("*", "*"),
-}
+# 多重度は "from側:to側" の文字列。from は外部キーを持つ子、to は参照される親。
+# 各側の値は 0..1 / 1 / 0..* / 1..*（下限＝相手が無くてもよいか、上限＝1つか多か）。
+# 線の両端にはこの値をそのまま描く（IPA表記に合わせ矢印は使わない）。
+# 旧表記（N:1 / 1:N / 1:1 / N:M）は card_norm が読み替えるので、古い meta.yaml もそのまま読める。
+MULT = ("0..1", "1", "0..*", "1..*")
+MULT_JA = {"1": "ちょうど1件", "0..1": "0件か1件", "0..*": "0件以上", "1..*": "1件以上"}
+#: 何も指定が無いときの多重度（多対1。子は必ず1つの親を持ち、親には子が無いこともある）
+CARD_DEFAULT = "0..*:1"
+#: 画面で選べる組み合わせ。順不同で10通りあり、親側（to）に小さい方を置いた向きで並べる
+CARD_CHOICES = ["0..*:1", "1..*:1", "0..*:0..1", "1..*:0..1",          # 多対1
+                "1:1", "0..1:1", "0..1:0..1",                          # 1対1
+                "0..*:0..*", "0..*:1..*", "1..*:1..*"]                 # 多対多
+_CARD_LEGACY = {"N": "0..*", "M": "0..*", "*": "0..*"}
 
-#: 向きを入れ替えたときの多重度。1:1 と N:M は入れ替えても同じ。
-_CARD_FLIP = {"N:1": "1:N", "1:N": "N:1", "1:1": "1:1", "N:M": "N:M"}
+
+def card_norm(value) -> str | None:
+    """多重度を "from側:to側" の正規形にする。旧表記は読み替え、読めなければ None。"""
+    parts = [p.strip() for p in str(value or "").split(":")]
+    if len(parts) != 2:
+        return None
+    parts = [_CARD_LEGACY.get(p, p) for p in parts]
+    if not all(p in MULT for p in parts):
+        return None
+    return ":".join(parts)
+
+
+def card_flip(card) -> str:
+    """向きを入れ替えたときの多重度（両端を入れ替える）。"""
+    a, b = (card_norm(card) or CARD_DEFAULT).split(":")
+    return f"{b}:{a}"
+
+
+def card_family(card) -> str:
+    """種類の名前（多対1 / 1対1 / 多対多 / 1対多）。上限だけで決まる。"""
+    f, to = (card_norm(card) or CARD_DEFAULT).split(":")
+    mf, mt = f.endswith("*"), to.endswith("*")
+    if mf and not mt:
+        return "多対1"
+    if not mf and not mt:
+        return "1対1"
+    return "多対多" if mf and mt else "1対多"
+
+
+def card_text(card, from_table: str, to_table: str) -> str:
+    """両端の意味を日本語で（AIと画面の説明に使う）。
+
+    from側の値は「親1件につき子が何件か」、to側の値は「子1件につき親が何件か」。
+    例: "0..*:1"（明細→受注）→「「受注」1件につき「明細」は0件以上。「明細」1件につき「受注」はちょうど1件」
+    表名は「」で囲む（末尾が数字の表名だと「設備21件」のように読めなくなる）。
+    """
+    f, to = (card_norm(card) or CARD_DEFAULT).split(":")
+    return (f"「{to_table}」1件につき「{from_table}」は{MULT_JA[f]}。"
+            f"「{from_table}」1件につき「{to_table}」は{MULT_JA[to]}")
 
 
 def _is_sole_pk(profile: dict, meta: dict, table: str, column: str) -> bool:
@@ -3287,7 +3338,7 @@ def normalize_direction(a: tuple, b: tuple, cardinality: str, lookup) -> tuple:
 
     戻り値: (from, to, cardinality)
     """
-    card = cardinality or "N:1"
+    card = card_norm(cardinality) or CARD_DEFAULT
     try:
         pa, ma = lookup(a[0])
         pb, mb = lookup(b[0])
@@ -3299,7 +3350,11 @@ def normalize_direction(a: tuple, b: tuple, cardinality: str, lookup) -> tuple:
     b_is_pk = _is_sole_pk(pb, mb, b[1], b[2])
     # 片方だけが主キーなら、そちらを親（to）にする
     if a_is_pk and not b_is_pk:
-        return b, a, _CARD_FLIP.get(card, card)
+        # 多重度が指定されていない（既定のまま）なら、向きを直したあとも既定の多対1。
+        # 既定まで反転させると "1:0..*"（子側が1・親側が多）という逆の意味で保存される
+        if card_norm(cardinality) in (None, CARD_DEFAULT):
+            return b, a, CARD_DEFAULT
+        return b, a, card_flip(card)
     return a, b, card
 
 
@@ -3314,7 +3369,7 @@ def tuple_unique(path, table: str, cols: list) -> bool:
     """その表で「列の組」ごとに1行しかない（＝組として一意）か。実データで数える。
 
     複合キーの判定に使う。単独の列では重複していても、組で一意なら
-    N:1 の親として成立する。数えられないときは False（安全側）。
+    多対1（0..*:1）の親として成立する。数えられないときは False（安全側）。
     """
     try:
         conn = db.connect_scope([(str(path), "p")])
@@ -3447,7 +3502,7 @@ def link_check(child: tuple, parent: tuple, lookup, path_of) -> dict:
             add("warn", "参照先（1側）の値が一意ではありません",
                 f"{pt}.{pc} は {n_parent:,} 件中 {dup:,} 件が重複しています。"
                 "「1側」は本来ユニークです。重複したまま JOIN すると行が増えて集計が膨らみます。"
-                "多重度を N:M にするか、参照先を主キー列に変えてください。")
+                "多重度を多対多（0..*:0..*）にするか、参照先を主キー列に変えてください。")
     except Exception as e:
         add("info", "実データでの確認ができませんでした", str(e)[:120])
 
@@ -3666,10 +3721,20 @@ def db_text(alias: str, db_path, tables: list[str] | None, full: bool) -> str:
             fk_lines.append(f"- {tname}.{fk['from']} = {fk['table']}.{fk['to']} (FK宣言)")
     if rels or fk_lines:
         lines.append("結合キー（JOINにはこれを使う）:")
+        if rels:
+            # 多重度の読み方は1回だけ書き、既定（多対1）の関連には記号だけ添える。
+            # 全件に日本語を添えると、関連の多いDBでプロンプトが倍以上に伸びる
+            lines.append(f"  ※ 多重度は「子側:親側」。{CARD_DEFAULT}＝多対1（子は必ず親を1つ持つ。親には子が無いこともある）。"
+                         "0.. は「相手の無い行がある」の意味で、その行を落としたくない集計ではその表を LEFT JOIN で残す")
         lines.extend(fk_lines)
         for r in rels:
-            card = f" ({r['cardinality']})" if r.get("cardinality") else ""
             pr = rel_pairs(r, "")
+            card = ""
+            if r.get("cardinality"):
+                cn = card_norm(r.get("cardinality")) or CARD_DEFAULT
+                # 既定以外の関連にだけ、両端の意味を日本語で添える（記号だけでは AI が読み違える）
+                card = (f" ({cn}: {card_text(cn, pr[0][1], pr[1][1])})" if pr and cn != CARD_DEFAULT
+                        else f" ({cn})")
             if pr and len(pr[2]) > 1:
                 (fa, ftb), (ta, ttb), pairs = pr
                 fh = ftb if not fa else f"{fa}.{ftb}"
@@ -4460,7 +4525,7 @@ def suggestions_for(alias: str, profile: dict, meta: dict) -> list[dict]:
             a, b = b, a
         frm = f"{a[1]}.{a[2]}"
         to = f"{b[1]}.{b[2]}" if b[0] == alias else f"{b[0]}.{b[1]}.{b[2]}"
-        out.append({"from": frm, "to": to, "cardinality": "N:1",
+        out.append({"from": frm, "to": to, "cardinality": CARD_DEFAULT,
                     "reason": f"過去の分析で{e['count']}回使われています（未登録）"})
     return out[:8]
 
@@ -11503,7 +11568,10 @@ def relationship():
         # 向きを「子（外部キー側）→ 親（主キー側）」に揃えてから保存する。
         # ER図は矢印を描かないので、人はどちら向きにもドラッグする。
         # from/to は描画順ではなく参照の向きで、整合性チェックがこれに依存する。
-        a, b, card = catalog.normalize_direction(a, b, body.get("cardinality"), lookup)
+        card_in = body.get("cardinality")
+        if card_in and catalog.card_norm(card_in) is None:
+            return jsonify({"error": "多重度の指定が正しくありません（例: 0..*:1）。"}), 400
+        a, b, card = catalog.normalize_direction(a, b, card_in, lookup)
 
         # 同じ表ペアの既存の関連（複合キーとして合流できる相手）。向きが逆でも拾い、
         # 逆なら既存の向きに合わせる（1つの関連の中で向きが混ざらないように）
@@ -11516,7 +11584,7 @@ def relationship():
                 same.append((i, r))
             elif (pr[0], pr[1]) == ((b[0], b[1]), (a[0], a[1])):
                 a, b = b, a
-                card = catalog._CARD_FLIP.get(card, card)
+                card = catalog.CARD_DEFAULT if card == catalog.CARD_DEFAULT else catalog.card_flip(card)
                 same.append((i, r))
 
         if a[0] != alias:
@@ -11538,7 +11606,7 @@ def relationship():
                             "from": _ref(a, alias), "to": _ref(b, alias),
                             "cardinality": card,
                             "existing": [{"from": r.get("from"), "to": r.get("to"),
-                                          "cardinality": r.get("cardinality") or "N:1",
+                                          "cardinality": catalog.card_norm(r.get("cardinality")) or catalog.CARD_DEFAULT,
                                           "pairs": [[fc, tc] for fc, tc
                                                     in catalog.rel_pairs(r, alias)[2]]}
                                          for _i, r in same]})
@@ -11582,7 +11650,7 @@ def relationship():
             tgt["from"] = catalog.format_endpoint(a[0], a[1], [p_[0] for p_ in pairs], alias)
             tgt["to"] = catalog.format_endpoint(b[0], b[1], [p_[1] for p_ in pairs], alias)
             extra = {"merged": {"from": tgt["from"], "to": tgt["to"],
-                                "cardinality": tgt.get("cardinality") or "N:1",
+                                "cardinality": catalog.card_norm(tgt.get("cardinality")) or catalog.CARD_DEFAULT,
                                 "pair": [a[2], b[2]],
                                 # 画面の「元に戻す／やり直す」が同じ列ペアを付け外し
                                 # できるよう、addで送り直せる形も返す
@@ -11608,8 +11676,11 @@ def relationship():
         if action == "delete":
             extra = {"removed": rels.pop(i)}
         else:
-            prev = rels[i].get("cardinality")
-            rels[i]["cardinality"] = body.get("cardinality") or prev
+            # previous は正規形で返す（画面の「元に戻す」がそのまま送り返す。旧表記や空でも既定に戻せる）
+            prev = catalog.card_norm(rels[i].get("cardinality")) or catalog.CARD_DEFAULT
+            if body.get("cardinality") and catalog.card_norm(body.get("cardinality")) is None:
+                return jsonify({"error": "多重度の指定が正しくありません（例: 0..*:1）。"}), 400
+            rels[i]["cardinality"] = catalog.card_norm(body.get("cardinality")) or catalog.CARD_DEFAULT
             extra = {"updated": {**rels[i], "previous": prev}}
     elif action == "remove_pair":
         # 複合キーの関連から列ペアを1つ外す。残り1ペアなら単独形式へ、0なら関連ごと削除。
@@ -11637,7 +11708,7 @@ def relationship():
             rels[i]["to"] = catalog.format_endpoint(ta, ttb, [p_[1] for p_ in pairs], alias)
             (fa2, ftb2), (ta2, ttb2) = pr[0], pr[1]
             extra = {"pair_removed": {"from": rels[i]["from"], "to": rels[i]["to"],
-                                      "cardinality": rels[i].get("cardinality") or "N:1",
+                                      "cardinality": catalog.card_norm(rels[i].get("cardinality")) or catalog.CARD_DEFAULT,
                                       "pair": pair,
                                       "add_body": {
                                           "from_table": ftb2 if fa2 == alias else f"{fa2}.{ftb2}",
