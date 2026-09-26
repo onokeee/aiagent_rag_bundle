@@ -5186,6 +5186,11 @@ const ER = (() => {
         if (st.running) { showDiscoverProgress(); return; }
         const stale = (st.new || []).length + (st.changed || []).length;
         const lines = [];
+        // 画面を閉じている間に失敗していたら、次に開いたときに知らせる（裏で動くので気づけない）
+        if (st.progress && st.progress.error) {
+            lines.push(el('div', { class: 'alert alert--err small mb' },
+                `前回（${String(st.progress.finished_at || '').replace('T', ' ')}）は失敗しました: ${st.progress.error}`));
+        }
         lines.push(el('div', { class: 'small muted mb' },
             '全表の全列を実データで調べ、値が重なる列の組を結合の候補にします。多重度も推定します。'
             + '表が大きいと数分かかります。表の定義が変わらなければ探し直す必要はありません。'));
