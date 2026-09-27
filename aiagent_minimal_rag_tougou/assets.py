@@ -5817,7 +5817,9 @@ async function confirmDelete(opts) {
                     drop_jobs: dropJobs.checked,
                 });
                 close();
-                toast(opts.done(r));
+                // 波及（動かなくなるマイロボット等）まで書くので長くなる。読める時間だけ出す
+                const msg = opts.done(r);
+                toast(msg, 'ok', msg.length > 60 ? 12000 : 5000);
                 MANAGE.refresh();
                 opts.after?.(r);
             } catch (e) { toast(e.message, 'err', 9000); go.disabled = false; }
@@ -5951,7 +5953,16 @@ function openRenameTable(dbName, table) {
         try {
             const r = await api('/api/catalog/rename-table',
                 { db: dbName, table, new_table: full });
-            toast(`${table} を ${r.new} に変更しました。ページを読み直します。`);
+            // 何に波及したかを出す（マイロボットの手順は自動で付け替えている。
+            // 黙って直すと、持ち主は「壊れたかもしれない」と思って作り直してしまう）
+            const also = [];
+            if (r.robots) also.push(`マイロボット ${r.robots}件`);
+            if (r.jobs) also.push(`取り込みの予定 ${r.jobs}件`);
+            if (r.prefs) also.push(`利用者の設定 ${r.prefs}件`);
+            if (r.joins) also.push(`結合候補 ${r.joins}件`);
+            toast(`${table} を ${r.new} に変更しました`
+                  + (also.length ? `（${also.join('・')}も付け替えました）` : '')
+                  + '。ページを読み直します。', 'ok', also.length ? 9000 : 5000);
             // reloadClean で読み直す。素の reload だと、書きかけの説明や
             // メモが残っているせいで離脱警告が出て止まり、改名は済んでいるのに
             // 画面だけ旧名のまま残る（保存も 400 で弾かれる）
@@ -6000,7 +6011,17 @@ function askDeleteTable(dbName, name, rows, isView) {
         url: '/api/import/drop-table',
         body: { db: dbName, table: name },
         action: isView ? 'ビューを削除する' : 'テーブルを削除する',
-        done: () => `${name} を削除し、カタログの記述も片づけました。`,
+        // 消したことで動かなくなるマイロボットは、消した本人に伝える
+        // （持ち主は自分の画面を見ていないので、誰も気づかないまま次の実行が失敗する）
+        done: (res) => {
+            const rb = ((res?.groups || []).find(g => g.key === 'robots')?.items) || [];
+            return `${name} を削除し、カタログの記述も片づけました。`
+                + (rb.length
+                   ? `動かなくなるマイロボットが ${rb.length}件あります`
+                     + `（${rb.map(x => x.text).slice(0, 3).join('、')}）。`
+                     + '持ち主に手順の直しを伝えてください。'
+                   : '');
+        },
         after: (res) => dropTableFromView(name, res && res.stamps),
     });
 }
@@ -6299,10 +6320,32 @@ function wireScope() {
     const saveTables = async () => {
         syncTableUi();
         const off = picks().filter(c => !c.checked).map(c => c.dataset.table);
+        // この画面が見ている顔ぶれも送る。読み込んだあとに表が増えた・改名された・
+        // 消えたときは、サーバが保存せずに教えてくれる（古い一覧で上書きすると、
+        // 外したはずの表が対象に戻る）
+        const known = picks().map(c => c.dataset.table);
         try {
-            await api('/api/tables/prefs', { off });
-        } catch (e) { toast(e.message, 'err', 8000); }
+            await api('/api/tables/prefs', { off, known });
+        } catch (e) { toast(e.message, 'err', 10000); }
     };
+
+    // 画面に戻ってきたときに、表の顔ぶれが変わっていないか確かめる。
+    // 変わっていたら読み直してもらう（黙って古い一覧のまま使わせない）
+    let scopeNotified = false;
+    const checkScopeFresh = async () => {
+        if (scopeNotified || document.hidden) return;
+        try {
+            const r = await api('/api/tables/prefs', undefined, 'GET');
+            const now = (r.names || []).slice().sort().join('\u0000');
+            const mine = picks().map(c => c.dataset.table).sort().join('\u0000');
+            if (now !== mine) {
+                scopeNotified = true;
+                toast('表の一覧が変わりました（追加・改名・削除）。画面を読み直してください。',
+                      'warn', 12000);
+            }
+        } catch (e) { /* 取れなくても、いまの表示で困らない */ }
+    };
+    window.addEventListener('focus', checkScopeFresh);
 
     // 見出しの数と、まとまりのチェック状態を実際の選択に合わせる
     function syncTableUi() {
@@ -11895,8 +11938,13 @@ function syncDest() {
 }
 
 function importPayload() {
+    // この画面が「新しい表を作る」つもりか「作り直す」つもりかも送る。開いたあとに
+    // 別の管理者が同じ名前の表を作っていたら、サーバが取り込まずに教えてくれる
+    // （作り直しだと、その人のデータを黙って全部入れ替えてしまう）
+    const existed = (IMP.existing[dbFile] || []).includes(finalTableName());
     return {
         ...readOptions(),
+        existed,
         table: finalTableName(), mode: $('#mode').value,
         timestamp_column: $('#tsCol')?.value || null,
         keep_runs: $('#mode').value === 'append' ? $('#keepRuns')?.value : null,
@@ -11926,7 +11974,12 @@ async function runImport(ev) {
             toast(`数値にできない値があったため TEXT で取り込んだ列: ${r.degraded.join(', ')}`, 'warn', 9000);
         }
         setTimeout(() => window.location.reload(), 1500);
-    } catch (e) { toast(e.message, 'err', 9000); }
+    } catch (e) {
+        toast(e.message, 'err', e.data?.stale ? 14000 : 9000);
+        // 取り込み先の状態が画面と食い違っていた。読み直さないと同じ結果になるので、
+        // 画面を新しくしてから選び直してもらう
+        if (e.data?.stale) setTimeout(() => window.location.reload(), 3000);
+    }
     ev.target.disabled = false;
     syncMode();                        // ラベルと有効/無効を元の状態に戻す
 }

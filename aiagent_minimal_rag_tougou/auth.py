@@ -30,6 +30,8 @@ import hmac
 import json
 import os
 import secrets
+import threading
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -53,6 +55,13 @@ AUTH_USERS_FILE = Path(__file__).resolve().parent / "auth_users.yaml"
 # 管理者とみなすグループ名。
 # http では認証APIが返すグループ名の実物と完全一致させること（部分一致はしない）。
 AUTH_ADMIN_GROUP = "admin"
+
+# 連続して間違えたときの足止め。同じ利用者名・同じ接続元からの失敗を数え、
+# 上限を超えたらしばらく受け付けない（総当たりで当てられないようにする）。
+# 社内利用なので締め出しはせず、待てば再開できる長さにしている。
+LOGIN_MAX_FAILS = 8            # この回数まで
+LOGIN_FAIL_WINDOW_SEC = 300    # この時間内に間違えたら
+LOGIN_BLOCK_SEC = 300          # この時間だけ受け付けない
 
 # 常設の管理者アカウント。LDAPや auth_users.yaml とは別枠で、どのプロバイダを
 # 使っていても必ずログインできる「非常口」。LDAPが落ちても設定画面に入れる。
@@ -348,6 +357,31 @@ def groups_now(username: str) -> list | None:
     return []                                     # 一覧から消えている＝権限は無い
 
 
+def known_now(username: str) -> bool | None:
+    """パスワード無しで、いまも本人が居るかを確かめる。確かめられない構成では None。
+
+    groups_now は「権限が無い」を [] で返すが、それは「居るが管理者ではない」と
+    「もう居ない（消された・退職した）」の両方に当てはまり、区別できない。
+    定期実行を止めるかどうかはこの違いで決めたいので、別に持つ。
+    外部の認証API（http）はパスワード無しでは分からないので None（呼び出し側は
+    「居ないとは言えない」扱いにする。勝手に止めない）。
+    """
+    name = str(username or "").strip().lower()
+    if not name:
+        return False
+    if admin_enabled() and name == ADMIN_USER.lower():
+        return True
+    if any(name == str(u).strip().lower() for u in BUILTIN_USERS):
+        return True
+    if (AUTH_PROVIDER or "local").strip().lower() != "local":
+        return None
+    try:
+        users = LocalAuthProvider()._load()
+    except AuthError:
+        return None                               # 一覧が読めない。「もう居ない」と決めつけない
+    return any(str(u.get("username", "")).strip().lower() == name for u in users)
+
+
 def authenticate(username: str, password: str) -> User | None:
     """ログインの入口。常設の管理者→常設の一般ユーザー→プロバイダの順に見る。
 
@@ -365,6 +399,48 @@ def authenticate(username: str, password: str) -> User | None:
            for u in BUILTIN_USERS):
         return _try_builtin_user(username, password)
     return get_provider().authenticate(username, password)
+
+
+# --- 連続して間違えたときの足止め -------------------------------------------------
+#
+# 総当たりでパスワードを当てられないようにする。数えるのはこのプロセスの中だけ
+# （社内向けの1台構成なので、外部の置き場は持たない。再起動すると忘れる）。
+
+_fails: dict = {}                 # 鍵 → [失敗した時刻, ...]
+_fails_lock = threading.Lock()
+
+
+def _fail_key(username: str, source: str) -> str:
+    return f"{str(username or '').strip().lower()}@{source or ''}"
+
+
+def login_blocked_for(username: str, source: str = "") -> int:
+    """あと何秒受け付けないか（0 なら受け付ける）。"""
+    key = _fail_key(username, source)
+    now = time.time()
+    with _fails_lock:
+        times = [t for t in _fails.get(key, []) if now - t < LOGIN_FAIL_WINDOW_SEC]
+        _fails[key] = times
+        if len(times) < LOGIN_MAX_FAILS:
+            return 0
+        wait = int(LOGIN_BLOCK_SEC - (now - times[-1]))
+        return max(wait, 1)
+
+
+def note_login_failure(username: str, source: str = "") -> None:
+    """間違えた回数を1つ増やす。"""
+    key = _fail_key(username, source)
+    now = time.time()
+    with _fails_lock:
+        times = [t for t in _fails.get(key, []) if now - t < LOGIN_FAIL_WINDOW_SEC]
+        times.append(now)
+        _fails[key] = times
+
+
+def note_login_success(username: str, source: str = "") -> None:
+    """入れたら数えたものは捨てる（普段使いの人を足止めしない）。"""
+    with _fails_lock:
+        _fails.pop(_fail_key(username, source), None)
 
 
 # --- ユーザー定義ファイルの操作（core.py の users CLI から使う） --------------------------

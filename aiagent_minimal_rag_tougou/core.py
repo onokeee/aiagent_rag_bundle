@@ -6178,9 +6178,11 @@ def import_dataframe(db_path: Path, table: str, df: pd.DataFrame, columns: list[
         conn.commit()
         # WAL のときは、書いた分を本体のファイルへ移しておく（作業ファイルが
         # 大きくなり続けるのを防ぎ、.db を手でコピーした控えが直前の取り込みを含むようにする）。
-        # 読み手が居ると移しきれないことがあるが、その場合も後で自動で移るので気にしない
+        # PASSIVE は読み手が居れば「できるところまで」で戻る。TRUNCATE にすると
+        # 読み手が居るあいだ待ち続け、取り込み1回ごとに最大30秒止まる
+        # （残りは SQLite が後で自動的に移す）
         try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except sqlite3.Error:
             pass
         return len(rows), degraded
@@ -7566,6 +7568,13 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
             if jobs.delete_job(j.get("id")):
                 done["jobs"].append({"db": path.name,
                                      "text": j.get("name") or j.get("table")})
+    # マイロボットは書き換えない（削除には付け替え先が無く、手順のSQLを直しても
+    # 中身が本当に消えているので実行できるようにはならない）。ただし「どのロボットが
+    # 動かなくなるか」は、消した本人に必ず伝える。下見（table_impact）を見ずに
+    # 消す経路もあるので、掃除の結果にも載せる
+    using = _robots_using(table)
+    if using:
+        done["robots"] = using
     catalog.forget(path)
     # まとまりの最後の表が消えたら、まとまりのメモも片づける
     # （残すと、無いデータの前提だけがAIに渡り続ける）
@@ -7733,6 +7742,10 @@ def rename_table(path: Path, old: str, new: str) -> dict:
 
         # 利用者ごとの「対象から外した表」（好みの保存と同じ鍵を通す）
         prefs_hit = prefs.rename_in_tables_off(old, new)
+        # 利用者のマイロボット（手順のSQLと、使う表の一覧）。ここを素通りすると、
+        # 表は生きていて名前が変わっただけなのに、次の実行が「表が見つかりません
+        # （改名・削除された可能性）」で止まり、作り直しを促してしまう
+        robots_hit = _robots_rename_table(old, new)
     except Exception:
         # カタログ側で失敗したら、実表とカタログを元に戻す
         conn = sqlite3.connect(path, timeout=30)
@@ -7750,6 +7763,7 @@ def rename_table(path: Path, old: str, new: str) -> dict:
     # 「結合を探す」の保存も付け替える（探し直さなくて済むように）
     joins_hit = catalog.rename_join_candidates(path, old, new)
     return {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
+            "robots": robots_hit,
             "memo_moved": moved_memo, "memo_kept": kept_memo, "joins": joins_hit}
 
 
@@ -8235,7 +8249,15 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        if not username or not password:
+        # 総当たり対策の足止め。同じ利用者名・同じ接続元の失敗だけを数えるので、
+        # 隣の人が間違えても自分は止まらない（社内なので締め出しはせず、待てば再開する）
+        src = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+        wait = auth.login_blocked_for(username, src) if username else 0
+        if wait:
+            flash(f"続けて間違えたため、しばらく受け付けません（約{max(1, wait // 60)}分後にもう一度）。",
+                  "error")
+            print(f"[auth] 連続失敗で足止め: {username}（{src}）あと {wait} 秒")
+        elif not username or not password:
             flash("ユーザー名とパスワードを入力してください。", "warning")
         else:
             try:
@@ -8244,8 +8266,10 @@ def login():
                 flash(f"認証できませんでした: {e}", "error")
             else:
                 if user is None:
+                    auth.note_login_failure(username, src)
                     flash("ユーザー名またはパスワードが違います。", "error")
                 else:
+                    auth.note_login_success(username, src)
                     login_user(user)
                     # ログイン後の行き先は、このアプリの中の道だけ許す。
                     # "//どこか" や "/\\どこか" は、ブラウザが外のサイトとして扱う
@@ -10567,6 +10591,48 @@ def _robots_using(table: str) -> list[dict]:
     return out
 
 
+def _robots_rename_table(old: str, new: str) -> int:
+    """全利用者のマイロボットで、改名した表への参照を付け替える。戻り値は本数。
+
+    使う表の一覧（tables）は、実行前の点検（_robot_missing_tables）と削除の下見が
+    見る場所なので、まずそこを差し替える。手順の中身は道具ごとに引数の形が違うので
+    個別に追わず、手順をまとめて文字列に直してから境界つきで置換する
+    （カタログの改名で全文を通すのと同じやり方。道具が増えても追随できる）。
+    本人の保存や実行の書き戻しと重ならないよう、robots.json と同じ鍵の中で読み書きする。
+    """
+    root = config.USER_META_DIR
+    if not root.exists():
+        return 0
+    hit = 0
+    with _robots_lock:
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            p = d / "robots.json"
+            if not p.exists():
+                continue
+            data = _read_json(p)
+            if not isinstance(data, dict) or not isinstance(data.get("robots"), list):
+                # 読めないファイルには書かない（空と見なして上書きすると、
+                # そのひとの他のロボットまで消える）
+                print(f"[robot] 改名の付け替えを見送りました（読めません）: {p}")
+                continue
+            changed = False
+            for r in data["robots"]:
+                if not isinstance(r, dict) or old not in (r.get("tables") or []):
+                    continue
+                r["tables"] = [new if t == old else t for t in r["tables"]]
+                try:
+                    r["steps"] = json.loads(_rename_in_text(
+                        json.dumps(r.get("steps") or [], ensure_ascii=False), old, new))
+                except (TypeError, ValueError) as e:
+                    # 手順が読めない形（手で編集した等）。表の一覧だけ直して先へ進む
+                    print(f"[robot] 手順の付け替えを見送りました（{e}）: {p}")
+                changed = True
+                hit += 1
+            if changed:
+                _write_json(p, data)
+    return hit
+
+
 def _robot_run(robot: dict, values: dict, test: dict | None = None) -> tuple[dict, bool, str]:
     """新しい会話の中で手順を順に実行する。AIは呼ばない。戻り値は (会話, 成否, 一言)。
 
@@ -11265,6 +11331,21 @@ def _run_scheduled_robot(app, user, robot: dict) -> dict | None:
     robot = _robot_claim(user, robot["id"])
     if robot is None:                 # 直前に止められた・消された・時刻が変わった
         return None
+    # 権限は _robot_owner が実行のたびに引き直している。ここではもう一段、
+    # 「本人がまだ居るか」を確かめる。居なくなった人（消された・退職した）の
+    # ロボットが動き続けると、誰の代わりの処理なのか説明できず、自動送信も止まらない。
+    # ただし設定（定期実行の予定）は消さず、この回を見送るだけにする。
+    # 利用者の一覧が一時的に不完全だっただけで予定まで消すと、直したあとに
+    # 本人が全部つけ直すことになる（知らせのメールも送らない。宛先が居ないため）。
+    # 外部の認証APIでは確かめられないので、その構成では見送らない（None）
+    if auth.known_now(user.username) is False:
+        message = ("本人のアカウントが見当たらないため、この回は動かしませんでした"
+                   "（消された・退職した可能性。予定は残しています）。")
+        _robot_write_back(user, robot["id"], False, message, "schedule")
+        print(f"[robot] 定期実行を見送りました（{user.username} のアカウントが見当たりません）:"
+              f" {robot.get('name')}")
+        return {"user": user.username, "name": robot.get("name") or "（無題）",
+                "ok": False, "message": message, "at": chats.now()}
     values = dict(_robot_schedule_norm(robot)["values"])
     for h in robot.get("holes") or []:
         values.setdefault(h["key"], str(h.get("sample") or ""))
@@ -14968,6 +15049,21 @@ def run():
     if locked:
         return jsonify({"error": locked}), 400
 
+    # 画面が「新しい表を作る」つもりだったのか「作り直す」つもりだったのかを確かめる。
+    # 画面を開いたあとに、別の管理者が同じ名前の表を作った・別の表をこの名前に改名した
+    # 場合、作り直しはその人のデータを黙って捨ててしまう（元に戻せない）
+    existed = tname in importer.existing_tables(sole[0]) if sole[0].exists() else False
+    assumed = body.get("existed")
+    if isinstance(assumed, bool) and assumed != existed:
+        return jsonify({
+            "error": (f"この画面を開いたあとに「{tname}」が作られました。"
+                      "そのまま取り込むと、その中身を全部入れ替えてしまいます。"
+                      "画面を読み直して、作り直すかどうかを選び直してください。"
+                      if existed else
+                      f"この画面を開いたあとに「{tname}」が無くなりました（削除・改名）。"
+                      "画面を読み直してから取り込んでください。"),
+            "stale": True, "existed": existed}), 409
+
     started = datetime.now()
     db_path = None
     try:
@@ -15487,14 +15583,41 @@ def knowledge_prefs_payload() -> dict:
     }
 
 
+def _all_table_names() -> set:
+    """いま実在する表・ビューの名前（サイドバーに出ている顔ぶれ）。"""
+    known = set()
+    for f in db.list_db_files():
+        known |= set(catalog.profile_db(f)["tables"].keys())
+    return known
+
+
+@bp_chat.get("/api/tables/prefs")
+@login_required
+def tables_prefs_status():
+    """開いたままの画面が「顔ぶれが変わっていないか」を確かめるための口。
+
+    表の改名・削除・追加は、別のタブや管理者の操作で起きる。画面は読み込み時の
+    一覧を持ち続けるので、これを見て変わっていたら読み直してもらう。
+    """
+    return jsonify({"ok": True, "names": sorted(_all_table_names()),
+                    "off": rag.excluded_tables(g.user)})
+
+
 @bp_chat.post("/api/tables/prefs")
 @login_required
 def tables_prefs_save():
     """分析の対象から外した表を保存する（利用者ごと）。"""
     d = _body()
-    known = set()
-    for f in db.list_db_files():
-        known |= set(catalog.profile_db(f)["tables"].keys())
+    known = _all_table_names()
+    # 画面が持っている顔ぶれ（known）が今と違うなら保存しない。
+    # そのまま保存すると、改名を知らない画面が古い名前の一覧を書き戻し、
+    # 改名後の表が「対象に入っている」状態に勝手に戻る（外したつもりが外れない）
+    shown = d.get("known")
+    if isinstance(shown, (list, tuple)) and set(str(t) for t in shown) != known:
+        return jsonify({
+            "error": "この画面を開いたあとに、表の一覧が変わりました"
+                     "（追加・改名・削除）。画面を読み直してから選び直してください。",
+            "stale": True, "names": sorted(known)}), 409
     # いま実在する表だけ残す。消えた表の名前を持ち続けても意味がない
     off = d.get("off") or []
     if not isinstance(off, (list, tuple)):
@@ -16439,6 +16562,16 @@ def create_app() -> Flask:
         20 秒待ちののち「別の人が保存しています」になり続ける。
         """
         catalog.release_meta_locks()
+
+    @app.errorhandler(_TurnError)
+    def _turn_error_any(e: _TurnError):
+        """送信を始められない理由（会話の鍵が取れない等）。
+
+        bp_chat には同じものが登録済みだが、マイロボットの試運転は
+        bp_catalog の口から同じ処理を通るので、そちらでは 500 になっていた。
+        アプリ全体に登録して、どの口からでも理由が返るようにする。
+        """
+        return jsonify(e.payload), e.status
 
     @app.errorhandler(catalog.MetaBusy)
     def _meta_busy(e):
