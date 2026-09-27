@@ -7279,14 +7279,22 @@ def to_schema(tool: dict) -> dict:
 
 
 def coerce_params(tool: dict, args: dict) -> dict:
-    """LLMが渡してきた引数を、定義された型に寄せてバインド用の辞書にする。"""
-    out = {}
+    """LLMが渡してきた引数を、定義された型に寄せてバインド用の辞書にする。
+
+    必須の引数が来ていなければ、ここで止めて名前を返す。NULL のまま SQL に渡すと
+    条件（例 WHERE 部門 = :部門）が外れて「0件」というもっともらしい答えになり、
+    人もAIも間違いに気づけない。組み込みツールは _missing_required で同じことをしている。
+    """
+    out, missing = {}, []
     for p in (tool.get("parameters") or []):
         pn = str(p.get("name") or "").strip()
         if not pn:
             continue
         v = args.get(pn)
-        if v is None:
+        # 0 や False は正しい値。空とみなすのは None と空の入れ物だけ
+        if v is None or (isinstance(v, (str, list, dict, tuple)) and len(v) == 0):
+            if p.get("required", True):
+                missing.append(pn)
             out[pn] = None
             continue
         t = p.get("type") or "string"
@@ -7301,6 +7309,10 @@ def coerce_params(tool: dict, args: dict) -> dict:
                 out[pn] = str(v)
         except (TypeError, ValueError):
             raise ValueError(f"パラメータ '{pn}' を {t} として解釈できません: {v!r}")
+    if missing:
+        raise ValueError(f"ツール '{tool.get('name')}' に必要な値が渡っていません: "
+                         + "、".join(missing)
+                         + "。値を入れてから、もう一度呼んでください。")
     return out
 
 
@@ -7441,15 +7453,41 @@ def _cells(entry: dict) -> int:
 _store_lock = threading.RLock()
 
 
+def _drop_oldest_of_biggest() -> dict | None:
+    """いちばん多く預けている人の、いちばん古いものを1つ捨てる。
+
+    全体で古い順に捨てると、大きな表を何度も取った人のせいで、
+    別の人が同じ質問の中で使う予定の結果が消える（「結果が見つかりません」になる）。
+    """
+    if not _store:
+        return None
+    counts: dict = {}
+    for e in _store.values():
+        counts[e.get("owner", "")] = counts.get(e.get("owner", ""), 0) + 1
+    worst = max(counts.items(), key=lambda kv: kv[1])[0]
+    for rid, e in _store.items():
+        if e.get("owner", "") == worst:
+            return _store.pop(rid)
+    return _store.popitem(last=False)[1]
+
+
 def _evict() -> None:
-    """上限を超えたぶんを、古い順に捨てる。"""
+    """上限を超えたぶんを捨てる（捨てる相手は、いちばん多く預けている人から）。"""
     with _store_lock:
         while len(_store) > MAX_ENTRIES:
-            _store.popitem(last=False)
+            _drop_oldest_of_biggest()
         total = sum(_cells(e) for e in _store.values())
         while total > MAX_CELLS and len(_store) > 1:
-            _, old = _store.popitem(last=False)
+            old = _drop_oldest_of_biggest()
+            if old is None:
+                break
             total -= _cells(old)
+
+
+def _owner_key() -> str:
+    """いま預けている人。全員で1つの置き場を共有しているので、持ち主を必ず記録する。"""
+    u = _current_user()
+    return str(getattr(u, "username", "") or "")
 
 
 def put(scope: list[dict], columns: list, rows: list, truncated: bool = False,
@@ -7459,6 +7497,7 @@ def put(scope: list[dict], columns: list, rows: list, truncated: bool = False,
     with _store_lock:
         _store[rid] = {
             "scope": scope_key(scope),
+            "owner": _owner_key(),
             "columns": list(columns),
             "rows": [tuple(r) for r in rows],
             "truncated": bool(truncated),
@@ -7472,10 +7511,16 @@ def put(scope: list[dict], columns: list, rows: list, truncated: bool = False,
 
 
 def get(scope: list[dict], rid: str) -> dict | None:
-    """預けた結果を取り出す。無い・別のDBの組み合わせ、のときは None。"""
+    """預けた結果を取り出す。無い・別のDBの組み合わせ・他人のもの、のときは None。
+
+    置き場は全員で1つなので、持ち主を見ないと（result_id を言い当てられたときに）
+    他人の取ったデータを渡してしまう。
+    """
     with _store_lock:
         entry = _store.get(str(rid or ""))
         if entry is None or entry["scope"] != scope_key(scope):
+            return None
+        if entry.get("owner", "") != _owner_key():
             return None
         _store.move_to_end(rid)          # 使ったものは新しい扱いにして残す
         return entry
@@ -9478,11 +9523,22 @@ def _pk_duplicates(scope: list[dict], alias: str, table: str, pk: list) -> int |
 
 
 def _orphans(scope: list[dict], child: tuple, parent: tuple) -> int | None:
-    """親に居ない子（孤立した外部キー）の件数。"""
-    ca, ct, cc = child
-    pa, pt, pc = parent
-    sql = (f'SELECT COUNT(*) FROM {_q(ca, ct)} c WHERE c."{cc}" IS NOT NULL '
-           f'AND NOT EXISTS (SELECT 1 FROM {_q(pa, pt)} p WHERE p."{pc}" = c."{cc}")')
+    """親に居ない子（孤立した外部キー）の件数。複合キーは全列の組で見る。
+
+    子・親は (alias, table, [列, ...])。先頭の列だけで見ると、複合キーの
+    「片方の列は一致するが組では存在しない」行を見落とし、孤立が 0 件に見える。
+    """
+    ca, ct, ccs = child
+    pa, pt, pcs = parent
+    ccs = list(ccs) if isinstance(ccs, (list, tuple)) else [ccs]
+    pcs = list(pcs) if isinstance(pcs, (list, tuple)) else [pcs]
+    if not ccs or len(ccs) != len(pcs):
+        return None
+    # 組の一部でも空なら、そもそも参照していない行として数えない（SQLの NULL と同じ扱い）
+    not_null = " AND ".join(f'c."{c}" IS NOT NULL' for c in ccs)
+    on = " AND ".join(f'p."{p}" = c."{c}"' for c, p in zip(ccs, pcs))
+    sql = (f'SELECT COUNT(*) FROM {_q(ca, ct)} c WHERE {not_null} '
+           f'AND NOT EXISTS (SELECT 1 FROM {_q(pa, pt)} p WHERE {on})')
     try:
         _, rows, _ = db.run_select(sql, scope, max_rows=1)
         return int(rows[0][0] or 0)
@@ -9557,7 +9613,13 @@ def _data_quality(args: dict, scope: list[dict]) -> dict:
             dup = _pk_duplicates(scope, alias, tname, pk)
             tbl_rows.append([f"{alias}.{tname}", n, len(cols),
                              "、".join(pk) if pk else "（無し）",
-                             dup if dup is not None else "—"])
+                             dup if dup is not None else ("確認できず" if pk else "—")])
+            # 主キーはあるのに数えられなかった（時間切れ・ロック）。黙って「—」にすると
+            # 重複が無いように見えるので、確認できなかったことを残す
+            if pk and dup is None:
+                issues.append(("中", f"{alias}.{tname} の主キーの重複を確認できませんでした"
+                                     "（表が大きい・取り込み中などの可能性）。"
+                                     "二重計上が無いかは、この検査では分かっていません。"))
             if n == 0:
                 issues.append(("高", f"{alias}.{tname} は0行です。取り込みが済んでいない可能性があります。"))
                 continue
@@ -9599,11 +9661,21 @@ def _data_quality(args: dict, scope: list[dict]) -> dict:
         # 子と親は保存順ではなく主キーの位置から決める（手書きのYAMLが
         # 逆向きでも、「親に居ない子」を正しい向きで数えるため）
         for edge in edges:
-            (ca, ct, cc), (pa, pt, pc) = catalog.child_parent(entries, edge)
+            # 複合キーは全列の組で見る（先頭の列だけだと孤立を数え落とす）
+            (ca, ct, ccs), (pa, pt, pcs) = catalog.child_parent_cols(entries, edge)
             if ca != alias or ct not in allowed:
                 continue
-            miss = _orphans(scope, (ca, ct, cc), (pa, pt, pc))
+            miss = _orphans(scope, (ca, ct, ccs), (pa, pt, pcs))
+            cc = ccs[0] if len(ccs) == 1 else "(" + ", ".join(ccs) + ")"
+            pc = pcs[0] if len(pcs) == 1 else "(" + ", ".join(pcs) + ")"
             if miss is None:
+                # 数えられなかった（時間切れ・ロック・列が消えた）。黙って消すと
+                # 「問題なし」に見えるので、確認できなかったことを残す
+                ref_rows.append([f"{ca}.{ct}.{cc}", f"{pa}.{pt}.{pc}", "確認できず",
+                                 "FK宣言" if edge.get("kind") == "fk" else "カタログの結合定義"])
+                issues.append(("中", f"{ca}.{ct}.{cc} → {pa}.{pt}.{pc} の参照整合性を"
+                                     "確認できませんでした（表が大きい・取り込み中などの可能性）。"
+                                     "内部結合で行が落ちないかは、この検査では分かっていません。"))
                 continue
             kind = "FK宣言" if edge.get("kind") == "fk" else "カタログの結合定義"
             ref_rows.append([f"{ca}.{ct}.{cc}", f"{pa}.{pt}.{pc}", miss, kind])
@@ -9611,7 +9683,7 @@ def _data_quality(args: dict, scope: list[dict]) -> dict:
                 # 親側の多重度が 0..（親の無い子を許す定義）なら、異常ではなく注意にとどめる
                 card = catalog.card_norm(edge.get("cardinality")) or catalog.CARD_DEFAULT
                 ends = card.split(":")
-                parent_val = ends[1] if (pa, pt, pc) == tuple(edge["to"]) else ends[0]
+                parent_val = ends[1] if (pa, pt) == tuple(edge["to"])[:2] else ends[0]
                 if parent_val.startswith("0"):
                     issues.append(("低", f"{ca}.{ct}.{cc} の {miss} 件は {pa}.{pt} に存在しません"
                                          f"（多重度 {card}: {pa}.{pt} の無い {ct} を許す定義）。"
@@ -9645,9 +9717,16 @@ def _data_quality(args: dict, scope: list[dict]) -> dict:
         tables.append(_table_of("参照整合性", ["子", "親", "親に無い件数", "定義元"], ref_rows))
 
     high = [m for lv, m in issues if lv == "高"]
+    # 「確認できませんでした」を含む注意は、問題が無いことの裏付けにはならない。
+    # 1件でもあれば「問題なし」と言い切らない（言い切ると、確認できていない表の
+    # 数字をそのまま信じて読まれてしまう）
+    unchecked = [m for lv, m in issues if lv == "中" and "確認できませんでした" in m]
     notes = [f"{checked} テーブルを調べました。"
              + (f"深刻な問題が {len(high)} 件あります。" if high
-                else "分析を止めるような問題は見つかりませんでした。")]
+                else ("確認できなかった検査が %d 件あります（下の注意を参照）。それ以外に、"
+                      "分析を止めるような問題は見つかりませんでした。" % len(unchecked) if unchecked
+                      else "分析を止めるような問題は見つかりませんでした。"))]
+    notes += unchecked[:3]
     notes += high[:5]
     if checked >= _MAX_TABLES:
         notes.append(f"テーブルが多いため {_MAX_TABLES} 件までにしています。"

@@ -4043,6 +4043,23 @@ def child_parent(entries: list[dict], edge: dict) -> tuple:
     return frm, to
 
 
+def child_parent_cols(entries: list[dict], edge: dict) -> tuple:
+    """この関連の (子, 親) を、複合キーの列の並びごと返す。
+
+    形は ((alias, table, [列, ...]), (alias, table, [列, ...]))。単一列の関連も同じ形。
+    参照整合性は全列の組で見ないと意味が変わる（先頭の列だけ一致する行を「親に居る」と
+    数えてしまい、孤立が 0 件に見える）。child_parent と同じ向きに揃えて返す。
+    """
+    frm, to = child_parent(entries, edge)
+    pairs = [tuple(p) for p in (edge.get("pairs")
+                                or [[edge["from"][2], edge["to"][2]]])]
+    if frm == tuple(edge["from"]):
+        ccols, pcols = [p[0] for p in pairs], [p[1] for p in pairs]
+    else:                                     # 向きが入れ替わったので列も入れ替える
+        ccols, pcols = [p[1] for p in pairs], [p[0] for p in pairs]
+    return (frm[0], frm[1], ccols), (to[0], to[1], pcols)
+
+
 # =============================================================================
 # LLM用テキスト生成（プロンプト＝カタログの直列化）
 # =============================================================================
@@ -6159,6 +6176,13 @@ def import_dataframe(db_path: Path, table: str, df: pd.DataFrame, columns: list[
         conn.executemany(
             f"INSERT INTO {_importer_qi(table)} ({cols_list}) VALUES ({placeholders})", rows)
         conn.commit()
+        # WAL のときは、書いた分を本体のファイルへ移しておく（作業ファイルが
+        # 大きくなり続けるのを防ぎ、.db を手でコピーした控えが直前の取り込みを含むようにする）。
+        # 読み手が居ると移しきれないことがあるが、その場合も後で自動で移るので気にしない
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
         return len(rows), degraded
     except sqlite3.Error as e:
         conn.rollback()
@@ -7888,7 +7912,20 @@ def _fs_put(data: bytes, filename: str, mime: str, owner: str,
         _files[token] = {"data": data, "filename": filename, "mime": mime, "owner": owner,
                          "trusted": bool(trusted), "label": label}
         while len(_files) > _MAX_ITEMS:
-            _files.popitem(last=False)
+            # 全体で古い順に捨てると、たくさん出した人のせいで、別の人の
+            # 送信待ちの画像や取り込み待ちのファイルが消える（押した瞬間に
+            # 「見つかりません」になる）。いちばん多く預けている人の、
+            # いちばん古いものから捨てる
+            counts: dict = {}
+            for v in _files.values():
+                counts[v.get("owner", "")] = counts.get(v.get("owner", ""), 0) + 1
+            worst = max(counts.items(), key=lambda kv: kv[1])[0]
+            for t, v in _files.items():
+                if v.get("owner", "") == worst:
+                    _files.pop(t)
+                    break
+            else:
+                _files.popitem(last=False)
     return token
 
 
@@ -8476,19 +8513,23 @@ def _hold_chat(cid) -> None:
 
     読んでから書き戻すまでの間に、同じ会話への別の送信が割り込むと、
     片方のやり取りがまるごと消える。ここで待たせて順番にする。
-    離すのは _release_chat（要求の終わりに必ず呼ばれる）。
+    離すのは _release_chat（要求の終わりに必ず呼ばれる。要求の後始末なので、
+    途中で例外が出ても、応答を流し終えたあとでも必ず通る）。
 
-    待ちきれないときは止めずに進む。ここで断ると、鍵が何かの拍子に
-    返らなくなったときに、その会話が二度と使えなくなるため。
+    待ちきれないときは、鍵を持たないまま進めずに断る。進めると、読んでから
+    書き戻すまでの間に相手が書き戻し、そのやり取りがまるごと消える
+    （鍵がある意味が無くなる）。断れば、利用者はもう一度押すだけで済む。
     """
     if not cid or getattr(g, "_chat_lock", None) is not None:
         return
     lk = chats.lock_for(g.user, cid)
     if lk.acquire(timeout=config.CHAT_LOCK_WAIT_SEC):
         g._chat_lock = lk
-    else:
-        print(f"[chat] 会話 {cid} の順番待ちが "
-              f"{config.CHAT_LOCK_WAIT_SEC}秒を超えました。そのまま続けます。")
+        return
+    print(f"[chat] 会話 {cid} の順番待ちが {config.CHAT_LOCK_WAIT_SEC}秒を超えました。断ります。")
+    raise _TurnError("この会話はいま別の送信を処理しています"
+                     f"（{config.CHAT_LOCK_WAIT_SEC}秒待っても終わりませんでした）。"
+                     "少し待ってから、もう一度お試しください。", status=503)
 
 
 def _release_chat(_exc=None) -> None:
@@ -11167,15 +11208,24 @@ def _owner_snapshot(user) -> dict:
 
 
 def _robot_owner(dir_name: str, robot: dict):
-    """定期実行で名乗る利用者。登録時に写した本人の情報（無ければフォルダ名の一般利用者）。
+    """定期実行で名乗る利用者。名前は登録時の写し、権限は「いまの権限」。
 
-    権限は登録時のもの。管理者でなくなった人のロボットが管理者の道具を使い続けないよう、
-    登録し直せば新しい権限の写しになる。
+    権限まで写しのままだと、管理者から外れた人のロボットが管理者向けの道具を
+    使い続ける（本人はもう画面から使えないのに、定期実行だけ通ってしまう）。
+    動かす直前に auth へ引き直す。外部の認証APIはパスワード無しで引けないので、
+    その構成では写しのまま動かす（それ以外に確かめる術が無い）。
     """
     o = robot.get("owner") if isinstance(robot.get("owner"), dict) else {}
-    return auth.User(username=str(o.get("username") or dir_name),
+    username = str(o.get("username") or dir_name)
+    groups = list(o.get("groups") or [])
+    is_admin = bool(o.get("is_admin"))
+    now = auth.groups_now(username)
+    if now is not None:
+        groups = now
+        is_admin = auth.AUTH_ADMIN_GROUP in now
+    return auth.User(username=username,
                      display_name=str(o.get("display_name") or ""),
-                     groups=list(o.get("groups") or []), is_admin=bool(o.get("is_admin")))
+                     groups=groups, is_admin=is_admin)
 
 
 def robots_due(now: datetime | None = None) -> list[tuple]:
@@ -16212,6 +16262,33 @@ def _ensure_default_db() -> None:
     print(f"[app] 初回起動: 空のデータベースを用意しました（data/{path.name}）")
 
 
+def _ensure_wal() -> None:
+    """DBの書き込み方式を WAL にする（config.SQLITE_WAL）。
+
+    既定の方式では、取り込みが書き込みをつかんでいる間、利用者の問い合わせは
+    COMMIT まで待たされる（長い取り込みでは 30 秒を超えて database is locked になる）。
+    WAL なら読み手は待たされない（実測 6.06 秒 → 0.02 秒）。
+    設定は一度DBに書かれたら残るが、控えから戻したときに消えるので毎回入れ直す。
+    ネットワーク共有では使えないので、切り替えられなければそのまま続ける。
+    """
+    if not getattr(config, "SQLITE_WAL", False):
+        return
+    for path in db.list_db_files():
+        try:
+            conn = sqlite3.connect(path, timeout=30)
+            try:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"[app] {path.name}: WAL に切り替えられませんでした（{e}）。"
+                  "既定の方式で続けます（取り込み中は問い合わせが待たされます）。")
+            continue
+        if str(mode).lower() != "wal":
+            print(f"[app] {path.name}: WAL に切り替えられませんでした（いまの方式: {mode}）。"
+                  "ネットワーク共有フォルダでは使えません。config.SQLITE_WAL を False にしてください。")
+
+
 def _warn_if_no_admin() -> None:
     """管理者が1人も居ない設定なら、起動時に知らせる。
 
@@ -16338,6 +16415,7 @@ def create_app() -> Flask:
 
     _warn_if_no_admin()
     _ensure_default_db()
+    _ensure_wal()                 # 取り込み中でも問い合わせが待たされないようにする
 
     @app.after_request
     def _no_html_cache(res):

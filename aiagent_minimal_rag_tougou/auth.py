@@ -322,6 +322,32 @@ def _try_builtin_user(username: str, password: str) -> User | None:
     return None
 
 
+def groups_now(username: str) -> list | None:
+    """パスワード無しで、いまの所属グループを引く。引けない構成では None。
+
+    定期実行のマイロボットは、登録した時点の権限の写しで動く。管理者から外れた人の
+    ロボットが管理者向けの道具を使い続けないよう、動かす直前にここで今の権限を見る。
+    外部の認証API（http）はパスワード無しでは引けないので None を返し、
+    呼び出し側は登録時の写しをそのまま使う（それ以外に確かめる術が無いため）。
+    """
+    name = str(username or "").strip().lower()
+    if not name:
+        return None
+    if admin_enabled() and name == ADMIN_USER.lower():
+        return [AUTH_ADMIN_GROUP]                 # 常設の管理者はいつでも管理者
+    if any(name == str(u).strip().lower() for u in BUILTIN_USERS):
+        return []                                 # 常設の一般ユーザー（グループ無し）
+    if (AUTH_PROVIDER or "local").strip().lower() != "local":
+        return None                               # 認証APIには問い合わせられない
+    try:
+        for u in LocalAuthProvider()._load():
+            if str(u.get("username", "")).strip().lower() == name:
+                return list(u.get("groups") or [])
+    except AuthError:
+        return None                               # 一覧が読めないときは写しのままにする
+    return []                                     # 一覧から消えている＝権限は無い
+
+
 def authenticate(username: str, password: str) -> User | None:
     """ログインの入口。常設の管理者→常設の一般ユーザー→プロバイダの順に見る。
 
