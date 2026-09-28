@@ -2842,7 +2842,8 @@ def _make_timeout(conn: sqlite3.Connection, seconds: float):
     return reset
 
 
-def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
+def _profile_table(conn: sqlite3.Connection, name: str, reset,
+                   with_stats: bool = True) -> dict:
     t = _qi(name)
     info: dict = {"columns": [], "fks": [], "row_count": None,
                   "sample_columns": [], "sample_rows": [], "col_stats": {},
@@ -2879,9 +2880,10 @@ def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
     except sqlite3.Error:
         info["degraded"] = True
 
-    # 列統計（巨大テーブルはスキップ）
+    # 列統計（巨大テーブルはスキップ）。ここが作り直しの時間のほとんどを占めるので、
+    # 中身が変わっていない表では飛ばして、前回数えたものを持ち越す
     rc = info["row_count"]
-    if rc is not None and rc <= config.PROFILE_STATS_MAX_ROWS and rc > 0:
+    if with_stats and rc is not None and rc <= config.PROFILE_STATS_MAX_ROWS and rc > 0:
         limit = config.PROFILE_LOW_CARDINALITY
         for col in info["columns"]:
             c = _qi(col["name"])
@@ -2927,51 +2929,71 @@ def _profile_lock(db_path) -> threading.Lock:
         return lk
 
 
-def refresh_table(db_path, table: str) -> None:
-    """取り込んだ表「1つだけ」を測り直して、控えに差し替える。
+def refresh_profile(db_path, changed=()) -> None:
+    """取り込み・改名・削除のあとに、表の一覧の控えを更新する。
 
-    取り込みのたびに profile_db(force=True) を呼ぶと、触っていない表も含めて
-    全部を測り直す（本番の 672MB・120表では45秒）。5行のファイルを入れても
-    同じだけ待たされるので、変わった表だけを測って控えを更新する。
+    全部を測り直すと本番（672MB・121表）で45秒かかるが、その大半は「値の分布
+    （よく出る値・最小と最大）」を列ごとに数えている時間で、名前・列・行数・
+    値の例は121表ぶんでも 0.4 秒で読める。
 
-    途中で他の書き込みが入った（data_version が動いた）ときは、控えを消すだけに
-    してやめる。次に見る人が作り直す（古い数字を「いまの数字」として残さない）。
+    そこで、名前・列・行数・値の例は毎回すべての表について読み直し、重い
+    「値の分布」は、いま触った表（changed）と、行数や列が前回と変わっていた表
+    だけ数え直す。変わっていない表は前回の分をそのまま持ち越す。
+    こうすると「どの表・どの列があるか」「何行あるか」は常に最新になり、
+    取り込みのたびに45秒待つこともない。
     """
     db_path = Path(db_path)
     cache = _cache_path(db_path)
+    want = {changed} if isinstance(changed, str) else {str(c) for c in (changed or ())}
     with _profile_lock(db_path):
         try:
-            data = json.loads(cache.read_text(encoding="utf-8"))
-            tables = dict(data["tables"])
+            old = (json.loads(cache.read_text(encoding="utf-8")).get("tables") or {})
         except Exception:
-            forget(db_path)          # 控えが無い・読めない。次に見る人が作り直す
-            return
+            old = {}                      # 控えが無い＝全部数える（初回と同じ）
         before = _sqlite_data_version(db_path)
         conn = db.connect_ro(db_path)
+        tables: dict = {}
         try:
             reset = _make_timeout(conn, config.PROFILE_TIMEOUT_SEC)
-            row = conn.execute(
-                "SELECT type FROM sqlite_master WHERE name = ?", (table,)).fetchone()
-            if row is None:
-                tables.pop(table, None)          # 消えていた
-            else:
-                t = _profile_table(conn, table, reset)
-                if t.get("degraded"):
-                    forget(db_path)              # 測り切れなかった。作り直させる
-                    return
-                t["type"] = row[0]
-                tables[table] = t
+            rows = conn.execute(
+                "SELECT name, type FROM sqlite_master "
+                "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            for name, typ in rows:
+                prev = old.get(name) or {}
+                # 前回と同じ中身なら、重い「値の分布」は数え直さない
+                keep = (name not in want and prev
+                        and not prev.get("error") and not prev.get("degraded"))
+                t = _profile_table(conn, name, reset, with_stats=not keep)
+                t["type"] = typ
+                if keep:
+                    same = (prev.get("row_count") == t["row_count"]
+                            and [c["name"] for c in (prev.get("columns") or [])]
+                            == [c["name"] for c in t["columns"]])
+                    if same:
+                        t["col_stats"] = prev.get("col_stats") or {}
+                    else:
+                        # 行数か列が変わっている＝中身が変わった。ここだけ数え直す
+                        t = _profile_table(conn, name, reset)
+                        t["type"] = typ
+                tables[name] = t
         except sqlite3.Error as e:
-            print(f"[catalog] {table} を測り直せませんでした（控えは作り直させます）: {e}")
+            print(f"[catalog] 表の一覧を更新できませんでした（控えは作り直させます）: {e}")
             forget(db_path)
             return
         finally:
             conn.close()
+        broken = [t for t, v in tables.items() if v.get("error") or v.get("degraded")]
+        if broken:
+            print(f"[catalog] {db_path.name}: 読めなかった表があるので控えは残しません: "
+                  f"{'、'.join(broken[:5])}")
+            forget(db_path)
+            return
         st = db_path.stat()
         key = {"v": 3, "mtime": st.st_mtime, "size": st.st_size,
                "dv": _sqlite_data_version(db_path)}
         if key["dv"] != before:
-            forget(db_path)          # 測っている間に誰かが書いた。作り直させる
+            forget(db_path)      # 測っている間に誰かが書いた。次の人に作り直させる
             return
         config.PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         config.write_text_atomic(cache, json.dumps(
@@ -8084,7 +8106,7 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
         done["history"] = [{"db": path.name, "text": f"更新履歴 {hist_hit}件を削除"}]
     # 消した表だけを一覧から下ろす（丸ごと捨てると、次に画面を開いた人が
     # 全部の表を測り直すことになる。本番の672MBでは1回45秒）
-    catalog.refresh_table(path, table)
+    catalog.refresh_profile(path, table)
     # まとまりの最後の表が消えたら、まとまりのメモも片づける
     # （残すと、無いデータの前提だけがAIに渡り続ける）
     if table and "__" in table:
@@ -8326,9 +8348,8 @@ def rename_table(path: Path, old: str, new: str, *, profile: dict | None = None)
                 "画面を読み直して、名前とカタログの食い違いを直してください。") from None
         raise
 
-    # 名前が変わった2つ（旧名・新名）だけを一覧に反映する（丸ごと捨てない）
-    catalog.refresh_table(path, old)
-    catalog.refresh_table(path, new)
+    # 一覧を更新する（重い「値の分布」は、名前が変わったこの表だけ数え直す）
+    catalog.refresh_profile(path, [old, new])
     out = {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
            "robots": robots_hit,
            "memo_moved": moved_memo, "memo_kept": kept_memo, "joins": 0}
@@ -13550,9 +13571,8 @@ def view_save():
         elif prev_sql.strip().rstrip(";").strip() != sql:
             entry.pop("explanation", None)
     catalog.save_meta(path, meta)
-    # 作った（作り直した）ビューだけを一覧に反映する。旧名からの改名なら、
-    # 旧名の後片づけは rename_table の中で済んでいる
-    catalog.refresh_table(path, name)
+    # 一覧を更新する（重い「値の分布」は、作り直したこのビューだけ数え直す）
+    catalog.refresh_profile(path, name)
 
     print(f"[view] {path.name} のビュー {name} を保存しました（{g.user.username}）")
     # 用語集・例文・検算の印も返す。返さないと、開いたままのカタログ画面からの
@@ -13594,7 +13614,7 @@ def view_delete():
         done, warn = {}, (f"ビューは削除しました。ただし、カタログなどの後片づけだけが"
                           f"できませんでした（{e}）。カタログに残った「{name}」の記述を"
                           "手で消してください。")
-    catalog.refresh_table(path, name)      # 消したビューだけ一覧から下ろす
+    # 一覧からの取り下げは clean_table の中で済んでいる
     print(f"[view] {path.name} のビュー {name} を削除しました（{g.user.username}）")
     # 掃除で用語集・例文・検算が変わっていることがある。新しい印を返さないと、
     # 開いたままの画面からの次の保存が「別の場所で変わりました」で拒まれる
@@ -15916,7 +15936,7 @@ def run():
                 rows=n, removed=removed, kept=kept, keep=keep)
 
     # 触った表だけ測り直す（全部だと本番では45秒かかり、5行のファイルでも同じだけ待つ）
-    catalog.refresh_table(db_path, tname)     # tname は実際に書き込んだ表の綴り
+    catalog.refresh_profile(db_path, tname)   # tname は実際に書き込んだ表の綴り
     return jsonify({"ok": True, "rows": n, "degraded": degraded, "removed": removed,
                     "kept": kept, "keep": keep if mode == "append" else None,
                     "timestamp_column": importer.safe_name(ts_col, "取得日時"),
@@ -16141,7 +16161,7 @@ def job_save():
                            fetched=fetched)
         if res.get("ok"):
             # 触った表だけ測り直す（全部だと本番では45秒）
-            catalog.refresh_table(config.DATA_DIR / saved["db_file"], saved["table"])
+            catalog.refresh_profile(config.DATA_DIR / saved["db_file"], saved["table"])
         else:
             print(f"[import] 登録直後の取り込みに失敗: {res.get('message')}")
         first = {"ok": res.get("ok"), "rows": res.get("rows"),
@@ -16167,7 +16187,7 @@ def job_run():
     for j, r in results:
         if r["ok"]:
             # 触った表だけ測り直す（全部だと本番では45秒）
-            catalog.refresh_table(config.DATA_DIR / j["db_file"], j["table"])
+            catalog.refresh_profile(config.DATA_DIR / j["db_file"], j["table"])
     return jsonify({"ok": True,
                     "results": [{"name": j.get("name"), **r} for j, r in results],
                     "jobs": [_job_row(x) for x in jobs.list_jobs()]})
