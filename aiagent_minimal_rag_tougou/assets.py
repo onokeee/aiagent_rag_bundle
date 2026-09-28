@@ -281,6 +281,12 @@ TEMPLATES = {
   </div>
 {% else %}
 
+  {% if meta_broken %}<div class="alert alert--err">
+    カタログのファイル（.meta.yaml）が読めていません（{{ meta_broken }}）。<br>
+    いま画面に出ている説明・用語・例文は空として扱われています。この状態で保存すると、
+    書いてあった内容が失われます。先に data フォルダの .meta.yaml を直してください
+    （控えがあれば戻す、無ければ書き方の崩れを直す）。
+  </div>{% endif %}
   {% for w in drift %}<div class="alert alert--warn">{{ w }}</div>{% endfor %}
 
   {# タブ・充実度・DB選択を1本の帯にまとめる。段を分けるとそれだけで
@@ -300,7 +306,7 @@ TEMPLATES = {
           <div class="metric__value" id="mCols">{{ coverage.columns[0] }}/{{ coverage.columns[1] }}</div></button>
         <button class="metric metric--link" data-jump="er" title="クリックで結合・ER図へ">
           <div class="metric__label">結合定義</div>
-          <div class="metric__value">{{ coverage.relationships }}</div></button>
+          <div class="metric__value" id="mRel">{{ coverage.relationships }}</div></button>
         <button class="metric metric--link" data-jump="glossary" data-sec="gl" title="クリックで用語集へ">
           <div class="metric__label">用語集</div>
           <div class="metric__value" id="mGloss">{{ coverage.glossary }}</div></button>
@@ -3579,6 +3585,17 @@ async function api(url, body, method = 'POST') {
         const err = new Error(data.error || `通信に失敗しました (${res.status})`);
         err.status = res.status;
         err.data = data;
+        // ログインが切れていたら、どの画面からでもログインへ戻す。
+        // 戻さないと「ログインしてください」が操作のたびに出るだけで、
+        // 何をすれば直るのか分からない（打ちかけの本文は失われるので、一拍おく）
+        if (res.status === 401 && !window.__loginRedirecting) {
+            window.__loginRedirecting = true;
+            toast('ログインの有効期限が切れました。ログイン画面に戻ります。', 'warn', 4000);
+            setTimeout(() => {
+                const back = encodeURIComponent(location.pathname + location.search);
+                location.href = `/login?next=${back}`;
+            }, 1500);
+        }
         throw err;
     }
     return data;
@@ -4908,6 +4925,9 @@ const ER = (() => {
         data.nodes.forEach(n => { if (positions[n.id]) [n.x, n.y] = positions[n.id]; });
         render(); syncHistoryUi();
         refreshSuggestions();
+        // 上の「結合定義」の件数も、その場で数え直す（読み直すまで古い数のままだった）
+        const relBox = $('#mRel');
+        if (relBox) relBox.textContent = (data.edges || []).filter(e => e.editable).length;
     }
 
     /** 候補を取り直す。関連の追加・削除・主キー変更のたびに呼ぶ。
@@ -5820,6 +5840,9 @@ async function confirmDelete(opts) {
                 // 波及（動かなくなるマイロボット等）まで書くので長くなる。読める時間だけ出す
                 const msg = opts.done(r);
                 toast(msg, 'ok', msg.length > 60 ? 12000 : 5000);
+                // 実物は消えたが後片づけだけできなかった場合。成功の知らせに
+                // 混ぜると気づかれないので、別に赤で出す
+                if (r.warning) toast(r.warning, 'err', 14000);
                 MANAGE.refresh();
                 opts.after?.(r);
             } catch (e) { toast(e.message, 'err', 9000); go.disabled = false; }
@@ -5867,7 +5890,7 @@ async function confirmDelete(opts) {
  *  （別の画面へ行って戻ると消える、という分かりにくい挙動になっていた）。
  *  一覧・上部の数字・ER図・カタログの控えを、その場で揃える。
  */
-function dropTableFromView(name, stamps) {
+function dropTableFromView(name, stamps, groups) {
     if (typeof CAT === 'undefined') return;      // カタログ画面以外では何もしない
     const acc = $(`#pane-tables details.acc[data-table="${CSS.escape(name)}"]:not(.t-manage)`);
     const group = acc?.closest('details.acc--group');
@@ -5910,6 +5933,16 @@ function dropTableFromView(name, stamps) {
     // まとまりごと消えたときは、そのメモの未保存も一緒に下ろす
     MANAGE.clearDirty?.(name, groupGone);
     MANAGE.recompute?.();          // 上部の数字（テーブル説明・列の説明）を数え直す
+    // サーバ側の掃除で一緒に消えた「AIに配る道具」も、開いたままの画面から下ろす。
+    // 残しておくと、そのカードで「保存」を押したときに、消えたはずの道具が戻ってくる
+    const goneTools = new Set(((groups || []).find(g => g.key === 'tools')?.items || [])
+        .map(x => x.text).filter(Boolean));
+    if (goneTools.size) {
+        CAT.custom = (CAT.custom || []).filter(t => !goneTools.has(t.name));
+        for (const n of goneTools) {
+            $(`#toolList details.acc[data-tool="${CSS.escape(n)}"]`)?.remove();
+        }
+    }
 }
 
 
@@ -5962,7 +5995,9 @@ function openRenameTable(dbName, table) {
             if (r.joins) also.push(`結合候補 ${r.joins}件`);
             toast(`${table} を ${r.new} に変更しました`
                   + (also.length ? `（${also.join('・')}も付け替えました）` : '')
-                  + '。ページを読み直します。', 'ok', also.length ? 9000 : 5000);
+                  + '。ページを読み直します。'
+                  + (r.joins_error ? ' ' + r.joins_error : ''),
+                  r.joins_error ? 'warn' : 'ok', (also.length || r.joins_error) ? 9000 : 5000);
             // reloadClean で読み直す。素の reload だと、書きかけの説明や
             // メモが残っているせいで離脱警告が出て止まり、改名は済んでいるのに
             // 画面だけ旧名のまま残る（保存も 400 で弾かれる）
@@ -6022,7 +6057,7 @@ function askDeleteTable(dbName, name, rows, isView) {
                      + '持ち主に手順の直しを伝えてください。'
                    : '');
         },
-        after: (res) => dropTableFromView(name, res && res.stamps),
+        after: (res) => dropTableFromView(name, res && res.stamps, res && res.groups),
     });
 }
 
@@ -6534,7 +6569,9 @@ function renderHistory(items) {
                 class: 'histitem__del', title: '削除',
                 onclick: async () => {
                     if (!confirm(`「${c.title}」を削除しますか？`)) return;
-                    await api('/api/chat/delete', { id: c.id });
+                    try {
+                        await api('/api/chat/delete', { id: c.id });
+                    } catch (e) { toast(e.message, 'warn'); }   // 無反応にしない
                     if (c.id === currentChatId) { currentChatId = null; clearLog(); }
                     refreshHistory();
                 },
@@ -9890,7 +9927,8 @@ function toolCard(tool) {
         el('option', { value: k, ...(k === t.render ? { selected: 'selected' } : {}) }, label)));
     renderSel.addEventListener('change', () => chartFields(chartBox, renderSel.value, t.chart));
 
-    const card = el('details', { class: 'acc', ...(tool ? {} : { open: 'open' }) },
+    const card = el('details', { class: 'acc', 'data-tool': t.name || '',
+                                 ...(tool ? {} : { open: 'open' }) },
         el('summary', {},
             el('strong', {}, t.name || '（新しいツール）'),
             t.enabled === false ? el('span', { class: 'badge badge--warn' }, '無効') : null),
@@ -9930,11 +9968,16 @@ function toolCard(tool) {
                     onclick: async () => {
                         if (!confirm(`${t.name} を削除しますか？`)) return;
                         // ここだけ try が無く、失敗しても何も出ないまま無反応だった
+                        let r;
                         try {
-                            await api('/api/catalog/tool',
+                            r = await api('/api/catalog/tool',
                                 { db: ownerFile, action: 'delete', name: t.name });
                         } catch (e) { toast(e.message, 'err', 9000); return; }
-                        toast('削除しました。'); reloadCleanIfSaved();
+                        toast('削除しました。');
+                        // この道具を手順に持つマイロボットは、次の実行で止まる。
+                        // こちらから直せないので、消した人に必ず伝える
+                        warnRobots(r, `道具「${t.name}」`);
+                        reloadCleanIfSaved();
                     },
                 }, '削除') : null,
                 el('button', {
@@ -9942,9 +9985,11 @@ function toolCard(tool) {
                     onclick: async () => {
                         const payload = readTool(card, original);
                         try {
-                            await api('/api/catalog/tool',
+                            const r = await api('/api/catalog/tool',
                                 { db: ownerFile, tool: payload, name: payload.name, original });
-                            toast('保存しました。'); reloadCleanIfSaved();
+                            toast('保存しました。');
+                            warnRobots(r, `道具「${original}」`);   // 改名したとき
+                            reloadCleanIfSaved();
                         } catch (e) { toast(e.message, 'err'); }
                     },
                 }, '保存'))));
@@ -9952,6 +9997,16 @@ function toolCard(tool) {
     chartFields(chartBox, t.render, t.chart);
     return card;
 }
+
+/** 道具を消した・名前を変えたときに、動かなくなるマイロボットを知らせる。 */
+function warnRobots(res, what) {
+    const rs = (res && res.robots) || [];
+    if (!rs.length) return;
+    toast(`${what}を使っているマイロボットが ${rs.length} 件あります`
+        + `（${rs.map(x => x.text).join('、')}）。`
+        + '次の実行で止まるので、登録した人に作り直しをお願いしてください。', 'warn', 14000);
+}
+
 
 /** 編集欄の中身を、保存できる形にまとめる。 */
 function readTool(card, original) {
@@ -10634,8 +10689,9 @@ async function deleteView(v) {
         // 「テーブル」タブとER図からも下ろす。ここを scrubTableFromPanes だけに
         // していたので、消したビューが一覧に残り、そこに説明を書いて保存すると
         // 存在しないビューの説明がカタログに戻っていた
-        dropTableFromView(v.name, r.stamps);
+        dropTableFromView(v.name, r.stamps, r.groups);
         toast('ビューを削除しました。');
+        if (r.warning) toast(r.warning, 'err', 14000);   // 後片づけだけ失敗した場合
     } catch (e) { toast(e.message, 'err', 9000); }
 }
 
@@ -10779,6 +10835,9 @@ function wireViews() {
                 r = await api('/api/catalog/view', { ...payload, overwrite: true });
             }
             CAT.views = r.views || [];
+            // 用語集・例文・検算の印を揃える（揃えないと、このあとの保存が
+            // 「別の場所で変わりました」で拒まれ、書きかけが失われる）
+            if (r.stamps && CAT.stamps) Object.assign(CAT.stamps, r.stamps);
             renderViews();
             $('#viewEditor').classList.add('hidden');
             viewEditing = null;
@@ -11941,6 +12000,9 @@ function importPayload() {
     // この画面が「新しい表を作る」つもりか「作り直す」つもりかも送る。開いたあとに
     // 別の管理者が同じ名前の表を作っていたら、サーバが取り込まずに教えてくれる
     // （作り直しだと、その人のデータを黙って全部入れ替えてしまう）
+    // 保存先は常に唯一のDB（dbFile は syncDest の中だけの変数なので、ここで取り直す。
+    // ここを借りていたため「dbFile is not defined」で登録そのものができなかった）
+    const dbFile = IMP.dbFiles[0];
     const existed = (IMP.existing[dbFile] || []).includes(finalTableName());
     return {
         ...readOptions(),
@@ -12584,7 +12646,15 @@ async function run(r) {
             el('span', { class: 'spinner' }), `${r.n_steps}手順をいまの日付で動かしています…`),
         [], { closable: false });
     try {
-        await api('/api/robots/run', { id: r.id, values });
+        const res = await api('/api/robots/run', { id: r.id, values });
+        // 手順の途中で失敗していても 200 で返る（会話には理由が残る）。
+        // 黙って会話へ飛ばすと「動いた」と誤解されるので、失敗は先に知らせる
+        if (res.run_ok === false) {
+            toast(`「${r.name}」は途中で失敗しました: ${res.message || '理由は会話をご覧ください'}`,
+                  'err', 12000);
+            setTimeout(() => { window.location.href = window.ROBOTS_INIT.agentUrl; }, 2500);
+            return;
+        }
         // 実行した会話が「いま開いている会話」になっている。結果はそこに並ぶ
         window.location.href = window.ROBOTS_INIT.agentUrl;
     } catch (e) {
@@ -12746,14 +12816,28 @@ document.addEventListener('DOMContentLoaded', () => {
         const btn = $('#memSave'); btn.disabled = true;
         const sent = $('#memText').value;
         try {
-            m = { ...m, ...(await api('/api/memory/save', { text: sent })) };
+            // 開いたときの時刻も送る。この間にAIが書き直していたら、サーバが断る
+            m = { ...m, ...(await api('/api/memory/save',
+                                      { text: sent, updated_at: m.updated_at || '' })) };
             $('#memText').value = m.text || ''; dirty = false; show();
             const cut = sent.trim().length > (m.text || '').length;
             toast(cut ? `保存しました（上限 ${m.max_chars} 文字を超えた分は切りました）。`
                       : (m.enabled ? '保存しました。次の質問からAIに渡ります。'
                                    : '保存しました（いまは機能が止まっているので、AIには渡りません）。'),
                   cut ? 'warn' : 'ok', cut ? 9000 : 4000);
-        } catch (e) { toast(e.message, 'err', 9000); }
+        } catch (e) {
+            toast(e.message, 'err', e.data?.stale ? 12000 : 9000);
+            // AIの書き直しと重なった。打った文は残したまま、いまの内容を見せる
+            // （消してしまうと、書いたことも消えたのか分からない）
+            if (e.data?.stale) {
+                try {
+                    const fresh = await api('/api/memory', undefined, 'GET');
+                    m = { ...m, ...fresh };
+                    toast('いまの内容に読み直しました。打った文と見比べて、もう一度保存してください。',
+                          'warn', 12000);
+                } catch (e2) { /* 取れなければ、そのまま */ }
+            }
+        }
         btn.disabled = false;
     });
     $('#memClear').addEventListener('click', async () => {
@@ -12844,6 +12928,9 @@ function baseRow(b) {
         placeholder: b.has_api_key ? '••••（変えるときだけ入力）' : '未設定',
     });
     const on = el('input', { type: 'checkbox', ...(b.enabled ? { checked: 'checked' } : {}) });
+    // 空欄は「変えない」なので、外すための指示は別に持つ（入れたキーを画面から
+    // 消す手段が無いと、消すには登録し直すしかない）
+    const clearKey = el('input', { type: 'checkbox' });
     const result = el('div', { class: 'small muted mt' });
 
     const save = el('button', {
@@ -12854,6 +12941,7 @@ function baseRow(b) {
                 const r = await api(`/api/knowledge/${b.id}`, {
                     name: name.value, base_url: url.value, description: desc.value,
                     enabled: on.checked, api_key: key.value,
+                    clear_api_key: clearKey.checked,
                 });
                 state.bases = r.bases;
                 toast('保存しました。', 'ok');
@@ -12920,7 +13008,13 @@ function baseRow(b) {
                 el('label', { class: 'field' }, 'URL'), url),
             el('div', { style: 'width:200px' },
                 el('label', { class: 'field' }, 'APIキー'), key),
-            b.has_api_key ? reveal : null),
+            b.has_api_key ? reveal : null,
+            // 空欄は「変えない」なので、外すときはこれで指示する
+            b.has_api_key
+                ? el('label', { class: 'small', style: 'display:flex;gap:6px;align-items:center',
+                                title: '保存すると、このナレッジベースのAPIキーを消します' },
+                     clearKey, 'キーを外す')
+                : null),
         el('div', { class: 'row mt' },
             el('div', { class: 'grow' },
                 el('label', { class: 'field' }, '説明（AIが読みます）'), desc)),

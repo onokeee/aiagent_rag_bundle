@@ -112,6 +112,11 @@ MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1").strip().lower() not in ("0", "
 MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "2000") or 2000)   # 本文の文字数（1つのテキスト）
 # 書き直しに使うモデル。空なら回答と同じモデル。安いモデルにすると1質問あたりの追加費用を抑えられる
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "").strip() or None
+# 書き直し（AIに頼む）を同時に何本まで走らせるか。回答のたびに1本立つので、
+# 50人が一斉に質問すると、上限が無いとAIへの問い合わせが積み上がり、
+# レート制限に当たって「利用者が待っている回答」まで遅くなる。
+# 溢れた分はその回は見送る（次の回答でまた呼ばれるので、1回遅れても困らない）。
+MEMORY_MAX_PARALLEL = 4
 # 管理者メニュー → パーソナライズ で保存した値（上の3つの初期値を上書きする）
 MEMORY_SETTINGS_FILE = Path(os.getenv("MEMORY_SETTINGS_FILE",
                                       str(DATA_DIR / "memory_settings.yaml"))).expanduser()
@@ -285,6 +290,11 @@ REPORT_FONT_JA = os.getenv("REPORT_FONT_JA", "Meiryo").strip() or "Meiryo"
 REPORT_IMAGE_WIDTH = int(os.getenv("REPORT_IMAGE_WIDTH", "1200") or 1200)
 REPORT_IMAGE_HEIGHT = int(os.getenv("REPORT_IMAGE_HEIGHT", "650") or 650)
 REPORT_IMAGE_SCALE = float(os.getenv("REPORT_IMAGE_SCALE", "2") or 2)
+
+#: グラフの画像化が一度失敗したあと、これだけ時間が経ったら次の1回だけ試し直す（秒）。
+#: サーバは再起動せずに何日も動くので、一時的な不調（Chrome の入れ替え中など）が
+#: 直っても「画像は入れられません」のままになってしまうため、猶予を置いて試し直す。
+FIGURE_RENDER_RETRY_SEC = 300
 # 表紙などに入れる組織名（空なら出さない）
 REPORT_ORG = os.getenv("REPORT_ORG", "").strip()
 
@@ -411,6 +421,10 @@ LLM_RATE_LIMIT_RETRIES = int(os.getenv("LLM_RATE_LIMIT_RETRIES", "3") or 3)
 # 1回あたりの待ち時間の上限（秒）。サーバが「60秒待て」と言ってきても、
 # 利用者を待たせすぎないためここで頭打ちにする。
 LLM_RATE_LIMIT_MAX_WAIT = float(os.getenv("LLM_RATE_LIMIT_MAX_WAIT", "20") or 20)
+# 同時に「待ち」に入れる本数の上限。サーバのスレッドは THREADS 本（32）しかないので、
+# 全員が待つとページの表示も含めて全部詰まる。これを超えた質問は待たずに
+# 「混み合っています」で返す（利用者は少しおいてから送り直せる）。
+LLM_RATE_LIMIT_MAX_WAITERS = 8
 
 # --- ナレッジベース（LightRAG連携） -------------------------------------------
 # 社内文書の検索は、別に立てた LightRAG サーバへHTTPで問い合わせる。

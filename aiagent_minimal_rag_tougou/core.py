@@ -533,6 +533,28 @@ def run_select(sql: str, scope: list[dict], max_rows: int | None = None,
         try:
             cur = conn.execute(safe_sql, params or {})  # 単一ステートメントのみ実行可能
         except sqlite3.Error as e:
+            # 「読んでよい表」の外を触ったときの SQLite の断り文は英語で、
+            # しかも「なぜ断られたか」が書かれていない（not authorized / prohibited）。
+            # 実際には「その表は在るが、いまの対象に入っていない」ときに出るので、
+            # 何をすればよいかまで日本語で返す（AIにもそのまま渡る文面）
+            low = str(e).lower()
+            if allowed is not None and ("authoriz" in low or "prohibited" in low):
+                for s_ in use:
+                    try:
+                        fresh = profile_db(s_["path"])
+                    except Exception:
+                        continue
+                    for t in fresh["tables"]:
+                        if t in allowed:
+                            continue
+                        if re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)",
+                                     safe_sql, re.IGNORECASE):
+                            raise sqlite3.OperationalError(
+                                f"テーブル '{t}' はありますが、いまの対象に入っていません"
+                                "（対象から外されている、または改名・削除の直後で"
+                                "対象の一覧が古いままの可能性があります）。"
+                                "サイドバーの一覧でその表にチェックを入れるか、"
+                                "画面を読み直してもう一度お試しください。") from e
             # 「何が悪いか」だけでなく「代わりに何を使うか」まで返す
             raise sqlite3.OperationalError(explain_error(e)) from e
         columns = [d[0] for d in cur.description] if cur.description else []
@@ -1183,10 +1205,22 @@ def list_chats(user) -> list[dict]:
     items = [c for c in items
              if isinstance(c, dict) and c.get("id") and _chat_file(user, c["id"]).exists()]
     items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
-    # 期限切れは、一覧を出すついでに片付ける（掃除専用の仕組みを持たない）
-    kept = _drop_expired(user, items)
-    if len(kept) != len(items):
-        _save_index(user, kept)
+    # 期限切れは、一覧を出すついでに片付ける（掃除専用の仕組みを持たない）。
+    # 読み直してから書くまでを鍵の中でやる。外でやると、この間に始まった新しい
+    # 会話が古い一覧で上書きされ、サイドバーから消える
+    with _index_lock:
+        kept = _drop_expired(user, items)
+        if len(kept) != len(items):
+            fresh = _read_json(_index_path(user)) if _index_path(user).exists() else None
+            cur = fresh.get("chats") if isinstance(fresh, dict) else fresh
+            if isinstance(cur, list):
+                # 待っている間に増えた会話は残す（消すのは期限切れだけ）
+                gone = {c.get("id") for c in items} - {c.get("id") for c in kept}
+                kept = [c for c in cur
+                        if isinstance(c, dict) and c.get("id") and c.get("id") not in gone
+                        and _chat_file(user, c["id"]).exists()]
+                kept.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
+            _save_index(user, kept)
     return kept
 
 
@@ -1544,6 +1578,75 @@ def latest_by_source() -> dict[str, dict]:
     return out
 
 
+def _rewrite_history(p: Path, lines: list) -> None:
+    """更新履歴を書き直す（行数の控えも作り直させる）。"""
+    global _count
+    text = "".join(line + "\n" for line in lines)
+    config.write_text_atomic(p, text)
+    _count = None
+
+
+def rename_table_in_history(db_file: str, old: str, new: str) -> int:
+    """表の改名にあわせて、更新履歴のテーブル名も付け替える。戻り値は件数。
+
+    付け替えないと、その表の「更新履歴」タブが新しい名前では空になり、
+    いつ・どのファイルから入ったのかが辿れなくなる。
+    """
+    with _history_lock:
+        p = _history_path()
+        if not p.exists():
+            return 0
+        out, hit = [], 0
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                out.append(line)              # 読めない行はそのまま残す
+                continue
+            if (isinstance(rec, dict) and rec.get("db_file") == db_file
+                    and rec.get("table") == old):
+                rec["table"] = new
+                hit += 1
+                line = json.dumps(rec, ensure_ascii=False)
+            out.append(line)
+        if hit:
+            _rewrite_history(p, out)
+        return hit
+
+
+def drop_table_from_history(db_file: str, table: str) -> int:
+    """消した表の更新履歴を落とす。戻り値は件数。
+
+    残すと、消した表が「更新履歴」にだけ生き残り、取り込み元ファイルの一覧でも
+    「このファイルはもう取り込み済み」と出てしまう（取り込み直せない）。
+    """
+    with _history_lock:
+        p = _history_path()
+        if not p.exists():
+            return 0
+        out, hit = [], 0
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                out.append(line)
+                continue
+            if (isinstance(rec, dict) and rec.get("db_file") == db_file
+                    and rec.get("table") == table):
+                hit += 1
+                continue
+            out.append(line)
+        if hit:
+            _rewrite_history(p, out)
+        return hit
+
+
 # ==========================================================================
 # ===== 元 catalog_history.py
 # 用語集・例文の変更履歴。誰が・いつ・何を・どう変えたかを残す。
@@ -1739,6 +1842,11 @@ def drop_from_tables_off(name: str) -> int:
 # データの中身や1回きりの指示は覚えない（brain.extract_memory の決まり）。本人だけのもの。
 # ==========================================================================
 _memory_lock = threading.RLock()
+#: 管理者の決めごとのファイル（パーソナライズ・マイロボット・出力先・取り込み元フォルダ）を
+#: 「読む→直す→丸ごと書き戻す」ときの鍵。1本で足りる（管理者の保存はめったに重ならないし、
+#: 重なったときに片方の変更が黙って消えるのを防ぐのが目的）。利用者ごとの memory.yaml 用の
+#: _memory_lock とは別物。
+_settings_file_lock = threading.RLock()
 MEMORY_SETTING_RANGES = {"max_chars": (100, 20000)}
 
 
@@ -1786,6 +1894,11 @@ def memory_settings_note() -> dict:
 
 def save_memory_settings(values: dict, user: str | None = None) -> dict:
     """管理者が決めた値を保存する。範囲の外・知らないモデルは ValueError（保存しない）。"""
+    with _settings_file_lock:           # 読む→直す→書くを1本にする
+        return _save_memory_settings_locked(values, user)
+
+
+def _save_memory_settings_locked(values: dict, user: str | None = None) -> dict:
     cur = memory_settings()
     if "enabled" in values:
         if not isinstance(values["enabled"], bool):
@@ -2186,6 +2299,10 @@ def memory_after_turn(user, chat_id: str, question: str, answer: str, model: str
     return done
 
 
+#: パーソナライズの書き直しを同時に走らせる本数の上限（回答のたびに立つので上限が必要）
+_memory_slots = threading.Semaphore(config.MEMORY_MAX_PARALLEL)
+
+
 def _schedule_memory(user, chat: dict) -> None:
     """回答のあとに、パーソナライズの書き直しを別スレッドでAIに頼む（回答は待たせない）。
 
@@ -2198,8 +2315,21 @@ def _schedule_memory(user, chat: dict) -> None:
         return
     # 書き直しに使うモデル: 管理者の指定（決めごと）> 回答に使ったモデル。スレッドの外で決めておく
     model = memory_settings()["model"] or models.current(user)
-    threading.Thread(target=memory_after_turn, args=(user, chat.get("id") or "", q, a, model),
-                     daemon=True).start()
+    # 同時に走らせる本数に上限を付ける。50人が一斉に質問すると、回答のたびに
+    # 立てていた分だけAIへの問い合わせが増え、レート制限に当たって
+    # 本来の回答（利用者が待っている方）まで遅くなる。溢れた分は今回は見送る
+    # （次の回答でまた呼ばれる。覚え直しは1回遅れても困らない）
+    if not _memory_slots.acquire(blocking=False):
+        print("[memory] 書き直しが混んでいるので今回は見送りました。")
+        return
+
+    def _run():
+        try:
+            memory_after_turn(user, chat.get("id") or "", q, a, model)
+        finally:
+            _memory_slots.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # --- モデルの選択 ----------------------------------------------------------------
@@ -2288,6 +2418,33 @@ def meta_path(db_path) -> Path:
 #: 読み込んだカタログの控え。キーはファイルのパス、値は (更新時刻, 大きさ, 中身)。
 #: ファイルが書き換わったら自動で読み直すので、画面から編集した内容はすぐ反映される。
 _meta_cache: dict = {}
+#: 読めなかったカタログ {パス: 理由}。読み取り側は空として続けるしかないので、
+#: 画面に一言出すためにここへ残す（読めたら消える）
+_meta_unreadable: dict = {}
+
+
+def meta_broken_note() -> str:
+    """カタログが読めていないときの一言（読めていれば空文字）。
+
+    画面（マイエージェントのサイドバー）に出す。出さないと、説明も用語も無い
+    状態でAIが答えていることに誰も気づけない。
+    """
+    if not _meta_unreadable:
+        return ""
+    names = "、".join(sorted(Path(p).name for p in _meta_unreadable))
+    return (f"カタログのファイルが読めていません（{names}）。"
+            "表や用語の説明がAIに渡らないため、回答の精度が落ちます。"
+            "管理者に知らせてください。")
+
+
+def meta_broken(db_path) -> str | None:
+    """このDBのカタログだけ、読めているかを見る（読めていれば None）。
+
+    管理者のカタログ画面は「まだ何も書いていない」のか「壊れて読めない」のかを
+    見分けられず、後者でも何も出なかった。控え（_meta_unreadable）を見るだけで、
+    ここで読み直しはしない。
+    """
+    return _meta_unreadable.get(str(meta_path(db_path)))
 
 
 class MetaUnreadable(RuntimeError):
@@ -2317,12 +2474,19 @@ def _read_yaml(p: Path, strict: bool = False) -> dict:
     key = str(p)
     hit = _meta_cache.get(key)
     if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        # 控えが使える＝この中身は読めている。壊れていた印が残っていたら下ろす
+        # （控えから戻したときは更新時刻も元に戻るので、この道を通る）
+        _meta_unreadable.pop(key, None)
         return hit[2]
     try:
         data = yaml.safe_load(p.read_text(encoding="utf-8"))
         data = data if isinstance(data, dict) else {}
     except Exception as e:
         print(f"[catalog] メタ情報を読めませんでした: {p} ({e})")
+        # 読めなかったことを覚えておく。読み取り側（AI・チャット画面）は
+        # 空のカタログとして続けるしかないが、黙って続けると「説明も用語も
+        # 無い状態で答えている」ことに誰も気づけない。画面に一言出すために使う
+        _meta_unreadable[str(p)] = str(e)[:200]
         if strict:
             raise MetaUnreadable(
                 f"カタログのファイルが壊れていて読めません（{p.name}）。"
@@ -2331,6 +2495,7 @@ def _read_yaml(p: Path, strict: bool = False) -> dict:
                 "ファイルを直すか、隣の .bak から戻してから操作してください。"
                 f"（読めなかった理由: {e}）") from e
         return {}
+    _meta_unreadable.pop(str(p), None)     # 読めたので「壊れている」印を下ろす
     # 控えは読み取り専用のつもりで扱う。呼び出し側が書き換えると次の人に伝染するため、
     # 書き込みは必ず save_meta を通す決まりにしている（画面もそうしている）。
     _meta_cache[key] = (st.st_mtime_ns, st.st_size, data)
@@ -2643,6 +2808,26 @@ def _qi(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def _sqlite_data_version(db_path) -> int:
+    """SQLite の data_version（別の接続が書き込むたびに上がる番号）。
+
+    名前は _sqlite_ で始める。この1枚のファイルには後ろに別の _data_version
+    （検算の版）があり、同名だと後ろの定義に食われて静かに壊れる。
+
+    表の一覧の控えが古いままにならないように、更新の見分けに使う。
+    大きさも更新時刻も変わらない書き換え（UPDATE だけ・同じ秒内の連続）では
+    mtime+size だけでは気づけない。読めなければ 0（控えは更新時刻だけで見分ける）。
+    """
+    try:
+        conn = db.connect_ro(db_path)
+        try:
+            return int(conn.execute("PRAGMA data_version").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
 def _cache_path(db_path) -> Path:
     return config.PROFILE_CACHE_DIR / (Path(db_path).name + ".profile.json")
 
@@ -2660,7 +2845,10 @@ def _make_timeout(conn: sqlite3.Connection, seconds: float):
 def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
     t = _qi(name)
     info: dict = {"columns": [], "fks": [], "row_count": None,
-                  "sample_columns": [], "sample_rows": [], "col_stats": {}}
+                  "sample_columns": [], "sample_rows": [], "col_stats": {},
+                  # 途中の1つでも読めなかったら立てる目印。控えを残さない判断に使う
+                  # （欠けたまま控えにすると、DBが変わるまで行数不明・値の例なしが続く）
+                  "degraded": False}
 
     reset()
     # PRAGMA table_info の pk は 0=非キー / 1以上=複合主キー内の順番。
@@ -2675,13 +2863,13 @@ def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
             # (id, seq, table, from, to, on_update, on_delete, match)
             info["fks"].append({"from": row[3], "table": row[2], "to": row[4] or "id"})
     except sqlite3.Error:
-        pass
+        info["degraded"] = True
 
     reset()
     try:
         info["row_count"] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
     except sqlite3.Error:
-        pass  # タイムアウト等 → 行数不明として続行
+        info["degraded"] = True    # タイムアウト等 → 行数不明のまま続けるが控えは残さない
 
     reset()
     try:
@@ -2689,7 +2877,7 @@ def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
         info["sample_columns"] = [d[0] for d in cur.description] if cur.description else []
         info["sample_rows"] = [[_jsonable(v) for v in r] for r in cur.fetchall()]
     except sqlite3.Error:
-        pass
+        info["degraded"] = True
 
     # 列統計（巨大テーブルはスキップ）
     rc = info["row_count"]
@@ -2710,7 +2898,7 @@ def _profile_table(conn: sqlite3.Connection, name: str, reset) -> dict:
                     mn, mx = conn.execute(f"SELECT MIN({c}), MAX({c}) FROM {t}").fetchone()
                     stat["min"], stat["max"] = _jsonable(mn), _jsonable(mx)
             except sqlite3.Error:
-                pass
+                info["degraded"] = True
             if stat:
                 info["col_stats"][col["name"]] = stat
     return info
@@ -2722,12 +2910,52 @@ def _jsonable(v):
     return v
 
 
+#: 表の一覧の作り直しを、DBごとに1本ずつにする鍵。
+#: 取り込みの直後は全員の控えが同時に古くなるので、鍵が無いと50人ぶんの
+#: 作り直しが同時に走り（本番の 700MB では1回45秒）、その間ずっと画面が返らない。
+#: 1本目が作り終われば、待っていた人は控えを読むだけで済む。
+_profile_locks: dict = {}
+_profile_locks_guard = threading.Lock()
+
+
+def _profile_lock(db_path) -> threading.Lock:
+    key = str(db_path).lower()
+    with _profile_locks_guard:
+        lk = _profile_locks.get(key)
+        if lk is None:
+            lk = _profile_locks[key] = threading.Lock()
+        return lk
+
+
+def object_names(db_path) -> set:
+    """いまDBにある表とビューの「名前だけ」を読む。
+
+    「その名前があるか」を確かめたいだけの場所で profile_db を呼ぶと、全表の
+    列や件数まで作り直してしまう（本番の 700MB では1回45秒）。名前の一覧は
+    sqlite_master を1回引くだけなので、一瞬で済む。
+    """
+    conn = db.connect_ro(Path(db_path))
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'")}
+    finally:
+        conn.close()
+
+
 def profile_db(db_path, force: bool = False) -> dict:
-    """DBを読み取り専用でプロファイリング。mtime+sizeが一致するキャッシュがあれば再利用。"""
+    """DBを読み取り専用でプロファイリング。mtime+sizeが一致するキャッシュがあれば再利用。
+
+    作り直しは1本ずつ（同時に呼ばれたら、先の1本が作り終わるのを待って控えを読む）。
+    """
     db_path = Path(db_path)
     st = db_path.stat()
     # v はプロファイルの構造バージョン。上げると古いキャッシュが無効になる。
-    key = {"v": 2, "mtime": st.st_mtime, "size": st.st_size}
+    # 更新の見分けは mtime+size に data_version を足す。SQLite の data_version は
+    # 別の接続が書き込むたびに上がるので、ファイルの大きさが変わらない更新
+    # （UPDATE で書き換えただけ・同じ秒内の書き込み）も取りこぼさない
+    key = {"v": 3, "mtime": st.st_mtime, "size": st.st_size,
+           "dv": _sqlite_data_version(db_path)}
 
     cache = _cache_path(db_path)
     if not force and cache.exists():
@@ -2738,6 +2966,20 @@ def profile_db(db_path, force: bool = False) -> dict:
         except Exception:
             pass
 
+    # ここから作り直し。同時に何本も走らせない（待つ側は、先の1本の結果を控えから読む）
+    with _profile_lock(db_path):
+        if not force and cache.exists():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if data.get("key") == key:
+                    return data              # 待っている間に、別の1本が作り終えた
+            except Exception:
+                pass
+        return _profile_db_locked(db_path, key, cache)
+
+
+def _profile_db_locked(db_path, key: dict, cache) -> dict:
+    """profile_db の本体（このDBについて1本だけ走る）。"""
     conn = db.connect_ro(db_path)
     try:
         reset = _make_timeout(conn, config.PROFILE_TIMEOUT_SEC)
@@ -2765,6 +3007,14 @@ def profile_db(db_path, force: bool = False) -> dict:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "tables": tables,
     }
+    # 取り込みやロックで読めなかった表が混じった控えは残さない。残すと、DBが
+    # 変わるまで（mtime が動くまで）「列も行数も分からない表」がAIにも画面にも
+    # 出続ける。次に呼ばれたときに作り直させる（その1回は少し重いだけで済む）
+    broken = [t for t, v in tables.items() if v.get("error") or v.get("degraded")]
+    if broken:
+        print(f"[catalog] {db_path.name}: 読めなかった表があるので控えは残しません: "
+              f"{'、'.join(broken[:5])}")
+        return profile
     config.PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.write_text_atomic(cache, json.dumps(profile, ensure_ascii=False, default=str))
     return profile
@@ -3691,6 +3941,29 @@ def rename_join_candidates(path, old: str, new: str) -> int:
     return n
 
 
+def drop_join_candidates(path, table: str) -> int:
+    """消えた表に関わる候補・列の記録・指紋を落とす。落とした候補の数を返す。
+
+    残すと、同じ名前で取り込み直したときに「実データを見て作ったはずの候補」が
+    中身を確かめずに復活する（列の意味が変わっていても線が出る）。
+    """
+    saved = load_join_candidates(path)
+    if not saved:
+        return 0
+    keep, dropped = [], 0
+    for c in saved.get("candidates") or []:
+        if table in (c.get("tables") or []):
+            dropped += 1
+            continue
+        keep.append(c)
+    saved["candidates"] = keep
+    saved["columns"] = {k: v for k, v in (saved.get("columns") or {}).items()
+                        if str(k).partition(".")[0] != table}
+    (saved.get("fingerprints") or {}).pop(table, None)
+    _write_json(config.JOIN_CANDIDATES_FILE, saved)
+    return dropped
+
+
 def _col_kind(ctype: str) -> str | None:
     t = str(ctype or "").upper()
     if "INT" in t:
@@ -3726,9 +3999,14 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
     ptables = profile.get("tables") or {}
 
     def skip_error(e) -> bool:
-        """時間切れ（interrupted）と、取り込みと重なって待ちきれなかった locked は、その列・組を飛ばす。"""
+        """その列・組を飛ばしてよい失敗か。
+
+        時間切れ（interrupted）・取り込みと重なった locked のほか、
+        「no such table」も飛ばす（探している最中に別のタブで表が改名・削除された）。
+        これを飛ばさないと、1表の改名で数分ぶんの調べが全部無駄になる。
+        """
         s = str(e).lower()
-        return "interrupt" in s or "locked" in s
+        return "interrupt" in s or "locked" in s or "no such table" in s
 
     def tell(phase, done, total):
         if progress:
@@ -3989,6 +4267,26 @@ def discover_joins(path, profile: dict, meta: dict, tables: list | None = None, 
            "seconds": round(time.time() - started, 1), "fingerprints": table_fingerprints(profile),
            "scope": sorted(subset) if subset else "all", "skipped_timeout": skipped_timeout,
            "columns": columns, "candidates": uniq}
+    # 書く直前に、いまの表の名前をもう一度確かめる。探している間（数分）に改名や削除が
+    # あると、古い名前で作った候補が、改名で付け替えた保存を上書きしてしまう
+    try:
+        conn2 = db.connect_ro(path)
+        try:
+            now_tables = {r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+        finally:
+            conn2.close()
+        gone = [c for c in out["candidates"]
+                if not all(t in now_tables for t in (c.get("tables") or []))]
+        if gone:
+            print(f"[joins] 探している間に無くなった表の候補 {len(gone)} 件は保存しません。")
+        out["candidates"] = [c for c in out["candidates"] if c not in gone]
+        out["columns"] = {k: v for k, v in out["columns"].items()
+                          if str(k).partition(".")[0] in now_tables}
+        out["fingerprints"] = {k: v for k, v in (out["fingerprints"] or {}).items()
+                               if k in now_tables}
+    except sqlite3.Error:
+        pass                          # 確かめられなければ、これまでどおり書く
     _write_json(config.JOIN_CANDIDATES_FILE, out)
     return out
 
@@ -4820,6 +5118,42 @@ def _walk_sql(node, acc: list) -> None:
             _walk_sql(v, acc)
 
 
+#: 会話ファイル1つぶんの読み取り結果の控え。
+#: キー=パス、値=(更新時刻, 大きさ, 作成日時, SQLの集合)。
+#: 会話は増えるだけで、済んだ会話の中身は変わらない。にもかかわらず、カタログを
+#: 開くたびに全員ぶんの会話ファイルを読み直していた（50人×数百件で毎回数秒）。
+#: 変わっていないファイルは読み直さない（カタログの _read_yaml と同じ手口）。
+_sqls_cache: dict = {}
+_SQLS_CACHE_MAX = 4000
+
+
+def _sqls_of_chat(f: Path) -> tuple:
+    """1つの会話ファイルから (作成日時, SQLの集合) を取り出す。控えつき。"""
+    st = f.stat()
+    hit = _sqls_cache.get(str(f))
+    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2], hit[3]
+    data = json.loads(f.read_text(encoding="utf-8"))
+    seen: set = set()
+    for item in data.get("render_log") or []:
+        if item.get("kind") == "sql" and item.get("sql"):
+            seen.add(str(item["sql"]).strip())
+    buf: list = []
+    for m in data.get("messages") or []:
+        for tc in (m.get("tool_calls") or []):
+            try:
+                args = json.loads((tc.get("function") or {}).get("arguments") or "{}")
+            except Exception:
+                continue
+            _walk_sql(args, buf)
+    seen |= {s.strip() for s in buf}
+    created = str(data.get("created_at") or "")
+    if len(_sqls_cache) > _SQLS_CACHE_MAX:
+        _sqls_cache.clear()                # 増えすぎたら丸ごと捨てる（作り直せる）
+    _sqls_cache[str(f)] = (st.st_mtime_ns, st.st_size, created, seen)
+    return created, seen
+
+
 def collect_sqls(days: int | None = None, user: str | None = None) -> tuple:
     """全ユーザーのチャット履歴から実行SQLを集める。
 
@@ -4844,27 +5178,12 @@ def collect_sqls(days: int | None = None, user: str | None = None) -> tuple:
         if user and f.parent.parent.name.lower() != str(user).lower():
             continue
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
+            created, seen = _sqls_of_chat(f)
         except Exception:
             continue
-        if limit:
-            created = str(data.get("created_at") or "")
-            if created and created[:19] < limit.strftime("%Y-%m-%dT%H:%M:%S"):
-                continue
+        if limit and created and created[:19] < limit.strftime("%Y-%m-%dT%H:%M:%S"):
+            continue
         chats += 1
-        seen: set = set()
-        for item in data.get("render_log") or []:
-            if item.get("kind") == "sql" and item.get("sql"):
-                seen.add(str(item["sql"]).strip())
-        buf: list = []
-        for m in data.get("messages") or []:
-            for tc in (m.get("tool_calls") or []):
-                try:
-                    args = json.loads((tc.get("function") or {}).get("arguments") or "{}")
-                except Exception:
-                    continue
-                _walk_sql(args, buf)
-        seen |= {s.strip() for s in buf}
         sqls.extend(seen)
     return sqls, chats
 
@@ -5158,19 +5477,26 @@ def add_dir(raw: str) -> Path:
     if any(d.resolve() == real for d in config.IMPORT_DIRS if d.exists()):
         raise ImportError_("env の IMPORT_DIRS に既に入っています。")
 
-    current.append(str(real))
-    _write_extra(current)
+    # 読む（_read_extra）→足す→書くを1本にする。鍵の外でやると、2人が同時に
+    # 足したときに片方のフォルダが消える
+    with _settings_file_lock:
+        current = _read_extra()
+        if str(real) in current:
+            return real
+        current.append(str(real))
+        _write_extra(current)
     return real
 
 
 def remove_dir(raw: str) -> bool:
     if not config.IMPORT_DIRS_EDITABLE:
         raise ImportError_("画面からのフォルダ変更は無効化されています。")
-    current = _read_extra()
-    left = [s for s in current if s != raw]
-    if len(left) == len(current):
-        return False
-    _write_extra(left)
+    with _settings_file_lock:          # 読む→外す→書くを1本にする
+        current = _read_extra()
+        left = [s for s in current if s != raw]
+        if len(left) == len(current):
+            return False
+        _write_extra(left)
     return True
 
 
@@ -5775,6 +6101,11 @@ def output_dir_status() -> dict:
 
 def save_output_dir(path: str, user: str | None = None) -> dict:
     """出力先を保存する。空文字は「使わない」。"""
+    with _settings_file_lock:           # 他の決めごとの保存と重ならないように
+        return _save_output_dir_locked(path, user)
+
+
+def _save_output_dir_locked(path: str, user: str | None = None) -> dict:
     path = str(path or "").strip()
     if path:
         ok, msg = check_output_dir(path)
@@ -6137,15 +6468,42 @@ def import_dataframe(db_path: Path, table: str, df: pd.DataFrame, columns: list[
         write_cols.append({"列名": ts_name, "型": "TEXT"})
 
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 作り直し（replace）は、いまの表を捨てて新しい列で作り直す。列が減ると、その列を
+    # 使っていたビューが壊れたままDBに残り、壊れたビューが1つあるだけで SQLite は
+    # まったく無関係な表の改名まで断る。取り込みの前に「いま動いているビュー」を
+    # 覚えておき、取り込み後にまだ動くかを確かめる（動かなくなるなら取り込みを取り消す）
+    watch_views: list[str] = []
+    if mode == "replace" and db_path.exists():
+        try:
+            watch_views = views_using(db_path, table)
+        except Exception as e:
+            print(f"[import] ビューの確認を省きました（{e}）")
     # timeout: 裏のスケジューラと画面からの手動更新が重なっても、即エラーにせず順番待ちする
     conn = sqlite3.connect(db_path, timeout=30)
     try:
+        alive_before = []
+        for v in watch_views:
+            try:
+                conn.execute(f'SELECT * FROM {_importer_qi(v)} LIMIT 0')
+                alive_before.append(v)
+            except sqlite3.Error:
+                pass                      # 取り込みの前から壊れていたビューは対象外
         # DROP → CREATE → INSERT を1つのまとまりにする。
         # Python の sqlite3 は既定では DDL の前に BEGIN を張らない（DMLの前だけ）ので、
         # ここで自分で張らないと DROP がその場で確定し、
         # INSERT が落ちても元のデータが戻らない（表が空のまま残る）。
         conn.execute("BEGIN")
         have = table in existing_tables(db_path) if db_path.exists() else False
+        # 同じ名前のビューがあると、CREATE TABLE も DROP TABLE も SQLite の英語の
+        # エラーで落ちる（ビューは existing_tables に出てこないので「新しい表」の
+        # つもりで進んでしまう）。何をすればよいかが分かる日本語で先に止める
+        row = conn.execute("SELECT type FROM sqlite_master WHERE name = ?",
+                           (table,)).fetchone()
+        if row and row[0] == "view":
+            raise ImportError_(
+                f"'{table}' は同じ名前のビューが既にあります。"
+                "表とビューは名前を分けてください。"
+                "そのビューが不要なら、カタログの「ビュー」タブで先に削除してください。")
         if mode == "create" and have:
             raise ImportError_(f"テーブル '{table}' は既にあります。"
                                "「作り直す」か「追記する」を選ぶか、別の名前にしてください。")
@@ -6175,6 +6533,20 @@ def import_dataframe(db_path: Path, table: str, df: pd.DataFrame, columns: list[
                     .itertuples(index=False, name=None))   # _cast で素の値に揃え済み
         conn.executemany(
             f"INSERT INTO {_importer_qi(table)} ({cols_list}) VALUES ({placeholders})", rows)
+        # 確定の前に、この表を使っているビューがまだ動くかを確かめる。
+        # ここで止めれば（rollback で）元のデータも列もそのまま残る
+        broke = []
+        for v in alive_before:
+            try:
+                conn.execute(f'SELECT * FROM {_importer_qi(v)} LIMIT 0')
+            except sqlite3.Error:
+                broke.append(v)
+        if broke:
+            raise ImportError_(
+                f"このまま取り込むと、次のビューが動かなくなります: {'、'.join(broke)}。"
+                "新しいデータには、そのビューが使っている列がありません。"
+                "取り込みは行いませんでした（元のデータはそのままです）。"
+                "先にカタログの「ビュー」タブでビューを直すか削除してから、もう一度お試しください。")
         conn.commit()
         # WAL のときは、書いた分を本体のファイルへ移しておく（作業ファイルが
         # 大きくなり続けるのを防ぎ、.db を手でコピーした控えが直前の取り込みを含むようにする）。
@@ -6419,6 +6791,59 @@ import importer
 # 定義ファイルの書き換えとジョブ実行を直列化する。
 # 裏で回るスケジューラと、画面からの「▶ 今すぐ更新」が同時に走りうるため。
 _jobs_lock = threading.RLock()
+
+#: プロセスをまたぐ直列化の鍵（ファイル）。_jobs_lock はこのプロセスの中だけなので、
+#: cron の `python core.py refresh` とアプリ内のスケジューラが同時に走ると、
+#: 同じ取り込みが二重に走る（追記なら同じ行が2回入る）。
+#: 置き場は DATA_DIR/.job_locks。取れなければ、その回は見送る。
+#: 前のプロセスが落ちて残った鍵は、この時間を過ぎたら取り直してよいものとみなす。
+JOB_LOCK_STALE_SEC = 3600
+
+
+def _job_lock_path(job: dict) -> Path:
+    import re as _re
+    import time as _time                  # この節では未 import（節ごとに import する作り）
+    _ = _time
+    key = f"{job.get('db_file') or ''}__{job.get('table') or ''}__{job.get('id') or ''}"
+    safe = _re.sub(r"[^0-9A-Za-z_.-]", "_", key)[:120]
+    return config.DATA_DIR / ".job_locks" / f"{safe}.lock"
+
+
+def _take_job_lock(job: dict):
+    """この取り込みの鍵を取る（取れたらパス、取れなければ None）。"""
+    import time
+    p = _job_lock_path(job)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = time.time() - p.stat().st_mtime
+        except OSError:
+            return None
+        if age < JOB_LOCK_STALE_SEC:
+            return None                    # 別のプロセスが実行中
+        # 古すぎる鍵。前のプロセスが落ちて残ったものとして取り直す
+        print(f"[jobs] 古い鍵を取り直します（{int(age)}秒前）: {p.name}")
+        try:
+            p.unlink()
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            return None
+    try:
+        os.write(fd, f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}".encode())
+    finally:
+        os.close(fd)
+    return p
+
+
+def _free_job_lock(p) -> None:
+    if not p:
+        return
+    try:
+        Path(p).unlink()
+    except OSError as e:
+        print(f"[jobs] 鍵を外せませんでした（次は古い鍵として扱われます）: {e}")
 
 # 画面に出す更新間隔。値は分。0 は「手動のみ」。
 INTERVALS = {
@@ -6828,7 +7253,16 @@ def run_job(job: dict, kind: str = "auto", user: str | None = None,
     """
     if not is_scraper(job) or fetched is not None:
         with _jobs_lock:                   # 同じテーブルへ同時に書かないように直列化する
-            return _run_job_locked(job, kind, user, fetched)
+            # プロセスをまたぐ鍵も取る（cron と アプリ内スケジューラの二重実行を防ぐ）
+            lk = _take_job_lock(job)
+            if lk is None:
+                return {"ok": False, "rows": 0, "degraded": [], "skipped": True,
+                        "message": "この取り込みは別のプロセス（cron など）で実行中です。"
+                                   "終わるまで前回取り込んだ内容で答えます。"}
+            try:
+                return _run_job_locked(job, kind, user, fetched)
+            finally:
+                _free_job_lock(lk)
 
     # スクレイピングはロックの外で走らせる。ロックを握ったまま数分待つと、
     # その間の質問（リアルタイム更新の確認）と定期実行が全部止まるため。
@@ -7014,16 +7448,19 @@ def _note_realtime_failure(job: dict, message: str) -> bool:
     質問のたびに呼ばれるので、状態が変わったときだけ書く
     （毎回書くとジョブ定義と履歴が肥大する）。戻り値は今回新しく記録したか。
     """
-    saved = get_job(job.get("id", ""))
-    if saved is None:
-        return False
-    if saved.get("last_status") == "error" and saved.get("last_message") == message:
-        return False                       # 既に同じ理由で記録済み。黙って続ける
-    saved["last_status"] = "error"
-    saved["last_message"] = message
-    # last_run は触らない。実行していないので「最後に動いた時刻」は変わらない。
-    # source_stamp も残す。ファイルが戻ったとき、版が違えば取り込み直せる。
-    save_job(saved)
+    # 読んで直して保存するまでを1本にする。鍵の外でやると、ちょうど動いた
+    # 定期実行の記録（取り込んだ版・最後に動いた時刻）と取り合いになって消える
+    with _jobs_lock:
+        saved = get_job(job.get("id", ""))
+        if saved is None:
+            return False
+        if saved.get("last_status") == "error" and saved.get("last_message") == message:
+            return False                   # 既に同じ理由で記録済み。黙って続ける
+        saved["last_status"] = "error"
+        saved["last_message"] = message
+        # last_run は触らない。実行していないので「最後に動いた時刻」は変わらない。
+        # source_stamp も残す。ファイルが戻ったとき、版が違えば取り込み直せる。
+        save_job(saved)
     history.add_import_record(
         job.get("db_file", ""), job.get("table", ""), False, message,
         kind="realtime", mode=job.get("mode") or "replace", rows=0,
@@ -7088,12 +7525,14 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
             # 一致しているので取り込み直しは不要だが、警告だけは下ろす
             # （下ろさないと、ファイルが次に変わるまで⚠が出続ける）。
             if job.get("last_status") == "error":
-                saved = get_job(job.get("id", ""))
+                with _jobs_lock:           # 読む→直す→保存を1本にする（取り合いで消えないように）
+                    saved = get_job(job.get("id", ""))
+                    if saved is not None:
+                        saved["last_status"] = "ok"
+                        saved["last_message"] = ("取り込み元のファイルが戻りました"
+                                                 "（内容は前回取り込んだものと同じ）。")
+                        save_job(saved)
                 if saved is not None:
-                    saved["last_status"] = "ok"
-                    saved["last_message"] = ("取り込み元のファイルが戻りました"
-                                             "（内容は前回取り込んだものと同じ）。")
-                    save_job(saved)
                     done.append({"job": job.get("name") or job.get("table"), "ok": True,
                                  "table": job.get("table"), "db_file": job.get("db_file"),
                                  "message": saved["last_message"]})
@@ -7291,6 +7730,7 @@ from pathlib import Path
 import catalog
 import config
 import db
+import history          # 削除・改名を更新履歴（import_history.jsonl）にも反映する
 import jobs
 import prefs
 import verify
@@ -7575,13 +8015,29 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
     using = _robots_using(table)
     if using:
         done["robots"] = using
+    # 消えた表を、利用者の「対象から外した表」と結合候補の控えからも落とす。
+    # 残すと、同じ名前で取り込み直したときに「その人だけ最初から対象外」になり、
+    # 中身を確かめていない古い結合候補が復活する
+    off_hit = prefs.drop_from_tables_off(table)
+    if off_hit:
+        done["prefs"] = [{"db": path.name, "text": f"{off_hit}人の「対象から外した表」から削除"}]
+    joins_hit = catalog.drop_join_candidates(path, table)
+    if joins_hit:
+        done["joins"] = [{"db": path.name, "text": f"結合候補 {joins_hit}件を削除"}]
+    # 更新履歴（いつ・どのファイルから取り込んだか）も落とす。残すと、消した表が
+    # 履歴にだけ生き残り、取り込み元の一覧でも「もう取り込み済み」と出てしまう
+    hist_hit = history.drop_table_from_history(path.name, table)
+    if hist_hit:
+        done["history"] = [{"db": path.name, "text": f"更新履歴 {hist_hit}件を削除"}]
     catalog.forget(path)
     # まとまりの最後の表が消えたら、まとまりのメモも片づける
     # （残すと、無いデータの前提だけがAIに渡り続ける）
     if table and "__" in table:
         pref = table.split("__", 1)[0]
-        prof = catalog.profile_db(path)
-        if not any(t.startswith(pref + "__") for t in prof["tables"]):
+        # 名前があるかだけを見る（ここで profile_db を呼ぶと、削除のたびに
+        # 全表の列・件数を作り直してしまう）
+        names = catalog.object_names(path)
+        if not any(t.startswith(pref + "__") for t in names):
             meta = catalog.load_meta_for_edit(path)
             try:
                 if pref in (meta.get("groups") or {}):
@@ -7592,17 +8048,50 @@ def clean_table(path: Path, table: str, drop_jobs: bool = True) -> dict:
                     done["groups"] = [{"db": path.name, "text": pref}]
             finally:
                 catalog.release_meta_lock(path)        # 保存しなかったときの後始末
+        else:
+            # まとまりはまだ使われているのでメモ本文は勝手に書き換えない。ただし
+            # 消した表の名前がメモに残っていると、無いデータの前提がAIに渡り続ける。
+            # 消した人がその場で気づけるように、結果に載せる
+            memo = str(((catalog.load_meta(path).get("groups") or {})
+                        .get(pref) or {}).get("description") or "")
+            if table in memo:
+                done["memo_warn"] = [{"db": path.name,
+                                      "text": f"まとまり「{pref}」のメモに「{table}」が残っています"}]
     return done
 
 
-def _rename_in_text(text: str, old: str, new: str) -> str:
+def _rename_in_text(text: str, old: str, new: str, others=()) -> str:
     """文の中のテーブル名を境界つきで置き換える（SQL・散文の両方に使う）。
 
-    境界はUnicodeの語構成文字で見る。日本語のテーブル名では「品質__x」が
-    「高品質__x」の一部に一致してしまう事故があり得るため、英数字だけの
-    境界では足りない。
+    others … いまDBにあるテーブル名。渡すと、日本語の文の中でも置き換えられる。
+
+    境界をUnicodeの語構成文字（日本語を含む）で見ると、「品質__x」が「高品質__x」の
+    一部に一致する事故は防げるが、日本語の説明文の「毎日の品質__claimsは…」のように
+    助詞や修飾語がすぐ隣に来るとまったく置き換わらず、旧名が説明の中に残ってしまう。
+
+    そこで others を渡せる場所では、境界は英数字と下線だけで見て、代わりに
+    「その位置が、旧名を含むもっと長い別の表名（品質__claims と 高品質__claims、
+    売上__日次 と 売上__日次実績）の一部になっていないか」を実名で確かめる。
+    others が無いときは、これまでどおり語構成文字の境界で安全側に倒す。
     """
-    return re.sub(r"(?<!\w)" + re.escape(old) + r"(?!\w)", new, text)
+    if not others:
+        return re.sub(r"(?<!\w)" + re.escape(old) + r"(?!\w)", new, text)
+
+    related = [o for o in others if o != old and old in o]
+
+    def rep(m):
+        start = m.start()
+        for o in related:
+            i = o.find(old)
+            while i >= 0:
+                head = start - i
+                if head >= 0 and text[head:head + len(o)] == o:
+                    return m.group(0)    # 別の表名の一部だった（触らない）
+                i = o.find(old, i + 1)
+        return new
+
+    return re.sub(r"(?<![A-Za-z0-9_])" + re.escape(old) + r"(?![A-Za-z0-9_])",
+                  rep, text)
 
 
 def _fix_view_refs(conn, old: str, new: str) -> int:
@@ -7627,6 +8116,13 @@ def _fix_view_refs(conn, old: str, new: str) -> int:
         conn.execute(f"CREATE VIEW {_importer_qi(name)} AS {body}")
         fixed += 1
     return fixed
+
+
+class RenameNotRolledBack(RuntimeError):
+    """改名が途中で失敗し、巻き戻しにも失敗した（名前とカタログが食い違ったまま）。
+
+    呼び出し側は「元に戻しました」と言わずに、この文言をそのまま画面へ出す。
+    """
 
 
 def _rename_object(conn, path: Path, old: str, new: str) -> None:
@@ -7664,7 +8160,7 @@ def _rename_object(conn, path: Path, old: str, new: str) -> None:
             raise
 
 
-def rename_table(path: Path, old: str, new: str) -> dict:
+def rename_table(path: Path, old: str, new: str, *, profile: dict | None = None) -> dict:
     """テーブルを改名し、カタログ・定期取り込み・利用者の選択を全部付け替える。
 
     まとまりはテーブル名の接頭辞なので、接頭辞を変えれば「まとまりの移動」になる。
@@ -7672,7 +8168,10 @@ def rename_table(path: Path, old: str, new: str) -> dict:
     失敗したら実表とカタログを元に戻す。
     """
     new = importer.safe_name(new, table=True)
-    prof = catalog.profile_db(path)
+    # まとまりの改名（rename_group）は表ごとにここを通る。毎回 profile_db を呼ぶと
+    # 表の一覧の作り直しが表の数だけ走る（本番の 700MB では1回45秒なので、
+    # 20表のまとまりで15分かかる）。呼び出し側が持っている一覧を使い回せるようにする
+    prof = profile if profile is not None else catalog.profile_db(path)
     if old not in prof["tables"]:
         raise ValueError(f"テーブル '{old}' が見つかりません。")
     if "__" not in new.strip("_"):
@@ -7697,7 +8196,8 @@ def rename_table(path: Path, old: str, new: str) -> dict:
         # 説明・SQL・関連の端点・ER配置キーのどこに現れても同じ置き換えでよい。
         # そのあと一度読み直して save_meta に通し、形を正規化して保存する。
         if meta_backup is not None:
-            data = yaml.safe_load(_rename_in_text(meta_backup, old, new)) or {}
+            data = yaml.safe_load(_rename_in_text(
+                meta_backup, old, new, others=prof["tables"])) or {}
         else:
             data = {}
 
@@ -7735,7 +8235,8 @@ def rename_table(path: Path, old: str, new: str) -> dict:
                 if j.get("db_file") == path.name and j.get("table") == old:
                     j["table"] = new
                     if j.get("name"):
-                        j["name"] = _rename_in_text(str(j["name"]), old, new)
+                        j["name"] = _rename_in_text(str(j["name"]), old, new,
+                                                    others=prof["tables"])
                     jobs_hit += 1
             if jobs_hit:
                 jobs._write(items)
@@ -7745,26 +8246,51 @@ def rename_table(path: Path, old: str, new: str) -> dict:
         # 利用者のマイロボット（手順のSQLと、使う表の一覧）。ここを素通りすると、
         # 表は生きていて名前が変わっただけなのに、次の実行が「表が見つかりません
         # （改名・削除された可能性）」で止まり、作り直しを促してしまう
-        robots_hit = _robots_rename_table(old, new)
+        robots_hit = _robots_rename_table(old, new, others=prof["tables"])
     except Exception:
         # カタログ側で失敗したら、実表とカタログを元に戻す
         conn = sqlite3.connect(path, timeout=30)
+        rolled = True
         try:
             _rename_object(conn, path, new, old)   # 巻き戻しも同じ扱い
             conn.commit()
+        except Exception as e2:
+            # 巻き戻しも失敗した。名前は新しいまま、カタログだけ古い状態で残る。
+            # 「元に戻しました」と言い切ると、管理者は直す必要に気づけない
+            rolled = False
+            print(f"[catalog] 改名の巻き戻しに失敗しました（{old} → {new} のまま）: {e2}")
         finally:
             conn.close()
         if meta_backup is not None:
             config.write_text_atomic(meta_file, meta_backup)
         catalog.forget(path)
+        if not rolled:
+            raise RenameNotRolledBack(
+                f"改名の途中で失敗し、元に戻せませんでした。表の名前は「{new}」のままです"
+                f"（カタログは「{old}」の状態に戻しました）。"
+                "画面を読み直して、名前とカタログの食い違いを直してください。") from None
         raise
 
     catalog.forget(path)
-    # 「結合を探す」の保存も付け替える（探し直さなくて済むように）
-    joins_hit = catalog.rename_join_candidates(path, old, new)
-    return {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
-            "robots": robots_hit,
-            "memo_moved": moved_memo, "memo_kept": kept_memo, "joins": joins_hit}
+    out = {"old": old, "new": new, "jobs": jobs_hit, "prefs": prefs_hit,
+           "robots": robots_hit,
+           "memo_moved": moved_memo, "memo_kept": kept_memo, "joins": 0}
+    # 「結合を探す」の保存も付け替える（探し直さなくて済むように）。
+    # ここまでで改名は確定しているので、ここが失敗しても巻き戻さない。
+    # 例外をそのまま上げると「元に戻しました」と嘘を言うことになるので、
+    # 付け替えられなかったことだけを伝える（候補は探し直せば作れる）
+    try:
+        out["joins"] = catalog.rename_join_candidates(path, old, new)
+    except Exception as e:
+        print(f"[catalog] 結合候補の付け替えに失敗しました（改名は完了）: {e}")
+        out["joins_error"] = ("結合候補の付け替えだけできませんでした"
+                              "（「結合を探す」で作り直せます）。")
+    # 更新履歴のテーブル名も付け替える（改名は確定済みなので、失敗しても戻さない）
+    try:
+        out["history"] = history.rename_table_in_history(path.name, old, new)
+    except Exception as e:
+        print(f"[history] 更新履歴の付け替えに失敗しました（改名は完了）: {e}")
+    return out
 
 
 def rename_group(path: Path, old_key: str, new_key: str) -> dict:
@@ -7795,9 +8321,16 @@ def rename_group(path: Path, old_key: str, new_key: str) -> dict:
         if t in views and not view_body(path, t):
             raise ValueError(f"ビュー '{t}' の定義を読めないため、まとめて改名できません。")
     renamed = []
+    # 表の一覧は先に取った prof を使い回す（表ごとに作り直すと、20表のまとまりで
+    # 作り直しが20回走る）。改名するたびに名前だけ手元で入れ替えておく
+    work = dict(prof)
+    work["tables"] = dict(prof["tables"])
     for t in members:
-        r = rename_table(path, t, new_key + "__" + t.split("__", 1)[1])
+        target = new_key + "__" + t.split("__", 1)[1]
+        r = rename_table(path, t, target, profile=work)
+        work["tables"][target] = work["tables"].pop(t, {})
         renamed.append({"old": r["old"], "new": r["new"]})
+    catalog.forget(path)            # 最後に1回だけ作り直させる
     return {"renamed": renamed, "count": len(renamed)}
 
 
@@ -7814,7 +8347,11 @@ LABELS = {
     "groups": "まとまりのメモ",
     "jobs": "定期取り込みの設定",
     "robots": "利用者のマイロボット（消すと実行できなくなります。設定は残ります）",
+    "prefs": "利用者の「対象から外した表」",
+    "joins": "「結合を探す」で作った結合候補",
+    "history": "取り込みの更新履歴",
     "orphan_terms": "自動では消えない用語（表名の無いSQL式）",
+    "memo_warn": "まとまりのメモに残る、この表の名前（手で直してください）",
     "broken_views": "これを使っているビュー（消すと動かなくなります）",
     "removed": "削除したファイル",
 }
@@ -7974,9 +8511,25 @@ _USER_KEY = "user"
 # --- ログイン -----------------------------------------------------------------
 
 def load_user_into_context():
-    """毎リクエストの冒頭でログイン中のユーザーを復元する。"""
+    """毎リクエストの冒頭でログイン中のユーザーを復元する。
+
+    古い形のセッション（項目が増える前に入ったもの）が残っていても落ちないように、
+    知っている項目だけを渡す。そのまま **data すると、項目を1つ増やした日に
+    ログイン中の全員が全ページ 500 になる（本人はログインし直すまで直せない）。
+    """
     data = session.get(_USER_KEY)
-    g.user = auth.User(**data) if data else None
+    if not isinstance(data, dict):
+        g.user = None
+        return
+    try:
+        g.user = auth.User(username=str(data.get("username") or ""),
+                           display_name=str(data.get("display_name") or ""),
+                           groups=list(data.get("groups") or []),
+                           is_admin=bool(data.get("is_admin")))
+    except Exception as e:                    # 想定外の中身。ログインし直してもらう
+        print(f"[auth] セッションを読めませんでした（ログインし直しになります）: {e}")
+        session.pop(_USER_KEY, None)
+        g.user = None
 
 
 def login_user(user: auth.User) -> None:
@@ -8435,8 +8988,12 @@ def chat_index():
         data = {"db": f.name,
                 "groups": groups, "grouped": grouped, "total": len(tables),
                 "on_count": sum(1 for t in tables if t["on"]),
-                "problem": (f"定期取り込みが設定どおりに動いていません: {'、'.join(marks)}"
-                            if marks else "")}
+                # カタログが読めていないことも、ここに出す（同じ帯を使う）
+                "problem": "／".join(x for x in [
+                    (f"定期取り込みが設定どおりに動いていません: {'、'.join(marks)}"
+                     if marks else ""),
+                    catalog.meta_broken_note(),
+                ] if x)}
     return render_template(
         "chat.html",
         data=data,
@@ -8465,8 +9022,12 @@ def chat_index():
 @bp_chat.get("/api/models")
 @login_required
 def list_models():
+    # 取り直し（refresh）は管理者だけ。全員で1つの控えを共有しているので、
+    # 誰でも消せると、APIへの問い合わせを何度も起こせてしまう
+    # （一般利用者が見る一覧は控えのままで十分。中身は同じ）
     return jsonify(models.status(g.user,
-                                 refresh=request.args.get("refresh") == "1"))
+                                 refresh=(request.args.get("refresh") == "1"
+                                          and _is_admin())))
 
 
 @bp_chat.post("/api/models")
@@ -8587,6 +9148,15 @@ def _load_current() -> dict:
         chat = chats.load_chat(g.user, cid)
         if chat:
             return chat
+        # ファイルはあるのに読めない（壊れている）。ここで黙って新しい会話に
+        # すり替えると、続きのつもりで書いた質問が別の会話に入り、元の会話は
+        # 一覧に残ったまま中身だけ見えない、という分かりにくい状態になる。
+        # 会話を開くとき（/api/chat/open）と同じ理由の返し方に揃える
+        if chats._chat_file(g.user, cid).exists():
+            raise _TurnError("この会話のファイルが読めませんでした。"
+                             "会話の一覧から開き直してください"
+                             "（管理者に知らせると、控えから戻せる場合があります）。",
+                             status=409, broken=True)
     return {"id": None, "title": "", "created_at": "", "messages": [], "render_log": []}
 
 
@@ -8613,15 +9183,19 @@ def _persist(chat: dict) -> dict:
     sqls = [str(i["sql"]) for i in chat["render_log"]
             if i.get("kind") == "sql" and i.get("sql")]
     if sqls:
-        for name in chat["db_names"]:
+        # db_names は「DB名.表名」と書かれたSQLでしか埋まらない。DBは1つなので
+        # ふだんのSQLは修飾なしで、ここが常に空になり、表の記録が一度も残らなかった。
+        # 実在するDBを直接見る（控えがあるので重くない）
+        for f in db.list_db_files():
             try:
-                prof = catalog.profile_db(db.path_for(name))
-            except Exception:              # DBが消えた等。表の記録はあきらめてよい
+                prof = catalog.profile_db(f)
+            except Exception as e:         # DBが消えた等。表の記録はあきらめてよい
+                print(f"[chat] 使った表の記録を見送りました（{f.name}）: {e}")
                 continue
             for t in prof["tables"].keys():
                 pat = r"(?<!\w)" + re.escape(t) + r"(?!\w)"
                 if any(re.search(pat, s, re.IGNORECASE) for s in sqls):
-                    tabs.add(f"{name}.{t}")
+                    tabs.add(f"{f.name}.{t}")
     chat["table_names"] = sorted(tabs)
     saved = chats.save_chat(
         g.user, chat["id"], chat["messages"], chat["render_log"],
@@ -8714,6 +9288,14 @@ def open_chat():
         return jsonify({"ok": True, "items": []})
     chat = chats.load_chat(g.user, cid)
     if chat is None:
+        # ファイルが残っているのに読めない（途中で電源が落ちた・手で編集した等）ときは、
+        # 「見つかりません」ではなく読めないことを伝える。履歴からは消えないので、
+        # 何度も開こうとする人が「消せばよい」と分かるようにする
+        if chats._chat_file(g.user, cid).exists():
+            return jsonify({"error": "この会話のファイルが読めませんでした（壊れている可能性）。"
+                                     "履歴からこの会話を削除してください。"
+                                     "新しい会話は問題なく始められます。",
+                            "broken": True}), 409
         return jsonify({"error": "この会話は見つかりませんでした。"}), 404
     session["chat_id"] = cid
     return jsonify({"ok": True, "items": _web_log(chat.get("render_log") or []),
@@ -9162,14 +9744,18 @@ def _auto_scope(question: str, chat: dict) -> list[dict]:
                if i.get("role") == "user" and i.get("kind") == "text"]
     picked = llm.route_tables(question, scope, chat_history)
     if picked:
-        # この会話で実際にSQLが触った表は選から漏れても残す（続き質問のため）
+        # この会話で実際にSQLが触った表は選から漏れても残す（続き質問のため）。
+        # ただし「いまもある表」に限る。消した・改名した表の名前をそのまま足すと、
+        # その会話を開くたびに古い名前が復活し、AIに「（中身が読めません）」と
+        # 書かれた表が渡り続ける
+        now_tables = {s["name"]: set(s["tables"]) for s in scope}
         for t in (chat.get("table_names") or []):
             # 形式は "DBファイル名.テーブル名"。DBファイル名自体が .db を含むので
             # 最後のドットで割る（先頭で割ると equipment / db.stop_records になる）
             dbn, _, tn = str(t).rpartition(".")
-            if dbn in {s["name"] for s in scope}:
+            if tn and tn in now_tables.get(dbn, ()):
                 picked.setdefault(dbn, [])
-                if tn and tn not in picked[dbn]:
+                if tn not in picked[dbn]:
                     picked[dbn] = sorted(set(picked[dbn]) | {tn})
         picked = llm.expand_tables_by_relations(picked, scope)
         for s in scope:
@@ -9196,7 +9782,16 @@ def _realtime_refresh(scope: list[dict]) -> None:
             print(f"[realtime] {mark} {r.get('db_file')}/{r.get('table')}: "
                   f"{r.get('message')}")
     except Exception as e:
+        # 表ごとの失敗は履歴に残るが、確認そのものが落ちたときは何も残らない。
+        # ログだけだと誰も見ないので、取り込み履歴にも1行残す（画面の「取り込み」に出る）。
+        # 回答は止めない（読めなければ前回取り込んだ内容で答える、が決めごと）
         print(f"[realtime] 更新の確認でエラー（回答は続行）: {e}")
+        try:
+            names = [s.get("name") or "" for s in (scope or [])]
+            history.add_import_record(names[0] if names else "", "", False,
+                                      f"取り込み直しの確認でエラー: {e}", kind="realtime")
+        except Exception as e2:                # 履歴にも書けない。ログだけで諦める
+            print(f"[realtime] 履歴にも残せませんでした: {e2}")
 
 
 def _begin_turn():
@@ -9832,6 +10427,11 @@ def robot_settings_note() -> dict:
 
 def save_robot_settings(values: dict, user: str | None = None) -> dict:
     """管理者が決めた値を保存する。範囲の外・数でないものは ValueError（保存しない）。"""
+    with _settings_file_lock:           # 読む→直す→書くを1本にする
+        return _save_robot_settings_locked(values, user)
+
+
+def _save_robot_settings_locked(values: dict, user: str | None = None) -> dict:
     cur = robot_settings()
     for k in ROBOT_SETTING_RANGES:
         if k not in values:
@@ -9974,7 +10574,7 @@ def robot_get(user, rid: str) -> dict | None:
     return next((r for r in robots_list(user) if r.get("id") == rid), None)
 
 
-def robot_save(user, robot: dict, check_dup=None) -> dict:
+def robot_save(user, robot: dict, check_dup=None, touch: bool = True) -> dict:
     """保存して、保存した形を返す。id が無ければ新規。
 
     check_dup … True なら同じ名前・同じ内容のものがあれば断る（RobotConflict）。"name" なら名前だけ見る
@@ -10005,7 +10605,10 @@ def robot_save(user, robot: dict, check_dup=None) -> dict:
             if not robot.get("last_run") and ledger.get(fp):
                 robot["last_run"], robot["last_status"] = ledger[fp], "ok"
                 robot["last_message"] = "（同じ内容のマイロボットの前回の実行）"
-        robot["updated_at"] = chats.now()
+        # 「更新」は人が直したときだけ動かす。実行の書き戻しでも動かすと、
+        # 画面の「作成・更新」が実行時刻と同じ意味になり、いつ直したのか分からなくなる
+        if touch:
+            robot["updated_at"] = chats.now()
         if robot.get("last_status") == "ok" and robot.get("last_run"):
             ledger[fp] = max(str(ledger.get(fp) or ""), str(robot["last_run"]))
         items = [r for r in items if r.get("id") != robot["id"]] + [robot]
@@ -10560,7 +11163,13 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
 
 
 def _robot_missing_tables(robot: dict) -> list[str]:
-    """手順のSQLが使う表のうち、いま無いもの（改名・削除された）。"""
+    """手順のSQLが使う表のうち、いま無いもの（改名・削除された）。
+
+    表の一覧が1つでも読めなかったときは、この点検そのものを見送る（空を返す）。
+    読めなかった分を「無い」と数えると、取り込み中に少し待たされただけで
+    ふつうに動くロボットが「改名・削除された可能性」と言われて止まってしまう。
+    本当に無ければ、このあとのSQLの実行で分かる。
+    """
     want = list(robot.get("tables") or [])
     if not want:
         return []
@@ -10568,8 +11177,9 @@ def _robot_missing_tables(robot: dict) -> list[str]:
     for f in db.list_db_files():
         try:
             have |= set(catalog.profile_db(f)["tables"].keys())
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"[robot] {f.name} の表の一覧を読めなかったので、存否の点検を見送りました: {e}")
+            return []
     return [t for t in want if t not in have]
 
 
@@ -10591,7 +11201,32 @@ def _robots_using(table: str) -> list[dict]:
     return out
 
 
-def _robots_rename_table(old: str, new: str) -> int:
+def _robots_using_tool(name: str) -> list[dict]:
+    """その道具（ユーザー定義ツール）を手順に持つ、全利用者のマイロボット。
+
+    道具を消す・名前を変えると、その手順は次の実行で「知らない道具です」で止まる。
+    こちらから直せないので（作り直すのは本人）、消す前に必ず知らせる。
+    """
+    out = []
+    if not name:
+        return out
+    try:
+        dirs = [d for d in config.USER_META_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in sorted(dirs):
+        p = d / "robots.json"
+        if not p.exists():
+            continue
+        data = _read_json(p)
+        for r in (data.get("robots") if isinstance(data, dict) else None) or []:
+            steps = (r.get("steps") if isinstance(r, dict) else None) or []
+            if any(isinstance(s, dict) and s.get("name") == name for s in steps):
+                out.append({"db": d.name, "text": f"{d.name} のマイロボット「{r.get('name')}」"})
+    return out
+
+
+def _robots_rename_table(old: str, new: str, others=()) -> int:
     """全利用者のマイロボットで、改名した表への参照を付け替える。戻り値は本数。
 
     使う表の一覧（tables）は、実行前の点検（_robot_missing_tables）と削除の下見が
@@ -10622,7 +11257,8 @@ def _robots_rename_table(old: str, new: str) -> int:
                 r["tables"] = [new if t == old else t for t in r["tables"]]
                 try:
                     r["steps"] = json.loads(_rename_in_text(
-                        json.dumps(r.get("steps") or [], ensure_ascii=False), old, new))
+                        json.dumps(r.get("steps") or [], ensure_ascii=False),
+                        old, new, others=others))
                 except (TypeError, ValueError) as e:
                     # 手順が読めない形（手で編集した等）。表の一覧だけ直して先へ進む
                     print(f"[robot] 手順の付け替えを見送りました（{e}）: {p}")
@@ -11168,9 +11804,13 @@ def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> No
             sch["last_run"] = sch["last_run"] or now      # 始めるときに押さえた時刻を残す
             saved["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
         try:
-            robot_save(user, saved)
-        except ValueError as e:
-            print(f"[robot] 実行結果を書き戻せませんでした: {e}")
+            robot_save(user, saved, touch=False)      # 実行では「更新」を動かさない
+        except Exception as e:
+            # 書き戻せなくても、実行そのものは終わっている（メールも出ている）。
+            # ここで例外を上げると「失敗しました」になってしまうので、
+            # 記録が残らなかったことだけをログに出す。Windowsでは同時に読まれて
+            # いるファイルの置き換えが OSError になることがある
+            print(f"[robot] 実行結果を書き戻せませんでした（実行そのものは終わっています）: {e}")
 
 
 def _robot_claim(user, rid: str):
@@ -11191,7 +11831,7 @@ def _robot_claim(user, rid: str):
         sch.update({"last_run": chats.now(), "last_status": "running", "last_message": "実行中…"})
         fresh["schedule"] = {k: sch[k] for k in _SCHEDULE_KEYS}
         try:
-            robot_save(user, fresh, check_dup=False)
+            robot_save(user, fresh, check_dup=False, touch=False)   # 実行の印。「更新」は動かさない
         except ValueError as e:
             print(f"[robot] 定期実行の印を書けませんでした: {e}")
             return None
@@ -11223,7 +11863,7 @@ def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
             if saved is not None:
                 saved["_last_chat_id"] = chat.get("id") or ""
                 try:
-                    robot_save(user, saved, check_dup=False)
+                    robot_save(user, saved, check_dup=False, touch=False)
                 except ValueError:
                     pass
         _robot_write_back(user, robot["id"], ok, message, source)
@@ -11831,9 +12471,13 @@ def feedback_post():
         # そのまま記録すると、他人の会話の行に印が付いてしまう
         return jsonify({"error": "その会話は見つかりません。"}), 404
     facts = _fb_turn_facts(chat or {}, turn)
+    # 「この取り方で合っている／違う」（sql_ok / sql_ng）は、検算の材料として
+    # SQL文そのものが入ってくる。300字だとほぼ必ず途中で切れて、後から読んでも
+    # 何を確かめたのか分からなくなるので、この2種類だけ上限を広げる
+    detail_max = 4000 if kind in ("sql_ok", "sql_ng") else 300
     rec = {"at": datetime.now().isoformat(timespec="seconds"),
            "user": g.user.username, "chat_id": chat_id, "turn": turn,
-           "detail": str(body.get("detail") or "")[:300], **facts}
+           "detail": str(body.get("detail") or "")[:detail_max], **facts}
     if kind in ("gap_confirm", "gap_dismiss"):
         # AIの申告はもう1行書かれている。ここはその申告に対する本人の返事。
         # 種別を引き継がないと、同じ文が別の束に分かれて二重に数えられる
@@ -11845,9 +12489,9 @@ def feedback_post():
     # 同じ質問に同じ評価を何度も押せると、件数をいくらでも作れてしまう。
     # 「いちばん多い要望」はレポートの文面にも乗るので、ここで断つ。
     # 押し直し（気が変わった）は受けたいので、種類が違えば通す
-    if usage.feedback_seen(g.user.username, chat_id, turn, kind):
+    # 確かめてから足すまでを1つの鍵の中でやる（続けて2回押されても1件にする）
+    if not usage.feedback_add(rec, once=True):
         return jsonify({"ok": True, "already": True})
-    usage.feedback_add(rec)
     return jsonify({"ok": True})
 
 # --- パーソナライズ（メニューの「マイロボット」の下。本文は1つのテキスト） -------
@@ -11871,6 +12515,16 @@ def memory_save():
     body = _body()
     if not isinstance(body.get("text"), str):
         return jsonify({"error": "本文がありません。"}), 400
+    # 画面を開いたあとに、AIの書き直し（回答のたびに裏で走る）で中身が変わって
+    # いたら、そのまま保存させない。人の手入れでAIの追記が消えると、
+    # 何が消えたのか誰にも分からない
+    seen = body.get("updated_at")
+    now_at = memory_payload(g.user).get("updated_at") or ""
+    if isinstance(seen, str) and seen and seen != now_at:
+        return jsonify({"error": "この画面を開いたあとに、覚えた内容が変わりました"
+                                 "（会話から自動で追記されています）。"
+                                 "読み直してから直してください。",
+                        "stale": True, "updated_at": now_at}), 409
     memory_set_text(g.user, body["text"], force=True)
     return jsonify({"ok": True, **memory_payload(g.user)})
 
@@ -12048,7 +12702,10 @@ def _overview(path: Path) -> dict:
     meta = catalog.load_meta(path)
     cov = catalog.coverage(profile, meta)
     return {"profile": profile, "meta": meta, "coverage": cov,
-            "drift": catalog.drift_warnings(profile, meta)}
+            "drift": catalog.drift_warnings(profile, meta),
+            # カタログのファイルが壊れて読めていない理由（読めていれば None）。
+            # 出さないと「まだ何も書いていない」のと見分けがつかない
+            "meta_broken": catalog.meta_broken(path)}
 
 
 @bp_catalog.get("/catalog", endpoint="index")
@@ -12116,6 +12773,7 @@ def catalog_index():
         intervals=list(jobs.INTERVALS.keys()),
         llm_ready=llm.is_configured(),
         views=_views_payload(target),
+        meta_broken=ov["meta_broken"],
     )
 
 
@@ -12179,7 +12837,17 @@ def _join_suggestions_merged(path, profile: dict, meta: dict) -> list[dict]:
     連番の ID に小さな整数がたまたま収まって雑な候補が混ざり、画面を開くたびに全列を読み直していたため。
     """
     saved = catalog.saved_join_suggestions(path, profile, meta) or []
-    return saved + sqlusage.suggestions_for(db.alias_for(path), profile, meta)
+    out, seen = [], set()
+    # 同じ列ペアは1本だけにする（「結合を探す」で見つけた組が、過去のSQLでも
+    # 使われていると2本重なって出て、同じ線を2回登録しようとしてしまう）。
+    # 向きは問わない（子→親と親→子は同じ1本）
+    for sg in saved + sqlusage.suggestions_for(db.alias_for(path), profile, meta):
+        key = frozenset((str(sg.get("from") or ""), str(sg.get("to") or "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(sg)
+    return out
 
 
 @bp_catalog.post("/api/catalog/joins/discover")
@@ -12225,6 +12893,9 @@ def api_rename_table():
                                  str(body.get("new_table") or ""))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except cleanup.RenameNotRolledBack as e:
+        # 巻き戻しにも失敗している。「元に戻しました」と言うと、直す必要に気づけない
+        return jsonify({"error": str(e), "needs_attention": True}), 500
     except Exception as e:
         return jsonify({"error": f"改名に失敗しました（元に戻しました）: {e}"}), 500
     print(f"[rename] {path.name}: {r['old']} → {r['new']}（{g.user.username}）")
@@ -12242,6 +12913,9 @@ def api_rename_group():
                                  str(body.get("new_group") or ""))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except cleanup.RenameNotRolledBack as e:
+        # 途中の1表で巻き戻しにも失敗した。まとまりの途中まで名前が変わっている
+        return jsonify({"error": str(e), "needs_attention": True}), 500
     except Exception as e:
         return jsonify({"error": f"改名に失敗しました: {e}"}), 500
     print(f"[rename] {path.name}: まとまり {body.get('group')} → "
@@ -12263,9 +12937,12 @@ def relationship():
     # 関連の指定は2通り。ドラッグ直後は from_table/from_column、
     # 「元に戻す／やり直す」は保存済みの文字列 from/to（'table.col' や 'db.table.col'）で来る
     def _ep(side):
-        if body.get(side):
-            return catalog.parse_endpoint(str(body[side]), alias)
-        return catalog.parse_endpoint(f"{body.get(side + '_table')}.{body.get(side + '_column')}", alias)
+        raw = (str(body[side]) if body.get(side)
+               else f"{body.get(side + '_table')}.{body.get(side + '_column')}")
+        # 複合キーの '表.(列1, 列2)' も解ける形で受ける。ここを単一列専用の
+        # parse_endpoint にしていたため、複合キーの線を消して「元に戻す」と
+        # '(列1, 列2)' という名前の列を探しに行き、必ず失敗していた
+        return catalog.parse_endpoint_cols(raw, alias)
 
     if action == "add":
         lookup = _alias_lookup(alias, catalog.profile_db(path), meta)
@@ -12273,6 +12950,30 @@ def relationship():
         a, b = _ep("from"), _ep("to")
         if not a or not b:
             return jsonify({"error": "関連の指定が正しくありません。"}), 400
+        if len(a[2]) > 1 or len(b[2]) > 1:
+            # 複合キーの線をそのまま足す（消した線の「元に戻す」がここに来る）。
+            # 向きの推定や「合流しますか」の相談は列が1本ずつのときの話なので通さず、
+            # 渡された列の組をそのまま登録する
+            if len(a[2]) != len(b[2]):
+                return jsonify({"error": "関連の列の数が、両側で合っていません。"}), 400
+            for ep in [(a[0], a[1], c) for c in a[2]] + [(b[0], b[1], c) for c in b[2]]:
+                err = _endpoint_error(ep, lookup)
+                if err:
+                    return jsonify({"error": err}), 400
+            if a[0] != alias and b[0] != alias:
+                return jsonify({"error": "どちらか一方は、いま開いているDBのテーブルにしてください。"}), 400
+            new = {"from": catalog.format_endpoint(a[0], a[1], a[2], alias),
+                   "to": catalog.format_endpoint(b[0], b[1], b[2], alias),
+                   "cardinality": catalog.card_norm(body.get("cardinality")) or catalog.CARD_DEFAULT}
+            if any(r.get("from") == new["from"] and r.get("to") == new["to"] for r in rels):
+                return jsonify({"error": "この関連はすでに登録されています。"}), 400
+            rels.append(new)
+            catalog.save_meta(path, meta)
+            profile = catalog.profile_db(path)
+            return jsonify({"ok": True, "added": new,
+                            "er": _er_payload(path, profile, catalog.load_meta(path))})
+        # ここから先は列が1本ずつの通常の関連。以降は (alias, 表, 列) の形で扱う
+        a, b = (a[0], a[1], a[2][0]), (b[0], b[1], b[2][0])
         for ep in (a, b):
             err = _endpoint_error(ep, lookup)
             if err:
@@ -12387,7 +13088,11 @@ def relationship():
             i = next((k for k, r in enumerate(rels)
                       if r.get("from") == body["from"] and r.get("to") == body["to"]), -1)
         else:
-            i = int(body.get("index", -1))
+            try:
+                i = int(body.get("index", -1))
+            except (TypeError, ValueError):
+                # 数字以外が来たら、素の500ではなく「指定が正しくありません」を返す
+                return jsonify({"error": "関連の指定が正しくありません。"}), 400
         if not (0 <= i < len(rels)):
             return jsonify({"error": "この関連は既に削除されています。"}), 400
         if action == "delete":
@@ -12752,9 +13457,18 @@ def view_save():
         # 検算・まとまりメモ・利用者の「対象から外した表」まで一緒に付け替わる。
         # （ここを自前で書いていたときは、説明以外が旧名のまま取り残されていた）
         if old and old != name:
+            if existing:
+                # 上書き先の名前には既に別のビューがある。改名は名前の重複を
+                # 断るので、先に上書き先を片づけてから名前を空ける
+                importer.drop_table(path, name)
+                cleanup.clean_table(path, name, drop_jobs=False)
+            # 先に「旧名のまま」新しいSQLを入れてから改名する。こうすると、
+            # 改名が途中で失敗しても「旧名＋新しいSQL」で止まるだけで、
+            # 「新しい名前なのに中身は古いSQL」という分かりにくい状態にならない
+            importer.create_view(path, old, sql, replace=True)
             cleanup.rename_table(path, old, name)
-        importer.create_view(path, name, sql,
-                             replace=bool(old) or bool(existing))
+        else:
+            importer.create_view(path, name, sql, replace=bool(existing))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -12781,7 +13495,10 @@ def view_save():
     catalog.forget(path)
 
     print(f"[view] {path.name} のビュー {name} を保存しました（{g.user.username}）")
-    return jsonify({"ok": True, "name": name, "views": _views_payload(path)})
+    # 用語集・例文・検算の印も返す。返さないと、開いたままのカタログ画面からの
+    # 次の保存が「別の場所で変わりました」で拒まれ、書きかけが失われる
+    return jsonify({"ok": True, "name": name, "views": _views_payload(path),
+                    "stamps": _stamps_of(path)})
 
 
 @bp_catalog.post("/api/catalog/view/delete")
@@ -12807,13 +13524,22 @@ def view_delete():
                      "先にそちらを直すか削除してください。",
             "broken_views": using}), 409
     importer.drop_table(path, name)
-    done = cleanup.clean_table(path, name, drop_jobs=False)
+    # ビューはもう消えている。後片づけの失敗を素の500にすると「消えていない」と
+    # 誤解されるので、片づけだけの失敗として伝える
+    warn = None
+    try:
+        done = cleanup.clean_table(path, name, drop_jobs=False)
+    except Exception as e:
+        print(f"[view] {name} は削除しましたが、後片づけで失敗しました: {e}")
+        done, warn = {}, (f"ビューは削除しました。ただし、カタログなどの後片づけだけが"
+                          f"できませんでした（{e}）。カタログに残った「{name}」の記述を"
+                          "手で消してください。")
     catalog.forget(path)
     print(f"[view] {path.name} のビュー {name} を削除しました（{g.user.username}）")
     # 掃除で用語集・例文・検算が変わっていることがある。新しい印を返さないと、
     # 開いたままの画面からの次の保存が「別の場所で変わりました」で拒まれる
     return jsonify({"ok": True, "groups": cleanup.summarize(done),
-                    "stamps": _stamps_of(path),
+                    "warning": warn, "stamps": _stamps_of(path),
                     "views": _views_payload(path)})
 
 
@@ -13761,7 +14487,16 @@ def save_layout():
     if not isinstance(incoming, dict):
         return jsonify({"error": "配置の形式が正しくありません。"}), 400
     clean = {}
+    alias = db.alias_for(path)
+    names = catalog.object_names(path)     # 名前があるかだけの軽い確認
+    skipped = 0
     for k, v in incoming.items():
+        # いま無い表の置き場所は受け付けない。開いたままの古い画面や、改名前の
+        # タブから送られてくると、存在しない表の座標が延々と溜まっていく
+        ks = str(k).split(".")
+        if len(ks) == 2 and ks[0] == alias and ks[1] not in names:
+            skipped += 1
+            continue
         # 1ノード = [x, y] の数値2つ。それ以外は受け付けない（保存すると以後ER図が読めなくなる）
         if not isinstance(v, (list, tuple)) or len(v) != 2:
             return jsonify({"error": f"配置の形式が正しくありません（{k}）。"}), 400
@@ -13769,9 +14504,11 @@ def save_layout():
             clean[str(k)] = [int(round(float(v[0]))), int(round(float(v[1])))]
         except (TypeError, ValueError):
             return jsonify({"error": f"配置の座標が数値ではありません（{k}）。"}), 400
+    if skipped:
+        print(f"[er] いま無い表の配置 {skipped} 件は保存しませんでした（{path.name}）")
     meta["er_layout"] = {**(meta.get("er_layout") or {}), **clean}
     catalog.save_meta(path, meta)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "skipped": skipped})
 
 
 @bp_catalog.post("/api/catalog/primary-key")
@@ -13905,16 +14642,29 @@ def save_glossary():
     # チャットからの登録は1か所だけなので、従来の terms / table でも受ける。
     if isinstance(body.get("scopes"), dict):
         groups = []
+        known = set(catalog.profile_db(path)["tables"])
         for tname, rows in body["scopes"].items():
             r = _rows({"terms": rows}, "terms")
             if r is None:
                 return jsonify({"error": "用語の形式が正しくありません。"}), 400
+            # 無い表に用語を置かせない（消した・改名した表の用語だけが残らないように）
+            if tname and str(tname) not in known:
+                return jsonify({"error": f"「{tname}」は見つかりませんでした。"
+                                         "消された・名前が変わった可能性があります。"
+                                         "画面を読み直してください。", "stale": True}), 409
             groups.append((str(tname) or None, r))
     else:
         rows = _rows(body, "terms")
         if rows is None:
             return jsonify({"error": "用語の形式が正しくありません。"}), 400
-        groups = [(body.get("table") or None, rows)]
+        tname = body.get("table") or None
+        # こちらの受け方（チャットからの1か所ずつの登録）にも同じ確認を入れる。
+        # 無い表の用語を受けると、消えた・改名前の表名だけがカタログに残る
+        if tname and str(tname) not in set(catalog.profile_db(path)["tables"]):
+            return jsonify({"error": f"「{tname}」は見つかりませんでした。"
+                                     "消された・名前が変わった可能性があります。"
+                                     "画面を読み直してください。", "stale": True}), 409
+        groups = [(str(tname) if tname else None, rows)]
 
     for tname, rows in groups:
         gl = {}
@@ -14598,8 +15348,10 @@ def save_tool():
     items = list(meta.get("tools") or [])
     name = body.get("name")
 
+    gone = None            # 無くなる道具の名前（マイロボットへの影響を知らせる用）
     if body.get("action") == "delete":
         items = [t for t in items if t.get("name") != name]
+        gone = name
     else:
         tool = body.get("tool") or {}
         # 既存の名前も見て検証する。見ていないと、新規作成で同名を付けたとき
@@ -14611,12 +15363,16 @@ def save_tool():
             return jsonify({"error": " / ".join(errors)}), 400
         items = [t for t in items if t.get("name") != (original or name)]
         items.append(tool)
+        if original and original != tool.get("name"):
+            gone = original            # 改名。旧名の手順は次の実行で止まる
     if items:
         meta["tools"] = items
     else:
         meta.pop("tools", None)
     catalog.save_meta(path, meta)
-    return jsonify({"ok": True})
+    # 表の削除と同じ考え方で、動かなくなるマイロボットを知らせる（勝手に直さない）
+    robots = _robots_using_tool(gone) if gone else []
+    return jsonify({"ok": True, "robots": robots})
 
 
 @bp_catalog.post("/api/catalog/builtin")
@@ -14746,6 +15502,15 @@ def _locked_tables() -> dict:
     out: dict[str, dict] = {}
     for j in jobs.list_jobs():
         why = jobs.manual_run_blocked(j)
+        if not why and j.get("realtime") and j.get("enabled") is not False:
+            # リアルタイム更新の表は、元ファイルの変化を見て自動で入れ替わる。
+            # 手で別のファイルを入れても、次の質問のときに元のファイルの内容へ
+            # 戻ってしまう（入れたつもりのデータが黙って消える）
+            why = (f"「{j.get('name') or 'この設定'}」はリアルタイム更新（元ファイルの"
+                   "変化を見て自動で入れ替え）に設定されています。手で入れ替えても、"
+                   "次に質問したときに元ファイルの内容へ戻ります。"
+                   "入れ替えたいときは、この設定のリアルタイム更新を止めてから"
+                   "実行してください。")
         if why:
             out.setdefault(j.get("db_file", ""), {})[j.get("table", "")] = why
     return out
@@ -15175,14 +15940,24 @@ def _w_drop_table():
         table = importer.drop_table(path, table)   # 実物の綴りで掃除する
     except ImportError_ as e:
         return jsonify({"error": str(e)}), 404
-    done = cleanup.clean_table(path, table,
-                              drop_jobs=body.get("drop_jobs", True) is not False)
+    # ここまで来たら実物はもう消えている（コミット済み）。このあとの掃除が
+    # 落ちても「削除できませんでした」ではない。素の500にすると、利用者は
+    # 消えていないと思って何度も押すことになるので、掃除だけの失敗として伝える
+    warn = None
+    try:
+        done = cleanup.clean_table(path, table,
+                                   drop_jobs=body.get("drop_jobs", True) is not False)
+    except Exception as e:
+        print(f"[import] {table} は削除しましたが、後片づけで失敗しました: {e}")
+        done, warn = {}, (f"表は削除しました。ただし、カタログなどの後片づけだけができませんでした（{e}）。"
+                          "もう一度「削除」を押すか、カタログの説明・用語集に残った"
+                          f"「{table}」の記述を手で消してください。")
     print(f"[import] {path.name} の {table} を削除しました（{g.user.username}）")
     # 掃除で用語集・例文・検算が変わる。新しい印を返さないと、開いたままの
     # 画面からの次の保存が「別の場所で変わりました」で拒まれ、
     # 読み直しで書きかけが失われる
     return jsonify({"ok": True, "groups": cleanup.summarize(done),
-                    "stamps": _stamps_of(path)})
+                    "warning": warn, "stamps": _stamps_of(path)})
 
 
 # =============================================================================
@@ -15339,28 +16114,37 @@ def job_run():
 @admin_required
 def job_update():
     body = _body()
-    job = jobs.get_job(body.get("id", ""))
-    if job is None:
-        return jsonify({"error": "ジョブが見つかりません。"}), 404
-    if "enabled" in body:
-        job["enabled"] = bool(body["enabled"])
-    if body.get("interval"):
-        job["interval_minutes"] = jobs.INTERVALS.get(body["interval"], 0)
-    if "realtime" in body:
-        job["realtime"] = bool(body["realtime"])
-    # スクレイピングの「1回にどれだけ待つか」「質問に応じた取り直しの最小間隔」は
-    # 登録した設定ごとに変えられる（範囲は validate_job が見る）
-    scrape_keys = [k for k in ("scrape_timeout_sec", "scrape_interval_minutes")
-                   if k in body and jobs.is_scraper(job)]
-    for k in scrape_keys:
-        job[k] = body[k]
-    # 開始日時は触らないので過去チェックはしない（登録時に済んでいる）
-    errors = jobs.validate_job(job, check_start=False)
-    if errors:
-        return jsonify({"error": " / ".join(errors)}), 400
-    for k in scrape_keys:
-        job[k] = int(job[k])
-    jobs.save_job(job)
+    # 読んで直して保存するまでを予定の鍵の中で行う。鍵の外でやると、ちょうど
+    # 動いた定期実行の記録（取り込んだ版・最後に動いた時刻）を巻き戻してしまう
+    with jobs._jobs_lock:
+        job = jobs.get_job(body.get("id", ""))
+        if job is None:
+            return jsonify({"error": "ジョブが見つかりません。"}), 404
+        if "enabled" in body:
+            job["enabled"] = bool(body["enabled"])
+        if body.get("interval"):
+            # 知らない言い方は黙って「手動のみ（0分）」にしない。落ちると、設定した
+            # つもりの定期取り込みが二度と動かず、しかも画面では設定済みに見える
+            if body["interval"] not in jobs.INTERVALS:
+                return jsonify({"error": f"更新の頻度「{body['interval']}」は選べません"
+                                         f"（選べるのは {'、'.join(jobs.INTERVALS)}）。"
+                                         "画面を読み直してから選んでください。"}), 400
+            job["interval_minutes"] = jobs.INTERVALS[body["interval"]]
+        if "realtime" in body:
+            job["realtime"] = bool(body["realtime"])
+        # スクレイピングの「1回にどれだけ待つか」「質問に応じた取り直しの最小間隔」は
+        # 登録した設定ごとに変えられる（範囲は validate_job が見る）
+        scrape_keys = [k for k in ("scrape_timeout_sec", "scrape_interval_minutes")
+                       if k in body and jobs.is_scraper(job)]
+        for k in scrape_keys:
+            job[k] = body[k]
+        # 開始日時は触らないので過去チェックはしない（登録時に済んでいる）
+        errors = jobs.validate_job(job, check_start=False)
+        if errors:
+            return jsonify({"error": " / ".join(errors)}), 400
+        for k in scrape_keys:
+            job[k] = int(job[k])
+        jobs.save_job(job)
     return jsonify({"ok": True, "jobs": [_job_row(x) for x in jobs.list_jobs()]})
 
 
@@ -15515,7 +16299,8 @@ def knowledge_add():
 @admin_required
 def knowledge_update(kb_id):
     d = _body()
-    fields = {k: d[k] for k in ("name", "base_url", "description", "enabled", "api_key")
+    fields = {k: d[k] for k in ("name", "base_url", "description", "enabled", "api_key",
+                                "clear_api_key")          # キーを外す指示（空欄は据え置き）
               if k in d}
     try:
         rag.kb_update(kb_id, **fields)

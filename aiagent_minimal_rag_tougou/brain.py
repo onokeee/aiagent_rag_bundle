@@ -2626,13 +2626,23 @@ GAP_KINDS = {
 }
 
 
-def feedback_add(record: dict) -> bool:
-    """1行足す。書けなくても呼び出し元は止めない（記録のために回答を止めない）。"""
+def feedback_add(record: dict, *, once: bool = False) -> bool:
+    """1行足す。書けなくても呼び出し元は止めない（記録のために回答を止めない）。
+
+    once=True なら「同じ人・同じ質問・同じ種類」が既にあるときは足さない。
+    確かめてから足すまでを鍵の中で行う（外で確かめると、続けて2回押されたとき
+    どちらも「まだ無い」と見て2件入る）。戻り値は足したか。
+    """
     try:
         path = Path(config.FEEDBACK_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False)
         with _FB_LOCK:
+            if once and _feedback_seen_unlocked(
+                    str(record.get("user") or ""), str(record.get("chat_id") or ""),
+                    record.get("turn"), str(record.get("kind") or ""),
+                    str(record.get("question") or "")):
+                return False
             with io.open(str(path), "a", encoding="utf-8", newline="\n") as f:
                 f.write(line + "\n")
         return True
@@ -2641,18 +2651,30 @@ def feedback_add(record: dict) -> bool:
         return False
 
 
-def feedback_seen(user: str, chat_id: str, turn, kind: str) -> bool:
+def feedback_seen(user: str, chat_id: str, turn, kind: str, question: str = "") -> bool:
     """同じ人が、同じ質問に、同じ評価を既に付けているか。
 
     付いているのに何度も受けると、件数をいくらでも作れてしまう
     （その件数はレポートの文面にも乗る）。押し直しは種類が違うので通る。
+    """
+    return _feedback_seen_unlocked(user, chat_id, turn, kind, question)
+
+
+def _feedback_seen_unlocked(user: str, chat_id: str, turn, kind: str,
+                            question: str = "") -> bool:
+    """feedback_seen の本体（鍵を持っていても呼べる形。入れ子で取らない）。
+
+    やり取りの番号（turn）は、巻き戻して聞き直すと同じ番号が使い回される。
+    番号だけで見ていると、別の質問への評価が「もう押しました」と断られるので、
+    質問の文も一致しているときだけ同じものとして扱う。
     """
     if not chat_id:
         return False
     for r in feedback_read():
         if (str(r.get("user") or "") == str(user)
                 and str(r.get("chat_id") or "") == str(chat_id)
-                and r.get("turn") == turn and str(r.get("kind") or "") == str(kind)):
+                and r.get("turn") == turn and str(r.get("kind") or "") == str(kind)
+                and str(r.get("question") or "") == str(question)):
             return True
     return False
 
@@ -4584,8 +4606,11 @@ import config
 _lock = threading.Lock()
 _cache: dict[str, bytes] = {}
 _MAX_CACHE = 40
-# 一度失敗したら、その実行中は再挑戦しない（1枚あたり数秒待たされるため）
+# 一度失敗したら、しばらく再挑戦しない（1枚あたり数秒待たされるため）。
+# ただしサーバは再起動せずに何日も動くので、config.FIGURE_RENDER_RETRY_SEC だけ
+# 経ったら次の1回だけ試し直す（直ったのに「画像は入れられません」のままを避ける）
 _broken: list[str] = []
+_broken_at = 0.0
 
 
 def why_unavailable() -> str:
@@ -4595,8 +4620,11 @@ def why_unavailable() -> str:
 def render(fig, width: int | None = None, height: int | None = None,
            scale: float | None = None) -> bytes | None:
     """plotly の figure を PNG のバイト列にする。できなければ None。"""
+    global _broken_at
     if _broken:
-        return None
+        if time.monotonic() - _broken_at < config.FIGURE_RENDER_RETRY_SEC:
+            return None
+        _broken.clear()            # 時間が経ったので、直っているか一度だけ試す
     w = int(width or config.REPORT_IMAGE_WIDTH)
     h = int(height or config.REPORT_IMAGE_HEIGHT)
     s = float(scale or config.REPORT_IMAGE_SCALE)
@@ -4618,6 +4646,7 @@ def render(fig, width: int | None = None, height: int | None = None,
                        "文書には表と説明だけを入れます。"
                        "画像も入れたい場合は、サーバに Chrome/Chromium を用意して"
                        "kaleido が使える状態にしてください。")
+        _broken_at = time.monotonic()
         print(f"[figures] 画像化を無効にしました: {msg}")
         return None
     if key:
@@ -6292,7 +6321,7 @@ MAIL_HINTS = ("mail", "メール", "eメール", "address", "アドレス", "宛
 NAME_HINTS = ("name", "氏名", "名前", "担当", "社員名", "person", "user", "顧客名", "得意先")
 DEPT_HINTS = ("部署", "部門", "所属", "課", "dept", "department", "division", "組織", "拠点")
 
-_mailer_lock = threading.Lock()
+_mailer_lock = threading.RLock()     # 保存の「読む→直す→書く」を丸ごと囲むので入れ子にできる形
 _sent_log: list[dict] = []          # 直近の送信記録（画面表示用）
 _MAX_LOG = 200
 
@@ -6594,6 +6623,11 @@ def _with_current(data: dict) -> dict:
 
 def save_settings(data: dict, user: str | None = None) -> SmtpSettings:
     """画面からの保存。検証してから書く。"""
+    with _mailer_lock:                 # 読む→直す→書くを1本にする（同時保存で片方が消えないように）
+        return _save_settings_locked(data, user)
+
+
+def _save_settings_locked(data: dict, user: str | None = None) -> SmtpSettings:
     merged = _with_current(data)
     errors = validate_settings(merged)
     if errors:
@@ -7515,6 +7549,8 @@ def get(scope: list[dict], rid: str) -> dict | None:
 
     置き場は全員で1つなので、持ち主を見ないと（result_id を言い当てられたときに）
     他人の取ったデータを渡してしまう。
+    いま対象から外している表のデータも渡さない（外したあとに古い結果から読めると、
+    サイドバーで外した意味が無くなる）。
     """
     with _store_lock:
         entry = _store.get(str(rid or ""))
@@ -7522,8 +7558,38 @@ def get(scope: list[dict], rid: str) -> dict | None:
             return None
         if entry.get("owner", "") != _owner_key():
             return None
+        if _uses_excluded_table(entry, scope):
+            return None
         _store.move_to_end(rid)          # 使ったものは新しい扱いにして残す
         return entry
+
+
+def _uses_excluded_table(entry: dict, scope: list[dict]) -> bool:
+    """この結果のSQLが、いま対象から外している表を使っているか。
+
+    表の選択は質問ごとに scope へ入ってくる（entry["tables"] は持たない）ので、
+    預けたときのSQLの文字列を見て判断する。判断に使える材料が無ければ通す
+    （SQL の無い結果＝ツールが組み立てた表などは、そのとき選ばれていた範囲のもの）。
+    """
+    sql = str(entry.get("sql") or "")
+    if not sql:
+        return False
+    low = sql.lower()
+    for s in (scope or []):
+        allow = s.get("tables")
+        if not allow:
+            continue                      # 全部が対象（外していない）
+        try:
+            import catalog as _catalog
+            names = list((_catalog.profile_db(s["path"]).get("tables") or {}).keys())
+        except Exception:
+            continue
+        for t in names:
+            if t in allow:
+                continue
+            if re.search(r"(?<!\w)" + re.escape(t.lower()) + r"(?!\w)", low):
+                return True
+    return False
 
 
 def find_by_sql(scope: list[dict], sql: str) -> str | None:
@@ -10472,6 +10538,12 @@ def _propose_glossary_term(args: dict, scope: list[dict]) -> dict:
     alias = dbmod.alias_for(target)
     if table and table not in (catalog.profile_db(target).get("tables") or {}):
         return _err(f"{target.name} にテーブル '{table}' がありません。")
+    # 対象から外した表に用語を置かせない（見えていない表の用語は確かめようがなく、
+    # 用語集は全利用者のプロンプトに載る）
+    ent = next((s for s in (scope or []) if str(s.get("path")) == str(target)), None)
+    if table and ent and ent.get("tables") and table not in ent["tables"]:
+        return _err(f"テーブル '{table}' はいまの対象に入っていません。"
+                    "サイドバーでチェックを入れてから登録してください。")
 
     # SQL式の検証。条件式→該当件数 / 計算式→計算例 / 通らない→エラーで差し戻し
     verdict, detail = "", ""
@@ -10608,6 +10680,17 @@ def _show_er_diagram(args: dict, scope: list[dict]) -> dict:
         payload = catalog.er_payload(target)
     except Exception as e:
         return _err(f"ER図データの組み立てに失敗しました: {e}")
+
+    # 利用者が対象から外した表は、図からも落とす（describe_table・open_table と同じ線）。
+    # 落とさないと、外した表の名前と列がここだけから見えてしまう
+    ent = next((s for s in (scope or []) if str(s.get("path")) == str(target)), None)
+    if ent and ent.get("tables"):
+        allow = set(ent["tables"])
+        keep = {n["id"] for n in payload["nodes"] if n.get("table") in allow}
+        payload["nodes"] = [n for n in payload["nodes"] if n["id"] in keep]
+        payload["edges"] = [e for e in payload["edges"]
+                            if f"{e['from'][0]}.{e['from'][1]}" in keep
+                            and f"{e['to'][0]}.{e['to'][1]}" in keep]
 
     own = [n for n in payload["nodes"] if not n.get("external")]
     rels = [{"from": e.get("from_ref") or ".".join(str(x) for x in e["from"]),
@@ -10860,6 +10943,12 @@ def _open_table(args: dict, scope: list[dict]) -> dict:
     if info is None:
         return _err(f"テーブル '{table}' が {target.name} にありません。"
                     "このDBのテーブル: " + "、".join(list((profile.get("tables") or {}).keys())[:20]))
+    # 利用者が対象から外した表は開かない（describe_table と同じ線を引く。
+    # ここだけ通ると、サイドバーで外した表の中身が別タブで全部見えてしまう）
+    ent = next((s for s in (scope or []) if str(s.get("path")) == str(target)), None)
+    if ent and ent.get("tables") and table not in ent["tables"]:
+        return _err(f"テーブル '{table}' は実在しますが、いまの対象に入っていません。"
+                    "サイドバーの一覧でチェックを入れると開けます。")
 
     meta = catalog.load_meta(target)
     tmeta = (meta.get("tables") or {}).get(table) or {}
@@ -11867,7 +11956,11 @@ def kb_update(kb_id: str, **fields) -> dict:
                 item["enabled"] = bool(fields["enabled"])
             # 空文字のAPIキーは「変更なし」として扱う。画面はキーを伏せて表示するので、
             # 未入力＝据え置きが自然なため。
-            if fields.get("api_key"):
+            # 消したいときは clear_api_key を送る（据え置きの規則のままだと、
+            # 一度入れたキーを画面から外す手段が無く、消すには登録し直すしかなかった）
+            if fields.get("clear_api_key"):
+                item.pop("api_key", None)
+            elif fields.get("api_key"):
                 item["api_key"] = str(fields["api_key"]).strip()
             _kb_write(items)
             return _kb_redact(item)
@@ -12933,6 +13026,7 @@ def _attach_verification(res: dict, sqls: list[str], scope: list[dict]) -> dict:
 
 def dispatch(name: str, arguments_json: str | None, scope: list[dict],
              entries: list[dict] | None = None, admin: bool = False) -> dict:
+    import traceback                    # 道具が落ちたときだけ使う（起動を重くしない）
     try:
         args = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError as e:
@@ -12958,6 +13052,10 @@ def dispatch(name: str, arguments_json: str | None, scope: list[dict],
         try:
             return _attach_folder_save(args, _attach_verification(handler(args, scope), sqls, scope))
         except Exception as e:  # ツールの例外でアプリを落とさない
+            # AIには文言を返すが、どの道具がどう落ちたかはログにも残す。
+            # 残さないと「AIの答えがおかしい」という報告から原因に辿り着けない
+            print(f"[tool] {name} の実行でエラー: {type(e).__name__}: {e}")
+            traceback.print_exc()
             return _err(f"ツール '{name}' の実行でエラー: {e}")
 
     tool = next((t for t in custom_tools.collect_everywhere(entries or []) if t.get("name") == name), None)
@@ -12967,6 +13065,8 @@ def dispatch(name: str, arguments_json: str | None, scope: list[dict],
         sqls.append(render_sql(tool))
         return _attach_folder_save(args, _attach_verification(_run_custom(tool, args, scope), sqls, scope))
     except Exception as e:
+        print(f"[tool] ユーザー定義ツール {name} の実行でエラー: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return _err(f"ツール '{name}' の実行でエラー: {e}")
 
 
@@ -13065,6 +13165,12 @@ def reset_llm_client() -> None:
     global _client, _models_client
     _client = None
     _models_client = None
+    # 接続先が変われば、同じモデル名でも受け付ける引数が違う（別のゲートウェイ・別の版）。
+    # 覚えた癖と、モデル一覧の控えも捨てる。残すと、前の接続先で学んだ引数を
+    # 送り続けて「なぜか通らない」状態が再起動まで直らない
+    _QUIRKS.clear()
+    _models_cache["at"] = 0.0
+    print("[llm] 接続先が変わったので、覚えた呼び出し方とモデル一覧の控えを捨てました。")
 
 
 # --- モデルごとの作法の違いを吸収する ---------------------------------------------
@@ -13143,8 +13249,22 @@ def _fix_for(message: str, kwargs: dict) -> tuple | None:
 _RETRY_IN = re.compile(r"try again in\s+([\d.]+)\s*(ms|s|m)\b", re.IGNORECASE)
 
 
+#: レート制限で待っているスレッドの数。全員が待つと、サーバのスレッド（32本）が
+#: 待つだけで埋まり、新しい質問もページの表示も詰まる。数えて上限で止める
+_waiting = [0]
+_waiting_lock = threading.Lock()
+
+
 def _is_rate_limit(e: Exception) -> bool:
-    return getattr(e, "status_code", None) == 429 or "rate_limit" in str(e).lower()
+    # 429 か、それらしい文言で見る。「rate_limit」が入っているだけの文言
+    # （例: 知らない引数 rate_limit_tier を指摘する400のエラー）まで拾うと、
+    # 引数を直せば済む失敗を「混んでいます」として待ち続けてしまうので、
+    # 下線つきの部分一致は使わない（本物の429は空白入りかコード名で出る）
+    if getattr(e, "status_code", None) == 429:
+        return True
+    s = str(e).lower()
+    return ("rate limit" in s or "rate_limit_exceeded" in s
+            or "too many requests" in s)
 
 
 def _rate_limit_wait(e: Exception, attempt: int) -> float:
@@ -13202,9 +13322,25 @@ def _create(**kwargs):
                 waits += 1
                 sec = _rate_limit_wait(e, waits)
                 waited_total += sec
-                print(f"[llm] レート制限。{sec:.1f}秒待って投げ直します"
-                      f"（{waits}/{config.LLM_RATE_LIMIT_RETRIES}回目）")
-                time.sleep(sec)
+                # 何人が同時に待っているかも出す。全員が同じ待ちに入ると、
+                # 待っているスレッドの数だけサーバのスレッドが埋まる（32本が上限）。
+                # 埋まりきる手前で気づけるように、数をログに残す
+                with _waiting_lock:
+                    _waiting[0] += 1
+                    n = _waiting[0]
+                try:
+                    if n > config.LLM_RATE_LIMIT_MAX_WAITERS:
+                        raise RateLimited(
+                            f"混み合っています（レート制限）。いま{n}件が待っているため、"
+                            "この質問は待たずに止めました。少し時間をおいてから"
+                            "「続けて」と送ってください。"
+                            "ここまでに取得したデータは残っています。") from e
+                    print(f"[llm] レート制限。{sec:.1f}秒待って投げ直します"
+                          f"（{waits}/{config.LLM_RATE_LIMIT_RETRIES}回目・待ち{n}件）")
+                    time.sleep(sec)
+                finally:
+                    with _waiting_lock:
+                        _waiting[0] -= 1
                 continue
             fixes += 1
             fix = _fix_for(str(e), attempt)
@@ -13280,7 +13416,11 @@ def route_tables(question: str, scope: list[dict],
     ask.append(f"今回の質問: {question}")
     try:
         resp = _create(
-            model=config.OPENAI_MODEL,
+            # 振り分けに使うモデルは、管理者が「モデル設定」で決めた既定
+            # （config.OPENAI_MODEL は、その画面で保存していないときの初期値）。
+            # 直書きだと、管理者が別のモデルに揃えても振り分けだけ古いモデルに残り、
+            # 「そのモデルは使えません」で毎回失敗する
+            model=default_model() or config.OPENAI_MODEL,
             messages=[{"role": "system", "content": _ROUTE_TABLE_SYSTEM},
                       {"role": "user", "content": f"{cards}\n\n{chr(10).join(ask)}"}],
             temperature=0, max_tokens=300,
@@ -13288,7 +13428,9 @@ def route_tables(question: str, scope: list[dict],
         m = re.search(r"\[.*?\]", resp.choices[0].message.content or "", re.DOTALL)
         picked = json.loads(m.group(0)) if m else []
     except Exception as e:
-        print(f"[router] 表の振り分けに失敗したため絞りません: {e}")
+        # 絞れなくても全部渡して続ける（ここで止めない）。ただし理由は残す。
+        # 毎回失敗していると、プロンプトが大きいまま費用と時間だけ増える
+        print(f"[router] 表の振り分けに失敗したため絞りません: {type(e).__name__}: {e}")
         return None
     if "*" in picked:
         return None
@@ -13884,11 +14026,14 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
     kwargs = dict(
         model=model or config.OPENAI_MODEL,
         messages=messages,
-        tools=tool_defs if tool_defs is not None else tools.BUILTIN_TOOLS,
-        tool_choice="auto",
         temperature=config.OPENAI_TEMPERATURE,
         stream=True,
     )
+    # 空のときは tools のキーごと外す（空配列を弾くAPIがある。chat() と同じ扱い）
+    defs = tools.BUILTIN_TOOLS if tool_defs is None else tool_defs
+    if defs:
+        kwargs["tools"] = defs
+        kwargs["tool_choice"] = "auto"
     if config.OPENAI_TOP_P is not None:
         kwargs["top_p"] = config.OPENAI_TOP_P
     if config.OPENAI_MAX_TOKENS is not None:
