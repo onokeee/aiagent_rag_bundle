@@ -1,0 +1,23 @@
+{
+  "v": 4,
+  "createdOnFiles": {"v": 1, "at": "2026-10-03T03:30:00Z"},
+  "lists": "css",
+  "title": "AIワークハブ システム概要",
+  "cover": "cover",
+  "order": ["cover", "introbg", "introissue", "introoverview", "introeffect", "arch", "external", "aiinput", "mail", "readonly", "nobreak", "tech", "toolcall", "step1", "step2", "step3", "step4", "step5", "toolcode", "flowq", "flowdata", "future", "summary"],
+  "sections": {
+    "s0": {"description": "表紙", "start": "cover"},
+    "si": {"description": "アプリの紹介：開発の背景・解決したい課題・アプリの概要・効果", "start": "introbg"},
+    "s1": {"description": "① システム設計図：サーバ1台で動き、データ本体は外部に出ない", "start": "arch"},
+    "s2": {"description": "② セキュリティ設計：外部との通信、AIに渡る情報、メールの宛先の制限", "start": "external"},
+    "s3": {"description": "③ 安全設計：AIは書き換えられない・壊さない仕組み", "start": "readonly"},
+    "s4": {"description": "④ 使用技術（ツール呼び出しの全体像・ステップごとのコード）とデータの流れ", "start": "tech"},
+    "sf": {"description": "この先の展望", "start": "future"},
+    "s5": {"description": "まとめ", "start": "summary"}
+  },
+  "faces": {
+    "biz-udpgothic": {"family": "BIZ UDPGothic", "href": "https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap"},
+    "biz-udgothic": {"family": "BIZ UDGothic", "href": "https://fonts.googleapis.com/css2?family=BIZ+UDGothic:wght@400;700&display=swap"}
+  },
+  "designSystems": []
+}

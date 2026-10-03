@@ -1,0 +1,37 @@
+<section id="readonly" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">③ 安全設計</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">AIはデータを書き換えられない（3重の守り）</h2>
+<div style="height:40px"></div>
+<div style="display:flex;align-items:stretch;gap:12px">
+<div style="width:260px;display:flex;flex-direction:column;gap:8px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:14px;padding:28px 24px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">入口</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">AIが書いたSQL</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="width:260px;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">守り 1</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">読み取りの命令（SELECT）だけ通す</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="width:260px;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">守り 2</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">読み取り専用で開く</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="width:260px;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">守り 3</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">DB自身が「読む」以外を拒否</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="width:260px;display:flex;flex-direction:column;gap:8px;background:#14233A;border:2px solid #14233A;border-radius:14px;padding:28px 24px">
+<p style="font-size:24px;font-weight:700;color:#F2A65A">データ</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#F3F5F8">統合.db</p>
+</div>
+</div>
+<div style="flex:1"></div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FDFDFB;border-left:6px solid #1F64A8;padding:28px 32px">
+<p style="font-size:32px;font-weight:700;color:#14233A">データを書き込めるのは、管理者の「取り込み」だけ</p>
+<p style="font-size:28px;line-height:1.5;color:#3D4A5C">利用者が外した表も、この段階で読めないようにしています（AIが名前を知っていても読めない）。</p>
+</div>
+<aside>AIが書いたSQLは、3つの守りを通ってからデータベースに届きます。1つめはアプリの検査で、読み取りの命令（SELECT）以外は通しません。2つめは接続の仕方で、データベースを読み取り専用で開きます。3つめはデータベース（SQLite）自身の許可の仕組みで、読む以外の操作はすべて拒否します。どれか1つをすり抜けても、残りで止まる作りです。データベースに書き込めるのは、管理者が操作する「取り込み」だけです。</aside>
+</section>

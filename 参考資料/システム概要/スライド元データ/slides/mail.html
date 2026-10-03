@@ -1,0 +1,43 @@
+<section id="mail" data-transition="fade" style="background:#EDF1F5;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">② セキュリティ設計</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">メールも、外部のアドレスには送れない</h2>
+<div style="height:32px"></div>
+<div style="display:flex;align-items:stretch;gap:12px">
+<div style="flex:1;display:flex;flex-direction:column;gap:8px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:14px;padding:28px 20px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">入口</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">AIが書いた<br>メールの下書き</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 20px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">関門 1</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">宛先は全員、<br>許可リストの人</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 20px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">関門 2</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">許可リストは<br>自社ドメインのみ</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:8px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 20px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">関門 3</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#14233A">利用者が中身を<br>見て「送信」</p>
+</div>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:8px;background:#14233A;border:2px solid #14233A;border-radius:14px;padding:28px 20px">
+<p style="font-size:24px;font-weight:700;color:#F2A65A">送り先</p>
+<p style="font-size:28px;font-weight:700;line-height:1.4;color:#F3F5F8">自社の<br>メールサーバ</p>
+</div>
+</div>
+<div style="flex:1"></div>
+<div style="display:flex;gap:28px">
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border-left:6px solid #1F64A8;padding:24px 32px">
+<p style="font-size:28px;font-weight:700;color:#14233A">許可リストが空なら、誰にも送れない</p>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">設定を忘れても、外部へ出ていかない作り</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border-left:6px solid #1F64A8;padding:24px 32px">
+<p style="font-size:28px;font-weight:700;color:#14233A">一度に送れる宛先には上限（初期値20件）</p>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">送ったメールは、宛先・件名・送った人を記録</p>
+</div>
+</div>
+<aside>メールの送り先も、外部のアドレスには送れないように絞っています。管理者は「メール設定」で、登録してよいドメイン（自社のドメイン）を決めます。それ以外のアドレスは、宛先の許可リストにそもそも登録できません。メールを送る直前には、To・Cc・Bcc の全員が許可リストに載っているかを確かめ、1人でも外れていれば送りません。許可リストが空のときは誰にも送れない、という初期状態にしてあるので、設定を忘れたまま外部へ出てしまうことはありません。AIが作るのは下書きまでで、送るのは利用者が中身を確かめて「送信」を押したときです。マイロボットの自動送信も同じ点検を通り、取り込みの失敗を知らせる管理者の宛先も、同じドメインの縛りを受けます。補足（運用）: 「登録してよいドメイン」の初期値は空（ドメインの縛りなし）なので、メールを使い始める前に自社のドメインを設定しておきます。いまはメール自体が未設定で、初期状態は「テスト送信（実際には送らない）」です。</aside>
+</section>

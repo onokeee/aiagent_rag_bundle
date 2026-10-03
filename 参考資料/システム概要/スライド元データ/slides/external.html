@@ -1,0 +1,14 @@
+<section id="external" data-transition="fade" style="background:#EDF1F5;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">② セキュリティ設計</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">外部とつながるのは ChatGPT API（OpenAI）だけ</h2>
+<table style="font-size:26px;color:#3D4A5C;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:12px">
+<tr><th style="width:28%;text-align:left">接続先</th><th style="width:28%;text-align:left">場所</th><th style="width:44%;text-align:left">いつ・何のために</th></tr>
+<tr><td><b>ChatGPT API（OpenAI）</b></td><td style="color:#A8561A"><b>外部（唯一の接続先）</b></td><td>質問に答えるとき（アプリ）／文書の索引づくりと検索（LightRAG）</td></tr>
+<tr><td>LightRAG（文書検索）</td><td>外部に出ない（いまはアプリと同じPC）</td><td>文書を調べるとき（本番は IT 部門が用意するサーバの予定）</td></tr>
+<tr><td>メールの中継サーバ</td><td>管理者が指定（自社のサーバを想定）</td><td>設定したときだけ（いまは未設定）</td></tr>
+<tr><td>外部の部品・アクセス解析・自動更新</td><td>なし</td><td>使っていない（グラフの部品もアプリに同梱）</td></tr>
+</table>
+<div style="flex:1"></div>
+<p style="font-size:28px;line-height:1.5;color:#14233A;background:#FDFDFB;border-left:6px solid #1F64A8;padding:20px 28px">画面は外部のサイトから何も読み込みません（フォント・部品・アクセス解析なし）。<br>利用状況の送信や、自動更新の確認のような「裏の通信」もありません。</p>
+<aside>外部との通信は ChatGPT API（OpenAI）の1か所だけです。アプリは質問に答えるときに使い、文書検索の LightRAG も、文書の索引を作るときと検索するときに同じ API を使います。LightRAG 自体は、いまはアプリと同じPCで動いていて、文書の元のファイルは外部に出ません。本番では IT 部門が用意する LightRAG を使う予定で、そのときに使うAIは、その LightRAG の設定に従います（いまの設定は OpenAI）。メールは、管理者がメールの中継サーバを設定したときだけ使い、いまは設定していません。画面も外部のサイトから何も読み込まない作りで、グラフを描く部品もアプリに同梱しています。補足: ChatGPT API に送ったデータの扱い（学習に使われない等）は、API の契約と規約で確認した内容をここで添えてください。Webから情報を取ってくる「スクレイピング」の仕組みもありますが、いまは見本だけで、使っていません。</aside>
+</section>

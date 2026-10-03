@@ -1,0 +1,49 @@
+<section id="step5" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ ツール呼び出し　ステップ 5 / 5</p>
+<div style="display:flex;gap:8px">
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">1 送る</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">2 依頼</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">3 実行</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">4 返す</p>
+<p style="font-size:24px;font-weight:700;color:#F3F5F8;background:#14233A;border:1px solid #14233A;border-radius:24px;padding:4px 16px">5 回答</p>
+</div>
+</div>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">依頼が無くなったら、最終回答</h2>
+<div style="display:flex;align-items:start;gap:40px">
+<div style="width:860px;flex:none;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;color:#14233A">アプリのコード（くり返しと終わり方）</p>
+<div style="display:flex;flex-direction:column;background:#14233A;border-radius:16px;padding:24px 28px;font-family:'BIZ UDGothic', monospace;color:#E6ECF3">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">for 回数 in range(10):&#160;&#160;<span style="color:#F2A65A"># 往復は最大10回</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">msg = AIに聞く(messages, tools)&#160;&#160;<span style="color:#9FB7D0"># ステップ1・4の create()</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">if not msg.tool_calls:&#160;&#160;<span style="color:#9FB7D0"># 依頼が無い＝最終回答</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px">画面に表示(msg.content, 表, グラフ, 実行したSQL)</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px">break</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">...&#160;&#160;<span style="color:#9FB7D0"># ステップ3・4（実行して、結果を返す）</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">else:&#160;&#160;<span style="color:#9FB7D0"># 10回で終わらなかったとき</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">画面に表示(<span style="color:#A9D3F5">"10回で区切りました。「続けて」で再開できます"</span>)</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">外部（ChatGPT API）から返ってくる中身（例）</p>
+<div style="display:flex;flex-direction:column;background:#FDFDFB;border:2px solid #C26A1E;border-radius:14px;padding:20px 24px;font-family:'BIZ UDGothic', monospace;color:#14233A">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">{<span style="color:#1F64A8">"role"</span>: "assistant",</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"content"</span>: "2026年9月の不良件数は12件でした。",</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"tool_calls"</span>: null}&#160;&#160;<span style="color:#A8561A">← 依頼なし</span></p>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:18px 24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">画面に出るもの</p>
+<ul style="font-size:24px;line-height:1.5;color:#14233A">
+<li>回答の文章（少しずつ表示）</li>
+<li>表やグラフ（全件はアプリの中から）</li>
+<li>実行したSQL（数字の根拠）</li>
+</ul>
+</div>
+<ul style="font-size:24px;line-height:1.5;color:#3D4A5C">
+<li>同じ依頼のくり返しは、実行せずに差し戻す</li>
+<li>10回で区切り、「続けて」と送れば再開できる</li>
+</ul>
+</div>
+</div>
+<aside>ステップ5です。AIの返事に依頼が無ければ、それが最終回答です。右の例では、tool_calls が null で、content に答えの文章が入っています。アプリは、回答の文章を少しずつ画面に出し、あわせて表やグラフ、実行したSQLを表示します。表やグラフの全件はアプリの中にあるデータから作るので、外部に出したのは最大40行だけです。実行したSQLが残るので、数字の出どころを後から確かめられます。左のコードは全体のくり返しの形です。往復は最大10回で、同じ依頼をくり返したときは実行せずに差し戻します。10回で終わらなかったときは、そこまでの内容で区切り、「続けて」と送ると再開できます。</aside>
+</section>

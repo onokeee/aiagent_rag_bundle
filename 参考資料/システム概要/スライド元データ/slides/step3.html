@@ -1,0 +1,43 @@
+<section id="step3" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ ツール呼び出し　ステップ 3 / 5</p>
+<div style="display:flex;gap:8px">
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">1 送る</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">2 依頼</p>
+<p style="font-size:24px;font-weight:700;color:#F3F5F8;background:#14233A;border:1px solid #14233A;border-radius:24px;padding:4px 16px">3 実行</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">4 返す</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">5 回答</p>
+</div>
+</div>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">アプリが道具を実行する（外部に出ない）</h2>
+<div style="display:flex;align-items:start;gap:40px">
+<div style="width:860px;flex:none;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;color:#14233A">アプリのコード（依頼された道具を実行する）</p>
+<div style="display:flex;flex-direction:column;background:#14233A;border-radius:16px;padding:24px 28px;font-family:'BIZ UDGothic', monospace;color:#E6ECF3">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">if name not in 渡した道具:&#160;&#160;<span style="color:#9FB7D0"># 渡していない道具は動かさない</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">result = {<span style="color:#A9D3F5">"error"</span>: f<span style="color:#A9D3F5">"未知のツール: {name}"</span>}</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">elif name in 管理者用の道具 and not 管理者:</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">result = {<span style="color:#A9D3F5">"error"</span>: <span style="color:#A9D3F5">"管理者だけが使えます"</span>}</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">else:</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">sql = validate_select(args[<span style="color:#A9D3F5">"sql"</span>])&#160;&#160;<span style="color:#F2A65A"># 守り1: SELECTだけ通す</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">conn = connect_readonly(統合db)&#160;&#160;<span style="color:#F2A65A"># 守り2: 読み取り専用</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">conn.set_authorizer(読む以外は拒否)&#160;&#160;<span style="color:#F2A65A"># 守り3: DB自身が拒否</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">cols, rows = 実行(conn, sql, 上限10秒, 最大2000行)</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">実行の結果（アプリの中だけで使う）</p>
+<div style="display:flex;flex-direction:column;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:20px 24px;font-family:'BIZ UDGothic', monospace;color:#14233A">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">cols = ["件数"]</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">rows = [(12,)]</p>
+</div>
+<ul style="font-size:24px;line-height:1.5;color:#3D4A5C">
+<li>実行するのはこのサーバの中。データベースは外部に出ない</li>
+<li>AIが書いたSQLでも、3重の守り（③ 安全設計）で「読む」以外はできない</li>
+<li>渡していない道具・管理者用の道具は、名指しされても動かさない</li>
+<li>10秒を超えるSQLは止める。画面に出すのは最大2,000行</li>
+</ul>
+</div>
+</div>
+<aside>ステップ3です。依頼を受けたアプリが、道具を実行します。ここは外部に出ない、このサーバの中だけの処理です。まず、依頼された道具がステップ1で渡した一覧にあるかを確かめます。渡していない道具の名前を言われても実行しません。管理者用の道具は、一般の利用者からの依頼では動かしません。run_sql_query の場合は、AIが書いたSQLを3重の守りに通します。1つめは validate_select で、SELECT文以外を断ります。2つめは、データベースを読み取り専用で開くことです。3つめは、SQLite 自身の許可の仕組み（オーソライザ）で、読む以外の操作を拒否します。さらに、10秒を超えるSQLは途中で止め、画面に出すのは最大2,000行までです。左のコードは説明用に短くしたもので、実際のアプリはこれを道具ごとに分けて持っています。</aside>
+</section>

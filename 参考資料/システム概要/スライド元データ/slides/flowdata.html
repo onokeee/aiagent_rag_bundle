@@ -1,0 +1,30 @@
+<section id="flowdata" data-transition="fade" style="background:#EDF1F5;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ データの流れ</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">データが入る道と、繰り返しの自動化</h2>
+<div style="height:16px"></div>
+<div style="display:flex;align-items:stretch;gap:16px">
+<p style="width:260px;font-size:30px;font-weight:700;line-height:1.3;color:#14233A;align-self:center">取り込み</p>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #8FB0D2;border-radius:12px;padding:20px 24px">Excel・CSV（共有フォルダ）</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">列と型を確かめ、見本で確認</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#F3F5F8;background:#14233A;border:2px solid #14233A;border-radius:12px;padding:20px 24px">統合.db に書き込む（全部か、何もしないか）</p>
+</div>
+<div style="display:flex;align-items:stretch;gap:16px">
+<p style="width:260px;font-size:30px;font-weight:700;line-height:1.3;color:#14233A;align-self:center">自動の更新</p>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">定期取り込み（決めた間隔で入れ替え・追記）</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">リアルタイム（元ファイルが変わったら質問の前に）</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">二重に取り込まない（鍵で1本ずつ）</p>
+</div>
+<div style="display:flex;align-items:stretch;gap:16px">
+<p style="width:260px;font-size:30px;font-weight:700;line-height:1.3;color:#14233A;align-self:center">マイロボット</p>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">うまくいった質問の手順を登録</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">決めた時刻にAIなしで同じ手順を実行</p>
+<x-connector style="width:48px;align-self:center"></x-connector>
+<p style="flex:1;font-size:26px;line-height:1.45;color:#14233A;background:#FDFDFB;border:2px solid #1F64A8;border-radius:12px;padding:20px 24px">Excel・メールで届ける</p>
+</div>
+<aside>データが入る道です。取り込みは管理者が行い、共有フォルダの Excel や CSV を、列と型を確かめてから統合.db に書き込みます。途中で失敗したら元のデータのまま残ります。決めた間隔で全件入れ替えや追記をする「定期取り込み」と、元のファイルが変わったときだけ質問の前に入れ直す「リアルタイム更新」があり（ファイルが読めないときは前回の内容のまま答えます）、同じ取り込みが二重に走らないようにしています。マイロボットは、うまくいった質問の手順を登録して、決めた時刻にAIを使わずに同じ手順を繰り返す仕組みです。結果は Excel やメールで届けられます。</aside>
+</section>

@@ -1,0 +1,32 @@
+<section id="nobreak" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">③ 安全設計</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">壊さない・混ざらない仕組み</h2>
+<div style="height:16px"></div>
+<div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:28px">
+<div style="display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:1px solid #CDD5DF;border-top:6px solid #1F64A8;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#14233A">取り込みは全部か、何もしないか</h3>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">途中で失敗したら元のデータのまま。空のファイルでは入れ替えない</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:1px solid #CDD5DF;border-top:6px solid #1F64A8;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#14233A">書きかけで壊れない</h3>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">設定は別の一時ファイルに書いてから、一度に置き換える</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:1px solid #CDD5DF;border-top:6px solid #1F64A8;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#14233A">同時の操作は順番に</h3>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">取り込み・会話・カタログの保存は、鍵をかけて1つずつ</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:1px solid #CDD5DF;border-top:6px solid #1F64A8;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#14233A">古い画面から上書きしない</h3>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">開いたあとに誰かが変えていたら、保存せずに知らせる</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:1px solid #CDD5DF;border-top:6px solid #1F64A8;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#14233A">消す前に影響を見せる</h3>
+<p style="font-size:26px;line-height:1.5;color:#3D4A5C">削除・改名は関係先を一覧し、説明や予定も一緒に直す</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:10px;background:#14233A;border:1px solid #14233A;border-top:6px solid #F2A65A;border-radius:12px;padding:28px 32px">
+<h3 style="font-size:32px;font-weight:700;line-height:1.3;color:#F3F5F8">変更のたびに検証</h3>
+<p style="font-size:26px;line-height:1.5;color:#C9D3DF">検証スイート44本・約3,200項目を毎回実行</p>
+</div>
+</div>
+<aside>データが壊れたり、混ざったりしないための仕組みです。取り込みは「全部成功するか、何もしないか」のどちらかで、途中で失敗しても元のデータが残ります。中身が空のファイルで入れ替えることもしません。設定ファイルは書きかけの状態で残らないよう、一時ファイルに書いてから置き換えます。50人が同時に使っても取り違えが起きないよう、取り込みや保存は鍵をかけて順番に処理します。開きっぱなしの古い画面から保存して、新しい内容を消してしまうことも防いでいます。最後に、こうした動きは約3,200項目の検証を変更のたびに実行して確かめています。</aside>
+</section>

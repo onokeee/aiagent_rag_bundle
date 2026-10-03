@@ -1,0 +1,46 @@
+<section id="toolcall" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ 使用技術　ツール呼び出し（Tool Calling）の全体像</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">AIとアプリの「やり取り」で答えを作る</h2>
+<div style="display:flex;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">アプリ（外部に出ない）</p>
+<p style="font-size:24px;font-weight:700;color:#A8561A">ChatGPT API（外部）</p>
+</div>
+<div style="display:flex;justify-content:start">
+<div style="width:1120px;display:flex;align-items:center;gap:16px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:16px;padding:14px 24px">
+<p style="font-size:36px;font-weight:700;line-height:1;color:#1F64A8">1</p>
+<p style="font-size:24px;font-weight:700;color:#1F64A8;background:#E3EDF7;border-radius:20px;padding:4px 14px">アプリ → AI</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#14233A">「先月の不良件数は？」と、使える道具の一覧を送る</p>
+</div>
+</div>
+<div style="display:flex;justify-content:end">
+<div style="width:1120px;display:flex;align-items:center;gap:16px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:16px;padding:14px 24px">
+<p style="font-size:36px;font-weight:700;line-height:1;color:#A8561A">2</p>
+<p style="font-size:24px;font-weight:700;color:#A8561A;background:#FDFDFB;border-radius:20px;padding:4px 14px">AI → アプリ</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#14233A">「run_sql_query を、このSQLで使って」と依頼が返る</p>
+</div>
+</div>
+<div style="display:flex;justify-content:start">
+<div style="width:1120px;display:flex;align-items:center;gap:16px;background:#EEF3F8;border:2px dashed #1F64A8;border-radius:16px;padding:14px 24px">
+<p style="font-size:36px;font-weight:700;line-height:1;color:#1F64A8">3</p>
+<p style="font-size:24px;font-weight:700;color:#1F64A8;background:#FDFDFB;border-radius:20px;padding:4px 14px">アプリの中</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#14233A">SQLを実行（読むだけ）→ 結果は「件数 12」</p>
+</div>
+</div>
+<div style="display:flex;justify-content:start">
+<div style="width:1120px;display:flex;align-items:center;gap:16px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:16px;padding:14px 24px">
+<p style="font-size:36px;font-weight:700;line-height:1;color:#1F64A8">4</p>
+<p style="font-size:24px;font-weight:700;color:#1F64A8;background:#E3EDF7;border-radius:20px;padding:4px 14px">アプリ → AI</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#14233A">「件数 12」という結果を返す（最大40行）</p>
+</div>
+</div>
+<div style="display:flex;justify-content:end">
+<div style="width:1120px;display:flex;align-items:center;gap:16px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:16px;padding:14px 24px">
+<p style="font-size:36px;font-weight:700;line-height:1;color:#A8561A">5</p>
+<p style="font-size:24px;font-weight:700;color:#A8561A;background:#FDFDFB;border-radius:20px;padding:4px 14px">AI → アプリ</p>
+<p style="flex:1;font-size:28px;line-height:1.4;color:#14233A">「先月の不良件数は12件です」と最終回答が返る</p>
+</div>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:28px;line-height:1.5;color:#14233A;background:#FDFDFB;border-left:6px solid #C26A1E;padding:16px 28px">2〜4 は、AIが必要とするかぎりくり返す（最大10回）。AIは依頼するだけで、実行するのはアプリです。</p>
+<aside>ツール呼び出し（Tool Calling）は、ChatGPT API に標準で備わっている仕組みです。AIとアプリの会話として見ると分かりやすくなります。左がアプリ、右がAIです。1、アプリは質問と一緒に、使ってよい道具の一覧を送ります。2、AIは答えの文章を書く代わりに、「run_sql_query という道具を、このSQLで使ってほしい」という依頼を返します。3、アプリはその依頼を受けて、外部に出ないサーバの中でSQLを実行します。読むだけの実行です。4、アプリは結果の一部をAIに返します。5、AIは結果を読んで、足りていれば最終回答を返します。足りなければ、2から4をくり返します。往復は最大10回です。大事なのは、AIは依頼を出すだけで、実行するのはアプリだという点です。次のページから、ステップごとに実際のコードと、やり取りされる中身を見ていきます。</aside>
+</section>

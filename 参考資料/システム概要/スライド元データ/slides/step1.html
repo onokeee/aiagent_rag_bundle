@@ -1,0 +1,60 @@
+<section id="step1" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ ツール呼び出し　ステップ 1 / 5</p>
+<div style="display:flex;gap:8px">
+<p style="font-size:24px;font-weight:700;color:#F3F5F8;background:#14233A;border:1px solid #14233A;border-radius:24px;padding:4px 16px">1 送る</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">2 依頼</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">3 実行</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">4 返す</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">5 回答</p>
+</div>
+</div>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">質問と「道具の一覧」をAIに送る</h2>
+<div style="display:flex;align-items:start;gap:40px">
+<div style="width:860px;flex:none;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;color:#14233A">アプリのコード（Python・説明用に短くしたもの）</p>
+<div style="display:flex;flex-direction:column;background:#14233A;border-radius:16px;padding:24px 28px;font-family:'BIZ UDGothic', monospace;color:#E6ECF3">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap"><span style="color:#9FB7D0"># 道具の一覧（AIに見せるのは名前・説明・引数の形だけ）</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">tools = [{<span style="color:#A9D3F5">"type"</span>: <span style="color:#A9D3F5">"function"</span>, <span style="color:#A9D3F5">"function"</span>: {</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"name"</span>: <span style="color:#A9D3F5">"run_sql_query"</span>,</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"description"</span>: <span style="color:#A9D3F5">"読み取り専用のSELECT文を実行する"</span>,</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"parameters"</span>: {<span style="color:#A9D3F5">"type"</span>: <span style="color:#A9D3F5">"object"</span>, <span style="color:#A9D3F5">"properties"</span>: {</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"sql"</span>: {<span style="color:#A9D3F5">"type"</span>: <span style="color:#A9D3F5">"string"</span>},</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"purpose"</span>: {<span style="color:#A9D3F5">"type"</span>: <span style="color:#A9D3F5">"string"</span>}},</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"required"</span>: [<span style="color:#A9D3F5">"sql"</span>, <span style="color:#A9D3F5">"purpose"</span>]}}}]</p>
+<div style="height:16px"></div>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap"><span style="color:#9FB7D0"># 会話（最初は「決まりごと＋表の説明」と質問）</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">messages = [</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">{<span style="color:#A9D3F5">"role"</span>: <span style="color:#A9D3F5">"system"</span>, <span style="color:#A9D3F5">"content"</span>: 決まりごと + 表の説明},</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">{<span style="color:#A9D3F5">"role"</span>: <span style="color:#A9D3F5">"user"</span>, <span style="color:#A9D3F5">"content"</span>: <span style="color:#A9D3F5">"先月の不良件数は？"</span>}]</p>
+<div style="height:16px"></div>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">resp = client.chat.completions.create(&#160;&#160;<span style="color:#F2A65A"># 外部へ送る</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">model=MODEL, messages=messages, tools=tools)</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<div style="display:flex;flex-direction:column;gap:6px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:14px;padding:18px 24px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">外部（ChatGPT API）に送るもの</p>
+<ul style="font-size:24px;line-height:1.5;color:#14233A">
+<li>答え方の決まり（システムへの指示）</li>
+<li>表と列の説明（値の例・範囲、表ごとの見本3行まで）</li>
+<li>質問「先月の不良件数は？」</li>
+<li>道具の一覧（名前・説明・引数の形）</li>
+</ul>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:18px 24px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">送らないもの</p>
+<ul style="font-size:24px;line-height:1.5;color:#14233A">
+<li>データベースのファイル・全件のデータ</li>
+<li>道具のプログラム・パスワード・APIキー</li>
+<li>利用者が対象から外した表の説明</li>
+</ul>
+</div>
+<ul style="font-size:24px;line-height:1.5;color:#3D4A5C">
+<li>渡す道具は人によって変わる（管理者用の道具は一般の人に渡さない）</li>
+<li>実際の道具は40種類以上（SQL・グラフ・統計・Excel出力・文書検索 など）</li>
+</ul>
+</div>
+</div>
+<aside>ステップ1です。アプリは、質問と一緒に「道具の一覧」をAIに送ります。左のコードの tools が道具の一覧で、ここでは読み取り専用のSQLを実行する run_sql_query という道具を1つだけ書いています。AIに見えるのは、道具の名前と説明、それにどんな引数を受け取るか（sql と purpose）だけです。道具の中身のプログラムは見えません。messages は会話で、最初に「答え方の決まり」と「表と列の説明」、続けて利用者の質問を入れます。表と列の説明には、列の値の例や範囲、表ごとの見本が3行まで含まれます。最後の create で、これらをまとめて ChatGPT API に送ります。データベースのファイルや全件のデータは送りません。</aside>
+</section>

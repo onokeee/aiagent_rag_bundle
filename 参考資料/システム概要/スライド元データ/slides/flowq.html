@@ -1,0 +1,43 @@
+<section id="flowq" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ データの流れ</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">質問してから答えが出るまで</h2>
+<div style="height:8px"></div>
+<div style="display:flex;align-items:stretch;gap:12px">
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">1　外部に出ない</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">利用者が日本語で質問する</p>
+</div>
+<x-connector style="width:56px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">2　外部に出ない</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">アプリが関係する表を選び、表の説明を添える</p>
+</div>
+<x-connector style="width:56px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FCEFE3;border:2px solid #C26A1E;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">3　外部（ChatGPT API）</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">ChatGPT API が<br>使う道具と引数を決める<br>（ツール呼び出し）</p>
+</div>
+</div>
+<div style="display:flex;align-items:stretch;gap:12px">
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">4　外部に出ない＊</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">アプリが読むだけのSQL・文書検索を実行</p>
+</div>
+<x-connector style="width:56px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:2px solid #C26A1E;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">5　外部へ送る</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">結果の一部をAIに返す（必要なら3〜5を繰り返す）</p>
+</div>
+<x-connector style="width:56px;align-self:center"></x-connector>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px;background:#FDFDFB;border:2px solid #1F64A8;border-radius:14px;padding:28px 28px">
+<p style="font-size:24px;font-weight:700;color:#1F64A8">6　外部に出ない</p>
+<p style="font-size:28px;line-height:1.5;color:#14233A">回答・表・グラフを画面に少しずつ表示</p>
+</div>
+</div>
+<div style="flex:1"></div>
+<div style="display:flex;flex-direction:column;gap:6px;background:#FDFDFB;border-left:6px solid #C26A1E;padding:18px 28px">
+<p style="font-size:28px;line-height:1.5;color:#14233A">AIは「どう調べるか」を考えるだけ。実際にデータを読むのは、外部に出ないアプリの中です。</p>
+<p style="font-size:24px;line-height:1.5;color:#5B6B80">＊文書検索のときは、LightRAG が検索の言葉を同じ ChatGPT API（OpenAI）に送ります</p>
+</div>
+<aside>質問してから答えが出るまでの流れです。利用者が質問すると、アプリが関係しそうな表を選び、表と列の説明を添えて ChatGPT API に送ります。AIは「どの表を、どう集計するか」を決めて、前のページまでで説明したツール呼び出しの形でアプリに依頼を返します。実際にデータベースを読むのは、外部に出ないアプリの中で、読み取りだけのSQLを実行し、結果の一部をAIに返します。文書検索のときは、LightRAG が検索の言葉を同じ ChatGPT API に送って、関係する文書の抜粋を探します。足りなければこれを数回繰り返し、最後に回答・表・グラフを画面に少しずつ表示します。実行したSQLは回答に必ず残るので、何をどう数えたかを後から確かめられます。</aside>
+</section>

@@ -1,0 +1,17 @@
+<section id="tech" data-transition="fade" style="background:#EDF1F5;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ 使用技術</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">一般的な部品を、サーバ1台に組み合わせる</h2>
+<div style="height:16px"></div>
+<table style="font-size:28px;color:#3D4A5C;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:12px">
+<tr><th style="width:26%;text-align:left">役割</th><th style="width:74%;text-align:left">使っているもの</th></tr>
+<tr><td><b>言語・サーバ</b></td><td>Python 3.13 ／ Flask ＋ waitress（32人分を同時に処理）</td></tr>
+<tr><td><b>データベース</b></td><td>SQLite（ファイル1つ「統合.db」。取り込み中でも読める方式）</td></tr>
+<tr><td><b>AI</b></td><td>ChatGPT API（OpenAI。開発中は同じ作りのままローカルのAIに差し替え可）</td></tr>
+<tr><td><b>AIと道具の連携</b></td><td><b>ツール呼び出し（Tool Calling）</b>：40種類以上の道具をAIが選び、アプリが実行</td></tr>
+<tr><td><b>文書検索</b></td><td>LightRAG（いまはアプリと同じPC。中で OpenAI の API を使う）</td></tr>
+<tr><td><b>分析</b></td><td>pandas・SciPy・statsmodels（集計・統計・予測）</td></tr>
+<tr><td><b>出力</b></td><td>Excel・Word・PowerPoint・グラフ（Plotly）</td></tr>
+<tr><td><b>画面の部品</b></td><td>HTML・CSS・JavaScript（外部からの読み込みなし）</td></tr>
+</table>
+<aside>使っている技術です。プログラムは Python で書いていて、画面とサーバは Flask と waitress という一般的な組み合わせです。データベースは SQLite で、ファイル1つにまとまっています。取り込みの最中でも利用者の検索が待たされない方式（WAL）にしています。AIは ChatGPT API（OpenAI）を使い、開発中は同じ作りのまま、このPCで動くAIに切り替えられます。AIとアプリの連携には「ツール呼び出し」という仕組みを使っています。次のページから、全体像とステップごとのコードを説明します。文書検索は LightRAG で、いまはアプリと同じPCで動き、索引づくりと検索に OpenAI の API を使っています（本番では IT 部門が用意する LightRAG を使う予定です）。分析は pandas などの定番の部品、出力は Excel・Word・PowerPoint に対応しています。画面は外部のサイトから部品を読み込まない作りです。</aside>
+</section>

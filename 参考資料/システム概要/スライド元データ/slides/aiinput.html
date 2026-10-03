@@ -1,0 +1,30 @@
+<section id="aiinput" data-transition="fade" style="background:#EDF1F5;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">② セキュリティ設計</p>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">AIに渡すのは、答えるのに必要な分だけ</h2>
+<div style="display:flex;gap:32px">
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FDFDFB;border:3px solid #C26A1E;border-radius:16px;padding:32px 36px">
+<h3 style="font-size:34px;font-weight:700;color:#A8561A">AIに渡るもの（外部に出る）</h3>
+<ul style="font-size:26px;line-height:1.55;color:#3D4A5C">
+<li>質問の文章（その会話のやり取りを含む）</li>
+<li>表と列の説明（値の例・範囲、表ごとの見本3行まで）</li>
+<li>検索結果の一部（1回につき最大40行）</li>
+<li>文書検索の結果の抜粋</li>
+<li>本人の「記憶」メモ（本人が止められる）</li>
+<li>文書の中身（LightRAG が索引を作るとき）</li>
+</ul>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px;background:#FDFDFB;border:3px solid #1F64A8;border-radius:16px;padding:32px 36px">
+<h3 style="font-size:34px;font-weight:700;color:#1F64A8">AIに渡らないもの（外部に出ない）</h3>
+<ul style="font-size:26px;line-height:1.55;color:#3D4A5C">
+<li>データベースのファイル・全件のデータ</li>
+<li>パスワード・APIキー</li>
+<li>他の人の会話・マイロボット・記憶メモ</li>
+<li>利用者が対象から外した表</li>
+<li>文書の元のファイル</li>
+</ul>
+</div>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:28px;line-height:1.5;color:#14233A;background:#FDFDFB;border-left:6px solid #1F64A8;padding:20px 28px">ログイン必須。管理者の画面は管理者だけ、会話とマイロボットは本人だけ。<br>判定は画面ではなく、毎回サーバ側で行います。</p>
+<aside>AIに渡すのは、答えるのに必要な分だけです。質問の文章（同じ会話の前のやり取りを含む）と、表と列の説明、それにSQLで調べた結果の一部です。表と列の説明には、列の値の例や範囲と、表ごとの見本が3行まで含まれます。結果は画面には最大2,000行まで出しますが、AIに渡すのは1回につき最大40行までです。記憶機能を使っている人は、過去のやり取りから作った本人のメモも渡ります（本人が設定で止められます）。また、いまの LightRAG は文書の索引を作るときに、文書の中身を同じ ChatGPT API に送ります（本番で使う LightRAG では、その設定に従います）。一方で、データベースのファイルや全件のデータ、パスワード・APIキー、他の人の会話は渡しません。利用者が「対象から外した表」は、AIへの説明から消すだけでなく、データベースを読む段階でも拒否します。</aside>
+</section>

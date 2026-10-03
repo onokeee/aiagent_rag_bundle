@@ -1,0 +1,48 @@
+<section id="step4" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ ツール呼び出し　ステップ 4 / 5</p>
+<div style="display:flex;gap:8px">
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">1 送る</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">2 依頼</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">3 実行</p>
+<p style="font-size:24px;font-weight:700;color:#F3F5F8;background:#14233A;border:1px solid #14233A;border-radius:24px;padding:4px 16px">4 返す</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">5 回答</p>
+</div>
+</div>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">結果の一部をAIに返す</h2>
+<div style="display:flex;align-items:start;gap:40px">
+<div style="width:840px;flex:none;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;color:#14233A">アプリのコード（結果を会話に足して、もう一度AIへ）</p>
+<div style="display:flex;flex-direction:column;background:#14233A;border-radius:16px;padding:24px 28px;font-family:'BIZ UDGothic', monospace;color:#E6ECF3">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">messages.append(msg)&#160;&#160;<span style="color:#9FB7D0"># AIの依頼も会話に残す</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">messages.append({</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"role"</span>: <span style="color:#A9D3F5">"tool"</span>,</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"tool_call_id"</span>: call.id,&#160;&#160;<span style="color:#9FB7D0"># どの依頼への答えか</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px"><span style="color:#A9D3F5">"content"</span>: json.dumps({</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"columns"</span>: cols,</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"rows"</span>: rows[:40],&#160;&#160;<span style="color:#F2A65A"># AIに渡すのは最大40行</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#A9D3F5">"row_count"</span>: len(rows)}, ensure_ascii=False)})</p>
+<div style="height:16px"></div>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">resp = client.chat.completions.create(&#160;&#160;<span style="color:#F2A65A"># もう一度AIへ</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">model=MODEL, messages=messages, tools=tools)</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">外部（ChatGPT API）に送る中身（例）</p>
+<div style="display:flex;flex-direction:column;background:#FDFDFB;border:2px solid #C26A1E;border-radius:14px;padding:20px 24px;font-family:'BIZ UDGothic', monospace;color:#14233A">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">{<span style="color:#1F64A8">"role"</span>: "tool",</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"tool_call_id"</span>: "call_01",&#160;&#160;<span style="color:#A8561A">← 依頼の番号</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"content"</span>: {</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 36px"><span style="color:#1F64A8">"columns"</span>: ["件数"],</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 36px"><span style="color:#1F64A8">"rows"</span>: [[12]],&#160;&#160;<span style="color:#A8561A">← 最大40行まで</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 36px"><span style="color:#1F64A8">"row_count"</span>: 1}}</p>
+</div>
+<ul style="font-size:24px;line-height:1.5;color:#3D4A5C">
+<li>外部に出るのは結果の一部（最大40行）だけ。全件やDBファイルは送らない</li>
+<li>AIは結果を読み、足りなければまた依頼する（ステップ2に戻る）</li>
+<li>1つの質問で、この往復は最大10回まで</li>
+</ul>
+</div>
+</div>
+<aside>ステップ4です。実行した結果を会話に足して、もう一度AIに送ります。まず、ステップ2で受け取ったAIの依頼そのものを会話に残し、続けて tool という役割のメッセージで結果を足します。tool_call_id には依頼の番号を入れて、どの依頼への答えかを示します。結果のうち、AIに渡すのは最大40行までです。全件はアプリの中に残り、画面の表やファイル出力に使います。この会話を create でもう一度 ChatGPT API に送ると、AIは結果を読んで、足りていれば最終回答を、足りなければ次の依頼を返します。依頼ならステップ2に戻ります。この往復は、1つの質問につき最大10回までです。</aside>
+</section>

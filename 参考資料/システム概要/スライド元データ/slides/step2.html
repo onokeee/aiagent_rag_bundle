@@ -1,0 +1,50 @@
+<section id="step2" data-transition="fade" style="background:#F6F7F4;color:#3D4A5C;font-family:'BIZ UDPGothic', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:24px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#1F64A8">④ ツール呼び出し　ステップ 2 / 5</p>
+<div style="display:flex;gap:8px">
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">1 送る</p>
+<p style="font-size:24px;font-weight:700;color:#F3F5F8;background:#14233A;border:1px solid #14233A;border-radius:24px;padding:4px 16px">2 依頼</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">3 実行</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">4 返す</p>
+<p style="font-size:24px;color:#5B6B80;background:#FDFDFB;border:1px solid #CDD5DF;border-radius:24px;padding:4px 16px">5 回答</p>
+</div>
+</div>
+<h2 style="font-size:56px;font-weight:700;line-height:1.15;color:#14233A">AIから「依頼」が返ってくる</h2>
+<div style="display:flex;align-items:start;gap:40px">
+<div style="width:760px;flex:none;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;color:#14233A">アプリのコード（AIの返事を読む）</p>
+<div style="display:flex;flex-direction:column;background:#14233A;border-radius:16px;padding:24px 28px;font-family:'BIZ UDGothic', monospace;color:#E6ECF3">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">msg = resp.choices[0].message</p>
+<div style="height:16px"></div>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">if msg.tool_calls:&#160;&#160;<span style="color:#9FB7D0"># 依頼あり → ステップ3へ</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">for call in msg.tool_calls:</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px">name = call.function.name&#160;&#160;<span style="color:#9FB7D0"># "run_sql_query"</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px">args = json.loads(call.function.arguments)</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 96px"><span style="color:#9FB7D0"># args["sql"] に AI が書いた SQL が入っている</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">else:&#160;&#160;<span style="color:#9FB7D0"># 依頼なし → ステップ5（最終回答）</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 48px">answer = msg.content</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<p style="font-size:24px;font-weight:700;color:#A8561A">外部（ChatGPT API）から返ってくる中身（例）</p>
+<div style="display:flex;flex-direction:column;background:#FDFDFB;border:2px solid #C26A1E;border-radius:14px;padding:20px 24px;font-family:'BIZ UDGothic', monospace;color:#14233A">
+<p style="font-size:24px;line-height:1.35;white-space:nowrap">{<span style="color:#1F64A8">"role"</span>: "assistant",</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"content"</span>: null,&#160;&#160;<span style="color:#A8561A">← 文章は書かない</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 12px"><span style="color:#1F64A8">"tool_calls"</span>: [{</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 36px"><span style="color:#1F64A8">"id"</span>: "call_01",&#160;&#160;<span style="color:#A8561A">← 依頼の番号</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 36px"><span style="color:#1F64A8">"function"</span>: {</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 60px"><span style="color:#1F64A8">"name"</span>: "run_sql_query",&#160;&#160;<span style="color:#A8561A">← 使う道具</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 60px"><span style="color:#1F64A8">"arguments"</span>: {&#160;&#160;<span style="color:#A8561A">← 引数</span></p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 84px"><span style="color:#1F64A8">"sql"</span>: "SELECT COUNT(*) AS 件数 FROM 品質__不良記録</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 168px">WHERE strftime('%Y-%m', 発生日) = '2026-09'",</p>
+<p style="font-size:24px;line-height:1.35;white-space:nowrap;padding:0 0 0 84px"><span style="color:#1F64A8">"purpose"</span>: "先月の不良件数を数える"}}}]}</p>
+</div>
+<ul style="font-size:24px;line-height:1.5;color:#3D4A5C">
+<li>AIは文章の代わりに「この道具を、この引数で」と依頼を返す</li>
+<li>AIはデータベースに触れない。実行するかどうかはアプリが決める</li>
+<li>1回の返事に、依頼が複数入ることもある（順に実行する）</li>
+</ul>
+</div>
+</div>
+<aside>ステップ2です。AIからの返事には2種類あります。文章で答える場合と、道具を使ってほしいという「依頼」の場合です。右がその依頼の例です。content（文章）は空で、代わりに tool_calls に「run_sql_query という道具を、この引数で使ってほしい」と入っています。引数の sql には、AIが表の説明を見て書いたSQLが入っています。id は依頼の番号で、ステップ4で結果を返すときに「どの依頼への答えか」を示すのに使います。左のコードは、この返事を読む部分です。依頼があれば道具の名前と引数を取り出してステップ3へ進み、依頼が無ければ、それが最終回答なのでステップ5へ進みます。AIがデータベースに直接触れることはありません。依頼を実行するかどうかは、アプリが決めます。</aside>
+</section>
