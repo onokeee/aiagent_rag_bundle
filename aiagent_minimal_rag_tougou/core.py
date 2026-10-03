@@ -2314,7 +2314,19 @@ def _schedule_memory(user, chat: dict) -> None:
     if not a.strip() or (len(q.strip()) < 4 and not any(w in q for w in ("忘れ", "覚え"))):
         return
     # 書き直しに使うモデル: 管理者の指定（決めごと）> 回答に使ったモデル。スレッドの外で決めておく
-    model = memory_settings()["model"] or models.current(user)
+    # 決めごとに書いたモデルが、あとで「モデル設定」の一覧から外れることがある
+    # （保存のときにしか確かめていなかった）。そのままだと書き直しが毎回黙って失敗し続けるので、
+    # 使えなくなっていたら、回答に使ったモデルで書き直す
+    configured = memory_settings()["model"]
+    if configured:
+        try:
+            if configured not in models.available():
+                print(f"[memory] 決めごとのモデル「{configured}」はいまの一覧にありません。"
+                      "回答に使ったモデルで書き直します（管理者メニューで選び直してください）。")
+                configured = ""
+        except Exception:
+            pass                               # 一覧が取れないときは、決めごとのまま
+    model = configured or models.current(user)
     # 同時に走らせる本数に上限を付ける。50人が一斉に質問すると、回答のたびに
     # 立てていた分だけAIへの問い合わせが増え、レート制限に当たって
     # 本来の回答（利用者が待っている方）まで遅くなる。溢れた分は今回は見送る
@@ -6095,6 +6107,10 @@ def run_scraper(name: str, timeout_sec: int | None = None) -> dict:
             shutil.rmtree(out_dir, ignore_errors=True)
             if not out_dir.exists():
                 break
+        else:
+            # 3回とも消せなかった（取得したプログラムがまだファイルを掴んでいる等）。
+            # 黙って残すと、取得したファイルがサーバに溜まっていくので、ログに残す
+            print(f"[scraper] 取得用の一時フォルダを消せませんでした（手で消してください）: {out_dir}")
 
 
 # --- 出力先フォルダ（作ったファイルを、サーバ上の決まった場所にも置く） ----------------
@@ -6152,9 +6168,15 @@ def check_output_dir(path) -> tuple[bool, str]:
     probe = real / f".書き込み確認_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}.tmp"
     try:
         probe.write_bytes(b"ok")
-        probe.unlink()
     except OSError as e:
         return False, f"書き込めません（権限を確認してください）: {e}"
+    finally:
+        # 確認用のファイルは必ず片づける。消すのに失敗しても「書けない」とは言わない
+        # （書き込み自体はできている。ウイルス対策ソフトが一瞬掴んでいる等で起きる）
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[output] 書き込み確認用のファイルを消せませんでした: {probe} ({e})")
     return True, "使えます。"
 
 
@@ -7386,7 +7408,7 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
             if stamp == str(fresh.get("source_stamp") or ""):
                 return {**result, "skipped": True,
                         "message": "別の質問が同じ版を取り込み済みのため、取り込み直しませんでした。"}
-            if stamp == str(fresh.get("failed_stamp") or ""):
+            if _failed_recently(fresh, stamp):
                 return {**result, "skipped": True,
                         "message": "この版は別の質問が試して失敗済みのため、読み直しませんでした。"}
     try:
@@ -7474,10 +7496,12 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
         # 「変わったときだけ動く」ための基準になる（経路によらず記録する）
         saved["source_stamp"] = stamp
         saved.pop("failed_stamp", None)
+        saved.pop("failed_at", None)
     elif kind == "realtime" and stamp:
-        # 失敗した版を覚え、ファイルが変わるまで質問のたびに読み直さない。
+        # 失敗した版を覚え、しばらくは質問のたびに読み直さない（_failed_recently）。
         # 鍵の中で書くので、並んで待っていた質問にも見える
         saved["failed_stamp"] = stamp
+        saved["failed_at"] = started.isoformat(timespec="seconds")
     save_job(saved)
     history.add_import_record(job.get("db_file", ""), job.get("table", ""),
                 result["ok"], result["message"], kind=kind,
@@ -7544,6 +7568,22 @@ def _note_realtime_failure(job: dict, message: str) -> bool:
     return True
 
 
+def _failed_recently(job: dict, stamp: str) -> bool:
+    """この版は、ついさっき試して失敗したばかりか（それならしばらく読み直さない）。
+
+    「失敗した版は二度と試さない」にすると、共有フォルダの瞬断や、誰かがExcelで
+    開いていて読めなかっただけの失敗でも、ファイルを上書きし直すまで永久に
+    古い内容のまま答え続けてしまう。config.IMPORT_REALTIME_RETRY_MINUTES ごとに
+    1回だけ試し直す。いつ失敗したかの記録が無い古い設定は、すぐ1回試し直す。
+    """
+    if not stamp or stamp != str(job.get("failed_stamp") or ""):
+        return False
+    at = parse_dt(job.get("failed_at"))
+    if at is None:
+        return False
+    return (datetime.now() - at) < timedelta(minutes=config.IMPORT_REALTIME_RETRY_MINUTES)
+
+
 def refresh_realtime(scope: list[dict]) -> list[dict]:
     """スコープ内のテーブルのうち、元ファイルが更新されたものを取り込み直す。
 
@@ -7589,10 +7629,10 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
                          "table": job.get("table"), "db_file": job.get("db_file"),
                          "message": msg})
             continue
-        if stamp == str(job.get("failed_stamp") or ""):
-            # この版はもう試して駄目だった。質問のたびに読み直しても結果は同じで、
+        if _failed_recently(job, stamp):
+            # この版はついさっき試して駄目だった。質問のたびに読み直しても結果は同じで、
             # 大きなファイルだと1問ごとに数十秒待たせ、履歴も同じ失敗で埋まる。
-            # ファイルがさらに変わったら（stamp が違ったら）また試す
+            # ファイルが変わったら（stamp が違ったら）、または間隔が経ったらまた試す
             continue
         if stamp == str(job.get("source_stamp") or ""):
             # 変わっていない。ただし「ファイルが無い」で失敗扱いになった後、
@@ -7661,6 +7701,15 @@ _state: dict = {
     "last_ran": [],        # 直近に実行したジョブ [{name, ok, message, at}]
     "last_error": None,
 }
+#: 「直近の実行」は取り込みの周回とマイロボットの周回（別スレッド）の両方が足す。
+#: 読む→足す→書くの間に相手が書くと片方の記録が消えるので、鍵を通す
+_state_lock = threading.Lock()
+
+
+def _note_ran(entries: list) -> None:
+    """直近の実行記録に足す（新しい10件だけ残す）。"""
+    with _state_lock:
+        _state["last_ran"] = (list(_state.get("last_ran") or []) + list(entries))[-10:]
 
 
 def is_running() -> bool:
@@ -7713,7 +7762,7 @@ def tick() -> list:
     _state["tick_count"] += 1
     if ran:
         # 足す形にする。丸ごと置き換えると、別スレッドで動いたマイロボットの記録が消える
-        _state["last_ran"] = (list(_state.get("last_ran") or []) + ran)[-10:]
+        _note_ran(ran)
     # 「健全→失敗」「失敗→復旧」の変わり目だけ管理者に知らせる
     try:
         import mailer
@@ -7734,7 +7783,7 @@ def _robots_pass() -> None:
         for r in run_scheduled_robots():
             entry = {"name": f"🤖 {r['name']}（{r['user']}）", "ok": r["ok"],
                      "message": r["message"], "at": r["at"]}
-            _state["last_ran"] = (list(_state.get("last_ran") or []) + [entry])[-10:]
+            _note_ran([entry])
             _scheduler_log(("OK  " if r["ok"] else "NG  ") + f"🤖 {r['name']}（{r['user']}）: {r['message']}")
     except Exception as e:
         _scheduler_log(f"マイロボットの定期実行でエラー（続行）: {e}")
@@ -7773,6 +7822,12 @@ def start() -> bool:
         return False
     if is_running():
         return False
+    try:
+        n = _robots_reconcile_stuck()
+        if n:
+            _scheduler_log(f"前回、実行の途中でアプリが止まったマイロボット {n}件を「中断」に直しました。")
+    except Exception as e:                 # 直せなくても、スケジューラは動かす
+        _scheduler_log(f"「実行中」のまま残った印を直せませんでした（続行）: {e}")
     _stop.clear()
     t = threading.Thread(target=_loop, name=_THREAD_NAME, daemon=True)
     t.start()
@@ -8600,6 +8655,28 @@ def load_user_into_context():
     if not isinstance(data, dict):
         g.user = None
         return
+    # 利用者の一覧が、ログインしたあとに書き換わっていたら確かめ直す。
+    # 確かめないと、消された人・管理者から外された人のログインが、ブラウザを
+    # 閉じるまで（何日も開きっぱなしなら何日でも）そのまま効き続ける。
+    # 一覧が変わっていなければ何もしない（毎回ファイルを読まない）。
+    # 版を持っていないセッション（この仕組みを入れる前にログインした分）は対象外。
+    try:
+        seen, now_v = data.get("uv"), auth.users_version()
+        if seen is not None and now_v is not None and seen != now_v:
+            name = str(data.get("username") or "")
+            if auth.known_now(name) is False:
+                print(f"[auth] 利用者の一覧から消えたため、ログインを解きました: {name}")
+                session.pop(_USER_KEY, None)
+                g.user = None
+                return
+            groups = auth.groups_now(name)
+            data = {**data, "uv": now_v}
+            if groups is not None:                # 確かめられたときだけ、いまの権限にする
+                data["groups"] = list(groups)
+                data["is_admin"] = auth.AUTH_ADMIN_GROUP in groups
+            session[_USER_KEY] = data
+    except Exception as e:                        # 確かめられなくても、いまの状態で続ける
+        print(f"[auth] ログインの確かめ直しに失敗しました（続行）: {e}")
     try:
         g.user = auth.User(username=str(data.get("username") or ""),
                            display_name=str(data.get("display_name") or ""),
@@ -8612,8 +8689,10 @@ def load_user_into_context():
 
 
 def login_user(user: auth.User) -> None:
+    # uv … ログインした時点の利用者一覧の版（load_user_into_context が確かめ直しに使う）
     session[_USER_KEY] = {"username": user.username, "display_name": user.display_name,
-                          "groups": list(user.groups), "is_admin": user.is_admin}
+                          "groups": list(user.groups), "is_admin": user.is_admin,
+                          "uv": auth.users_version()}
     session.permanent = False
 
 
@@ -8742,6 +8821,10 @@ def dbs_in_sql(sql: str, scope: list[dict]) -> list[dict]:
     return out
 
 
+#: 直前が「AS」（列や式に付けた別名の書き方）
+_AS_BEFORE = re.compile(r"(?i)\bAS\s*\Z")
+
+
 def tables_in_sql(sql: str, scope: list[dict], limit: int = 6) -> list[dict]:
     """SQLが触れているテーブルを {db, table} で返す。
 
@@ -8758,8 +8841,12 @@ def tables_in_sql(sql: str, scope: list[dict], limit: int = 6) -> list[dict]:
             qualified = (alias and re.search(
                 r'(?<![\w.])' + re.escape(alias) + r'\s*\.\s*' + re.escape(name) + r'(?![\w])',
                 flat, re.IGNORECASE))
-            bare = re.search(r'(?<![\w.])' + re.escape(name) + r'(?![\w])',
-                             flat, re.IGNORECASE)
+            # 列の別名（SELECT 1 AS orders / AS "orders"）は表を使っていない。
+            # 数えると、マイロボットが使っていない表まで「使う表」に入り、その表を
+            # 消しただけで「表が見つかりません」と止まってしまう
+            bare = any(not _AS_BEFORE.search(flat[:m.start()])
+                       for m in re.finditer(r'(?<![\w.])' + re.escape(name) + r'(?![\w])',
+                                            flat, re.IGNORECASE))
             if not (qualified or bare):
                 continue
             key = (s.get("name"), name)
@@ -10962,6 +11049,36 @@ def _robot_date_text_safe(h: dict, now: datetime) -> str:
         return "?"
 
 
+#: 比べている相手が「年・日付」らしいかの目印（列名・関数・日本語の列名）
+#: y / yr / yy / yyyy は、年を短い別名にしたもの（strftime('%Y', d) AS y など。AIがよく書く）
+_ROBOT_YEARISH = re.compile(r"(?i)year|date|time|strftime|%Y|nendo|fiscal|(?<![a-z])fy"
+                            r"|(?<![a-z0-9_])(?:y|yr|yy|yyyy)(?![a-z0-9_])|年|日|月|期")
+#: 比べる相手そのものが年の数値（2026 = 2026 のように、年どうしを比べている）
+_ROBOT_YEAR_TAIL = re.compile(r"(?<![\w.])20[0-9]{2}\s*\Z")
+_ROBOT_CMP_TAIL = re.compile(r"(?:=|==|<>|!=|<=|>=|<|>)\s*\Z")
+_ROBOT_SQL_KEYWORD = re.compile(r"(?i)\b(?:where|and|or|on|having|when|select|case)\b")
+
+
+def _robot_bare_year_ok(text: str, pos: int) -> bool:
+    """SQL の裸の 20xx が、本当に「年」として比べられているか。
+
+    裸の数値は、実行日の年に置き換える値として拾う（strftime('%Y', 日付) = 2026 など）。
+    ところが「顧客ID = 2025」「金額 > 2000」のような、年ではない数値まで拾うと、
+    毎年その数値が書き換わり、黙って別の行を取るようになる（気づきにくい）。
+    「= / < / >」で比べている形なら、比べる相手（左辺）に年や日付の目印があるときだけ
+    年とみなす。比べる形でないもの（IN (2025, 2026) や BETWEEN …）はこれまでどおり拾う。
+    拾われた値は、登録の画面の「実行日で変わる値」に並ぶので、人が確かめられる。
+    """
+    m = _ROBOT_CMP_TAIL.search(text[:pos])
+    if not m:
+        return True
+    left = text[max(0, m.start() - 120):m.start()]
+    cut = [k.end() for k in _ROBOT_SQL_KEYWORD.finditer(left)]
+    if cut:
+        left = left[cut[-1]:]
+    return bool(_ROBOT_YEARISH.search(left) or _ROBOT_YEAR_TAIL.search(left))
+
+
 def _robot_dates_in_text(text: str, sql: bool = False) -> list[tuple]:
     """文字列の中の日付らしい値 [(開始, 終了, 種類, 書式, 値)]。
 
@@ -10976,8 +11093,11 @@ def _robot_dates_in_text(text: str, sql: bool = False) -> list[tuple]:
         skip += [(m.start(), m.end()) for m in _ROBOT_SQL_IDENT.finditer(text)]
         skip += [(m.start(), m.end()) for m in _ROBOT_SQL_IDENT2.finditer(text)]
         for m in _ROBOT_YEAR_NUM.finditer(text):
-            if not any(a <= m.start() < b for a, b in skip):
-                found.append((m.start(), m.end(), "year", "{Y}", m.group(1)))
+            if any(a <= m.start() < b for a, b in skip):
+                continue
+            if not _robot_bare_year_ok(text, m.start()):
+                continue                       # ID や金額など、年ではない数値
+            found.append((m.start(), m.end(), "year", "{Y}", m.group(1)))
         # '2026' のように、文字列の中身が年だけのもの（strftime('%Y', ...) = '2026'）
         for a0, b0 in regions:
             if re.fullmatch(r"20[0-9]{2}", text[a0:b0]):
@@ -11892,19 +12012,61 @@ def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> No
             print(f"[robot] 実行結果を書き戻せませんでした（実行そのものは終わっています）: {e}")
 
 
-def _robot_claim(user, rid: str):
+def _robots_reconcile_stuck() -> int:
+    """前回、実行の途中でアプリが止まって「実行中…」のまま残った定期実行を「中断」に直す。
+
+    _robot_claim は動かす直前に「実行中…」の印を付ける。そのあとアプリが落ちる
+    （再起動・停電）と、書き戻す人がいないまま印が残り、画面ではずっと「実行中…」に
+    見える。スケジューラが立ち上がるときに一度だけ見て、残っていれば「中断」として
+    実行履歴に1件足す（その回は動かし直さない。ファイルやメールが二重になるため）。
+    """
+    root = config.USER_META_DIR
+    if not root.exists():
+        return 0
+    n = 0
+    msg = "前回、実行の途中でアプリが止まりました（この回は中断。次の予定から動きます）。"
+    with _robots_lock:
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            p = d / "robots.json"
+            if not p.exists():
+                continue
+            data = _read_json(p)
+            if not isinstance(data, dict) or not isinstance(data.get("robots"), list):
+                continue                       # 読めないファイルには書かない
+            changed = False
+            for r in data["robots"]:
+                sch = r.get("schedule") if isinstance(r, dict) else None
+                if not isinstance(sch, dict) or sch.get("last_status") != "running":
+                    continue
+                sch["last_status"] = "error"
+                sch["last_message"] = msg
+                hist = [h for h in (r.get("history") or []) if isinstance(h, dict)]
+                hist.append({"at": chats.now(), "source": "schedule", "ok": False,
+                             "message": msg, "chat_id": ""})
+                r["history"] = hist[-ROBOT_HISTORY_MAX:]
+                changed = True
+                n += 1
+            if changed:
+                _write_json(p, data)
+    return n
+
+
+def _robot_claim(user, rid: str, now: datetime | None = None):
     """定期実行を始める直前に、登録を読み直して「いま動かす」と印を付ける。
 
     戻り値は動かすロボット（止められた・消された・時刻がまだなら None）。
     先に刻みを押さえるのは、実行の途中でアプリが落ちたときに、次の起動で
     もう一度動いてファイルやメールが二重になるのを防ぐため（1回抜けるほうが安全）。
+    now … 「時刻が来たか」を決める基準の時刻。run_scheduled_robots(now) と同じものを使う
+    （ここだけ実時刻で見ると、基準の時刻を渡して回したときに、来たはずの回を断ってしまう）。
     """
+    now = now or datetime.now()
     with _robots_lock:
         fresh = robot_get(user, rid)
         if fresh is None:
             return None
-        nxt = robot_next_scheduled(fresh)
-        if nxt is None or nxt > datetime.now():
+        nxt = robot_next_scheduled(fresh, now)
+        if nxt is None or nxt > now:
             return None                        # 管理者が止めた・本人が設定を変えた
         sch = _robot_schedule_norm(fresh)
         sch.update({"last_run": chats.now(), "last_status": "running", "last_message": "実行中…"})
@@ -12042,12 +12204,12 @@ def robots_due(now: datetime | None = None) -> list[tuple]:
     return out
 
 
-def _run_scheduled_robot(app, user, robot: dict) -> dict | None:
+def _run_scheduled_robot(app, user, robot: dict, now: datetime | None = None) -> dict | None:
     """時刻が来たロボットを1つ、本人の名前で動かす（1周の中の1本。並列でも1本ずつはここを通る）。
 
     戻り値は画面とログに出す記録。直前に止められた・消された・時刻が変わったときは None。
     """
-    robot = _robot_claim(user, robot["id"])
+    robot = _robot_claim(user, robot["id"], now)
     if robot is None:                 # 直前に止められた・消された・時刻が変わった
         return None
     # 権限は _robot_owner が実行のたびに引き直している。ここではもう一段、
@@ -12085,8 +12247,15 @@ def _run_scheduled_robot(app, user, robot: dict) -> dict | None:
         message = f"定期実行でエラー: {e}"
         try:
             message = _robot_failed(user, robot, message, "schedule")
-        except Exception:
-            pass
+        except Exception as e2:
+            # 失敗の後始末（知らせのメールなど）そのものが落ちると、動かす直前に付けた
+            # 「実行中…」の印が書き戻されないまま残る。記録だけは必ず残す
+            print(f"[robot] 失敗の後始末でもエラー: {e2}")
+            try:
+                _robot_write_back(user, robot["id"], False,
+                                  f"{message}（後始末でもエラー: {e2}）", "schedule")
+            except Exception as e3:
+                print(f"[robot] 実行結果を書き戻せませんでした: {e3}")
     print(f"[robot] 定期実行 {'OK' if ok else 'NG'} 「{robot.get('name')}」（{user.username}）: {message[:120]}")
     return {"user": user.username, "name": robot.get("name") or "（無題）", "ok": ok,
             "message": message, "at": chats.now()}
@@ -12117,7 +12286,7 @@ def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
         if scheduler.stopping():          # 終了の合図。まだ始めていない分は次回に回す
             return None
         user, robot = pair
-        return _run_scheduled_robot(app, user, robot)
+        return _run_scheduled_robot(app, user, robot, now)
 
     if workers <= 1 or len(due) == 1:
         out = [one(p) for p in due]
@@ -12169,9 +12338,24 @@ def _robot_steps_detail(steps: list[dict], holes: list[dict] | None = None) -> l
     return out
 
 
-def _robot_row(r: dict, settings: dict | None = None) -> dict:
-    """画面の一覧に出す形（本人の一覧・管理者の一覧）。詳細（手順の中身）は steps_detail に。"""
+def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
+    """画面の一覧に出す形（本人の一覧・管理者の一覧）。詳細（手順の中身）は steps_detail に。
+
+    mail … メールの決めごと（mailer.settings()）。一覧で何度も読まないよう、呼ぶ側で1回読んで渡す。
+    """
     steps = r.get("steps") or []
+    notify_to = [str(a) for a in (r.get("notify_to") or [])]
+    # 失敗したときの知らせ先が、登録したあとで「メール設定」の許可から外れることがある。
+    # そのままだと、失敗した瞬間に知らせも届かず、誰も気づかない。一覧の時点で印を出す
+    notify_invalid = []
+    if notify_to:
+        try:
+            if mail is None:
+                import mailer
+                mail = mailer.settings()
+            notify_invalid = [a for a in notify_to if not mail.allows(a)]
+        except Exception as e:
+            print(f"[robot] 知らせ先の確認をできませんでした（続行）: {e}")
     nxt = _robot_try_wait(r)
     sch = _robot_schedule_norm(r)
     holes = [h for h in (r.get("holes") or []) if isinstance(h, dict)]
@@ -12183,12 +12367,16 @@ def _robot_row(r: dict, settings: dict | None = None) -> dict:
     except (TypeError, ValueError):
         nxt_s = None
     return {"id": r.get("id"), "name": r.get("name") or "（無題）",
+            # 画面が持つ版。保存のときに送り返してもらい、管理者が止めたあとの
+            # 古い画面からの保存を見分ける（robots_update）
+            "updated_at": str(r.get("updated_at") or ""),
             "n_steps": len(steps),
             "schedule": {**sch, "next_at": nxt_s.isoformat(timespec="minutes") if nxt_s else "",
                          # 管理者の最低間隔より短い設定。動かない（間隔を直すまで）
                          "floor_blocked": floor_blocked},
             "mail_auto": bool(r.get("mail_auto")),
-            "notify_to": list(r.get("notify_to") or []),
+            "notify_to": notify_to,
+            "notify_invalid": notify_invalid,     # 許可から外れていて、知らせが届かない宛先
             "history": [h for h in (r.get("history") or []) if isinstance(h, dict)][-ROBOT_HISTORY_MAX:],
             "has_mail_steps": any(s.get("name") == "compose_email" for s in steps),
             "mail_table": bool(r.get("mail_table")),     # 昔のロボット（この欄が無い）は付けない
@@ -12219,7 +12407,12 @@ def _robot_row(r: dict, settings: dict | None = None) -> dict:
 def _robot_rows(user) -> list[dict]:
     """一覧を画面の形で。決めごとの読み込みは1回で済ませる。"""
     settings = robot_settings()
-    return [_robot_row(r, settings) for r in robots_list(user)]
+    import mailer
+    try:
+        mail = mailer.settings()
+    except Exception:
+        mail = None
+    return [_robot_row(r, settings, mail) for r in robots_list(user)]
 
 
 def _robot_turns(steps: list[dict]) -> list[dict]:
@@ -12341,7 +12534,13 @@ def robots_save():
     holes = [h for h in holes if "{{" + h["key"] + "}}" in used]
     scope = build_scope({f.name: [] for f in db.list_db_files()})
     # 使う表。Excel出力の sheets[].sql のような入れ子の SQL も見る
-    tables = sorted({t["table"] for s in kept for sql in _robot_sqls(s["arguments"])
+    # ユーザー定義ツールの手順は、引数にSQLを持たない（SQLはツールの定義の側にある）。
+    # 見ないと「使う表」から漏れ、その表の削除・改名がロボットに届かない
+    custom_sql = {t.get("name"): str(t.get("sql") or "")
+                  for t in custom_tools.collect_everywhere(include_disabled=True)}
+    tool_tables = {t["table"] for s in kept if custom_sql.get(s.get("name"))
+                   for t in tables_in_sql(custom_sql[s["name"]], scope, limit=200)}
+    tables = sorted(tool_tables | {t["table"] for s in kept for sql in _robot_sqls(s["arguments"])
                      for t in tables_in_sql(sql, scope, limit=200)})
     questions = []
     for s in kept:
@@ -12429,6 +12628,16 @@ def robots_update():
     robot = robot_get(g.user, str(body.get("id") or ""))
     if robot is None:
         return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    # 画面を開いたあとに、管理者がこのロボットを止めていたら（版が変わっていたら）断る。
+    # 断らないと、開きっぱなしの古い画面で定期実行の設定を保存しただけで、
+    # 止められたはずの定期実行が黙って再開してしまう。
+    # 版を送ってこない古い画面は、これまでどおり通す
+    stamp = body.get("stamp")
+    if stamp is not None and str(stamp) != str(robot.get("updated_at") or ""):
+        return jsonify({"error": "この画面を開いたあとに、このマイロボットが変更されました"
+                                 "（管理者が定期実行や自動送信を止めた可能性があります）。"
+                                 "一覧を読み直したので、内容を確かめてからもう一度操作してください。",
+                        "stale": True}), 409
     changed = False
     if "name" in body:
         name = str(body.get("name") or "").strip()
@@ -12845,7 +13054,8 @@ def catalog_index():
         join_status=catalog.join_candidates_status(target, profile),
         er=_er_payload(target, profile, meta),
         # ツールはDBに紐づけずに作るので、一覧も全DB分を出す（組み込みと同じ扱い）
-        custom=custom_tools.collect_everywhere(),
+        # 「有効」を外したツールも並べる（並べないと、二度と有効に戻せない）
+        custom=custom_tools.collect_everywhere(include_disabled=True),
         builtin=[_builtin_view(t) for t in tools.BUILTIN_TOOLS],
         chart_fields={t: list(charts.required_fields(t)) for t in charts.CHART_TYPES},
         builtin_overrides=meta.get("builtin_tools") or {},
@@ -13655,6 +13865,11 @@ def _robot_overview() -> list[dict]:
     except OSError:
         return out
     settings = robot_settings()
+    try:
+        import mailer
+        mail = mailer.settings()               # 知らせ先の確認に使う（全員分で1回だけ読む）
+    except Exception:
+        mail = None
     for d in sorted(dirs):
         p = d / "robots.json"
         if not p.exists():
@@ -13664,7 +13879,7 @@ def _robot_overview() -> list[dict]:
                  if isinstance(r, dict) and r.get("id")]
         if not items:
             continue
-        rows = [_robot_row(r, settings) for r in items]
+        rows = [_robot_row(r, settings, mail) for r in items]
         out.append({"user": d.name,
                     "display_name": next((str((r.get("owner") or {}).get("display_name") or "")
                                           for r in items if (r.get("owner") or {}).get("display_name")), ""),
@@ -14657,7 +14872,13 @@ def save_table():
         tm["columns"] = cols
     else:
         tm.pop("columns", None)
-    tm.pop("ai_draft", None)
+    # 画面が「AIが埋めてから1文字も直さずに保存した」と言ってきたときだけ、
+    # 「AI下書き・未確認」の印を残す（AIにも「AI推測・未確認」として渡る）。
+    # 人が直した・書いたときは外す
+    if body.get("ai_draft") is True:
+        tm["ai_draft"] = True
+    else:
+        tm.pop("ai_draft", None)
     # explanation はビューの「このSQLがしていること」。説明を空にして保存しても消さない
     if not any(tm.get(k) for k in ("description", "columns", "primary_key", "glossary", "explanation")):
         tables.pop(table, None)
@@ -15137,7 +15358,8 @@ def _w_draft_tool():
     render = body.get("render") or "table"
     # AIが付けた名前が不正・重複でも、保存で突き返されるのはユーザーには
     # 意味不明（名前を入力していないので）。ここで必ず有効な名前に直す。
-    taken = [t.get("name") for t in custom_tools.collect_everywhere()]
+    # 無効にしているツールの名前も使用中（同じ名前で作ると上書きになる）
+    taken = [t.get("name") for t in custom_tools.collect_everywhere(include_disabled=True)]
     tried = []
     draft, last_err = None, None
     for attempt in range(2):          # 1回目でだめならエラーを見せて書き直させる
@@ -15452,7 +15674,10 @@ def save_tool():
     catalog.save_meta(path, meta)
     # 表の削除と同じ考え方で、動かなくなるマイロボットを知らせる（勝手に直さない）
     robots = _robots_using_tool(gone) if gone else []
-    return jsonify({"ok": True, "robots": robots})
+    # いまのツールの一覧も返す。画面は保存のあと読み直すが、他の書きかけがあると
+    # 読み直しを断れる。断ったときも、画面の控え（CAT.custom）が古いままにならないように
+    return jsonify({"ok": True, "robots": robots,
+                    "tools": custom_tools.collect_everywhere(include_disabled=True)})
 
 
 @bp_catalog.post("/api/catalog/builtin")
@@ -16395,7 +16620,11 @@ def knowledge_update(kb_id):
 @bp_knowledge.post("/api/knowledge/<kb_id>/delete")
 @admin_required
 def knowledge_delete(kb_id):
-    if not rag.kb_delete(kb_id):
+    try:
+        gone = rag.kb_delete(kb_id)
+    except rag.RegistryError as e:         # 登録簿が読めない。書かずに理由を返す
+        return jsonify({"error": str(e)}), 409
+    if not gone:
         return jsonify({"error": "対象のナレッジベースが見つかりません。"}), 404
     return jsonify({"ok": True, "bases": rag.kb_list()})
 
@@ -16502,7 +16731,12 @@ def knowledge_prefs_save():
     if "off" in d:
         # 実在するidだけ残す。消えた環境のidを持ち続けても意味がなく、
         # 同じidが再利用されることもない。
-        known = {e["id"] for e in rag.kb_list()}
+        # ただし登録簿が壊れて読めないときは保存しない。読めない＝0件と取り違えると、
+        # 外していた文書がすべて「実在しない」扱いになり、除外設定が全部消える
+        known = rag.kb_ids_or_none()
+        if known is None:
+            return jsonify({"error": "ナレッジベースの登録簿が読めないため、いまは保存できません。"
+                                     "管理者に知らせてください（外している文書の設定はそのまま残っています）。"}), 503
         off = d.get("off") or []
         if not isinstance(off, (list, tuple)):
             return jsonify({"error": "外す文書の指定が正しくありません。"}), 400

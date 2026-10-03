@@ -233,8 +233,10 @@ class HttpApiAuthProvider(AuthProvider):
                 body = res.read().decode("utf-8", "replace")
                 status = res.status
         except urllib.error.HTTPError as e:
-            # 401/403 は「認証失敗」、それ以外は異常として扱う
-            if e.code in (400, 401, 403):
+            # 401/403 だけを「名前かパスワードが違う」として扱う。400 は、多くの場合
+            # こちらの送り方の設定（AUTH_API_USER_FIELD など）の誤りで、それまで
+            # 「パスワードが違う」に潰すと、設定の誤りに誰も気づけない
+            if e.code in (401, 403):
                 return None
             raise AuthError(f"認証APIがエラーを返しました: HTTP {e.code}")
         except Exception as e:
@@ -355,6 +357,22 @@ def groups_now(username: str) -> list | None:
     except AuthError:
         return None                               # 一覧が読めないときは写しのままにする
     return []                                     # 一覧から消えている＝権限は無い
+
+
+def users_version() -> str | None:
+    """利用者の一覧（auth_users.yaml）の「版」。書き換わると変わる。
+
+    ログインしたときの版をセッションに入れておき、版が変わったあとの最初の要求で
+    「まだ居るか・いまの権限は何か」を確かめ直すのに使う（毎回ファイルを読まずに済む）。
+    外部の認証API（http）のときは None（パスワード無しでは確かめられないため）。
+    """
+    if (AUTH_PROVIDER or "local").strip().lower() != "local":
+        return None
+    try:
+        st = AUTH_USERS_FILE.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return "none"                             # ファイルが無い（まだ誰も足していない）
 
 
 def known_now(username: str) -> bool | None:

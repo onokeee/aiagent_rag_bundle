@@ -75,6 +75,11 @@ IMPORT_SCHEDULER = (os.getenv("IMPORT_SCHEDULER", "true").strip().lower()
                     in ("1", "true", "yes", "on"))
 # 何秒おきに「期限が来たジョブがあるか」を見に行くか。
 IMPORT_SCHEDULER_TICK_SEC = int(os.getenv("IMPORT_SCHEDULER_TICK_SEC", "60") or 60)
+#: リアルタイム更新で失敗した版を、ファイルが変わらなくても試し直すまでの間隔（分）。
+#: 失敗した版は質問のたびに読み直さないようにしているが、共有フォルダの瞬断・
+#: 開いていたExcelの鍵など「待てば直る」失敗まで永久に避け続けると、ファイルを
+#: 上書きし直すまで古い内容のまま答え続けてしまう。この間隔ごとに1回だけ試し直す。
+IMPORT_REALTIME_RETRY_MINUTES = 10
 # 追記(append)時に付ける取得日時の列名
 IMPORT_TIMESTAMP_COLUMN = os.getenv("IMPORT_TIMESTAMP_COLUMN", "取得日時").strip() or "取得日時"
 
@@ -108,7 +113,10 @@ FEEDBACK_MAX_READ = int(os.getenv("FEEDBACK_MAX_READ", "20000") or 20000)
 # 書き足して data/users/<利用者>/memory.yaml に残す。次の質問からシステムプロンプトに載る。
 # 利用者は「パーソナライズ」の画面で直す・止めることができる。
 # 管理者メニュー → パーソナライズ で変えられる。ここは画面で保存する前の初期値。
-MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# 真偽値は、ほかの設定（IMPORT_SCHEDULER など）と同じく「1/true/yes/on のときだけ ON」で読む。
+# 既定は "1" なので、書いていない・正しく書いているときの動きは変わらない。
+# 変わるのは書き間違えたとき（例: "flase"）で、黙って ON のままにならず OFF に倒れる
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "2000") or 2000)   # 本文の文字数（1つのテキスト）
 # 書き直しに使うモデル。空なら回答と同じモデル。安いモデルにすると1質問あたりの追加費用を抑えられる
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "").strip() or None
@@ -126,7 +134,8 @@ MEMORY_SETTINGS_FILE = Path(os.getenv("MEMORY_SETTINGS_FILE",
 # 畳んで1行にしておき、押した人だけに開く。どれを畳むかは管理者が決める（全員共通）。
 # 管理者メニュー → 画面 で変えられる。ここは画面で保存する前の初期値。
 def _flag(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+    # ほかの設定と同じ読み方（1/true/yes/on のときだけ ON。上の MEMORY_ENABLED の説明を参照）
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 CHAT_FOLD_SQL = _flag("CHAT_FOLD_SQL", "1")              # SQLの枠（SQL本文・解説・正誤）

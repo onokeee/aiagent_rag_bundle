@@ -519,7 +519,7 @@ def regression(columns: list, rows: list, target: str, features: list,
         # 多重共線性。説明変数どうしが強く相関していると係数の解釈ができない
         if X.shape[1] > 1:
             from statsmodels.stats.outliers_influence import variance_inflation_factor
-            vifs = []
+            vifs, vif_failed = [], []
             arr = Xc.to_numpy(dtype=float)
             for i, name in enumerate(Xc.columns):
                 if name == "const":
@@ -527,7 +527,7 @@ def regression(columns: list, rows: list, target: str, features: list,
                 try:
                     vifs.append([name, variance_inflation_factor(arr, i)])
                 except Exception:
-                    pass
+                    vif_failed.append(str(name))
             if vifs:
                 tables.append(_advanced_table("多重共線性(VIF)", ["変数", "VIF"], vifs))
                 bad = [n for n, v in vifs if v and v > 10]
@@ -535,6 +535,11 @@ def regression(columns: list, rows: list, target: str, features: list,
                     notes.append(f"※ VIFが10を超える変数（{', '.join(bad)}）があります。"
                                  "説明変数どうしが似すぎていて、係数の意味を読み違えます。"
                                  "どちらかを外してください。")
+            if vif_failed:
+                # 黙って抜かすと「似すぎた変数は無い」と読まれてしまう
+                notes.append(f"※ 説明変数の似すぎ（VIF）を計算できなかった変数があります"
+                             f"（{', '.join(vif_failed[:5])}）。ほかの変数とほぼ同じ値の可能性が"
+                             "あるので、係数の読み方に注意してください。")
         resid = model.resid
         dw = float(sm.stats.durbin_watson(resid))
         notes.append(f"残差の自己相関 Durbin-Watson = {dw:.2f}"
@@ -549,6 +554,12 @@ def regression(columns: list, rows: list, target: str, features: list,
             tables.append(_advanced_table("検証（学習に使っていないデータでの成績）",
                                  ["項目", "値"], hold["rows"]))
             notes.append(hold["note"])
+        else:
+            # 黙って消すと「検証していない」のか「検証したが出せなかった」のか
+            # 分からず、学習に使ったデータでの成績だけで「予測に使える」と読まれてしまう
+            notes.append("※ 学習に使っていないデータでの検証は出せませんでした"
+                         "（件数に対して説明変数が多い、または計算できない形のデータのため）。"
+                         "上の成績は学習に使ったデータでのもので、予測に使えるかは分かりません。")
     notes.append("回帰は相関の構造を示すもので、因果を証明するものではありません。")
 
     meta = {"method": method, "n": len(X),
@@ -2039,15 +2050,24 @@ INLINE_LIMIT_MIN = 4_000
 INLINE_LIMIT_MAX = 400_000
 
 
+#: モデル設定のファイルが読めなかったときの理由。読めないと既定値で動くため、
+#: 管理者が選んだモデルや文脈量が黙って効かなくなる。「モデル設定」画面に出す
+_admin_read_error = ""
+
+
 def _read_admin() -> dict:
+    global _admin_read_error
     p = config.MODEL_SETTINGS_FILE
     if not p.exists():
+        _admin_read_error = ""
         return {}
     try:
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     except Exception as e:
         print(f"[models] 設定を読めませんでした: {p} ({e})")
+        _admin_read_error = f"{p.name}: {e}"
         return {}
+    _admin_read_error = ""
     return {k: v for k, v in data.items() if k in ADMIN_KEYS} \
         if isinstance(data, dict) else {}
 
@@ -2389,6 +2409,10 @@ def admin_status(refresh: bool = False, scope: list[dict] | None = None) -> dict
         "catalog_chars": catalog_total_chars(),
         # 候補ごとの文脈量とカタログ上限。出所も返す（登録 / 公式の表 / 推定）
         "contexts": [_context_row(m) for m in names],
+        # 黙って既定値に戻っている・絞り込みが失敗し続けている、を画面で知らせる
+        "config_read_error": _admin_read_error,
+        "router_failures": _route_failures,
+        "router_last_error": _route_last_error,
     }
     if scope is not None:
         import llm
@@ -7350,7 +7374,8 @@ def coerce_params(tool: dict, args: dict) -> dict:
     return out
 
 
-def collect_everywhere(selected: list[dict] | None = None) -> list[dict]:
+def collect_everywhere(selected: list[dict] | None = None,
+                       include_disabled: bool = False) -> list[dict]:
     """全DBのユーザー定義ツールを集める。置き場のDBを選んでいなくても拾う。
 
     ツールは作るときにDBを意識させない（SQLがどのDBに入るかはAIが決める）ので、
@@ -7359,6 +7384,10 @@ def collect_everywhere(selected: list[dict] | None = None) -> list[dict]:
 
     selected を渡すと、そのSQLが名指ししているDBが1つも選ばれていないツールは外す。
     いま見ている範囲と関係のないツールまで並べると、AIの選び分けが鈍るため。
+
+    include_disabled … 「有効」を外したツールも含める（カタログの編集画面用）。
+    含めないと、一度無効にしたツールが一覧から消え、画面から有効に戻せなくなる。
+    AIに配る道具の一覧では含めない（既定）。
     """
     import catalog                       # 循環importを避けるため、使うときに読む
     import db as dbmod
@@ -7371,7 +7400,9 @@ def collect_everywhere(selected: list[dict] | None = None) -> list[dict]:
             if not isinstance(t, dict):
                 continue
             name = str(t.get("name") or "").strip()
-            if not name or name in seen or t.get("enabled") is False:
+            if not name or name in seen:
+                continue
+            if t.get("enabled") is False and not include_disabled:
                 continue
             if picked:
                 needs = set(dbmod.dbs_named_in(str(t.get("sql") or "")))
@@ -11855,6 +11886,36 @@ def _kb_read() -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+def _kb_read_for_edit() -> list[dict]:
+    """書き換える前に読む用。ファイルはあるのに読めないときは断る（RegistryError）。
+
+    _kb_read は読めないとき空を返す（画面やAIに出す分には、それで困らない）。
+    ところが書き換えの前にそれを使うと「0件」と取り違え、1件足しただけで
+    他の登録（APIキーごと）を全部消して上書きしてしまう。
+    """
+    p = _kb_path()
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise RegistryError(
+            f"ナレッジベースの登録簿（{p.name}）が壊れていて読めないため、変更しませんでした"
+            f"（{e}）。data フォルダのこのファイルを直す（控えがあれば戻す）まで、"
+            "追加・変更・削除はできません。") from e
+    if not isinstance(data, list):
+        raise RegistryError(f"ナレッジベースの登録簿（{p.name}）の形が正しくないため、変更しませんでした。")
+    return data
+
+
+def kb_ids_or_none() -> set | None:
+    """登録されているナレッジベースのidの集合。登録簿が読めないときは None（0件と区別する）。"""
+    try:
+        return {str(i.get("id")) for i in _kb_read_for_edit() if isinstance(i, dict)}
+    except RegistryError:
+        return None
+
+
 def _kb_write(items: list[dict]) -> None:
     # 一時ファイルの名前は書き手ごとに変える（同じ名前だと、2人が同時に保存したときに
     # 互いの一時ファイルを踏んで、片方が消える）
@@ -11909,7 +11970,7 @@ def kb_add(*, name: str, base_url: str, api_key: str = "", description: str = ""
     if not base_url:
         raise RegistryError("URLを入力してください。")
     with _kb_lock:
-        items = _kb_read()
+        items = _kb_read_for_edit()            # 読めないときは書かずに断る
         if any(i.get("base_url") == base_url for i in items):
             raise RegistryError(f"このURLは既に登録されています: {base_url}")
         if any(i.get("name") == name for i in items):
@@ -11932,7 +11993,7 @@ def kb_add(*, name: str, base_url: str, api_key: str = "", description: str = ""
 
 def kb_update(kb_id: str, **fields) -> dict:
     with _kb_lock:
-        items = _kb_read()
+        items = _kb_read_for_edit()            # 読めないときは書かずに断る
         for item in items:
             if item.get("id") != kb_id:
                 continue
@@ -11969,7 +12030,7 @@ def kb_update(kb_id: str, **fields) -> dict:
 
 def kb_delete(kb_id: str) -> bool:
     with _kb_lock:
-        items = _kb_read()
+        items = _kb_read_for_edit()            # 読めないときは書かずに断る
         remaining = [i for i in items if i.get("id") != kb_id]
         if len(remaining) == len(items):
             return False
@@ -13374,6 +13435,13 @@ _ROUTE_TABLE_SYSTEM = """あなたはデータ分析アプリの振り分け係�
 - 名前は一覧に出てくる「alias.table」の形で書く。"""
 
 
+#: 表の絞り込み（ルーター）がAIの呼び出しで失敗した回数と、最後の理由（起動してからの数）。
+#: 失敗すると全部の表を渡して続けるので、利用者からは気づけない（答えは出るが、費用と
+#: 時間が増え、答えの質も落ちる）。管理者の「モデル設定」画面に出す
+_route_failures = 0
+_route_last_error = ""
+
+
 def route_tables(question: str, scope: list[dict],
                  history: list[str] | None = None) -> dict | None:
     """質問に関係するテーブルを選ぶ。判断できなければ None（=絞らない）。
@@ -13430,7 +13498,10 @@ def route_tables(question: str, scope: list[dict],
     except Exception as e:
         # 絞れなくても全部渡して続ける（ここで止めない）。ただし理由は残す。
         # 毎回失敗していると、プロンプトが大きいまま費用と時間だけ増える
+        global _route_failures, _route_last_error
         print(f"[router] 表の振り分けに失敗したため絞りません: {type(e).__name__}: {e}")
+        _route_failures += 1
+        _route_last_error = f"{datetime.now():%m/%d %H:%M} {type(e).__name__}: {str(e)[:200]}"
         return None
     if "*" in picked:
         return None

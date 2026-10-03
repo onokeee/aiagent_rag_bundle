@@ -1970,7 +1970,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
               <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
               <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
               <dt>定期実行</dt><dd>{% if r.schedule.kind != 'manual' %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
-              <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}{% if r.notify_to %}／失敗したら {{ r.notify_to|join('、') }} に知らせる{% endif %}</dd>
+              <dt>メール</dt><dd>{% if r.has_mail_steps %}{{ '実行のたびに自動で送る' if r.mail_auto else '下書きを出すだけ' }}{% else %}メールの手順はありません{% endif %}{% if r.notify_to %}／失敗したら {{ r.notify_to|join('、') }} に知らせる{% if r.notify_invalid %}<span class="warnmark" title="{{ r.notify_invalid|join('、') }} は「メール設定」で許可されていないため、失敗の知らせが届きません">{{ icon('alert', 'icon--sm') }}</span>{% endif %}{% endif %}</dd>
               <dt>実行履歴</dt>
               <dd>{% if r.history %}<div class="tablewrap" style="max-height:220px"><table class="data"><thead><tr><th style="width:120px">日時</th><th style="width:60px">種類</th><th style="width:56px">結果</th><th>内容</th></tr></thead><tbody>
                 {% for h in r.history|reverse %}<tr><td>{{ h.at[:16]|replace('T', ' ') }}</td><td>{{ '定期' if h.source == 'schedule' else '試す' }}</td><td>{{ '成功' if h.ok else '失敗' }}</td><td>{{ h.message }}</td></tr>{% endfor %}
@@ -3394,6 +3394,7 @@ details.acc.is-target {
 .toast--ok { border-left: 3px solid var(--ok); }
 .toast--err { border-left: 3px solid var(--err); }
 .toast--warn { border-left: 3px solid var(--warn); }
+.toast--info { border-left: 3px solid var(--muted); }
 @keyframes toastin { from { opacity: 0; transform: translateY(-8px); } }
 
 /* AIの回答の中の注意書き（※ ⚠ で始まる行）。データの信頼性にかかわるので目立たせる */
@@ -5564,7 +5565,14 @@ const ER = (() => {
               && !gone.includes(`${e.to[0]}.${e.to[1]}`));
         if (selected && (selected.table === name
                          || gone.includes(selected.id))) closePanel();
+        // 足した表の印と結合候補は "別名.表名" の形で持っている（表名だけでは消えない）。
+        // 残すと、消えた表への候補線を引こうとしたり、もう無い表を「足した表」と数えたりする
+        for (const id of gone) extraShown.delete(id);
         extraShown.delete(name);
+        suggestions = suggestions.filter(sg =>
+            !gone.includes(`${sg.edge.from[0]}.${sg.edge.from[1]}`)
+            && !gone.includes(`${sg.edge.to[0]}.${sg.edge.to[1]}`));
+        syncSugBtn();
         render();
         syncHistoryUi();
     }
@@ -5681,8 +5689,11 @@ function jobControls(j) {
                     ev.target.innerHTML = '<span class="spinner"></span>';
                     try {
                         const r = await api('/api/jobs/run', { id: j.id });
+                        // 「別の実行と重なったので見送った」は失敗ではない（ok は false で返る）。
+                        // 赤く出すと毎回エラーに見えるので、目立たない色にする
                         r.results.forEach(x =>
-                            toast(`${x.name}: ${x.message}`, x.ok ? 'ok' : 'err', 7000));
+                            toast(`${x.name}: ${x.message}`,
+                                  x.skipped ? 'info' : (x.ok ? 'ok' : 'err'), 7000));
                     } catch (e) { toast(e.message, 'err', 9000); }
                     MANAGE.refresh();
                 },
@@ -5819,6 +5830,9 @@ async function confirmDelete(opts) {
 
     const dropJobs = el('input', { type: 'checkbox', checked: 'checked' });
     const jobCount = (groups.find(g => g.key === 'jobs')?.items || []).length;
+    // この表を使っているビューがあると、サーバは削除を断る（消すと壊れたビューが残り、
+    // そのDBの改名がすべてできなくなるため）。押してから断られるより先に、ここで伝える
+    const usedBy = (groups.find(g => g.key === 'broken_views')?.items || []).map(x => x.text);
     // 合言葉。DB削除のときだけ、ファイル名をそのまま打ってもらう
     const phrase = opts.phrase
         ? el('input', { type: 'text', style: 'width:100%',
@@ -5849,7 +5863,8 @@ async function confirmDelete(opts) {
         },
     }, opts.action);
     phrase?.addEventListener('input',
-        () => { go.disabled = phrase.value.trim() !== opts.phrase; });
+        () => { go.disabled = usedBy.length > 0 || phrase.value.trim() !== opts.phrase; });
+    if (usedBy.length) { go.disabled = true; go.title = '先にビューを直すか削除してください'; }
 
     back.append(el('div', { class: 'modal__box' },
         el('div', { class: 'modal__head' },
@@ -5858,6 +5873,11 @@ async function confirmDelete(opts) {
                 icon('x', 'icon--sm'))),
         el('div', { class: 'modal__body', style: 'padding:12px 14px' },
             el('div', { class: 'alert alert--err' }, opts.warning),
+            usedBy.length
+                ? el('div', { class: 'alert alert--warn mt' },
+                    `この表は次のビューが使っているため、まだ削除できません: ${usedBy.join('、')}。`
+                    + 'カタログの「ビュー」タブで、先にビューを直すか削除してください。')
+                : null,
             el('div', { class: 'small muted', style: 'margin:10px 0 4px' },
                 '一緒に片づけるもの'),
             impactList(groups),
@@ -5983,6 +6003,15 @@ function openRenameTable(dbName, table) {
         const full = sync();
         if (!full || full === table) return;
         go.disabled = true;
+        // 改名のあとは画面を読み直す（旧名のまま残さないため）。ほかに書きかけがあると
+        // 黙って消えてしまうので、先に確かめる
+        const left = (typeof dirtyLabel === 'function') ? dirtyLabel() : '';
+        if (left && !confirm(`保存していない変更（${left}）があります。`
+                             + '改名すると画面を読み直すため、これらは失われます。\n'
+                             + '先に保存する場合は「キャンセル」を押してください。改名を続けますか？')) {
+            go.disabled = false;
+            return;
+        }
         try {
             const r = await api('/api/catalog/rename-table',
                 { db: dbName, table, new_table: full });
@@ -8394,13 +8423,17 @@ async function saveTable(acc) {
             values: parseValues($('.c-vals', tr).value),
         };
     });
-    await api('/api/catalog/table', { db: CAT.db, table, description: desc, columns });
+    // AIが埋めてから一度も直さずに保存したときだけ「未確認」として残す
+    const aiDraft = acc.dataset.aiDraftUntouched === '1';
+    await api('/api/catalog/table',
+              { db: CAT.db, table, description: desc, columns, ai_draft: aiDraft });
+    delete acc.dataset.aiDraftUntouched;
 
     // 絞り込みと充実度は CAT.tables を見るので、保存内容をそちらへも反映する
     const t = CAT.tables.find(x => x.name === table);
     if (t) {
         t.description = desc.trim();
-        t.ai_draft = false;
+        t.ai_draft = aiDraft;
         t.columns.forEach(c => {
             const tr = acc.querySelector(`tr[data-col="${CSS.escape(c.name)}"]`);
             if (tr) c.description = $('.c-desc', tr).value.trim();
@@ -8414,6 +8447,7 @@ async function saveTable(acc) {
     });
     summary.append(el('span', { class: `badge ${desc.trim() ? 'badge--ok' : 'badge--warn'}` },
         desc.trim() ? '説明あり' : '説明なし'));
+    if (aiDraft) summary.append(el('span', { class: 'badge badge--accent' }, 'AI下書き・未確認'));
     clearTableDirty(acc);
     recomputeMetrics();
 }
@@ -8589,6 +8623,14 @@ function wireTables() {
                 });
                 // スクリプトからの書き込みは input が飛ばないので、印は自分で付ける
                 if (filled) markTableDirty(acc);
+                // 「AIが埋めて、まだ誰も直していない」印。1文字でも直せば外れる。
+                // この印のまま保存すると、カタログに「AI下書き・未確認」と残り、
+                // AIにも「（AI推測・未確認）」として渡る（確かめた説明と区別するため）
+                if (filled) {
+                    acc.dataset.aiDraftUntouched = '1';
+                    acc.addEventListener('input', () => { delete acc.dataset.aiDraftUntouched; },
+                                         { once: true });
+                }
                 toast('AIの下書きを入れました。内容を確認して保存してください。');
             } catch (e) { toast(e.message, 'err'); }
             ev.target.disabled = false;
@@ -9973,6 +10015,8 @@ function toolCard(tool) {
                             r = await api('/api/catalog/tool',
                                 { db: ownerFile, action: 'delete', name: t.name });
                         } catch (e) { toast(e.message, 'err', 9000); return; }
+                        // 読み直しを断られても、画面の控えが古いままにならないように
+                        if (Array.isArray(r.tools)) CAT.custom = r.tools;
                         toast('削除しました。');
                         // この道具を手順に持つマイロボットは、次の実行で止まる。
                         // こちらから直せないので、消した人に必ず伝える
@@ -9987,6 +10031,7 @@ function toolCard(tool) {
                         try {
                             const r = await api('/api/catalog/tool',
                                 { db: ownerFile, tool: payload, name: payload.name, original });
+                            if (Array.isArray(r.tools)) CAT.custom = r.tools;   // 同上
                             toast('保存しました。');
                             warnRobots(r, `道具「${original}」`);   // 改名したとき
                             reloadCleanIfSaved();
@@ -10447,6 +10492,10 @@ function wireGroupMemo() {
             if (!confirm(`まとまり「${oldKey}」の ${count} テーブルすべてを「${n}__…」に改名します。
 `
                        + 'カタログの記述・関連・例文・検算はすべて引き継がれます。よろしいですか？')) return;
+            const left = dirtyLabel();
+            if (left && !confirm(`保存していない変更（${left}）があります。`
+                                 + '改名すると画面を読み直すため、これらは失われます。\n'
+                                 + '先に保存する場合は「キャンセル」を押してください。改名を続けますか？')) return;
             btn.disabled = true;
             try {
                 const r = await api('/api/catalog/rename-group',
@@ -12482,7 +12531,8 @@ function scheduleRow(r) {
     const summary = el('span', { class: 'small muted' }, window.ROBOT.scheduleLabel(r));
     const opts = window.ROBOT.scheduleOptions(r, window.ROBOTS_INIT.schedVocab, async () => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, schedule: opts.value() });
+            const res = await api('/api/robots/update',
+                { id: r.id, schedule: opts.value(), stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) {
                 Object.assign(r, fresh);
@@ -12492,7 +12542,7 @@ function scheduleRow(r) {
             }
             toast('定期実行の設定を保存しました。' + (r.schedule && r.schedule.next_at
                 ? ` 次回は ${r.schedule.next_at.slice(5, 16).replace('T', ' ')} です。` : ''));
-        } catch (e) { opts.reset(); toast(e.message, 'err', 9000); }
+        } catch (e) { opts.reset(); toast(e.message, 'err', 9000); reloadRobotsIfStale(e); }
     }, true, { minIntervalHours: window.ROBOTS_INIT.minIntervalHours, schedulerOn: window.ROBOTS_INIT.schedulerOn });
     const sch = r.schedule || {};
     // 失敗したときの知らせ先。管理者が許可したアドレスだけ（サーバも同じ判断で断る）
@@ -12501,11 +12551,16 @@ function scheduleRow(r) {
                                  placeholder: '例: yamada@example.co.jp（カンマ区切りで複数可）' });
     const saveNotify = async () => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, notify_to: notify.value });
+            const res = await api('/api/robots/update',
+                { id: r.id, notify_to: notify.value, stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) { Object.assign(r, fresh); notify.value = (r.notify_to || []).join(', '); }
             toast((r.notify_to || []).length ? '失敗したときの知らせ先を保存しました。' : '知らせ先を空にしました。');
-        } catch (e) { notify.value = (r.notify_to || []).join(', '); toast(e.message, 'err', 9000); }
+        } catch (e) {
+            notify.value = (r.notify_to || []).join(', ');
+            toast(e.message, 'err', 9000);
+            reloadRobotsIfStale(e);
+        }
     };
     notify.addEventListener('change', saveNotify);
     const notifyPick = window.ROBOT.mailPicker(notify, window.ROBOTS_INIT.mailAllowed || []);
@@ -12528,7 +12583,8 @@ function mailRow(r) {
     const cb = el('input', { type: 'checkbox', ...(r.mail_auto ? { checked: 'checked' } : {}) });
     cb.addEventListener('change', async () => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, mail_auto: cb.checked });
+            const res = await api('/api/robots/update',
+                { id: r.id, mail_auto: cb.checked, stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) {
                 Object.assign(r, fresh);
@@ -12536,16 +12592,17 @@ function mailRow(r) {
                 if (meta) meta.textContent = cardMeta(r);
             }
             toast(cb.checked ? '実行のたびにメールを送ります（宛先の許可はメール設定のとおり）。' : 'メールは下書きのまま出します（送りません）。');
-        } catch (e) { cb.checked = !cb.checked; toast(e.message, 'err', 8000); }
+        } catch (e) { cb.checked = !cb.checked; toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
     });
     const tb = el('input', { type: 'checkbox', ...(r.mail_table ? { checked: 'checked' } : {}) });
     tb.addEventListener('change', async () => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, mail_table: tb.checked });
+            const res = await api('/api/robots/update',
+                { id: r.id, mail_table: tb.checked, stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) Object.assign(r, fresh);
             toast(tb.checked ? '結果の表を本文の末尾に付けます（先頭20行）。' : '本文は登録時の文章だけを送ります。');
-        } catch (e) { tb.checked = !tb.checked; toast(e.message, 'err', 8000); }
+        } catch (e) { tb.checked = !tb.checked; toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
     });
     return el('div', { class: 'small', style: 'margin-top:8px' },
         el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, cb,
@@ -12622,11 +12679,12 @@ function folderRow(r) {
     const summary = el('span', { class: 'small muted' }, window.ROBOT.folderLabel(r));
     const opts = window.ROBOT.folderOptions(r, async () => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, ...opts.value() });
+            const res = await api('/api/robots/update',
+                { id: r.id, ...opts.value(), stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) { Object.assign(r, fresh); summary.textContent = window.ROBOT.folderLabel(r); }
             toast('フォルダ出力の決めごとを保存しました。');
-        } catch (e) { toast(e.message, 'err', 8000); }
+        } catch (e) { toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
     });
     return el('details', { class: 'acc', style: 'margin-top:8px' },
         el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
@@ -12675,9 +12733,20 @@ async function rename(r) {
     const name = prompt('マイロボットの名前', r.name);
     if (name === null) return;
     try {
-        const res = await api('/api/robots/update', { id: r.id, name });
+        const res = await api('/api/robots/update', { id: r.id, name, stamp: r.updated_at });
         robots = res.robots; render();
-    } catch (e) { toast(e.message, 'err', 8000); }
+    } catch (e) { toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
+}
+
+/** 保存が「画面を開いたあとに変更されました」で断られたら、一覧を取り直して描き直す。
+ *  （管理者が止めたことが画面に出て、古い表示のまま操作し直さずに済む） */
+async function reloadRobotsIfStale(e) {
+    if (!e.data?.stale) return;
+    try {
+        const res = await api('/api/robots', undefined, 'GET');
+        robots = res.robots || robots;
+        render();
+    } catch (_) { /* 取り直せなくても、いまの表示のまま */ }
 }
 
 async function remove(r) {
@@ -13415,6 +13484,19 @@ function render() {
 
     const box = $('#banner');
     box.replaceChildren();
+    // 設定ファイルが読めず既定値で動いている・表の絞り込みが失敗している、を画面で伝える
+    // （どちらも答えは出続けるので、ここに出さないと誰も気づかない）
+    if (state.config_read_error) {
+        box.append(el('div', { class: 'alert alert--err' },
+            'モデル設定のファイルが読めないため、既定値で動いています（選んだモデル・文脈量が'
+            + `効いていません）: ${state.config_read_error}`));
+    }
+    if (state.router_failures) {
+        box.append(el('div', { class: 'alert alert--warn' },
+            `表の絞り込み（質問に合う表だけをAIに渡す仕組み）が、起動してから `
+            + `${state.router_failures} 回失敗しています。失敗した回は全部の表を渡して答えています`
+            + `（費用と時間が増えます）。最後の理由: ${state.router_last_error || '不明'}`));
+    }
     if (!state.llm_ready) {
         box.append(el('div', { class: 'alert alert--warn' },
             'LLMが未設定です。env の OPENAI_* を設定するまで、'
