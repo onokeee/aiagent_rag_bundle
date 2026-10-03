@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 760 210" xmlns="http://www.w3.org/2000/svg"
+         font-size="13" text-anchor="middle" width="760" height="210"><rect width="100%" height="100%" fill="#ffffff"/>
+      <defs>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0L10 5L0 10z" fill="#7d7a73"/>
+        </marker>
+      </defs>
+      <rect x="20"  y="30" width="160" height="66" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="100" y="56" fill="#1f1e1d">テーブル・列の説明</text>
+      <text x="100" y="76" fill="#7d7a73" font-size="11">1行＝何か、コード値の意味</text>
+      <rect x="200" y="30" width="160" height="66" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="280" y="56" fill="#1f1e1d">まとまりのメモ</text>
+      <text x="280" y="76" fill="#7d7a73" font-size="11">複数の表にまたがる前提</text>
+      <rect x="380" y="30" width="160" height="66" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="460" y="56" fill="#1f1e1d">用語集</text>
+      <text x="460" y="76" fill="#7d7a73" font-size="11">言葉の定義（自然言語でOK）</text>
+      <rect x="560" y="30" width="160" height="66" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="640" y="56" fill="#1f1e1d">例文・検算</text>
+      <text x="640" y="76" fill="#7d7a73" font-size="11">正解のお手本と、数字の突き合わせ</text>
+      <line x1="380" y1="110" x2="380" y2="140" stroke="#7d7a73" marker-end="url(#ar2)"/>
+      <rect x="230" y="148" width="300" height="46" rx="8" fill="none" stroke="#b8552f" stroke-width="2"/>
+      <text x="380" y="176" fill="#1f1e1d">そのままAIの理解になる</text>
+    </svg>

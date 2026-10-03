@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg"
+         font-size="12" text-anchor="middle" width="760" height="320"><rect width="100%" height="100%" fill="#ffffff"/>
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0L10 5L0 10z" fill="#7d7a73"/>
+        </marker>
+      </defs>
+      
+      <text x="190" y="24" fill="#1f1e1d" font-weight="bold">AIが書いたSQLが通る道（3重の鍵）</text>
+      <rect x="120" y="40" width="140" height="44" rx="8" fill="none" stroke="#b8552f" stroke-width="2"/>
+      <text x="190" y="66" fill="#1f1e1d">AIが書いたSQL</text>
+      <line x1="190" y1="84" x2="190" y2="102" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <rect x="60" y="106" width="260" height="44" rx="8" fill="#f3f2ef" stroke="#d9d6cf"/>
+      <text x="190" y="124" fill="#1f1e1d">鍵1 言葉の検査</text>
+      <text x="190" y="140" fill="#7d7a73" font-size="11">SELECT 1文だけ・書き換えの言葉があれば断る</text>
+      <line x1="190" y1="150" x2="190" y2="168" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <rect x="60" y="172" width="260" height="44" rx="8" fill="#f3f2ef" stroke="#d9d6cf"/>
+      <text x="190" y="190" fill="#1f1e1d">鍵2 読み取り専用で開く</text>
+      <text x="190" y="206" fill="#7d7a73" font-size="11">検査をすり抜けても物理的に書けない</text>
+      <line x1="190" y1="216" x2="190" y2="234" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <rect x="60" y="238" width="260" height="44" rx="8" fill="#f3f2ef" stroke="#d9d6cf"/>
+      <text x="190" y="256" fill="#1f1e1d">鍵3 許可係（authorizer）</text>
+      <text x="190" y="272" fill="#7d7a73" font-size="11">操作を1つずつ判定し、危ないものは拒否</text>
+      <line x1="190" y1="282" x2="190" y2="300" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <text x="190" y="314" fill="#1f1e1d">データベース（読むだけ）</text>
+      
+      <text x="560" y="24" fill="#1f1e1d" font-weight="bold">外に出る口は3つだけ。全部に見張りがいる</text>
+      <rect x="420" y="40" width="280" height="56" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="560" y="61" fill="#1f1e1d">メール</text>
+      <text x="560" y="79" fill="#7d7a73" font-size="11">許可リストの宛先だけ。空なら誰にも送れない</text>
+      <rect x="420" y="108" width="280" height="56" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="560" y="129" fill="#1f1e1d">ファイル</text>
+      <text x="560" y="147" fill="#7d7a73" font-size="11">場所は誰も指定できない。本人のフォルダ＋引換券</text>
+      <rect x="420" y="176" width="280" height="56" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="560" y="197" fill="#1f1e1d">画面と道具</text>
+      <text x="560" y="215" fill="#7d7a73" font-size="11">権限はサーバで毎回判定。AIにも同じ線</text>
+      <rect x="420" y="244" width="280" height="56" rx="8" fill="none" stroke="#d9d6cf" stroke-dasharray="5 4"/>
+      <text x="560" y="265" fill="#1f1e1d">壊れたとき</text>
+      <text x="560" y="283" fill="#7d7a73" font-size="11">初期値に戻して警告。読めないものに上書きしない</text>
+    </svg>

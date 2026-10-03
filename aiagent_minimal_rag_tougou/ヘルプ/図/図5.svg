@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 760 430" xmlns="http://www.w3.org/2000/svg"
+         font-size="13" text-anchor="middle" width="760" height="430"><rect width="100%" height="100%" fill="#ffffff"/>
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0L10 5L0 10z" fill="#7d7a73"/>
+        </marker>
+      </defs>
+
+      
+      <rect x="20" y="60" width="130" height="64" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="85" y="86" fill="#1f1e1d">ブラウザ</text>
+      <text x="85" y="106" fill="#7d7a73" font-size="11">社内PC（素のHTML/JS）</text>
+
+      
+      <rect x="20" y="300" width="130" height="64" rx="8" fill="none" stroke="#d9d6cf" stroke-dasharray="5 4"/>
+      <text x="85" y="326" fill="#1f1e1d">取り込み元フォルダ</text>
+      <text x="85" y="346" fill="#7d7a73" font-size="11">Excel / CSV</text>
+
+      
+      <rect x="210" y="30" width="280" height="370" rx="10" fill="none" stroke="#b8552f" stroke-width="2"/>
+      <text x="350" y="54" fill="#1f1e1d" font-weight="bold">アプリサーバ（Flask・1台）</text>
+
+      <rect x="230" y="70" width="240" height="48" rx="6" fill="none" stroke="#d9d6cf"/>
+      <text x="350" y="90" fill="#1f1e1d">画面（マイエージェント・カタログ ほか）</text>
+      <text x="350" y="107" fill="#7d7a73" font-size="11">ログイン必須／画面ごとに権限</text>
+
+      <rect x="230" y="130" width="240" height="48" rx="6" fill="none" stroke="#d9d6cf"/>
+      <text x="350" y="150" fill="#1f1e1d">AIエージェント</text>
+      <text x="350" y="167" fill="#7d7a73" font-size="11">SQLは SELECT専用ガード を通る</text>
+
+      <rect x="230" y="190" width="240" height="48" rx="6" fill="none" stroke="#d9d6cf"/>
+      <text x="350" y="210" fill="#1f1e1d">取り込み・定期実行</text>
+      <text x="350" y="227" fill="#7d7a73" font-size="11">DBに書けるのはここだけ（管理者）</text>
+
+      
+      <rect x="230" y="256" width="240" height="128" rx="6" fill="none" stroke="#d9d6cf"/>
+      <text x="350" y="278" fill="#1f1e1d">保存ファイル（サーバ内）</text>
+      <text x="350" y="300" fill="#7d7a73" font-size="11">data/統合.db（SQLite・唯一のDB）</text>
+      <text x="350" y="320" fill="#7d7a73" font-size="11">統合.db.meta.yaml（カタログ）</text>
+      <text x="350" y="340" fill="#7d7a73" font-size="11">users/（会話履歴・個人設定）</text>
+      <text x="350" y="360" fill="#7d7a73" font-size="11">knowledge_bases.json（接続先の登録簿）</text>
+
+      
+      <rect x="560" y="60" width="180" height="64" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="650" y="84" fill="#1f1e1d">ChatGPT-API</text>
+      <text x="650" y="104" fill="#7d7a73" font-size="11">HTTPS・社外。envでローカルLLMに切替可</text>
+
+      <rect x="560" y="160" width="180" height="64" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="650" y="184" fill="#1f1e1d">LightRAGサーバ群</text>
+      <text x="650" y="204" fill="#7d7a73" font-size="11">社内・HTTP。文書の検索だけ</text>
+
+      <rect x="560" y="260" width="180" height="64" rx="8" fill="none" stroke="#d9d6cf"/>
+      <text x="650" y="284" fill="#1f1e1d">SMTPサーバ</text>
+      <text x="650" y="304" fill="#7d7a73" font-size="11">社内。許可宛先へ・承認後のみ</text>
+
+      
+      <line x1="150" y1="92" x2="202" y2="92" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <text x="176" y="82" fill="#7d7a73" font-size="10">HTTP</text>
+      <line x1="150" y1="322" x2="222" y2="230" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <line x1="350" y1="238" x2="350" y2="248" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <line x1="490" y1="92" x2="552" y2="92" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <line x1="490" y1="160" x2="552" y2="185" stroke="#7d7a73" marker-end="url(#ar3)"/>
+      <line x1="490" y1="230" x2="552" y2="285" stroke="#7d7a73" marker-end="url(#ar3)"/>
+    </svg>

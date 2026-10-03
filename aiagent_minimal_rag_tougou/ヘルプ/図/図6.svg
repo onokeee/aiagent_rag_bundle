@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" role="img"
+     aria-label="システム構成図。質問は❶利用者のブラウザ→アプリの画面へ。❷AIオーケストレーションがカタログの知識を添えてAIモデル（外部API）に思考を依頼し、❸モデルがツール実行を指示、❹ツールだけがデータベース（読み取り専用）と文書検索サーバ群に触れる。②〜④を必要なだけ往復し、❺回答が画面へ逐次表示で戻る。取り込みだけがDBへ書き込む別経路。" width="1200" height="620"><rect width="100%" height="100%" fill="#ffffff"/>
+  <style>
+    text { font-family: "IBM Plex Sans JP", "Yu Gothic UI", "Meiryo", sans-serif; }
+    .zone { fill: none; stroke: #e2d9cf; stroke-width: 1.6; }
+    .b    { fill: #faf7f3; stroke: #e2d9cf; stroke-width: 1.1; }
+    .ba   { fill: #ffffff; stroke: #b8552f; stroke-width: 1.6; }
+    .ea   { stroke: #b8552f; stroke-width: 2.4; fill: none; }
+    .er   { stroke: #2e7d5b; stroke-width: 2.4; fill: none; }
+    .ed   { stroke: #7a6f64; stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+    .t    { fill: #2a231d; font-size: 14px; font-weight: 700; }
+    .s    { fill: #2a231d; font-size: 11.5px; }
+    .m    { fill: #7a6f64; font-size: 11px; }
+    .cap  { fill: #7a6f64; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+    .num  { fill: #ffffff; font-size: 11px; font-weight: 700; text-anchor: middle; }
+  </style>
+  <defs>
+    <marker id="za" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b8552f"/></marker>
+    <marker id="zr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2e7d5b"/></marker>
+    <marker id="zm" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L7,4 L0,8 z" fill="#7a6f64"/></marker>
+  </defs>
+
+  
+  <rect class="zone" x="24" y="60" width="180" height="180" rx="10"/>
+  <text class="cap" x="40" y="84">利用者</text>
+  <rect class="b" x="40" y="100" width="148" height="76" rx="8"/>
+  <text class="t" x="54" y="126">ブラウザ</text>
+  <text class="s" x="54" y="146">マイエージェントなどの画面を</text>
+  <text class="s" x="54" y="162">開くだけ（導入物なし）</text>
+  <text class="m" x="40" y="222">権限は一般／管理者の2段階</text>
+
+  
+  <rect class="zone" x="252" y="36" width="500" height="540" rx="10"/>
+  <text class="cap" x="268" y="60">アプリサーバ（1台）</text>
+
+  <rect class="b" x="276" y="76" width="452" height="62" rx="8"/>
+  <text class="t" x="290" y="100">画面と認証</text>
+  <text class="s" x="290" y="120">ログイン・権限の入口。回答は逐次表示でブラウザへ流す</text>
+
+  <rect class="ba" x="276" y="162" width="452" height="102" rx="8"/>
+  <text class="t" x="290" y="186">AIオーケストレーション</text>
+  <text class="s" x="290" y="206">質問を計画に → ツールを選んで実行 → 結果を検算 → 回答を組み立て</text>
+  <text class="s" x="290" y="222">データの知識（カタログ）を毎回添えて、AIモデルと必要なだけ往復</text>
+  <text class="m" x="290" y="244">往復は上限つき。実行の中身はすべて記録され、画面から確認できる</text>
+
+  <rect class="b" x="276" y="288" width="452" height="76" rx="8"/>
+  <text class="t" x="290" y="312">ツール群（回答づくりの部品）</text>
+  <text class="s" x="290" y="332">データ検索・集計・統計・グラフ・ファイル出力・文書検索・メール下書き など</text>
+  <text class="m" x="290" y="350">実名と説明は下の「ツール一覧」に自動表示（管理者が追加・停止できる）</text>
+
+  <rect class="b" x="276" y="388" width="452" height="62" rx="8"/>
+  <text class="t" x="290" y="412">取り込み・定期実行</text>
+  <text class="s" x="290" y="432">Excel/CSVを表に変換。データベースへ書き込む唯一の経路（AIは書けない）</text>
+
+  <rect class="b" x="276" y="474" width="452" height="62" rx="8"/>
+  <text class="t" x="290" y="498">データカタログ管理（管理者）</text>
+  <text class="s" x="290" y="518">説明・関連・用語・例文・検算・ER図を編集し、AIに渡す知識を育てる</text>
+
+  
+  <rect class="zone" x="800" y="36" width="376" height="104" rx="10"/>
+  <text class="cap" x="816" y="60">AIモデル（外部API）</text>
+  <rect class="b" x="816" y="72" width="344" height="52" rx="8"/>
+  <text class="s" x="830" y="92">本番=ChatGPT-API ⇄ 開発=ローカルLLM</text>
+  <text class="m" x="830" y="110">コードを変えず、設定だけで切り替え</text>
+
+  <rect class="zone" x="800" y="164" width="376" height="150" rx="10"/>
+  <text class="cap" x="816" y="188">データ層</text>
+  <rect class="b" x="816" y="200" width="344" height="50" rx="8"/>
+  <text class="t" x="830" y="220">データベース（SQLite・1つ）</text>
+  <text class="s" x="830" y="238">全テーブルがここに入る。AIからは読み取り専用</text>
+  <rect class="b" x="816" y="256" width="344" height="46" rx="8"/>
+  <text class="t" x="830" y="276">データカタログ（知識の置き場）</text>
+  <text class="s" x="830" y="292">説明・関連・用語・例文・検算。全員で1つを共有</text>
+
+  <rect class="zone" x="800" y="338" width="376" height="96" rx="10"/>
+  <text class="cap" x="816" y="362">文書検索サーバ群</text>
+  <rect class="b" x="816" y="374" width="344" height="48" rx="8"/>
+  <text class="s" x="830" y="394">社内文書のナレッジベース（LightRAG・複数台）</text>
+  <text class="m" x="830" y="412">登録簿で追加・停止。一覧は下の「サーバ一覧」に自動表示</text>
+
+  <rect class="zone" x="800" y="458" width="376" height="96" rx="10"/>
+  <text class="cap" x="816" y="482">記録</text>
+  <rect class="b" x="816" y="494" width="344" height="48" rx="8"/>
+  <text class="s" x="830" y="514">会話の履歴・実行ログ・各種設定</text>
+  <text class="m" x="830" y="532">サーバ内のファイルに保存</text>
+
+  
+  <path class="ea" d="M188 116 H276" marker-end="url(#za)"/>
+  <circle cx="216" cy="116" r="9" fill="#b8552f"/><text class="num" x="216" y="120">1</text>
+  <text class="m" x="200" y="102">質問</text>
+
+  <path class="ea" d="M728 190 C770 176, 780 150, 812 118" marker-end="url(#za)"/>
+  <circle cx="770" cy="162" r="9" fill="#b8552f"/><text class="num" x="770" y="166">2</text>
+  <text class="m" x="700" y="152">思考を依頼</text>
+
+  <path class="ea" d="M812 130 C784 168, 772 190, 732 214" marker-end="url(#za)"/>
+  <circle cx="782" cy="192" r="9" fill="#b8552f"/><text class="num" x="782" y="196">3</text>
+
+  <path class="ea" d="M728 316 C766 300, 780 264, 812 232" marker-end="url(#za)"/>
+  <circle cx="772" cy="284" r="9" fill="#b8552f"/><text class="num" x="772" y="288">4</text>
+  <path class="ea" d="M728 340 C766 348, 780 368, 812 388" marker-end="url(#za)"/>
+
+  
+  <path class="er" d="M276 128 H188" marker-end="url(#zr)"/>
+  <circle cx="232" cy="128" r="9" fill="#2e7d5b"/><text class="num" x="232" y="132">5</text>
+  <text class="m" x="212" y="148">回答</text>
+
+  
+  <path class="ed" d="M812 268 C776 258, 760 240, 732 232" marker-end="url(#zm)"/>
+  <text class="m" x="744" y="252">知識を添える</text>
+  <path class="ed" d="M728 418 C780 402, 792 300, 812 230" marker-end="url(#zm)"/>
+  <text class="m" x="762" y="404">書き込み</text>
+  <path class="ed" d="M728 505 C760 508, 780 510, 812 512" marker-end="url(#zm)"/>
+  <text class="m" x="748" y="528">実行の記録</text>
+
+  
+  <text class="m" x="252" y="602">読み方: ❶質問 → ❷カタログの知識を添えてAIモデルへ → ❸ツール実行の指示 → ❹データに触れるのはツールだけ（②〜④を必要なだけ往復）→ ❺回答が画面へ。</text>
+</svg>

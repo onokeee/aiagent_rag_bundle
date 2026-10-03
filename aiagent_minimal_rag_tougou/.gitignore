@@ -43,9 +43,10 @@ import/*
 data/import_dirs.yaml
 
 # アプリの説明書は公開しない（手元には残す）
-# ヘルプ/ … 2026-10-03 にアプリの画面から外して Markdown にしたヘルプ（第5部は実装の内側の説明）
-ヘルプ/
 README.md
+# ただし ヘルプ/ （2026-10-03 にアプリの画面から外して Markdown にしたヘルプ）は
+# リポジトリに入れる（利用者の指示）。上の README.md の決まりに目次が当たらないよう例外にする
+!ヘルプ/README.md
 .build/docs/
 data/README.txt
 import/README.md
