@@ -1,28 +1,23 @@
 """assets.py — 画面の素材（HTML・CSS・JS）。
 
-このファイルにあるのは、次の2つの辞書と、ヘルプを読み込む数行だけ:
+このファイルにあるのは、次の2つの辞書だけ:
 
   TEMPLATES     … Jinja2 のテンプレート。core.py の create_app が
                    DictLoader(TEMPLATES) で読む。
   STATIC_FILES  … css/app.css と js/app.js。core.py の /static/<path> が
                    ETag を付けて配る。
 
-core.py から分けてあるのは、ここが大きく、
-ヘルプの文言を1行直すだけでコード本体の差分になってしまうため。
-分けても配り方は変わらない（core.py が import して使う）。
+core.py から分けてあるのは、ここが大きく、画面の文言を1行直すだけで
+コード本体の差分になってしまうため。分けても配り方は変わらない
+（core.py が import して使う）。
 
-**ヘルプ（help.html）だけは、同じ場所の templates/help.html にある。**
-48万字あって、このファイルの半分を占めていた。中身は文書なので、
-コードとは別の速度で変わる。読み込みは下の方の1か所だけで、
-TEMPLATES に入れたあとは他と区別が無い。
+ヘルプ（使い方と仕組みの説明）はアプリから外し、アプリと同じ場所の
+「ヘルプ/」フォルダの Markdown に移した（2026-10-03）。
 
 編集するときの注意:
   ・文字列は raw 文字列（r 付きの三重引用符）で囲んである。
     中のバックスラッシュは正規表現やJSのエスケープとしてそのまま生きるので、
     囲みを外さないこと。
-  ・ヘルプ（help.html）の第5部は raw ブロックで囲ってある。Jinja が
-    評価しない範囲なので、その中に if を書いても効かない。
-    表示を出し分けたいときは raw ブロックの外側で囲うこと。
   ・js/app.js と css/app.css を直したら、画面の見た目だけでなく
     検証スクリプト（t6_static / t15_er_bind / t18_ui_guards）も通すこと。
 """
@@ -149,7 +144,7 @@ TEMPLATES = {
                           ('mail', 'mail.index', 'メール設定'), ('robots', 'catalog.robot_settings', 'マイロボット'),
                           ('memory', 'catalog.memory_admin', 'パーソナライズ'),
                           ('display', 'catalog.display_admin', '画面'),
-                          ('usage', 'usage.index', '利用状況'), ('help', 'help.index', 'ヘルプ')] -%}
+                          ('usage', 'usage.index', '利用状況')] -%}
 {% if key == 'sep' %}<span class="tabs__sep" aria-hidden="true"></span>
 {% elif key == active %}<button class="tab is-active">{{ label }}</button>
 {% else %}<a class="tab" href="{{ url_for(ep) }}">{{ label }}</a>
@@ -191,14 +186,13 @@ TEMPLATES = {
         {{ icon('user') }} パーソナライズ</a>
       {% endif %}
       {# 管理者の画面は1本にまとめ、中はタブで切り替える（_admintabs.html）。
-         データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・画面・利用状況・ヘルプ #}
-      <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.', 'help.')) }}" href="{{ url_for('catalog.index') }}"
-         data-desc="管理者だけの画面。データカタログ（テーブル・結合・ER図・用語集・例文・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、画面、利用状況、ヘルプを、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
+         データカタログ・取り込み・出力・ナレッジベース・モデル設定・メール設定・マイロボット・パーソナライズ・画面・利用状況 #}
+      <a class="navlink {{ 'is-active' if nav.startswith(('catalog.', 'imp.', 'knowledge.', 'models.', 'mail.', 'usage.')) }}" href="{{ url_for('catalog.index') }}"
+         data-desc="管理者だけの画面。データカタログ（テーブル・結合・ER図・用語集・例文・ツール・ビュー）、取り込み、出力、ナレッジベース、モデル設定、メール設定、マイロボットの決めごと、パーソナライズ、画面、利用状況を、上のタブで切り替えます。カタログに書いた内容がそのまま AI の理解になります。">
         {{ icon('catalog') }} 管理者メニュー</a>
     </div>
     {% endif %}
-    {# 一般利用者のメニュー。管理者の分は上の囲いにある（同じものを2回出さない）。
-       ヘルプは管理者メニューのタブに移したので、ここには置かない #}
+    {# 一般利用者のメニュー。管理者の分は上の囲いにある（同じものを2回出さない） #}
     {% if not user.is_admin %}
     <div class="sidebar__section">
       <a class="navlink {{ 'is-active' if nav.startswith('chat.') }}" href="{{ url_for('chat.index') }}"
@@ -2206,23 +2200,6 @@ window.USAGE = {};
 }
 
 
-# --- help.html はファイルから読む ---------------------------------------------------
-# 48万字あって assets.py の半分を占めていた。中身は文書なので、コードとは
-# 別の速度で変わる。HTMLのファイルとして持てば、編集も検査もしやすい。
-#
-# 配り方は変えていない。ここで TEMPLATES に入れるだけなので、この先の
-# DictLoader も /help のルートも、検証スイートもそのまま通る。
-_HELP_FILE = Path(__file__).parent / "templates" / "help.html"
-try:
-    TEMPLATES["help.html"] = _HELP_FILE.read_text(encoding="utf-8")
-except OSError as _e:
-    # 黙って404を返してはいけない。画面が真っ白なのに理由が分からなくなる。
-    # 配り忘れはここで気づけるように、起動そのものを止める
-    raise RuntimeError(
-        f"ヘルプの本文が読めません: {_HELP_FILE}（{_e}）。"
-        "assets.py と同じ場所に templates/help.html を置いてください。") from _e
-
-
 STATIC_FILES = {
 
 # --- css/app.css ---
@@ -2705,34 +2682,6 @@ table.data thead th {
 }
 table.data tbody tr:hover { background: var(--surface-2); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
-
-/* ヘルプは同じ table.data に長い説明文を入れる。データ格子用の
-   「1行に収めて溢れたら … で切る」が効くと、どのセルも1行目の途中で
-   切れて読めなくなるので、ここだけ折り返す側に戻す。 */
-.help table.data th, .help table.data td {
-    white-space: normal; max-width: none; overflow: visible;
-    text-overflow: clip; vertical-align: top; line-height: 1.75;
-    /* 関数名のような長い英字1語も折り返す。これが無いと、その1語の幅より
-       列を狭くできず、表が画面からはみ出す */
-    overflow-wrap: anywhere;
-}
-/* セルの中のコード例。列の幅を決めるときは幅0として数えさせ（width:0）、
-   実際にはセル幅いっぱいに置く（min-width:100%）。
-   横に長いコードは <pre> の中だけで横スクロールする */
-.help table.data td pre { width: 0; min-width: 100%; }
-/* 見出し（thead）は上に貼り付かなくてよい。文章の途中で浮くと読みにくい */
-.help table.data thead th { position: static; }
-/* ヘルプでは表そのものが本文。高さ460pxの窓に閉じ込めると、
-   中をもう一度スクロールしないと続きが読めず、読み飛ばしが起きる。
-   縦の制限だけ外す（横に長いときのスクロールは残す） */
-.help .tablewrap { max-height: none; }
-/* 説明の中に入るコード。横に長いものはその場で横スクロールさせる
-   （ページ全体が横に伸びると本文が読めなくなる） */
-.help pre {
-    margin: 6px 0; padding: 9px 11px; overflow-x: auto;
-    background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); font-size: 12px; line-height: 1.6;
-}
 
 /* --- タブ ------------------------------------------------------------------ */
 

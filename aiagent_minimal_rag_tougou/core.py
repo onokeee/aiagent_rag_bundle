@@ -17106,69 +17106,6 @@ def usage_export():
                     "sheets": len(sheets)})
 
 
-bp_help = Blueprint("help", __name__)
-
-
-@bp_help.get("/help", endpoint="index")
-@login_required
-def help_index():
-    """全機能の説明書と、システム構成の説明。文章は TEMPLATES の help.html に全部書いてある。
-
-    サーバ一覧（管理者向け）・「まとまりとテーブルの一覧」・「ツール一覧」は、
-    いまの登録簿・DB・カタログから動的に描く。手で書くと、足した・改名した・
-    無効化したときにヘルプが古いままになるため。"""
-    groups_now = []
-    total_tables = 0
-    metas = []
-    for f in db.list_db_files():
-        prof = catalog.profile_db(f)
-        meta = catalog.load_meta(f)
-        metas.append(meta)
-        gmeta = catalog.db_groups(meta)
-        by_g: dict = {}
-        for t in sorted(prof["tables"]):
-            if "__" not in t:
-                continue
-            gkey, _, rest = t.partition("__")
-            by_g.setdefault(gkey, []).append(
-                {"suffix": rest, "rows": (prof["tables"][t] or {}).get("row_count")})
-            total_tables += 1
-        for gkey in sorted(by_g):
-            groups_now.append({"key": gkey, "tables": by_g[gkey],
-                               "memo": bool((gmeta.get(gkey) or {}).get("description"))})
-
-    # ツール一覧: 実行時と同じ合成（管理者の無効化・説明の差し替え・ユーザー定義追加が映る）
-    def _first_sentence(text: str, limit: int = 90) -> str:
-        s = str(text or "").strip().splitlines()[0] if text else ""
-        s = s.split("。")[0]
-        return (s[:limit] + "…") if len(s) > limit else (s + "。" if s else "")
-
-    over = builtin_overrides([{"meta": m} for m in metas])
-    tools_now = []
-    for t in tools.BUILTIN_TOOLS:
-        name = t["function"]["name"]
-        if name in tools.ADMIN_TOOLS and not g.user.is_admin:
-            continue                       # AIに渡らないツールは一覧にも出さない
-        ov = over.get(name) or {}
-        tools_now.append({
-            "kind": "組み込み", "name": name, "label": TOOL_LABELS.get(name, ""),
-            "desc": _first_sentence(ov.get("description")
-                                    or t["function"].get("description")),
-            "enabled": ov.get("enabled") is not False})
-    for m in metas:
-        for t in (m.get("tools") or []):
-            if isinstance(t, dict) and str(t.get("name") or "").strip():
-                tools_now.append({
-                    "kind": "ユーザー定義", "name": str(t["name"]), "label": "",
-                    "desc": _first_sentence(t.get("description")),
-                    "enabled": t.get("enabled") is not False})
-
-    return render_template("help.html",
-                           bases=rag.kb_list() if g.user.is_admin else [],
-                           groups_now=groups_now, total_tables=total_tables,
-                           tools_now=tools_now)
-
-
 bp_table = Blueprint("tableview", __name__)
 
 PAGE_SIZES = (50, 100, 200, 500)
@@ -17630,7 +17567,6 @@ def create_app() -> Flask:
     app.register_blueprint(bp_models)
     app.register_blueprint(bp_knowledge)
     app.register_blueprint(bp_usage)
-    app.register_blueprint(bp_help)
     app.register_blueprint(bp_table)
     app.register_blueprint(bp_api)
 
