@@ -13324,6 +13324,10 @@ def _fix_for(message: str, kwargs: dict) -> tuple | None:
         v = kwargs.get("max_tokens")
         if v is not None:
             return ({"max_completion_tokens": v}, "max_tokens")
+    # 「最後のチャンクにトークン数を付けて」の指示（stream_options）を知らないゲートウェイ → 落とす
+    # （[turn] ログにトークン数が出なくなるだけで、回答は変わらない）
+    if "stream_options" in low or "include_usage" in low:
+        return (None, "stream_options")
     return None
 
 
@@ -13506,16 +13510,18 @@ def _responses_request(attempt: dict) -> dict:
     return req
 
 
-def _chunk(content=None, tool=None, finish=None):
+def _chunk(content=None, tool=None, finish=None, usage=None):
     """chat.completions のストリームのチャンクと同じ形（chat_stream が読む属性だけ）。
 
     tool は (index, call_id, name, arguments の差分)。無い項目は None。
+    usage は最後のチャンクにだけ付く（入力・出力・キャッシュが効いたトークン数）。
     """
     tcs = None
     if tool is not None:
         index, call_id, name, args = tool
         tcs = [_NS(index=index, id=call_id, function=_NS(name=name, arguments=args))]
-    return _NS(choices=[_NS(delta=_NS(content=content, tool_calls=tcs), finish_reason=finish)])
+    return _NS(choices=[_NS(delta=_NS(content=content, tool_calls=tcs), finish_reason=finish)],
+               usage=usage)
 
 
 def _finish_of(resp, n_tools: int) -> str:
@@ -13555,7 +13561,8 @@ def _responses_stream(events):
             if idx is not None and idx not in got_delta and getattr(ev, "arguments", None):
                 yield _chunk(tool=(idx, None, None, ev.arguments))
         elif t in ("response.completed", "response.incomplete"):
-            yield _chunk(finish=_finish_of(getattr(ev, "response", None), n_tools))
+            resp = getattr(ev, "response", None)
+            yield _chunk(finish=_finish_of(resp, n_tools), usage=getattr(resp, "usage", None))
         elif t in ("response.failed", "error"):
             err = getattr(getattr(ev, "response", None), "error", None)
             msg = (getattr(err, "message", None) or getattr(ev, "message", None)
@@ -13582,7 +13589,39 @@ def _completion_from_response(resp):
                 "arguments": getattr(item, "arguments", "") or ""}
     msg._finish()
     msg.finish_reason = _finish_of(resp, len(msg._parts))
-    return _NS(choices=[_NS(message=msg, finish_reason=msg.finish_reason)])
+    return _NS(choices=[_NS(message=msg, finish_reason=msg.finish_reason)],
+               usage=getattr(resp, "usage", None))
+
+
+def _usage_of(usage) -> dict | None:
+    """応答の usage を {"input", "cached", "output"}（トークン数）にそろえる。
+
+    chat.completions は prompt_tokens / completion_tokens / prompt_tokens_details.cached_tokens、
+    Responses API は input_tokens / output_tokens / input_tokens_details.cached_tokens と
+    名前が違う。cached は「プロンプトキャッシュが効いた入力トークン数」で、プロンプトの
+    並び（build_system_prompt）を変えた効果はこの数字で確かめる（core の [turn] ログに出る）。
+    返ってこない構成（usage を付けないゲートウェイ）では None。
+    """
+    if usage is None:
+        return None
+
+    def pick(obj, *names):
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v is not None:
+                return v
+        return None
+
+    inp = pick(usage, "prompt_tokens", "input_tokens")
+    out = pick(usage, "completion_tokens", "output_tokens")
+    if inp is None and out is None:
+        return None
+    det = pick(usage, "prompt_tokens_details", "input_tokens_details")
+    cached = pick(det, "cached_tokens") if det is not None else None
+    try:
+        return {"input": int(inp or 0), "cached": int(cached or 0), "output": int(out or 0)}
+    except (TypeError, ValueError):
+        return None
 
 
 def _responses_call(**attempt):
@@ -13926,12 +13965,23 @@ search_knowledge_base で調べる。数値の集計は表（run_sql_query）、
              "あなたはSQLiteデータベースの分析アシスタントです。\n"
              "読み取り専用(SELECTのみ)でデータベースにアクセスできます。")
 
+    # 並び順はプロンプトキャッシュのため（OpenAI は先頭から一致する部分にだけ効く）。
+    # 全員に共通の部分（決めごと・道具の一覧・SQLルール・カタログ）を前に、利用者ごと・
+    # 時間で変わる部分（不調データの注記・文書の一覧・パーソナライズ・現在時刻）を後ろに置く。
+    # パーソナライズは回答のたびに書き直されるので、カタログより前にあると、同じ人の
+    # 次の質問でもカタログ全体（入力の大半）が読み直しになっていた。
+    # 効き具合はサーバのログの [turn] 行（うちキャッシュ ○tok）で確かめる。
+    # カタログ本文は経路によって末尾の改行が有ったり無かったりするので、ここでそろえる
+    catalog_text = catalog.prompt_for_scope(scope, limit=inline_cap, admin=admin).rstrip()
     return f"""{intro}
 
 # 振る舞い
 - ユーザーの質問に答えるため、必要に応じてツールを呼び出し、必ず実データに基づいて回答する。
 - 推測で数値を答えてはいけない。データが必要なら run_sql_query を使う。
-- 列の意味や値の実体が不確かなら、SQLを書く前に describe_table で確認する。
+- 列名・型・値の例は後述の「選択中のデータカタログ」に載っている。そこに列まで載っている表は、
+  describe_table を呼ばずにそのままSQLを書く（describe_table が返すのはカタログと同じ内容で、
+  利用者を1往復ぶん待たせるだけになる）。describe_table は、カタログに列が載っていない表の
+  列を知りたいときだけ使う。
 - 範囲や対象の取り方が複数あって答えが変わるとき（似た表が複数ある、期間が示されていない等）は、
   勝手にどれかへ決めて答えず、一言確認するか、選び方を明記して答える。
 - ツールを使うか・どのSQLを書くかはあなたが判断する(挨拶や一般的な雑談ならツール不要)。
@@ -14026,10 +14076,10 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
   押し、含める質問にチェックして名前を付けて保存します。定期実行やメールの自動送信もその画面で
   決められます。実行はメニューの『マイロボット』からです」。
 
-{memory}# 利用可能なツール
+# 利用可能なツール
 {tool_list}
 
-{kb_note}{stale_note}# SQLルール
+# SQLルール
 - SQLite方言。SELECT(または WITH ... SELECT)のみ。INSERT/UPDATE/DELETE/DDL/PRAGMA等は禁止(実行されません)。
 - {naming}
 - 1回の呼び出しで1ステートメント。末尾セミコロン不要。
@@ -14039,9 +14089,9 @@ PIVOT構文も無い。次はSQLで計算しようとせず、必ずツールを
 - 「テーブルを見せて」「中身を全部見たい」のようにデータそのものを見たいと言われたら、SELECT * を打って先頭数行を貼るのではなく open_table を使う（全行を辿れる画面へのリンクが出る）。出したあとは何のテーブルかを1〜2文添えるだけでよい。
 
 # 選択中のデータカタログ
-{catalog.prompt_for_scope(scope, limit=inline_cap, admin=admin)}
-
-現在時刻: {datetime.now().isoformat(timespec="seconds")}
+{catalog_text}
+{stale_note}
+{kb_note}{memory}現在時刻: {datetime.now().isoformat(timespec="seconds")}
 """
 
 
@@ -14298,10 +14348,12 @@ def chat(messages: list[dict], tool_defs: list[dict] | None = None,
         kwargs["max_tokens"] = config.OPENAI_MAX_TOKENS
     resp = _create(**kwargs)
     msg = resp.choices[0].message
-    # 出力が上限で切れたか（"length"）を呼び出し側が見られるようにしておく。
+    # 出力が上限で切れたか（"length"）と、トークン数（[turn] ログ用）を呼び出し側が
+    # 見られるようにしておく。
     # SDKのモデルは属性の後付けを許すが、万一拒まれても本体の動作は変えない。
     try:
         msg.finish_reason = resp.choices[0].finish_reason
+        msg.usage = _usage_of(getattr(resp, "usage", None))
     except (AttributeError, ValueError, TypeError):
         pass
     return msg
@@ -14327,6 +14379,8 @@ class StreamedMessage:
         self.content = ""
         self.tool_calls = None
         self.finish_reason = None      # "length" なら出力が上限で切れている
+        self.usage = None              # {"input","cached","output"}。付けてこない構成では None
+        self.first_at = None           # 呼び始めてから最初のチャンクが届くまでの秒数
         self._parts: dict[int, dict] = {}
 
     def _finish(self):
@@ -14352,6 +14406,9 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
         messages=messages,
         temperature=config.OPENAI_TEMPERATURE,
         stream=True,
+        # 最後のチャンクにトークン数（キャッシュが効いた分も）を付けてもらう（[turn] ログ用）。
+        # 知らないゲートウェイには _fix_for が落として投げ直す
+        stream_options={"include_usage": True},
     )
     # 空のときは tools のキーごと外す（空配列を弾くAPIがある。chat() と同じ扱い）
     defs = tools.BUILTIN_TOOLS if tool_defs is None else tool_defs
@@ -14364,7 +14421,13 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
         kwargs["max_tokens"] = config.OPENAI_MAX_TOKENS
 
     out = StreamedMessage()
+    t0 = time.perf_counter()
     for chunk in _create(**kwargs):
+        if out.first_at is None:
+            out.first_at = time.perf_counter() - t0
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:              # 最後のチャンク（choices は空）に付いてくる
+            out.usage = _usage_of(usage)
         if not chunk.choices:
             continue
         if chunk.choices[0].finish_reason:

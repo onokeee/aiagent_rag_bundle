@@ -9726,6 +9726,98 @@ def _may_contribute_catalog() -> bool:
             or in_catalog_contrib(getattr(g.get("user"), "username", None)))
 
 
+class _TurnClock:
+    """1回の送信の所要時間の内訳。終わりにサーバのログへ1行出す（[turn]）。
+
+    「考えています…」が長いとき、どこで待っているのかをログだけで切り分けるため:
+      前処理（対象の決定・リアルタイム取り込み・プロンプトの組み立て）
+      AIの往復ごとの「最初の応答まで」と「応答の終わりまで」
+      道具（SQL・グラフ・文書検索…）の実行
+    OpenAI が返す入力トークン数と「うちキャッシュが効いた分」も並べる。プロンプトの並び
+    （brain.build_system_prompt）を変えた効果はこの数字で確かめる。カタログまでが全員で
+    共通なら、2回目以降は入力の大半がキャッシュになるはず。
+    """
+
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.pre = None                 # 前処理の秒数（_begin_turn の終わりで入る）
+        self.rounds: list[dict] = []    # AIの往復ごとの記録
+        self.model = ""
+        self.reported = False
+
+    def preprocessed(self) -> None:
+        self.pre = time.perf_counter() - self.t0
+
+    def round_started(self) -> None:
+        self.rounds.append({"t0": time.perf_counter(), "first": None, "llm": None,
+                            "tools": 0.0, "usage": None, "error": ""})
+
+    def _cur(self) -> dict:
+        if not self.rounds:
+            self.round_started()
+        return self.rounds[-1]
+
+    def round_answered(self, msg) -> None:
+        r = self._cur()
+        r["llm"] = time.perf_counter() - r["t0"]
+        r["first"] = getattr(msg, "first_at", None)
+        r["usage"] = getattr(msg, "usage", None)
+
+    def round_failed(self, e: Exception) -> None:
+        r = self._cur()
+        r["llm"] = time.perf_counter() - r["t0"]
+        r["error"] = type(e).__name__
+
+    def tool_time(self, seconds: float) -> None:
+        self._cur()["tools"] += seconds
+
+    def line(self, aborted: bool = False) -> str:
+        total = time.perf_counter() - self.t0
+        parts = []
+        if self.pre is not None:
+            parts.append(f"前処理 {self.pre:.1f}秒")
+        for i, r in enumerate(self.rounds, 1):
+            seg = [f"往復{i}:"]
+            if r["error"]:
+                seg.append(f"失敗（{r['error']}）{(r['llm'] or 0):.1f}秒")
+            else:
+                if r["first"] is not None:
+                    seg.append(f"最初の応答まで {r['first']:.1f}秒")
+                if r["llm"] is not None:
+                    seg.append(f"AI {r['llm']:.1f}秒")
+            if r["tools"]:
+                seg.append(f"道具 {r['tools']:.1f}秒")
+            u = r["usage"]
+            if u:
+                seg.append(f"入力 {u['input']:,}tok（うちキャッシュ {u['cached']:,}）"
+                           f"出力 {u['output']:,}")
+            parts.append(" ".join(seg))
+        parts.append(f"合計 {total:.1f}秒" + ("（途中で切断）" if aborted else ""))
+        return " / ".join(parts)
+
+    def report(self, aborted: bool = False) -> None:
+        if self.reported or (self.pre is None and not self.rounds):
+            return
+        self.reported = True
+        try:
+            who = g.user.username
+        except Exception:
+            who = "?"
+        print(f"[turn] {who}（{self.model or '?'}）: {self.line(aborted)}")
+
+
+def _turn_clock() -> "_TurnClock":
+    """この送信の _TurnClock（_begin_turn が g に置く）。無ければ新しく作る。"""
+    try:
+        clock = getattr(g, "turn_clock", None)
+    except RuntimeError:                     # リクエストの外（検証など）
+        return _TurnClock()
+    if clock is None:
+        clock = _TurnClock()
+        g.turn_clock = clock
+    return clock
+
+
 def _advance(chat: dict, scope: list[dict], question: str) -> None:
     """最終回答が出るまで回す。
 
@@ -9734,18 +9826,23 @@ def _advance(chat: dict, scope: list[dict], question: str) -> None:
     """
     guard = _Guard()
     retried_empty = False
+    clock = _turn_clock()
     for _ in range(config.MAX_AGENT_STEPS):
+        clock.round_started()
         try:
             defs = tools.build_tools(scope, admin=_is_admin())
             model = models.current(g.user)
+            clock.model = model
             # 文脈に収まらないぶんは、古い質問から落とした控えを送る
             # （chat["messages"] 自体は削らない。削ると巻き戻しの位置がずれる）
             msg = llm.chat(llm.history_for_llm(chat["messages"], model, defs),
                            defs, model=model)
         except Exception as e:
+            clock.round_failed(e)
             chat["render_log"].append({"role": "assistant", "kind": "error",
                                        "message": _friendly_llm_error(e)})
             return
+        clock.round_answered(msg)
 
         chat["messages"].append(_msg_to_dict(msg))
         if msg.content:
@@ -9773,7 +9870,9 @@ def _advance(chat: dict, scope: list[dict], question: str) -> None:
 
         fresh = [c for c in calls if not guard.seen(c)]
         chat["render_log"].extend(_call_previews(fresh, scope, question))
+        t_tool = time.perf_counter()
         _execute(chat, calls, scope, guard)
+        clock.tool_time(time.perf_counter() - t_tool)
         if guard.stuck:
             _append_final_answer(chat)
             chat["render_log"].append(_stop_note(guard.stop_reason))
@@ -10046,6 +10145,7 @@ def _begin_turn():
     質問を検証し、スコープを確定し、会話にユーザーの発言を積むところまで。
     始められないときは _TurnError を投げる（呼び出し側で分岐を書かずに済む）。
     """
+    g.turn_clock = _TurnClock()          # この送信の所要時間（終わりに [turn] で1行出す）
     body = _body()
     text = str(body.get("text") or "").strip()
     if not text:
@@ -10102,6 +10202,7 @@ def _begin_turn():
                                    scope, admin=_is_admin(),
                                    model=models.current(g.user),
                                    memory=memory_prompt(g.user))}
+        g.turn_clock.preprocessed()
     except _TurnError:
         # 始められなかったので、先に保存した質問を取り消す。
         # 残すと「答えの無い質問」が履歴に積まれ、次の質問でLLMにも送られる
@@ -10134,6 +10235,7 @@ def _w_send():
     chat, scope, text = _begin_turn()
     before = len(chat["render_log"]) - 1
     _advance(chat, scope, text)
+    _turn_clock().report()
     _schedule_memory(g.user, chat)
     return _reply(chat, before)
 
@@ -10154,11 +10256,14 @@ def _stream_advance(chat: dict, scope: list[dict], question: str):
     """_advance のストリーミング版。起きたことを逐次 yield する。"""
     guard = _Guard()
     retried_empty = False
+    clock = _turn_clock()
     for _ in range(config.MAX_AGENT_STEPS):
         msg = None
+        clock.round_started()
         try:
             defs = tools.build_tools(scope, admin=_is_admin())
             model = models.current(g.user)
+            clock.model = model
             for kind, payload in llm.chat_stream(
                     llm.history_for_llm(chat["messages"], model, defs),
                     defs, model=model):
@@ -10167,11 +10272,13 @@ def _stream_advance(chat: dict, scope: list[dict], question: str):
                 else:
                     msg = payload
         except Exception as e:
+            clock.round_failed(e)
             item = {"role": "assistant", "kind": "error",
                     "message": _friendly_llm_error(e)}
             chat["render_log"].append(item)
             yield _sse("item", _web_log([item])[0])
             return
+        clock.round_answered(msg)
         if msg is None:
             return
 
@@ -10215,7 +10322,9 @@ def _stream_advance(chat: dict, scope: list[dict], question: str):
             yield _sse("running", {"name": c["name"],
                                    "label": TOOL_LABELS.get(c["name"], c["name"])})
             before = len(chat["render_log"])
+            t_tool = time.perf_counter()
             _execute(chat, [c], scope, guard)
+            clock.tool_time(time.perf_counter() - t_tool)
             for item in _web_log(chat["render_log"], before):
                 yield _sse("item", item)
 
@@ -10277,6 +10386,7 @@ def stream():
             yield _sse("item", {"role": "assistant", "kind": "error",
                                 "message": _friendly_llm_error(e)})
         finally:
+            _turn_clock().report(aborted=aborted)
             _persist(chat)
             _schedule_memory(user, chat)         # パーソナライズの抜き出し（別スレッド。end は待たない）
             if not aborted:
@@ -10312,6 +10422,7 @@ def rewind():
     # という、間違いに気づけない事故になる。
     rag.set_current_user(g.user)
     results.new_turn()
+    g.turn_clock = _TurnClock()
 
     chat = _load_current()
     try:
@@ -10348,12 +10459,14 @@ def rewind():
                                scope, admin=_is_admin(),
                                model=models.current(g.user),
                                memory=memory_prompt(g.user))}
+    g.turn_clock.preprocessed()
     chat["messages"].append({"role": "user", "content": text})
     llm.drop_old_images(chat["messages"])     # 送信と同じ扱いにする
     chat["render_log"].append({"role": "user", "kind": "text", "content": text,
                                "at": chats.now()})
 
     _advance(chat, scope, text)
+    _turn_clock().report()
     _schedule_memory(g.user, chat)
     return _reply(chat, 0, replace=True)
 
