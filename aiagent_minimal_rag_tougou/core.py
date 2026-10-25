@@ -2828,6 +2828,8 @@ def _profile_key(db_path) -> dict:
     （チェックポイント）。本体だけを見ていると、取り込んだのに印が変わらず、
     古い控えが「新しい」と判定される時間ができる。-wal も見れば、書いた瞬間に
     印が変わる。
+    0バイトの -wal は「無い」のと同じ扱いにする（読み取り専用の接続が空の -wal を
+    作り、書き込みの接続が最後に閉じると消す。中身は無いので本体と同じ）。
 
     SQLite の PRAGMA data_version は使わない。あの番号は「同じ接続で前に読んだ
     値と比べる」ためのもので、毎回新しい接続で読むと常に同じ値が返る
@@ -2836,12 +2838,13 @@ def _profile_key(db_path) -> dict:
     """
     p = Path(db_path)
     st = p.stat()
-    key = {"v": 4, "mtime": st.st_mtime, "size": st.st_size}
+    key = {"v": 4, "mtime": st.st_mtime, "size": st.st_size, "wal": None}
     try:
         ws = p.with_name(p.name + "-wal").stat()
-        key["wal"] = [ws.st_mtime, ws.st_size]
+        if ws.st_size > 0:
+            key["wal"] = [ws.st_mtime, ws.st_size]
     except OSError:
-        key["wal"] = None
+        pass
     return key
 
 
@@ -2965,73 +2968,90 @@ def refresh_profile(db_path, changed=()) -> None:
         _refresh_profile_locked(db_path, want)
 
 
-def _refresh_profile_locked(db_path: Path, want: set) -> bool:
-    """refresh_profile の本体（鍵を取った状態で呼ぶ）。控えを書けたら True。
+def _refresh_profile_locked(db_path: Path, want: set) -> str:
+    """refresh_profile の本体（鍵を取った状態で呼ぶ）。
 
     profile_db も「控えはあるが印が古い」ときにここを使う（全部を測り直さない）。
+    戻り値:
+      "written" … 控えを書いた
+      "kept"    … 測っている間に書き込みがあった／一時的に読めなかった。前の控えは
+                  残した（印が合わないので、次に読んだ人がもう一度差分更新する）
+      "none"    … 控えが無い、または読めなかった表があって控えを消した（次は全部作り直し）
     """
     cache = _cache_path(db_path)
-    try:
-        old = (json.loads(cache.read_text(encoding="utf-8")).get("tables") or {})
-    except Exception:
-        old = {}                      # 控えが無い＝全部数える（初回と同じ）
-    conn = db.connect_ro(db_path)
-    tables: dict = {}
-    try:
-        # 測っている間に別の書き込みが入ったかは、この接続で前後に読む data_version で
-        # 見分ける（同じ接続で読んだ値は、他の接続が書き込むと変わる）
-        before = conn.execute("PRAGMA data_version").fetchone()[0]
-        reset = _make_timeout(conn, config.PROFILE_TIMEOUT_SEC)
-        rows = conn.execute(
+    old_doc = _read_cache(cache)
+    old = (old_doc or {}).get("tables") or {}      # 控えが無い＝全部数える（初回と同じ）
+    # 測っている間に別の書き込みが入ったら、古い中身で控えを書かずに1回だけ測り直す
+    # （取り込みが続いている最中に当たることがあり、1回の失敗で全部作り直しに落とさない）
+    for _attempt in range(2):
+        conn = db.connect_ro(db_path)
+        tables: dict = {}
+        try:
+            # 書き込みの有無は、この接続で前後に読む data_version で見分ける
+            # （同じ接続で読んだ値は、他の接続が書き込むと変わる。新しい接続で読むと毎回同じ）
+            before = conn.execute("PRAGMA data_version").fetchone()[0]
+            reset = _make_timeout(conn, config.PROFILE_TIMEOUT_SEC)
+            rows = conn.execute(
                 "SELECT name, type FROM sqlite_master "
                 "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall()
-        for name, typ in rows:
-            prev = old.get(name) or {}
-            # 前回と同じ中身なら、重い「値の分布」は数え直さない
-            keep = (name not in want and prev
-                    and not prev.get("error") and not prev.get("degraded"))
-            t = _profile_table(conn, name, reset, with_stats=not keep)
-            t["type"] = typ
-            if keep:
-                same = (prev.get("row_count") == t["row_count"]
-                        and [c["name"] for c in (prev.get("columns") or [])]
-                        == [c["name"] for c in t["columns"]])
-                if same:
-                    t["col_stats"] = prev.get("col_stats") or {}
-                else:
-                    # 行数か列が変わっている＝中身が変わった。ここだけ数え直す
-                    t = _profile_table(conn, name, reset)
-                    t["type"] = typ
-            tables[name] = t
-        # 印は、測り終えた中身と同じ時点のものを使う（書き込みが無かったことを確かめる前に取る）
-        key = _profile_key(db_path)
-        after = conn.execute("PRAGMA data_version").fetchone()[0]
-    except sqlite3.Error as e:
-        print(f"[catalog] 表の一覧を更新できませんでした（控えは作り直させます）: {e}")
-        forget(db_path)
-        return False
-    finally:
-        conn.close()
+            ).fetchall()
+            for name, typ in rows:
+                prev = old.get(name) or {}
+                # 前回と同じ中身なら、重い「値の分布」は数え直さない
+                keep = (name not in want and prev
+                        and not prev.get("error") and not prev.get("degraded"))
+                t = _profile_table(conn, name, reset, with_stats=not keep)
+                t["type"] = typ
+                if keep:
+                    same = (prev.get("row_count") == t["row_count"]
+                            and [c["name"] for c in (prev.get("columns") or [])]
+                            == [c["name"] for c in t["columns"]])
+                    if same:
+                        t["col_stats"] = prev.get("col_stats") or {}
+                    else:
+                        # 行数か列が変わっている＝中身が変わった。ここだけ数え直す
+                        t = _profile_table(conn, name, reset)
+                        t["type"] = typ
+                tables[name] = t
+            # 印は、測り終えた中身と同じ時点のものを使う（書き込みが無かったと確かめる前に取る）
+            key = _profile_key(db_path)
+            after = conn.execute("PRAGMA data_version").fetchone()[0]
+        except sqlite3.Error as e:
+            # 一時的に読めない（取り込みと重なった・時間切れ）。前の控えは消さない。
+            # 消すと次の人が全部作り直し（本番で45秒）になる
+            print(f"[catalog] {db_path.name}: 表の一覧を更新できませんでした"
+                  f"（前の控えのまま。次に読むときに測り直します）: {e}")
+            return "kept" if old_doc is not None else "none"
+        finally:
+            conn.close()
+        if after == before:
+            break
+        print(f"[catalog] {db_path.name}: 表の一覧を測っている間に書き込みがあったので測り直します。")
+    else:
+        # 2回とも書き込みと重なった。前の控えを残すが、いま触った表（want）には
+        # 「数え直し」の印を付けておく。付けないと、行数も列も同じ全件入れ替え
+        # （値だけ変わった）で、値の分布が次の差分更新でも持ち越されてしまう
+        if old_doc is not None and want:
+            for n in want:
+                if n in old:
+                    old[n]["degraded"] = True
+            try:
+                config.write_text_atomic(cache, json.dumps(old_doc, ensure_ascii=False, default=str))
+            except OSError as e:
+                print(f"[catalog] 控えに印を付けられませんでした: {e}")
+        return "kept" if old_doc is not None else "none"
     broken = [t for t, v in tables.items() if v.get("error") or v.get("degraded")]
     if broken:
         print(f"[catalog] {db_path.name}: 読めなかった表があるので控えは残しません: "
               f"{'、'.join(broken[:5])}")
         forget(db_path)
-        return False
-    if after != before:
-        # 測っている間に誰かが書いた。古い中身で控えを書かない。前の控えは残して
-        # おく（印が合わないので、次に読んだ人が差分更新でもう一度測る。全部の
-        # 作り直しにはならない）
-        print(f"[catalog] {db_path.name}: 表の一覧を測っている間に書き込みがあったので、"
-              "次に読むときに測り直します。")
-        return False
+        return "none"
     config.PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.write_text_atomic(cache, json.dumps(
         {"file": db_path.name, "key": key,
          "generated_at": datetime.now().isoformat(timespec="seconds"),
          "tables": tables}, ensure_ascii=False, default=str))
-    return True
+    return "written"
 
 
 def object_names(db_path) -> set:
@@ -3064,8 +3084,11 @@ def profile_db(db_path, force: bool = False) -> dict:
 
     控えはあるが印が古いときは、全部を測り直さず差分更新（_refresh_profile_locked:
     名前・列・行数は全表、重い値の分布は変わった表だけ）で直す。取り込み側が控えを
-    直し忘れた場合や、WAL の書き戻しで印だけ変わった場合もこれで済む（本番で45秒
-    かかる全部の作り直しは、控えが無いときと force のときだけ）。
+    直し忘れた場合や、WAL の書き戻しで印だけ変わった場合もこれで済む。
+    差分更新が書き込みと重なって書けなかったときは、前の控え（名前・列が少し古い）で
+    答え、次に読んだ人がもう一度測る。本番で45秒かかる全部の作り直しは、控えが無い
+    ときと force のときだけ（ここで全部作り直すと、鍵を握る45秒の間、控えが要る全員が
+    止まる）。
     作り直しは1本ずつ（同時に呼ばれたら、先の1本が作り終わるのを待って控えを読む）。
     """
     db_path = Path(db_path)
@@ -3081,10 +3104,11 @@ def profile_db(db_path, force: bool = False) -> dict:
             data = _read_cache(cache)
             if data is not None and data.get("key") == _profile_key(db_path):
                 return data              # 待っている間に、別の1本が直し終えた
-            if data is not None and _refresh_profile_locked(db_path, set()):
+            if data is not None:
+                _refresh_profile_locked(db_path, set())
                 fresh = _read_cache(cache)
                 if fresh is not None:
-                    return fresh
+                    return fresh         # 書けた控え、または書き込みが重なって残した前の控え
         return _profile_db_locked(db_path, _profile_key(db_path), cache)
 
 
@@ -3108,6 +3132,9 @@ def _profile_db_locked(db_path, key: dict, cache) -> dict:
                 tables[name] = {"type": typ, "error": str(e), "columns": [], "fks": [],
                                 "row_count": None, "sample_columns": [], "sample_rows": [],
                                 "col_stats": {}}
+        # 印は測り終えた時点のもの（接続を開く前に取ると、読み取り専用の接続が作る
+        # 空の -wal のぶん印がずれて、次の人が差分更新をもう1回やることになる）
+        key = _profile_key(db_path)
     finally:
         conn.close()
 
@@ -7357,6 +7384,25 @@ def _scraped_frame(job: dict, fetched: dict):
     return df, hit["name"]
 
 
+def _after_import(job: dict, res: dict) -> None:
+    """取り込みが成功したら、表の一覧の控えをその場で差分更新する（取り込みの鍵の外で呼ぶ）。
+
+    手動の取り込みと同じ扱い（触った表だけ値の分布を数え直す。本番で0.4秒＋その表の分）。
+    ここで直さないと、次に画面を開いた人の処理の中で全部の作り直し（本番で45秒）が
+    始まり、その間は控えが要る全員が待つことになる。
+    取り込みの鍵（_jobs_lock）の中で呼ぶと、控えの鍵待ちのぶん定期実行とリアルタイム
+    更新まで止まるので、鍵を離してから呼ぶ。失敗しても取り込みの結果は変えない。
+    """
+    if not res.get("ok"):
+        return
+    try:
+        # 表名は import_dataframe が実際に書いた綴り（safe_name 後）に合わせる
+        catalog.refresh_profile(config.DATA_DIR / job["db_file"],
+                                importer.safe_name(str(job.get("table") or ""), table=True))
+    except Exception as e:
+        print(f"[jobs] 表の一覧の更新に失敗しました（次に開いたときに直します）: {e}")
+
+
 def run_job(job: dict, kind: str = "auto", user: str | None = None,
             fetched: dict | None = None) -> dict:
     """1ジョブを実行して、結果を定義ファイルに書き戻す。
@@ -7380,9 +7426,11 @@ def run_job(job: dict, kind: str = "auto", user: str | None = None,
                         "message": "この取り込みは別のプロセス（cron など）で実行中です。"
                                    "終わるまで前回取り込んだ内容で答えます。"}
             try:
-                return _run_job_locked(job, kind, user, fetched)
+                res = _run_job_locked(job, kind, user, fetched)
             finally:
                 _free_job_lock(lk)
+        _after_import(job, res)            # 鍵の外で（控えの更新で鍵を長く握らない）
+        return res
 
     # スクレイピングはロックの外で走らせる。ロックを握ったまま数分待つと、
     # その間の質問（リアルタイム更新の確認）と定期実行が全部止まるため。
@@ -7402,7 +7450,9 @@ def run_job(job: dict, kind: str = "auto", user: str | None = None,
         except Exception as e:                # 想定外でもジョブ一覧は壊さない
             fetched = {"error": f"想定外のエラー: {e}"}
         with _jobs_lock:
-            return _run_job_locked(job, kind, user, fetched, started)
+            res = _run_job_locked(job, kind, user, fetched, started)
+        _after_import(job, res)
+        return res
     finally:
         with _scraping_lock:
             _scraping.discard(jid)
@@ -7505,15 +7555,6 @@ def _run_job_locked(job: dict, kind: str = "auto", user: str | None = None,
         result["message"] = str(e)
     except Exception as e:                        # 想定外でもジョブ一覧は壊さない
         result["message"] = f"想定外のエラー: {e}"
-
-    if result["ok"]:
-        # 取り込んだ表だけ測り直して、表の一覧の控えをその場で新しくする（手動の取り込みと
-        # 同じ）。ここで直さないと、次に画面を開いた人の処理の中で全部の作り直し
-        # （本番で45秒）が始まり、その間は控えが要る全員が待つことになる
-        try:
-            catalog.refresh_profile(config.DATA_DIR / job["db_file"], job["table"])
-        except Exception as e:                    # 控えの更新は取り込みの成否を変えない
-            print(f"[jobs] 表の一覧の更新に失敗しました（次に開いたときに直します）: {e}")
 
     saved = get_job(job.get("id", "")) or dict(job)
     saved.update({
