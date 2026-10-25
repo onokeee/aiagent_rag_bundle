@@ -3173,6 +3173,10 @@ details.acc.is-target {
                  color: var(--muted); padding: 0 3px; font-size: 13px; }
 .histitem:hover .histitem__del { opacity: 1; }
 .histitem__del:hover { color: var(--err); }
+/* 回答待ちの会話: 履歴の行に小さな回転印を出す。別の会話を見ている間も、どの会話が
+   回答を待っているかが分かる。新しい会話（まだ一覧に無い）は仮の行を先頭に出す */
+.histitem .spinner { width: 12px; height: 12px; border-width: 2px; flex: none; }
+.histitem--pending { opacity: .85; }
 /* マイロボット: 登録ダイアログの質問ごとの囲いと、一覧のカード */
 .robotturn { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
              margin-bottom: 8px; }
@@ -6524,23 +6528,39 @@ function wireKnowledge() {
 
 /* --- 履歴 ------------------------------------------------------------------- */
 
+/** 回答待ちの印（履歴の行に付ける小さな回転印）。 */
+function waitMark() {
+    return el('span', { class: 'spinner', title: '回答を待っています' });
+}
+
+/** まだ一覧に無い新しい会話が回答待ちのときに、先頭に出す仮の行。 */
+function pendingRow() {
+    return el('div', { class: 'histitem is-active histitem--pending' },
+        waitMark(),
+        el('div', { class: 'histitem__title', title: pendingTitle }, pendingTitle || '新しい会話'),
+        el('span', { class: 'small muted' }, '回答待ち'));
+}
+
 function renderHistory(items) {
     const box = $('#historyList');
     box.replaceChildren();
+    if (busy && !busyChatId) box.append(pendingRow());   // 新しい会話の質問を送信中
     if (!items.length) {
-        box.append(el('div', { class: 'small muted' }, 'まだ履歴はありません。'));
+        if (!(busy && !busyChatId)) box.append(el('div', { class: 'small muted' }, 'まだ履歴はありません。'));
         return;
     }
     items.forEach(c => {
         const stamp = (c.updated_at || '').slice(5, 16).replace('T', ' ');
         box.append(el('div', {
             class: 'histitem' + (c.id === currentChatId ? ' is-active' : ''),
+            'data-id': c.id,
             onclick: ev => {
                 if (ev.target.closest('.histitem__del')) return;
                 // 別のタブで消された会話を押すと api() が投げる。黙って止まらないよう受ける
                 openChat(c.id).catch(e => { toast(e.message, 'warn'); refreshHistory(); });
             },
         },
+            busy && busyChatId === c.id ? waitMark() : null,   // この会話の回答を待っている
             el('div', { class: 'histitem__title', title: `${c.title}（${stamp}）` }, c.title || '（無題）'),
             el('span', { class: 'small muted' }, stamp),
             el('button', {
@@ -7876,6 +7896,26 @@ const elapsedText = (sec) =>
 let busyStart = null;
 let busyLabel = '';
 let busyChatId = null;   // いま回答を待っている質問が、どのマイエージェントのものか
+let pendingTitle = '';   // 新しい会話の質問を送信中のとき、履歴の仮の行に出す題
+let histMark = '';       // 履歴の回答待ちの印を、いまどの状態で描いているか（無駄に描き直さない）
+
+/** 履歴の一覧に、回答待ちの印を付け直す（setBusy のたびに呼ぶ。状態が変わったときだけ描く）。 */
+function markHistoryBusy() {
+    const box = $('#historyList');
+    if (!box) return;
+    const want = busy ? (busyChatId || '*new*') : '';
+    if (want === histMark) return;
+    histMark = want;
+    box.querySelectorAll('.histitem .spinner, .histitem--pending').forEach(n => n.remove());
+    if (!busy) return;
+    if (!busyChatId) {
+        box.prepend(pendingRow());
+        return;
+    }
+    for (const row of box.querySelectorAll('.histitem')) {
+        if (row.dataset.id === busyChatId) { row.prepend(waitMark()); break; }
+    }
+}
 
 function setBusy(on, label = '') {
     busy = on;
@@ -7888,9 +7928,12 @@ function setBusy(on, label = '') {
         busyStart = null;
         busyLabel = '';
         busyChatId = null;
+        pendingTitle = '';
         $('#thinking')?.remove();
+        markHistoryBusy();
         return;
     }
+    markHistoryBusy();
 
     if (busyStart === null) busyStart = Date.now();
     if (label) busyLabel = label;
@@ -7930,6 +7973,7 @@ async function send(text) {
               images: images.length ? images : undefined });
     scrollDown(true);                       // 自分の発言のときは必ず下へ
     busyChatId = currentChatId;             // この質問が属するマイエージェント（新規なら null）
+    pendingTitle = text.slice(0, 40);       // 新規のときは履歴の仮の行に質問の冒頭を出す
     setBusy(true, '考えています');
     const tokens = images.map(i => i.token);
     const ok = await sendStreaming(text, tokens);
