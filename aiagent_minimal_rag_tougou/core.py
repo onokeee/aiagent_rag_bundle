@@ -9812,7 +9812,14 @@ def _friendly_llm_error(e: Exception) -> str:
     if "timed out" in low or "timeout" in low:
         return ("モデルの応答が時間内に返りませんでした。"
                 "もう一度送るか、質問を短く分けてください。")
-    return f"LLM呼び出しに失敗しました: {s[:160]}"
+    # API の応答にある message だけを出す（生の例外文は JSON の飾りで160字が埋まり、
+    # 肝心の「何をすればよいか」が切れていた）。管理者が原因を追えるよう少し長めに
+    body = getattr(e, "body", None)
+    detail = ""
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        detail = str((err or {}).get("message") or "")
+    return f"LLM呼び出しに失敗しました: {(detail or s)[:300]}"
 
 
 _EMPTY_MESSAGE = ("（モデルから空の応答が返り、書き直しもできませんでした。"

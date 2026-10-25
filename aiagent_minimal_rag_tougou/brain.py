@@ -13260,15 +13260,19 @@ def _apply_quirks(kwargs: dict) -> dict:
     return out
 
 
-def _learn(model: str, *, set_: dict | None = None, drop: str | None = None) -> None:
+def _learn(model: str, *, set_: dict | None = None, drop: str | None = None,
+           api: str | None = None) -> None:
     q = _QUIRKS.setdefault(model, {"set": {}, "drop": set()})
     if set_:
         q["set"].update(set_)
     if drop:
         q["drop"].add(drop)
         q["set"].pop(drop, None)
+    if api:
+        q["api"] = api                      # "responses" … Responses API で呼ぶ
     print(f"[llm] {model} の呼び出し方を調整しました: "
-          f"set={q['set']} drop={sorted(q['drop'])}")
+          f"set={q['set']} drop={sorted(q['drop'])}"
+          + (f" api={q['api']}" if q.get("api") else ""))
 
 
 #: reasoning_effort の候補を「考える量が少ない順」に並べたもの。モデルが受け付ける値の
@@ -13312,6 +13316,7 @@ def _fix_for(message: str, kwargs: dict) -> tuple | None:
     # temperature / top_p が既定値しか許されないモデル → 落として既定に任せる
     for name in ("temperature", "top_p"):
         if f"'{name}'" in low and ("does not support" in low
+                                   or "is not supported" in low
                                    or "only the default" in low):
             return (None, name)
     # 新しいモデルは max_tokens ではなく max_completion_tokens を使う
@@ -13382,11 +13387,224 @@ class RateLimited(Exception):
     """
 
 
+# --- Responses API（/v1/responses）への切り替え -------------------------------------
+#
+# gpt-5.4 以降は、chat/completions で道具（function tools）を使うには reasoning_effort='none'
+# が要る。gpt-5.6 系は 'none' が通るが、gpt-6 系は 'none' を受け付けないので、chat/completions
+# では道具が使えない。OpenAI のエラー文:
+#   Function tools with reasoning_effort are not supported for gpt-6.1-sol in /v1/chat/completions.
+#   To use function tools, use /v1/responses or set reasoning_effort to 'none'.
+# そのモデルは Responses API で呼ぶ。呼び出し元（chat / chat_stream / _ask_json / route_tables）
+# を変えずに済むよう、ここで引数を変換し、戻りを chat.completions の形（choices[0].message、
+# stream ならチャンクの列）にそろえる。覚え方は作法の学習と同じ（_QUIRKS[model]["api"]）で、
+# プロセスの寿命だけ持つ。
+#
+# 送るもの: instructions（system）、input（user / assistant / function_call / function_call_output）、
+# tools（平らな形）、temperature・top_p、max_output_tokens、store=False（会話を保存しない）。
+# 推論（reasoning）は送らずモデルの既定に任せ、推論アイテムは履歴に含めない。
+from types import SimpleNamespace as _NS
+
+
+def _api_for(model: str) -> str:
+    return str((_QUIRKS.get(model) or {}).get("api") or "chat")
+
+
+def _wants_responses(message_low: str, attempt: dict) -> bool:
+    """このエラーは「Responses API に切り替えないと道具が使えない」か。
+
+    道具のために 'none' を送ったのに断られた（gpt-6 系）、または 'none' 以外の値で
+    「function tools … /v1/responses」と言われた、のどちらか。
+    """
+    if "reasoning_effort" not in message_low:
+        return False
+    if "'none'" in message_low and "does not support" in message_low:
+        return True
+    return ("function tools" in message_low and "/v1/responses" in message_low
+            and attempt.get("reasoning_effort") not in (None, "none"))
+
+
+def _msg_to_plain(m) -> dict:
+    """SDK のメッセージオブジェクトが混ざっていても dict にそろえる。"""
+    if isinstance(m, dict):
+        return m
+    d = {"role": getattr(m, "role", None), "content": getattr(m, "content", None)}
+    tcs = getattr(m, "tool_calls", None)
+    if tcs:
+        d["tool_calls"] = [{"id": tc.id, "function": {"name": tc.function.name,
+                                                      "arguments": tc.function.arguments}}
+                           for tc in tcs]
+    if getattr(m, "tool_call_id", None):
+        d["tool_call_id"] = m.tool_call_id
+    return d
+
+
+def _responses_request(attempt: dict) -> dict:
+    """chat.completions の引数を Responses API の引数に変換する。"""
+    req: dict = {"model": attempt.get("model"), "store": False}
+    instructions: list = []
+    items: list = []
+    for m in attempt.get("messages") or []:
+        m = _msg_to_plain(m)
+        role, content = m.get("role"), m.get("content")
+        if role == "system":
+            if content:
+                instructions.append(str(content))
+        elif role == "user":
+            if isinstance(content, list):          # 画像つき
+                parts = []
+                for p in content:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") == "text":
+                        parts.append({"type": "input_text", "text": str(p.get("text") or "")})
+                    elif p.get("type") == "image_url":
+                        u = p.get("image_url") or {}
+                        part = {"type": "input_image", "image_url": str(u.get("url") or "")}
+                        if u.get("detail"):
+                            part["detail"] = u["detail"]
+                        parts.append(part)
+                items.append({"role": "user", "content": parts or ""})
+            else:
+                items.append({"role": "user", "content": str(content or "")})
+        elif role == "assistant":
+            if content:
+                items.append({"role": "assistant", "content": str(content)})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                items.append({"type": "function_call",
+                              "call_id": str(tc.get("id") or ""),
+                              "name": str(fn.get("name") or ""),
+                              "arguments": str(fn.get("arguments") or "{}")})
+        elif role == "tool":
+            items.append({"type": "function_call_output",
+                          "call_id": str(m.get("tool_call_id") or ""),
+                          "output": str(content or "")})
+    if instructions:
+        req["instructions"] = "\n\n".join(instructions)
+    req["input"] = items
+    tools_ = attempt.get("tools")
+    if tools_:
+        req["tools"] = [{"type": "function",
+                         "name": t["function"]["name"],
+                         "description": t["function"].get("description") or "",
+                         "parameters": t["function"].get("parameters")
+                         or {"type": "object", "properties": {}}}
+                        for t in tools_ if t.get("type") == "function"]
+        if attempt.get("tool_choice"):
+            req["tool_choice"] = attempt["tool_choice"]
+    for k in ("temperature", "top_p"):
+        if k in attempt:
+            req[k] = attempt[k]
+    mx = attempt.get("max_completion_tokens", attempt.get("max_tokens"))
+    if mx is not None:
+        req["max_output_tokens"] = mx
+    if attempt.get("stream"):
+        req["stream"] = True
+    eff = attempt.get("reasoning_effort")
+    if eff and eff != "none":
+        req["reasoning"] = {"effort": eff}
+    return req
+
+
+def _chunk(content=None, tool=None, finish=None):
+    """chat.completions のストリームのチャンクと同じ形（chat_stream が読む属性だけ）。
+
+    tool は (index, call_id, name, arguments の差分)。無い項目は None。
+    """
+    tcs = None
+    if tool is not None:
+        index, call_id, name, args = tool
+        tcs = [_NS(index=index, id=call_id, function=_NS(name=name, arguments=args))]
+    return _NS(choices=[_NS(delta=_NS(content=content, tool_calls=tcs), finish_reason=finish)])
+
+
+def _finish_of(resp, n_tools: int) -> str:
+    inc = getattr(resp, "incomplete_details", None)
+    reason = getattr(inc, "reason", None) if inc is not None else None
+    if reason == "max_output_tokens":
+        return "length"
+    return "tool_calls" if n_tools else "stop"
+
+
+def _responses_stream(events):
+    """Responses API のイベントの列を、chat.completions のチャンクの列に読み替える。"""
+    index_of: dict = {}            # 出力アイテムの id → tool_calls の index
+    got_delta: set = set()
+    n_tools = 0
+    for ev in events:
+        t = str(getattr(ev, "type", "") or "")
+        if t == "response.output_text.delta":
+            if getattr(ev, "delta", None):
+                yield _chunk(content=ev.delta)
+        elif t == "response.output_item.added":
+            item = getattr(ev, "item", None)
+            if getattr(item, "type", "") == "function_call":
+                idx = n_tools
+                n_tools += 1
+                index_of[getattr(item, "id", None) or f"#{idx}"] = idx
+                yield _chunk(tool=(idx, getattr(item, "call_id", None) or getattr(item, "id", None),
+                                   getattr(item, "name", None), None))
+        elif t == "response.function_call_arguments.delta":
+            idx = index_of.get(getattr(ev, "item_id", None))
+            if idx is not None and getattr(ev, "delta", None):
+                got_delta.add(idx)
+                yield _chunk(tool=(idx, None, None, ev.delta))
+        elif t == "response.function_call_arguments.done":
+            # 差分を送ってこない実装のために、1つも受け取っていなければ全文を使う
+            idx = index_of.get(getattr(ev, "item_id", None))
+            if idx is not None and idx not in got_delta and getattr(ev, "arguments", None):
+                yield _chunk(tool=(idx, None, None, ev.arguments))
+        elif t in ("response.completed", "response.incomplete"):
+            yield _chunk(finish=_finish_of(getattr(ev, "response", None), n_tools))
+        elif t in ("response.failed", "error"):
+            err = getattr(getattr(ev, "response", None), "error", None)
+            msg = (getattr(err, "message", None) or getattr(ev, "message", None)
+                   or "Responses API からエラーが返りました。")
+            raise RuntimeError(str(msg))
+
+
+def _completion_from_response(resp):
+    """Responses API の応答（stream でない）を chat.completions の応答の形にする。"""
+    msg = StreamedMessage()
+    for item in getattr(resp, "output", None) or []:
+        typ = getattr(item, "type", "")
+        if typ == "message":
+            for p in getattr(item, "content", None) or []:
+                pt = getattr(p, "type", "")
+                if pt == "output_text":
+                    msg.content += getattr(p, "text", "") or ""
+                elif pt == "refusal":
+                    msg.content += getattr(p, "refusal", "") or ""
+        elif typ == "function_call":
+            msg._parts[len(msg._parts)] = {
+                "id": getattr(item, "call_id", None) or getattr(item, "id", "") or "",
+                "name": getattr(item, "name", "") or "",
+                "arguments": getattr(item, "arguments", "") or ""}
+    msg._finish()
+    msg.finish_reason = _finish_of(resp, len(msg._parts))
+    return _NS(choices=[_NS(message=msg, finish_reason=msg.finish_reason)])
+
+
+def _responses_call(**attempt):
+    req = _responses_request(attempt)
+    res = client().responses.create(**req)
+    if req.get("stream"):
+        return _responses_stream(res)
+    return _completion_from_response(res)
+
+
+def _dispatch(model: str, attempt: dict):
+    if _api_for(model) == "responses":
+        return _responses_call(**attempt)
+    return client().chat.completions.create(**attempt)
+
+
 def _create(**kwargs):
-    """chat.completions.create の呼び出し口。
+    """AI呼び出しの入口（chat.completions.create。学習済みのモデルは Responses API）。
 
     モデルが受け付けない引数を、エラーの内容を見て直しながら投げ直す。
     直し方が分からないエラーはそのまま投げる（画面にそのまま出す）。
+    戻りは常に chat.completions の形（choices[0].message、stream ならチャンクの列）。
     """
     model = str(kwargs.get("model") or "")
     attempt = _apply_quirks(kwargs)
@@ -13394,7 +13612,7 @@ def _create(**kwargs):
     waited_total = 0.0
     while fixes < _MAX_FIX:
         try:
-            return client().chat.completions.create(**attempt)
+            return _dispatch(model, attempt)
         except Exception as e:
             # レート制限は「引数の直し方」の問題ではないので、先に片付ける。
             # 待てば通ることがほとんどなので、その場で終わらせない。
@@ -13429,17 +13647,27 @@ def _create(**kwargs):
                         _waiting[0] -= 1
                 continue
             fixes += 1
+            low = str(e).lower()
+            # 道具のために 'none' を送って断られた（gpt-6 系）→ chat/completions では
+            # 道具が使えないので、このモデルは Responses API に切り替える
+            if _api_for(model) != "responses" and _wants_responses(low, attempt):
+                _learn(model, api="responses", drop="reasoning_effort")
+                attempt = _apply_quirks(kwargs)
+                continue
             fix = _fix_for(str(e), attempt)
             if fix is None:
+                print(f"[llm] {model}: 呼び出しに失敗しました（直し方が分からない）: {str(e)[:600]}")
                 raise
             set_, drop = fix
             if set_ and all(attempt.get(k) == v for k, v in set_.items()):
+                print(f"[llm] {model}: 同じ直しの繰り返しになるので諦めます: {str(e)[:600]}")
                 raise                      # 同じ直しを繰り返している
             if drop and drop not in attempt:
+                print(f"[llm] {model}: 落とす引数が無いので諦めます: {str(e)[:600]}")
                 raise
             _learn(model, set_=set_, drop=drop)
             attempt = _apply_quirks(kwargs)
-    return client().chat.completions.create(**attempt)
+    return _dispatch(model, attempt)
 
 
 # --- 表ルーター（質問に関係するテーブルだけを選ぶ） --------------------------------
