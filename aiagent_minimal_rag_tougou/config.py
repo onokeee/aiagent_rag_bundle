@@ -262,8 +262,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 #   2. 裏方の処理（DBルーター・用語集やツールのAI下書き）。こちらは画面での
 #      選択に関係なく常にこのモデルを使う。安く速いものを指定しておくとよい
 OPENAI_MODEL = "gpt-5.6-sol"
-# ※ gpt-5.6-sol は、ツールを使うとき reasoning_effort='none' が必須。
-#    この作法は llm.py の _fix_for が1回目の400応答から自動で学習するので、
+# ※ gpt-5.6-sol は、ツールを使うとき reasoning_effort='none' が必須。gpt-6 系は逆に
+#    'none' を断り、'low' 以上しか受け付けない（アプリはエラー文の候補からいちばん軽い値を選ぶ）。
+#    この作法は brain.py の _fix_for が400応答から自動で学習するので、
 #    ここでモデル名を変えるだけでよい（設定を書き足す必要はない）。
 # 画面のプルダウンに出すモデル。空ならAPIの /models から取りに行く。
 #   export OPENAI_MODELS="gpt-4o-mini;gpt-4o;5.6sol"

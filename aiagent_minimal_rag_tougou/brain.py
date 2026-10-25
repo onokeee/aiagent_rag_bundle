@@ -13271,16 +13271,41 @@ def _learn(model: str, *, set_: dict | None = None, drop: str | None = None) -> 
           f"set={q['set']} drop={sorted(q['drop'])}")
 
 
+#: reasoning_effort の候補を「考える量が少ない順」に並べたもの。モデルが受け付ける値の
+#: 中から、いちばん手前（いちばん軽い）を選ぶ。gpt-5.6-sol は 'none' を要求し、
+#: gpt-6 系は 'none' を断って 'low' 以上しか受け付けない（実際のエラー文より）
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh")
+_SUPPORTED_VALUES = re.compile(r"supported values are:?\s*(.+)", re.IGNORECASE)
+
+
+def _pick_effort(message_low: str, current) -> str:
+    """エラー文の「Supported values are: 'low', 'medium', …」から、いちばん軽い値を選ぶ。
+
+    一覧が無ければ 'none'（gpt-5.6-sol がツールと一緒に使うときの作法）。
+    いま送って断られた値（current）は選ばない。
+    """
+    m = _SUPPORTED_VALUES.search(message_low)
+    if m:
+        offered = set(re.findall(r"'([a-z]+)'", m.group(1)))
+        for v in _EFFORT_ORDER:
+            if v in offered and v != current:
+                return v
+    return "none"
+
+
 def _fix_for(message: str, kwargs: dict) -> tuple | None:
     """エラー文から、次に試す直し方を決める。戻り値: (set_, drop) か None。"""
     low = message.lower()
 
-    # ツールと推論モードを同時に使えない → 推論を切れば chat/completions で通る
+    # ツールと推論モードを同時に使えない → 推論を切る（'none'）か、モデルが受け付ける
+    # いちばん軽い値にすれば chat/completions で通る
     if "reasoning_effort" in low and "function tools" in low:
-        return ({"reasoning_effort": "none"}, None)
-    # 値が受け付けられない（'minimal' など）→ 'none' に寄せる
+        return ({"reasoning_effort": _pick_effort(low, kwargs.get("reasoning_effort"))}, None)
+    # 値が受け付けられない（'minimal' や 'none' など）→ モデルが受け付ける中でいちばん軽い値に
+    # 寄せる。gpt-6 系は 'none' を断る（Supported values are: 'low', 'medium', …）ので、
+    # ここで 'none' に固定すると同じ直しの繰り返しになって止まる
     if "reasoning_effort" in low and "does not support" in low:
-        return ({"reasoning_effort": "none"}, None)
+        return ({"reasoning_effort": _pick_effort(low, kwargs.get("reasoning_effort"))}, None)
     # そもそもこの引数を知らないモデル → 落とす
     if "reasoning_effort" in low and "unrecognized" in low:
         return (None, "reasoning_effort")
