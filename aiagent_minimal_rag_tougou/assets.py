@@ -2869,6 +2869,7 @@ details.acc.is-target {
 }
 .thinking__label:empty { display: none; }
 .thinking__time { font-variant-numeric: tabular-nums; }
+.thinking__parts { font-size: 12px; opacity: .7; }
 
 .toolblock {
     border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -7933,6 +7934,29 @@ let busyChatId = null;   // いま回答を待っている質問が、どのマ�
 let pendingTitle = '';   // 新しい会話の質問を送信中のとき、履歴の仮の行に出す題
 let histMark = '';       // 履歴の回答待ちの印を、いまどの状態で描いているか（無駄に描き直さない）
 
+// 進み具合の内訳（前処理・AI・道具）。サーバの合図が届いた時刻から数え、待ち表示の秒数の横に小さく出す
+let phaseKind = 'pre', phaseStart = 0, busyParts = '';
+const phaseSum = { pre: 0, ai: 0, tools: 0 };
+function phaseReset() {
+    phaseKind = 'pre'; phaseStart = Date.now(); busyParts = '';
+    phaseSum.pre = phaseSum.ai = phaseSum.tools = 0;
+}
+function phaseSwitch(kind) {
+    const now = Date.now();
+    phaseSum[phaseKind] += (now - phaseStart) / 1000;
+    phaseKind = kind; phaseStart = now;
+    const parts = [];
+    if (phaseSum.pre >= 1) parts.push(`前処理 ${Math.round(phaseSum.pre)}秒`);
+    if (phaseSum.ai >= 1) parts.push(`AI ${Math.round(phaseSum.ai)}秒`);
+    if (phaseSum.tools >= 1) parts.push(`道具 ${Math.round(phaseSum.tools)}秒`);
+    const text = parts.length ? `（${parts.join('・')}）` : '';
+    if (text !== busyParts) {
+        busyParts = text;
+        const n = $('#thinking .thinking__parts');
+        if (n) n.textContent = text;
+    }
+}
+
 /** 履歴の一覧に、回答待ちの印を付け直す（setBusy のたびに呼ぶ。状態が変わったときだけ描く）。 */
 function markHistoryBusy() {
     const box = $('#historyList');
@@ -7978,7 +8002,8 @@ function setBusy(on, label = '') {
             el('div', { class: 'msg__body thinking' },
                 el('span', { class: 'spinner' }),
                 el('span', { class: 'thinking__label' }),
-                el('span', { class: 'thinking__time' })));
+                el('span', { class: 'thinking__time' }),
+                el('span', { class: 'thinking__parts' }, busyParts)));
         $('#logInner').append(ind);
         const tick = () => {
             const sec = Math.floor((Date.now() - busyStart) / 1000);
@@ -8008,6 +8033,7 @@ async function send(text) {
     scrollDown(true);                       // 自分の発言のときは必ず下へ
     busyChatId = currentChatId;             // この質問が属するマイエージェント（新規なら null）
     pendingTitle = text.slice(0, 40);       // 新規のときは履歴の仮の行に質問の冒頭を出す
+    phaseReset();
     setBusy(true, '考えています');
     const tokens = images.map(i => i.token);
     const ok = await sendStreaming(text, tokens);
@@ -8114,6 +8140,7 @@ async function sendStreaming(text, imageTokens) {
             return;
         }
         if (event === 'delta') {
+            phaseSwitch('ai');
             openText();
             buf += data.text;
             node.innerHTML = mdToHtml(buf);
@@ -8121,7 +8148,12 @@ async function sendStreaming(text, imageTokens) {
         } else if (event === 'text_end') {
             closeText();
         } else if (event === 'running') {
+            phaseSwitch('tools');
             setBusy(true, `${data.label}`);
+        } else if (event === 'status') {
+            // サーバが「いま何をしているか」を知らせてきた（取り込み直し・AI に聞いている・検索の完了数）
+            if (/^AI /.test(data.text || '')) phaseSwitch('ai');
+            setBusy(true, data.text || '考えています');
         } else if (event === 'item') {
             closeText();
             lastRole = null;

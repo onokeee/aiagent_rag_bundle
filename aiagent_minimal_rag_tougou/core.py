@@ -7851,13 +7851,18 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
     質問のたびに呼ばれる。戻り値は実際に取り込み直したぶんの記録で、
     呼び出し側が画面やログに出すために使う（何も無ければ空リスト）。
     """
+    return [rec for kind, rec in iter_refresh_realtime(scope) if kind == "done"]
+
+
+def iter_refresh_realtime(scope: list[dict]):
+    """refresh_realtime の本体。取り込み直しを始める前に ("start", (ジョブ, 理由)) を、
+    終わるごとに ("done", 記録) を yield する。逐次表示が「いま何をしているか」を画面に出すために分けた。"""
     if not scope:
-        return []
+        return
     wanted = {str(s.get("name") or Path(s["path"]).name) for s in scope}
     # 表まで指定されていれば、その表の設定だけを見る（SQLガードも同じ表しか通さないので
     # 外の表を追随させても読めない。ロボット実行は自分が使う表だけを渡してくる）
     wanted_tables = {t for s in scope for t in (s.get("tables") or [])}
-    done = []
     for job in realtime_jobs():
         if job.get("db_file") not in wanted:
             continue
@@ -7870,13 +7875,15 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
             last = parse_dt(job.get("last_run"))
             if last and (datetime.now() - last) < timedelta(minutes=scrape_wait_minutes(job)):
                 continue
+            yield ("start", (job, "スクレイピング。最長"
+                             f"{int(job.get('scrape_timeout_sec') or importer.scrape_defaults()[0])}秒"))
             res = run_job(job, kind="realtime")
             if res.get("skipped"):
                 continue                   # 別の質問が取得中。終われば次の質問から効く
-            done.append({"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
-                         "table": job.get("table"), "db_file": job.get("db_file"),
-                         "rows": res.get("rows"),
-                         "message": res.get("message") or ""})
+            yield ("done", {"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
+                            "table": job.get("table"), "db_file": job.get("db_file"),
+                            "rows": res.get("rows"),
+                            "message": res.get("message") or ""})
             continue
         stamp = _source_stamp(job)
         if not stamp:
@@ -7886,9 +7893,9 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
             msg = ("取り込み元のファイルが見つかりません。"
                    "前回取り込んだ内容で回答します。")
             _note_realtime_failure(job, msg)
-            done.append({"job": job.get("name") or job.get("table"), "ok": False,
-                         "table": job.get("table"), "db_file": job.get("db_file"),
-                         "message": msg})
+            yield ("done", {"job": job.get("name") or job.get("table"), "ok": False,
+                            "table": job.get("table"), "db_file": job.get("db_file"),
+                            "message": msg})
             continue
         if _failed_recently(job, stamp):
             # この版はついさっき試して駄目だった。質問のたびに読み直しても結果は同じで、
@@ -7909,20 +7916,20 @@ def refresh_realtime(scope: list[dict]) -> list[dict]:
                                                  "（内容は前回取り込んだものと同じ）。")
                         save_job(saved)
                 if saved is not None:
-                    done.append({"job": job.get("name") or job.get("table"), "ok": True,
-                                 "table": job.get("table"), "db_file": job.get("db_file"),
-                                 "message": saved["last_message"]})
+                    yield ("done", {"job": job.get("name") or job.get("table"), "ok": True,
+                                    "table": job.get("table"), "db_file": job.get("db_file"),
+                                    "message": saved["last_message"]})
             continue                       # 変わっていない
         # 版の記録（取り込んだ版・失敗した版）は run_job 側が鍵の中で行う。
         # 失敗した版は、ファイルが変わるまで再挑戦しない
+        yield ("start", (job, "ファイルが更新されていました"))
         res = run_job(job, kind="realtime")
         if res.get("skipped"):
             continue                   # 鍵を待つ間に、別の質問が同じ版を取り込み終えていた（または失敗済み）
-        done.append({"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
-                     "table": job.get("table"), "db_file": job.get("db_file"),
-                     "rows": res.get("rows"),
-                     "message": res.get("message") or ""})
-    return done
+        yield ("done", {"job": job.get("name") or job.get("table"), "ok": res.get("ok"),
+                        "table": job.get("table"), "db_file": job.get("db_file"),
+                        "rows": res.get("rows"),
+                        "message": res.get("message") or ""})
 
 
 # ==========================================================================
@@ -10352,11 +10359,27 @@ def _realtime_refresh(scope: list[dict]) -> None:
             print(f"[realtime] 履歴にも残せませんでした: {e2}")
 
 
-def _begin_turn():
+def _set_system_prompt(chat: dict, scope: list[dict]) -> None:
+    """システムプロンプトを最新のカタログで作り直し、先頭（index 0）に差し替える。
+
+    スコープが決まってから組む。ユーザー発言より後に組むが、置き場所は必ず先頭なので並び順は崩れない。
+    """
+    if not chat["messages"] or chat["messages"][0].get("role") != "system":
+        chat["messages"].insert(0, {"role": "system", "content": ""})
+    chat["messages"][0] = {"role": "system",
+                           "content": llm.build_system_prompt(
+                               scope, admin=_is_admin(),
+                               model=models.current(g.user),
+                               memory=memory_prompt(g.user))}
+
+
+def _begin_turn(prepare: bool = True):
     """/send と /stream に共通する前処理。
 
     質問を検証し、スコープを確定し、会話にユーザーの発言を積むところまで。
     始められないときは _TurnError を投げる（呼び出し側で分岐を書かずに済む）。
+    prepare=False（逐次表示）は、時間のかかる取り込み直しとプロンプトの組み立てを行わず、
+    呼び出し側が応答を流し始めた後に _prepare_events で行う（進み具合を画面に出すため）。
     """
     g.turn_clock = _TurnClock()          # この送信の所要時間（終わりに [turn] で1行出す）
     body = _body()
@@ -10404,18 +10427,10 @@ def _begin_turn():
             raise _TurnError("いま調べられるものがありません。"
                              "サイドバーの SQLite3 か LightRAG で、"
                              "使うものにチェックを入れてください。")
-        _realtime_refresh(scope)
-
-        # システムプロンプトはスコープが決まってから。ユーザー発言より後に組むが、
-        # 置き場所は必ず先頭（index 0）なので、並び順は崩れない。
-        if not chat["messages"] or chat["messages"][0].get("role") != "system":
-            chat["messages"].insert(0, {"role": "system", "content": ""})
-        chat["messages"][0] = {"role": "system",
-                               "content": llm.build_system_prompt(
-                                   scope, admin=_is_admin(),
-                                   model=models.current(g.user),
-                                   memory=memory_prompt(g.user))}
-        g.turn_clock.preprocessed()
+        if prepare:
+            _realtime_refresh(scope)
+            _set_system_prompt(chat, scope)
+            g.turn_clock.preprocessed()
     except _TurnError:
         # 始められなかったので、先に保存した質問を取り消す。
         # 残すと「答えの無い質問」が履歴に積まれ、次の質問でLLMにも送られる
@@ -10465,14 +10480,108 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
+def _prepare_events(chat: dict, scope: list[dict]):
+    """逐次表示の前処理（取り込み直し → システムプロンプト）。進み具合を status で流す。
+
+    まとめて返す経路の _begin_turn(prepare=True) と同じことを、応答を流し始めた後に行う。
+    流し始めの前だと、ブラウザには何も伝えられず「考えています…」のまま固まって見える
+    （スクレイピングの取り直しは最長5分）。
+    """
+    yield _sse("status", {"text": "取り込み直しが要るか確かめています…"})
+    try:
+        for kind, payload in jobs.iter_refresh_realtime(scope):
+            if kind == "start":
+                job, how = payload
+                yield _sse("status", {"text": f"取り込み直しています: {job.get('table')}（{how}）…"})
+            elif kind == "done":
+                r = payload
+                print(f"[realtime] {'OK' if r.get('ok') else 'NG'} {r.get('db_file')}/{r.get('table')}: "
+                      f"{r.get('message')}")
+    except Exception as e:
+        # _realtime_refresh と同じ扱い: 回答は止めず、ログと取り込み履歴に残す
+        print(f"[realtime] 更新の確認でエラー（回答は続行）: {e}")
+        try:
+            names = [s.get("name") or "" for s in (scope or [])]
+            history.add_import_record(names[0] if names else "", "", False,
+                                      f"取り込み直しの確認でエラー: {e}", kind="realtime")
+        except Exception as e2:
+            print(f"[realtime] 履歴にも残せませんでした: {e2}")
+    yield _sse("status", {"text": "AI への説明（データカタログ）を組み立てています…"})
+    _set_system_prompt(chat, scope)
+    _turn_clock().preprocessed()
+
+
+def _writing_label(name: str) -> str:
+    """AI が道具の呼び出しを組み立てている間の表示（名前が届いてから引数が揃うまで）。"""
+    if name == "run_sql_query":
+        return "AI が SQL を書いています…"
+    if name.startswith("plot_"):
+        return "AI がグラフの指示を書いています…"
+    if name == "search_knowledge_base":
+        return "AI が検索の言葉を考えています…"
+    if name.startswith("export_") or name == "build_report":
+        return "AI がファイルの中身を書いています…"
+    return f"AI が「{TOOL_LABELS.get(name, name)}」の指示を書いています…"
+
+
+def _execute_with_status(chat: dict, call: dict, scope: list[dict], guard):
+    """道具を別スレッドで実行し、終わるまで「いま何をしているか」（status）を流す。
+
+    道具の中から brain.progress(text)（社内文書の検索の完了数など）が来たら、そのまま画面へ。
+    作業スレッドにはリクエストの文脈（g.user）と、スレッドに置いてある利用者・出典番号・質問の
+    区切りを写してから動かし、終わったら出典番号などを呼び元のスレッドに戻す
+    （出典番号は1回の質問の中で通し番号なので、スレッドをまたいでも続きから振る）。
+    失敗は呼び元で投げ直す（これまでと同じく generate() が画面に出す）。
+    """
+    from flask import current_app
+    app_obj = current_app._get_current_object()
+    user = g.user
+    turn_id = results.current_turn()
+    rag_state = rag.rag_thread_state()
+    holder: dict = {"text": None, "state": None}
+    err: list = []
+    finished = threading.Event()
+
+    def work():
+        try:
+            with app_obj.app_context():
+                g.user = user
+                rag.rag_thread_restore(rag_state)
+                results.set_turn(turn_id)
+                rag.set_progress(lambda t: holder.__setitem__("text", t))
+                try:
+                    _execute(chat, [call], scope, guard)
+                finally:
+                    holder["state"] = rag.rag_thread_state()
+        except BaseException as e:              # 呼び元で投げ直す（ここで握りつぶさない）
+            err.append(e)
+        finally:
+            finished.set()
+
+    threading.Thread(target=work, daemon=True, name="aiagent-tool").start()
+    last = None
+    while not finished.wait(0.5):
+        text = holder.get("text")
+        if text and text != last:
+            last = text
+            yield _sse("status", {"text": text})
+    if holder.get("state"):
+        rag.rag_thread_restore(holder["state"])
+    if err:
+        raise err[0]
+
+
 def _stream_advance(chat: dict, scope: list[dict], question: str):
     """_advance のストリーミング版。起きたことを逐次 yield する。"""
     guard = _Guard()
     retried_empty = False
     clock = _turn_clock()
+    rounds = 0
     for _ in range(config.MAX_AGENT_STEPS):
         msg = None
         clock.round_started()
+        rounds += 1
+        yield _sse("status", {"text": f"AI に聞いています（{rounds}往復目）…"})
         try:
             defs = tools.build_tools(scope, admin=_is_admin())
             model = models.current(g.user)
@@ -10482,6 +10591,9 @@ def _stream_advance(chat: dict, scope: list[dict], question: str):
                     defs, model=model):
                 if kind == "text":
                     yield _sse("delta", {"text": payload})
+                elif kind == "tool":
+                    # 道具の名前が分かった。引数が揃うまでの間、何を書いているかを出す
+                    yield _sse("status", {"text": _writing_label(str(payload))})
                 else:
                     msg = payload
         except Exception as e:
@@ -10536,7 +10648,8 @@ def _stream_advance(chat: dict, scope: list[dict], question: str):
                                    "label": TOOL_LABELS.get(c["name"], c["name"])})
             before = len(chat["render_log"])
             t_tool = time.perf_counter()
-            _execute(chat, [c], scope, guard)
+            # 道具は別スレッドで動かし、待っている間は中からの進み具合（検索の完了数など）を画面へ
+            yield from _execute_with_status(chat, c, scope, guard)
             clock.tool_time(time.perf_counter() - t_tool)
             for item in _web_log(chat["render_log"], before):
                 yield _sse("item", item)
@@ -10567,9 +10680,10 @@ def stream():
         text_end  … ひとまとまりの回答が終わった
         item      … 表・グラフ・ファイルなどの描画アイテム
         running   … ツールを実行し始めた
+        status    … いま何をしているか（取り込み直し・AI に聞いている・道具の進み具合）
         end       … 終わり（保存後の会話ID・タイトルを載せる）
     """
-    chat, scope, text = _begin_turn()
+    chat, scope, text = _begin_turn(prepare=False)   # 取り込み直しとプロンプトは流し始めの後で
     # 会話IDはここで確定させてセッションに入れる。
     # 応答を流し始めるとセッションに書けなくなるので、あとから入れても消える
     # （次の質問が別の会話として始まってしまう）。
@@ -10591,6 +10705,7 @@ def stream():
         # （切断後に yield すると RuntimeError になり、ログが汚れるだけ）。
         aborted = False
         try:
+            yield from _prepare_events(chat, scope)
             yield from _stream_advance(chat, scope, text)
         except GeneratorExit:
             aborted = True

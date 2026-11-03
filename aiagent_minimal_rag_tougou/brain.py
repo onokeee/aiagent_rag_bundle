@@ -12477,7 +12477,7 @@ def rag_form_fields() -> list[dict]:
 # 振り分けを多少誤っても効く。
 # ==========================================================================
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #: いまの利用者（ツールの実処理から prefs を引くために置く）。
 #: dispatch は引数に利用者を持たない（35個のツールすべての形が変わるため）。
@@ -12494,6 +12494,36 @@ def set_current_user(user) -> None:
 
 def _current_user():
     return getattr(_rag_local, "user", None)
+
+
+# --- いま何をしているかを画面へ伝える口 ------------------------------------------------
+# 道具の中（社内文書の検索の完了数など）から progress(text) を呼ぶと、逐次表示の待ち表示に出る。
+# 置き場はスレッドローカル（core._execute_with_status が作業スレッドに入れる）。無ければ何もしない。
+_progress_local = threading.local()
+
+
+def set_progress(cb) -> None:
+    _progress_local.cb = cb
+
+
+def progress(text: str) -> None:
+    cb = getattr(_progress_local, "cb", None)
+    if cb is None:
+        return
+    try:
+        cb(str(text))
+    except Exception:
+        pass
+
+
+def rag_thread_state() -> dict:
+    """このスレッドに置いてある利用者・出典番号などの写し（別スレッドで道具を動かすときに持ち出す）。"""
+    return dict(vars(_rag_local))
+
+
+def rag_thread_restore(state: dict) -> None:
+    for k, v in (state or {}).items():
+        setattr(_rag_local, k, v)
 
 
 def rag_user_settings(user=None) -> dict:
@@ -12572,8 +12602,15 @@ def rag_retrieve_all(question: str, environments: list[dict],
                 "error": None}
 
     workers = max(1, min(config.RAG_FANOUT_WORKERS, len(environments)))
+    total = len(environments)
+    progress(f"社内文書を検索しています（{total}件に問い合わせ中・最長{int(config.RAG_RETRIEVE_TIMEOUT)}秒）…")
+    out: list = [None] * total                 # 戻りの並びは問い合わせた順（pool.map と同じ）
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(_one, environments))
+        futs = {pool.submit(_one, env): i for i, env in enumerate(environments)}
+        for n, fut in enumerate(as_completed(futs), 1):
+            out[futs[fut]] = fut.result()
+            progress(f"社内文書を検索しています（{total}件中 {n}件完了）…")
+    return out
 
 
 def _rag_normalize_chunks(raw: list) -> list[dict]:
@@ -14779,9 +14816,9 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
                 model: str | None = None, purpose: str = "回答"):
     """1回の補完をストリーミングで受け取る。
 
-    文字が届くたびに ("text", 差分) を yield し、
+    文字が届くたびに ("text", 差分) を、道具の名前が分かった時点で ("tool", 名前) を yield し、
     最後に ("done", StreamedMessage) を1回だけ yield する。
-    ツール呼び出しは途中経過を出さない（引数のJSONは途中では読めないため）。
+    道具の引数は途中では読めない（JSONの断片）ので、揃ってから done に載せる。
     """
     kwargs = dict(
         model=model or config.OPENAI_MODEL,
@@ -14829,6 +14866,11 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
                 if fn is not None:
                     if getattr(fn, "name", None):
                         part["name"] += fn.name
+                        if not part.get("told"):
+                            # 道具の名前が分かった時点で呼び元へ知らせる。引数が揃うまで数秒〜十数秒
+                            # かかることがあり、その間「AI が SQL を書いています…」と出せる
+                            part["told"] = True
+                            yield ("tool", part["name"])
                     if getattr(fn, "arguments", None):
                         part["arguments"] += fn.arguments
     finally:
