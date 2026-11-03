@@ -12715,12 +12715,24 @@ def _who_am_i(args: dict, scope: list[dict]) -> dict:
     user = _current_user()
     if user is None:
         return _err("ログイン情報が取れませんでした。画面を開き直してもう一度お試しください。")
+    # 本人が登録した情報（部・課・氏名・TEL・mail）。prefs は core の別名で、パーソナライズの関数もそこにある
+    import prefs as _core_mod
+    prof: dict = {}
+    try:
+        if _core_mod.memory_settings()["enabled"]:
+            raw = _core_mod.memory_profile(user)
+            prof = {label: raw[key] for key, label in _core_mod.PROFILE_FIELDS if raw.get(key)}
+    except Exception as e:                       # 本人の情報が読めなくても、ログイン情報は返す
+        print(f"[tool] who_am_i: 本人の情報を読めませんでした: {e}")
     return {"ok": True, "llm_content": _json({
         "tool": "who_am_i",
         "login_id": getattr(user, "username", ""),
         "display_name": getattr(user, "display_name", "") or getattr(user, "username", ""),
         "is_admin": bool(getattr(user, "is_admin", False)),
+        "profile": prof,
         "note": ("これがいま質問している本人。「自分」「私」「担当した」はこの人を指す。"
+                 "profile は本人がパーソナライズに登録した部・課・氏名・TEL・mail（空なら未登録）。"
+                 "「自分の部署」「うちの課」はこれで絞り、メールの宛先に本人を入れるなら mail を使う。"
                  "社員番号や氏名で絞り込みたいときは、カタログから社員名簿にあたる表を探し、"
                  "このログインIDと同じ値が入っている列（統一ID・社員ID・アカウントなど）で1行に特定すること。"
                  "表や列の名前は決め打ちにせず、カタログの説明から判断する。"

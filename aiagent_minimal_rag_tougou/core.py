@@ -2160,7 +2160,7 @@ def _memory_path(user):
 
 def _memory_raw(user) -> tuple[dict, bool]:
     """({"text": str, "updated_at": str}, 壊れているか)。壊れていれば空を返し、足す・書き直す側は止める。"""
-    empty = {"text": "", "updated_at": ""}
+    empty = {"text": "", "updated_at": "", "profile": {}}
     if user is None:
         return empty, False
     p = _memory_path(user)
@@ -2181,21 +2181,65 @@ def _memory_raw(user) -> tuple[dict, bool]:
                          if isinstance(i, dict) and str(i.get("text") or "").strip())
     if not isinstance(text, str):
         return empty, True
-    return {"text": _memory_clean(text), "updated_at": str(data.get("updated_at") or "")}, False
+    return {"text": _memory_clean(text), "updated_at": str(data.get("updated_at") or ""),
+            "profile": normalize_profile(data.get("profile"))}, False
 
 
 def memory_load(user) -> dict:
     return _memory_raw(user)[0]
 
 
+# --- 本人の情報（部・課・氏名・TEL・mail。本人が登録する枠） -----------------------------------
+# AI が会話から書き直す本文とは別に、memory.yaml の profile に持つ。書き直し・「全部消す」では消えない。
+# 「自分の部署」「自分にメール」の手がかりとして AI に渡し、who_am_i にも載せる。
+
+PROFILE_FIELDS = (("dept", "部"), ("section", "課"), ("name", "氏名"), ("tel", "TEL"), ("mail", "mail"))
+_PROFILE_MAX = 100
+_PROFILE_MAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PROFILE_TEL = re.compile(r"^(?=.*[0-9])[0-9+()\-\s内線.]{3,40}$")
+
+
+def normalize_profile(raw) -> dict:
+    """本人の情報を文字列だけの辞書に揃える。空の項目と知らない項目は持たない。"""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, _label in PROFILE_FIELDS:
+        v = " ".join(str(raw.get(key) or "").split())[:_PROFILE_MAX]
+        if v:
+            out[key] = v
+    return out
+
+
+def profile_errors(prof: dict) -> str:
+    """保存前の検査。問題があれば利用者向けの文、無ければ空。"""
+    mail = prof.get("mail", "")
+    if mail and not _PROFILE_MAIL.match(mail):
+        return "mail の形が正しくありません（例: taro@example.com）。"
+    tel = prof.get("tel", "")
+    if tel and not _PROFILE_TEL.match(tel):
+        return "TEL は数字・ハイフン・括弧・＋（内線は「内線123」のように）で入力してください。"
+    return ""
+
+
+def profile_lines(prof: dict) -> list[str]:
+    """「部: 製造部」の形の並び（画面の一覧と AI への渡し方で共用）。"""
+    return [f"{label}: {prof[key]}" for key, label in PROFILE_FIELDS if prof.get(key)]
+
+
 def _memory_save(user, data: dict) -> None:
-    """一時ファイルに書いてから置き換える（書きかけを読まれない・途中で落ちても前の中身が残る）。"""
+    """一時ファイルに書いてから置き換える（書きかけを読まれない・途中で落ちても前の中身が残る）。
+
+    本人の情報（profile）は、本文を書き換えるどの経路でも引き継いで書く（落とすと本人の登録が消える）。
+    """
     p = _memory_path(user)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(yaml.safe_dump({"text": data.get("text") or "",
-                                   "updated_at": data.get("updated_at") or ""},
-                                  allow_unicode=True, sort_keys=False), encoding="utf-8")
+    body = {"text": data.get("text") or "", "updated_at": data.get("updated_at") or ""}
+    prof = normalize_profile(data.get("profile"))
+    if prof:
+        body["profile"] = prof
+    tmp.write_text(yaml.safe_dump(body, allow_unicode=True, sort_keys=False), encoding="utf-8")
     config.replace_atomic(tmp, p)
 
 
@@ -2237,7 +2281,7 @@ def memory_set_text(user, text, *, force: bool = False) -> dict:
         new = _memory_clean(text)
         if new == data["text"] and not broken:
             return {"changed": False, "text": new}
-        _memory_save(user, {"text": new, "updated_at": chats.now()})
+        _memory_save(user, {"text": new, "updated_at": chats.now(), "profile": data["profile"]})
         return {"changed": True, "text": new}
 
 
@@ -2273,29 +2317,60 @@ def memory_apply(user, new_text, question: str = "", base=None) -> dict:
         if old and not forget and (not new or (old_n >= 3 and new_n * 2 < old_n)):
             print(f"[memory] 本文が減る書き直し（{old_n}→{new_n}行）は捨てました（{getattr(user, 'username', user)}）")
             return {"changed": False, "reason": "減りすぎ"}
-        _memory_save(user, {"text": new, "updated_at": chats.now()})
+        _memory_save(user, {"text": new, "updated_at": chats.now(), "profile": data["profile"]})
         return {"changed": True, "reason": "書き直し"}
 
 
 def memory_clear(user) -> None:
+    """AI が覚えた本文を全部消す。本人の情報（profile）は残る（_memory_save が引き継ぐ）。"""
     memory_set_text(user, "", force=True)
 
 
+def memory_profile(user) -> dict:
+    """本人が登録した情報（部・課・氏名・TEL・mail）。無ければ空。"""
+    return memory_load(user).get("profile") or {}
+
+
+def memory_set_profile(user, raw) -> dict:
+    """本人の情報を置き換える（本人の操作）。形が悪ければ ValueError。本文と更新時刻は触らない。"""
+    prof = normalize_profile(raw)
+    bad = profile_errors(prof)
+    if bad:
+        raise ValueError(bad)
+    with _memory_lock:
+        data, _broken = _memory_raw(user)
+        _memory_save(user, {"text": data["text"], "updated_at": data["updated_at"], "profile": prof})
+    return {"profile": prof}
+
+
 def memory_prompt(user) -> str:
-    """システムプロンプトに載せる「この利用者について」の節。無ければ空。"""
-    if not memory_enabled(user):
+    """システムプロンプトに載せる「この利用者について」の節。無ければ空。
+
+    本人が登録した情報（部・課・氏名・TEL・mail）は、機能が生きていれば「覚えない」でも載せる
+    （自分で書いたもので、「自分の部署」「自分にメール」の手がかりになる。渡したくなければ空にする）。
+    AI が覚えた本文は、本人が止めていない（memory_enabled）ときだけ。
+    """
+    if user is None or not memory_settings()["enabled"]:
         return ""
-    text = memory_text(user)
-    if not text:
+    prof = memory_profile(user)
+    text = memory_text(user) if memory_enabled(user) else ""
+    if not prof and not text:
         return ""
-    return (
-        "# この利用者について（パーソナライズ。会話から自動で覚え、本人が直すこともある）\n"
-        f"{text}\n"
+    parts = ["# この利用者について（パーソナライズ。会話から自動で覚え、本人が直すこともある）\n"]
+    if prof:
+        parts.append(
+            "## 本人の情報（本人が登録したもの）\n"
+            "- " + " / ".join(profile_lines(prof)) + "\n"
+            "- 「自分」「自分の部署」「うちの課」はこの人を指す。社員名簿の表と突き合わせるときは氏名も手がかりにする。\n"
+            "- メールの宛先や返信先に本人を入れるときは、この mail を使う（無ければ聞く）。\n")
+    if text:
+        parts.append(f"{text}\n")
+    parts.append(
         "- 質問に書かれていない前提・好み・期間はここから補う。ただし今回の質問の指定が常に優先。\n"
         "- パーソナライズを使って答えたら、回答の末尾に「（パーソナライズ「…」を使いました）」と一言添える。\n"
         "- パーソナライズに無いことは推測で決めない。利用者が「忘れて」「もう違う」と言ったら、それは使わず、"
-        "「次の回答のあとに自動で直ります。直っていなければメニューのパーソナライズで直せます」と伝える。\n\n"
-    )
+        "「次の回答のあとに自動で直ります。直っていなければメニューのパーソナライズで直せます」と伝える。\n\n")
+    return "".join(parts)
 
 
 def memory_payload(user) -> dict:
@@ -2305,6 +2380,8 @@ def memory_payload(user) -> dict:
     return {"enabled": bool(st["enabled"]),
             "on": memory_enabled(user),
             "text": data["text"], "updated_at": data["updated_at"],
+            "profile": data["profile"],
+            "profile_fields": [[k, label] for k, label in PROFILE_FIELDS],
             "broken": bool(broken),
             "max_chars": int(st["max_chars"])}
 
@@ -13144,6 +13221,19 @@ def memory_toggle():
     return jsonify({"ok": True, **memory_payload(g.user)})
 
 
+@bp_chat.post("/api/memory/profile")
+@login_required
+def memory_profile_save():
+    """本人の情報（部・課・氏名・TEL・mail）を本人が登録する。AI の書き直しとは別の枠。"""
+    body = _body()
+    raw = body.get("profile") if isinstance(body.get("profile"), dict) else body
+    try:
+        memory_set_profile(g.user, raw)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **memory_payload(g.user)})
+
+
 # マイロボットの画面（メニューの「マイエージェント」の直下）。一覧・実行・改名・削除。
 # 実行すると、その結果の会話が「いま開いている会話」になるので、画面はマイエージェントへ移る。
 bp_robots = Blueprint("robots", __name__)
@@ -14969,9 +15059,10 @@ def _memory_overview() -> list[dict]:
         user = auth.User(username=d.name)
         data, broken = _memory_raw(user)
         off = bool(load(user).get("memory_off"))
-        if not data["text"] and not broken and not off:
+        if not data["text"] and not data["profile"] and not broken and not off:
             continue
         out.append({"user": d.name, "text": data["text"], "updated_at": data["updated_at"],
+                    "profile": " / ".join(profile_lines(data["profile"])),
                     "on": not off, "broken": broken, "chars": len(data["text"])})
     return out
 

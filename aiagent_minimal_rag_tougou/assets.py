@@ -1690,6 +1690,27 @@ window.IS_ADMIN = {{ user.is_admin|tojson }};
     </div>
   </details>
 
+  <div class="card" id="profCard">
+    <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+      <div class="card__title" style="margin:0">本人の情報（自分で登録）</div>
+      <div class="spacer"></div>
+      <button class="btn btn--primary btn--sm" id="profSave">保存</button>
+    </div>
+    <div class="card__desc">
+      AIが「自分の部署の残業」「自分にメールして」を正しく扱うための手がかりです。次の質問からAIに渡ります。
+      AIの書き直しでは変わらず、下の「全部消す」でも残ります。「覚えない」にしても本人の情報は渡ります（渡したくない項目は空にしてください）。
+      空欄の項目は渡しません。他の利用者には見えませんが、管理者は管理者メニューで見られます。
+    </div>
+    <div class="profgrid mt">
+      <label class="field" for="prof-dept">部</label><input type="text" id="prof-dept" maxlength="100" placeholder="例: 製造部">
+      <label class="field" for="prof-section">課</label><input type="text" id="prof-section" maxlength="100" placeholder="例: 第一製造課">
+      <label class="field" for="prof-name">氏名</label><input type="text" id="prof-name" maxlength="100" placeholder="例: 山田 太郎">
+      <label class="field" for="prof-tel">TEL</label><input type="text" id="prof-tel" maxlength="40" placeholder="例: 03-1234-5678 内線123">
+      <label class="field" for="prof-mail">mail</label><input type="text" id="prof-mail" maxlength="100" placeholder="例: taro@example.com">
+    </div>
+    <div class="small muted mt" id="profNote"></div>
+  </div>
+
   <div class="card memedit">
     <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
       <div class="card__title" style="margin:0">AIが覚えていること</div>
@@ -1851,6 +1872,7 @@ window.DISPLAY_SETTINGS_INIT = { settings: {{ settings|tojson }}, contrib: {{ co
         <span class="small muted" style="margin-left:8px">{{ o.chars }} 文字・最終更新 {{ o.updated_at|replace('T', ' ') if o.updated_at else '—' }}</span>
       </summary>
       <div class="acc__body">
+        {% if o.profile %}<div class="small" style="margin-bottom:6px">本人の情報: {{ o.profile }}</div>{% endif %}
         {% if o.text %}<pre class="mono" style="white-space:pre-wrap;word-break:break-all;font-size:13px">{{ o.text }}</pre>{% else %}<div class="small muted">本文はありません。</div>{% endif %}
       </div>
     </details>
@@ -3158,6 +3180,9 @@ details.acc.is-target {
 .memedit textarea { width: 100%; min-height: 340px; margin-top: 10px; font-size: 14px; line-height: 1.75;
                     font-family: inherit; resize: vertical; }
 .memedit.is-off textarea { opacity: .55; }
+/* 本人の情報（部・課・氏名・TEL・mail）の入力枠 */
+.profgrid { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }
+.profgrid .field { margin: 0; }
 
 /* --- 社内文書の検索先 ---------------------------------------------------------
    外したものは薄く見せる。消さずに残すのは、また戻せることを示すため。 */
@@ -13024,9 +13049,33 @@ function show() {
     $('#memNote').textContent = m.updated_at ? `最終更新 ${m.updated_at.replace('T', ' ')}` : 'まだありません';
 }
 
+/* 本人の情報（部・課・氏名・TEL・mail）。本文とは別の枠で、保存はこのカードのボタンで。 */
+const PROF_KEYS = ['dept', 'section', 'name', 'tel', 'mail'];
+
+function showProfile() {
+    const p = m.profile || {};
+    PROF_KEYS.forEach(k => { const i = $(`#prof-${k}`); if (i) i.value = p[k] || ''; });
+    const n = PROF_KEYS.filter(k => p[k]).length;
+    $('#profNote').textContent = n ? `${n} 項目を登録済み。` + (m.enabled ? '次の質問からAIに渡ります。' : '（いまは機能が止まっているので、AIには渡りません）')
+                                   : 'まだ登録がありません。';
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     $('#memText').value = m.text || '';
     show();
+    showProfile();
+    $('#profSave').addEventListener('click', async () => {
+        const btn = $('#profSave'); btn.disabled = true;
+        const profile = {};
+        PROF_KEYS.forEach(k => { profile[k] = ($(`#prof-${k}`).value || '').trim(); });
+        try {
+            m = { ...m, ...(await api('/api/memory/profile', { profile })) };
+            showProfile();
+            toast(m.enabled ? '本人の情報を保存しました。次の質問からAIに渡ります。'
+                            : '本人の情報を保存しました（いまは機能が止まっているので、AIには渡りません）。');
+        } catch (e) { toast(e.message, 'err', 9000); }
+        btn.disabled = false;
+    });
     $('#memText').addEventListener('input', () => { dirty = true; show(); });
     $('#memSave').addEventListener('click', async () => {
         const btn = $('#memSave'); btn.disabled = true;
