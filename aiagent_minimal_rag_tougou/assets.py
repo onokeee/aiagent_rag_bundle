@@ -5993,7 +5993,7 @@ function openRenameTable(dbName, table) {
         go.disabled = true;
         // 改名のあとは画面を読み直す（旧名のまま残さないため）。ほかに書きかけがあると
         // 黙って消えてしまうので、先に確かめる
-        const left = (typeof dirtyLabel === 'function') ? dirtyLabel() : '';
+        const left = (typeof window.catalogDirtyLabel === 'function') ? window.catalogDirtyLabel() : '';
         if (left && !confirm(`保存していない変更（${left}）があります。`
                              + '改名すると画面を読み直すため、これらは失われます。\n'
                              + '先に保存する場合は「キャンセル」を押してください。改名を続けますか？')) {
@@ -7678,6 +7678,7 @@ async function rewindTo(item, text, wrap) {
         }
         lastRole = null;
     }
+    busyChatId = currentChatId; pendingTitle = '';     // 既存の会話の操作。履歴に「新しい会話」の仮の行を出さない
     setBusy(true, send ? 'やり直し中' : '巻き戻し中');
     try {
         // 巻き戻す会話を指定する（添えないと、別のタブで開いた会話を削ってしまう）
@@ -8135,12 +8136,19 @@ async function sendStreaming(text, imageTokens) {
             scheduleMemoryRefresh();
             return;
         }
+        // 内訳（前処理・AI・道具）とラベルの状態は、別の画面を見ている間も進める。描くのは同じ画面のときだけ
+        if (event === 'delta') phaseSwitch('ai');
+        else if (event === 'running') { phaseSwitch('tools'); busyLabel = `${data.label}`; }
+        else if (event === 'status') {
+            // 「AI に聞いています」「AI が…書いています」だけが AI の時間。「AI への説明を組み立て」は前処理
+            if (/^AI (に聞いて|が)/.test(data.text || '')) phaseSwitch('ai');
+            busyLabel = data.text || '考えています';
+        } else if (event === 'item') busyLabel = '考えています';
         if (viewToken !== myView) {         // 別の画面を表示中。ここには描かない
             if (event === 'delta' || event === 'item') missed = true;
             return;
         }
         if (event === 'delta') {
-            phaseSwitch('ai');
             openText();
             buf += data.text;
             node.innerHTML = mdToHtml(buf);
@@ -8148,11 +8156,9 @@ async function sendStreaming(text, imageTokens) {
         } else if (event === 'text_end') {
             closeText();
         } else if (event === 'running') {
-            phaseSwitch('tools');
             setBusy(true, `${data.label}`);
         } else if (event === 'status') {
             // サーバが「いま何をしているか」を知らせてきた（取り込み直し・AI に聞いている・検索の完了数）
-            if (/^AI /.test(data.text || '')) phaseSwitch('ai');
             setBusy(true, data.text || '考えています');
         } else if (event === 'item') {
             closeText();
@@ -8428,6 +8434,8 @@ window.addEventListener('beforeunload', ev => {
     if (dirtyLabel() && !leavingOnPurpose) { ev.preventDefault(); ev.returnValue = ''; }
 });
 function reloadClean() { leavingOnPurpose = true; window.location.reload(); }
+// 改名ダイアログ（manage 側。別のスコープ）から未保存の有無を聞けるように公開する
+window.catalogDirtyLabel = dirtyLabel;
 
 /** 読み直してよいか確かめる。書きかけがあれば聞く。
 
@@ -8956,6 +8964,8 @@ const dirtyDot = it => it.dirty
 
 /* カーソル位置に文字列を挿し込む。参照の列名クリックから使う */
 function insertIntoTa(ta, text) {
+    // ロック中（disabled）の欄には差し込まない。disabled はクリックは止めるが、ここは値を直接書くため
+    if (ta.disabled) { toast('ロック中は変更できません。先にロックを解除してください。', 'warn'); return; }
     let s = ta.selectionStart ?? ta.value.length;
     let e = ta.selectionEnd ?? s;
     // まだ一度も触っていない欄はカーソルが先頭にあるだけなので、末尾に足す
@@ -9432,7 +9442,7 @@ async function saveGlossary() {
 
 /** 説明だけ書かれた用語すべてに、AIでSQL式を一括下書きする。 */
 async function draftGlossary(btn) {
-    const targets = glItems.filter(r => r.term.trim() && r.description.trim() && !r.sql.trim());
+    const targets = glItems.filter(r => r.term.trim() && r.description.trim() && !r.sql.trim() && !r.locked);
     if (!targets.length) {
         toast('SQL式が空で、説明が書かれている用語がありません。', 'warn');
         return;
@@ -9509,7 +9519,7 @@ function histRow(rec, onRestore, restoreLabel) {
     const where = rec.kind === 'glossary' ? `［${rec.table || '全体'}］` : '';
     return el('div', { class: 'hist__row' },
         el('div', { class: 'hist__meta' },
-            `${fmtAt(rec.at)}　${rec.op_label || rec.op}　${rec.user || '不明'}（${rec.source === 'chat' ? 'マイエージェント' : '画面'}）${where}`),
+            `${fmtAt(rec.at)}　${rec.op_label || rec.op}　${rec.user || '不明'}（${rec.source === 'chat' ? 'マイエージェント' : rec.source === 'cleanup' ? '表の削除' : '画面'}）${where}`),
         el('div', { class: 'hist__body' }, body || '（内容なし）'),
         v && onRestore ? el('button', { class: 'btn btn--sm', type: 'button',
                                onclick: () => onRestore(v, rec) }, restoreLabel) : null);
@@ -9541,7 +9551,13 @@ async function showRecent(kind) {
     const recs = r.changes || [];
     const restore = (v, rec) => {
         if (kind === 'glossary') {
-            const it = { id: ++idSeq, term: rec.name || '', scope: rec.table || SCOPE_DB,
+            let scope = rec.table || SCOPE_DB;
+            if (scope && !CAT.tables.some(t => t.name === scope)) {
+                // 置き場所の表が消えている・改名されている。一覧に出ない行を作ると保存で 409 になるので全体へ
+                toast(`置き場所の表「${scope}」はいま無いので、「全体」に戻します。必要なら置き場所を選び直してください。`, 'warn', 9000);
+                scope = SCOPE_DB;
+            }
+            const it = { id: ++idSeq, term: rec.name || '', scope,
                          description: v.description || '', sql: v.sql || '',
                          locked: false, lockedBy: '', lockedAt: '', verdict: null, detail: '', dirty: true };
             glItems.push(it); setDirty('glossary'); glSelect(it.id);

@@ -14018,18 +14018,20 @@ def _token_begin(purpose: str, model: str) -> dict:
 
 
 def _token_user() -> str:
-    """いまの利用者名。質問の処理中はスレッドに置かれた利用者（set_current_user）、
-    管理者の画面からの下書きなどは Flask のリクエストの g.user。どちらも無ければ空。"""
+    """いまの利用者名。リクエストの中なら Flask の g.user（確実にその人）。リクエストの外（パーソナライズの
+    書き直しや道具の作業スレッド）はスレッドに置かれた利用者（set_current_user）。どちらも無ければ空。
+
+    スレッドに置いた利用者はリクエストの終わりで消えず、サーバのスレッドは使い回される。リクエストの中で
+    それを見ると、前にそのスレッドで質問した人の名前で記録してしまう（管理者の下書きが別人の分になる）。
+    """
+    try:
+        from flask import g, has_request_context
+        if has_request_context():
+            return str(getattr(getattr(g, "user", None), "username", None) or "")
+    except Exception:
+        pass
     u = _current_user()
-    name = getattr(u, "username", None) if u is not None else None
-    if not name:
-        try:
-            from flask import g, has_request_context
-            if has_request_context():
-                name = getattr(getattr(g, "user", None), "username", None)
-        except Exception:
-            name = None
-    return str(name or "")
+    return str(getattr(u, "username", None) or "") if u is not None else ""
 
 
 def _token_done(rec: dict, usage, error=None) -> None:
@@ -14059,6 +14061,15 @@ def _token_stream(chunks, rec: dict):
     except Exception as e:
         _token_done(rec, usage, error=e)
         raise
+    finally:
+        # SDK の stream（HTTP 接続）も閉じる。途中で切れたとき（利用者が画面を閉じた）に閉じないと、
+        # 接続の片づけが GC 任せになる。流し終えたあとに閉じても何も起きない（点検 2026-11-03）
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
     _token_done(rec, usage)
 
 

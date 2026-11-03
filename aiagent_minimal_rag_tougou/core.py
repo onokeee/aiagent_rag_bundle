@@ -1697,8 +1697,18 @@ def add_catalog_change(kind: str, op: str, db_file: str, name: str, *,
         print(f"[catalog_history] 書けませんでした: {e}")
 
 
+_trim_calls = [0]
+
+
 def _trim(p: Path) -> None:
-    """上限を超えたら古い行から捨てる（毎回数えず、たまに間引く）。"""
+    """上限を超えたら古い行から捨てる（毎回数えず、たまに間引く）。
+
+    数えるには全行を読むので、追記 50 回に 1 回だけ数える（用語集の一括保存は用語ごとに1行書くため、
+    毎回読むと保存1回で何十回も全ファイルを読むことになる）。鍵の中で呼ばれる。
+    """
+    _trim_calls[0] += 1
+    if _trim_calls[0] % 50:
+        return
     lines = p.read_text(encoding="utf-8").splitlines()
     if len(lines) > config.CATALOG_HISTORY_MAX * 1.2:
         keep = lines[-config.CATALOG_HISTORY_MAX:]
@@ -2197,6 +2207,8 @@ PROFILE_FIELDS = (("dept", "部"), ("section", "課"), ("name", "氏名"), ("tel
 _PROFILE_MAX = 100
 _PROFILE_MAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PROFILE_TEL = re.compile(r"^(?=.*[0-9])[0-9+()\-\s内線.]{3,40}$")
+#: TEL の区切りに使われがちな長音・ダッシュ類をハイフンに（NFKC では揃わない）
+_TEL_DASHES = str.maketrans({c: "-" for c in "ー−‐‑‒–—―"})
 
 
 def normalize_profile(raw) -> dict:
@@ -2205,7 +2217,14 @@ def normalize_profile(raw) -> dict:
     if not isinstance(raw, dict):
         return out
     for key, _label in PROFILE_FIELDS:
-        v = " ".join(str(raw.get(key) or "").split())[:_PROFILE_MAX]
+        v = str(raw.get(key) or "")
+        if key in ("tel", "mail"):
+            # 全角で打たれた番号・アドレス（０３－…、ｔａｒｏ＠…）を半角に揃える。揃えないと検査で弾かれ、
+            # 案内文には「＋」と全角で書いてあるのに全角は通らない、という食い違いになる（点検 2026-11-03）
+            v = unicodedata.normalize("NFKC", v)
+            if key == "tel":
+                v = v.translate(_TEL_DASHES)
+        v = " ".join(v.split())[:_PROFILE_MAX]
         if v:
             out[key] = v
     return out
@@ -2338,7 +2357,11 @@ def memory_set_profile(user, raw) -> dict:
     if bad:
         raise ValueError(bad)
     with _memory_lock:
-        data, _broken = _memory_raw(user)
+        data, broken = _memory_raw(user)
+        if broken:
+            # 読めないファイルの上に書くと、読めなかった本文が空で置き換わる（memory_set_text と同じ守り）
+            raise ValueError("パーソナライズの保存ファイルが読めないため、本人の情報を保存できません。"
+                             "先に上の「AIが覚えていること」を保存し直してください（読めなかった中身は戻りません）。")
         _memory_save(user, {"text": data["text"], "updated_at": data["updated_at"], "profile": prof})
     return {"profile": prof}
 
@@ -3119,6 +3142,32 @@ def _jsonable(v):
     return v
 
 
+def _unreadable_table(typ: str, e: Exception) -> dict:
+    """読めなかった表・ビューの分（列も行数も分からない。error に理由）。"""
+    return {"type": typ, "error": str(e), "columns": [], "fks": [], "row_count": None,
+            "sample_columns": [], "sample_rows": [], "col_stats": {}}
+
+
+def _transient_broken(tables: dict) -> list[str]:
+    """控えに残してはいけない表の名前。
+
+    一時的に読めなかった表（取り込みと重なった・時間切れ）は、残すと DB が変わるまで
+    「列も行数も分からない表」が AI にも画面にも出続けるので残さない。
+    一方、壊れたビュー（土台の表が消えて定義の SQL が通らない）は DB が変わるまで直らない
+    ＝ DB が変われば印も変わって測り直す。残してよい。残さないと、壊れたビューが1つあるだけで
+    呼ばれるたびに全部を測り直す（本番では1回45秒）か、差分更新が丸ごと失敗して前の控えが
+    返り続け、その後に取り込んだ表がいつまでも一覧に出なかった（点検 2026-11-03）。
+    """
+    out = []
+    for name, v in tables.items():
+        if v.get("degraded"):
+            out.append(name)
+        elif v.get("error"):
+            if v.get("type") != "view" or re.search(r"locked|busy|interrupted", str(v["error"])):
+                out.append(name)
+    return out
+
+
 #: 表の一覧の作り直しを、DBごとに1本ずつにする鍵。
 #: 取り込みの直後は全員の控えが同時に古くなるので、鍵が無いと50人ぶんの
 #: 作り直しが同時に走り（本番の 700MB では1回45秒）、その間ずっと画面が返らない。
@@ -3187,18 +3236,24 @@ def _refresh_profile_locked(db_path: Path, want: set) -> str:
                 # 前回と同じ中身なら、重い「値の分布」は数え直さない
                 keep = (name not in want and prev
                         and not prev.get("error") and not prev.get("degraded"))
-                t = _profile_table(conn, name, reset, with_stats=not keep)
-                t["type"] = typ
-                if keep:
-                    same = (prev.get("row_count") == t["row_count"]
-                            and [c["name"] for c in (prev.get("columns") or [])]
-                            == [c["name"] for c in t["columns"]])
-                    if same:
-                        t["col_stats"] = prev.get("col_stats") or {}
-                    else:
-                        # 行数か列が変わっている＝中身が変わった。ここだけ数え直す
-                        t = _profile_table(conn, name, reset)
-                        t["type"] = typ
+                try:
+                    t = _profile_table(conn, name, reset, with_stats=not keep)
+                    t["type"] = typ
+                    if keep:
+                        same = (prev.get("row_count") == t["row_count"]
+                                and [c["name"] for c in (prev.get("columns") or [])]
+                                == [c["name"] for c in t["columns"]])
+                        if same:
+                            t["col_stats"] = prev.get("col_stats") or {}
+                        else:
+                            # 行数か列が変わっている＝中身が変わった。ここだけ数え直す
+                            t = _profile_table(conn, name, reset)
+                            t["type"] = typ
+                except sqlite3.Error as e:
+                    # この1つだけ読めない（土台の表が消えて壊れたビュー等）。全体を諦めると、壊れたビューが
+                    # 1つあるだけで控えが二度と更新されず、その後に取り込んだ表がいつまでも一覧に出なかった
+                    # （点検 2026-11-03）。読めなかった印を付けて先へ進む（残すかは _transient_broken が決める）
+                    t = _unreadable_table(typ, e)
                 tables[name] = t
             # 印は、測り終えた中身と同じ時点のものを使う（書き込みが無かったと確かめる前に取る）
             key = _profile_key(db_path)
@@ -3227,7 +3282,7 @@ def _refresh_profile_locked(db_path: Path, want: set) -> str:
             except OSError as e:
                 print(f"[catalog] 控えに印を付けられませんでした: {e}")
         return "kept" if old_doc is not None else "none"
-    broken = [t for t, v in tables.items() if v.get("error") or v.get("degraded")]
+    broken = _transient_broken(tables)
     if broken:
         print(f"[catalog] {db_path.name}: 読めなかった表があるので控えは残しません: "
               f"{'、'.join(broken[:5])}")
@@ -3303,6 +3358,8 @@ def _profile_db_locked(db_path, key: dict, cache) -> dict:
     """profile_db の本体（このDBについて1本だけ走る）。"""
     conn = db.connect_ro(db_path)
     try:
+        # 測っている間に書き込みがあったかを、差分更新と同じ見方（同じ接続で前後に読む data_version）で見る
+        before = conn.execute("PRAGMA data_version").fetchone()[0]
         reset = _make_timeout(conn, config.PROFILE_TIMEOUT_SEC)
         tables: dict = {}
         reset()
@@ -3316,12 +3373,11 @@ def _profile_db_locked(db_path, key: dict, cache) -> dict:
                 t["type"] = typ
                 tables[name] = t
             except sqlite3.Error as e:
-                tables[name] = {"type": typ, "error": str(e), "columns": [], "fks": [],
-                                "row_count": None, "sample_columns": [], "sample_rows": [],
-                                "col_stats": {}}
+                tables[name] = _unreadable_table(typ, e)
         # 印は測り終えた時点のもの（接続を開く前に取ると、読み取り専用の接続が作る
         # 空の -wal のぶん印がずれて、次の人が差分更新をもう1回やることになる）
         key = _profile_key(db_path)
+        after = conn.execute("PRAGMA data_version").fetchone()[0]
     finally:
         conn.close()
 
@@ -3334,10 +3390,16 @@ def _profile_db_locked(db_path, key: dict, cache) -> dict:
     # 取り込みやロックで読めなかった表が混じった控えは残さない。残すと、DBが
     # 変わるまで（mtime が動くまで）「列も行数も分からない表」がAIにも画面にも
     # 出続ける。次に呼ばれたときに作り直させる（その1回は少し重いだけで済む）
-    broken = [t for t, v in tables.items() if v.get("error") or v.get("degraded")]
+    broken = _transient_broken(tables)
     if broken:
         print(f"[catalog] {db_path.name}: 読めなかった表があるので控えは残しません: "
               f"{'、'.join(broken[:5])}")
+        return profile
+    if after != before:
+        # 測っている間に書き込みがあった。印は書き込み後のファイルから取っているので、このまま残すと
+        # 「新しい印の付いた古い中身」になり、次の取り込みまで直らない（増えた表が載らない）。
+        # 今回は残さず、次に読む人に測り直させる（点検 2026-11-03）
+        print(f"[catalog] {db_path.name}: 表の一覧を測っている間に書き込みがあったので控えは残しません。")
         return profile
     config.PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.write_text_atomic(cache, json.dumps(profile, ensure_ascii=False, default=str))
@@ -4715,6 +4777,10 @@ def table_text(alias: str, tname: str, profile: dict, meta: dict, full: bool) ->
     draft = "（AI推測・未確認）" if tmeta.get("ai_draft") else ""
     rc = t.get("row_count")
     rc_s = f"{rc:,}行" if rc is not None else "行数不明"
+    if t.get("error"):
+        # 読めなかった表・壊れたビュー（土台の表が消えた等）。列が無いまま載せると AI が普通に使おうとして
+        # SQL が落ちるので、読めないことを先に書く
+        rc_s = f"いま読めません: {str(t['error'])[:80]}"
     head = f"{tname}（{rc_s}）"
     if not full:
         line = f"- {head}" + (f" : {desc}{draft}" if desc else "")
@@ -8298,13 +8364,47 @@ def _cleanup_walk(alias: str, table: str | None, apply: bool, skip: Path | None 
         if skip is not None and f == skip:
             continue
         own = db.alias_for(f)
-        meta = copy.deepcopy(catalog.load_meta(f))
+        before = catalog.load_meta(f)
+        meta = copy.deepcopy(before)
         hit = _scrub_meta(meta, own, alias, table)
         if any(hit.values()):
             _merge(found, own, hit)
             if apply:
                 catalog.save_meta(f, meta)
+                # 用語集・例文の履歴にも「掃除で消えた」と残す。残さないと、履歴では登録されたままに見える
+                # のに本体から消えていて、ロック中の用語や例文も黙って無くなる（点検 2026-11-03）
+                _log_scrubbed(f.name, before, meta, table if own == alias else None)
     return found
+
+
+def _log_scrubbed(db_file: str, before: dict, after: dict, table: str | None) -> None:
+    """掃除で消えた用語・例文を、履歴（catalog_history）に「削除」として残す。
+
+    table はこの DB 自身の表を消したときだけ（その表に紐づく用語も消えている）。他 DB への参照を
+    落としただけのときは None（用語・例文は消えていないので、DB 全体の用語の差分だけ見る）。
+    """
+    try:
+        from flask import g as _g, has_request_context
+        user = getattr(getattr(_g, "user", None), "username", None) if has_request_context() else None
+    except Exception:
+        user = None
+    b_gl, a_gl = catalog.db_glossary(before), catalog.db_glossary(after)
+    for term, v in b_gl.items():
+        if term not in a_gl:
+            catalog_history.add_catalog_change("glossary", "remove", db_file, term, user=user,
+                                               before=catalog.strip_lock(v), source="cleanup")
+    if table:
+        for term, v in catalog.table_glossary(before, table).items():
+            catalog_history.add_catalog_change("glossary", "remove", db_file, term, user=user,
+                                               table=table, before=catalog.strip_lock(v), source="cleanup")
+
+    def key_of(e):
+        return (str(e.get("q") or "").strip(), catalog._norm_sql(str(e.get("sql") or "")))
+    left = {key_of(e) for e in (after.get("examples") or []) if isinstance(e, dict)}
+    for e in (before.get("examples") or []):
+        if isinstance(e, dict) and key_of(e) not in left:
+            catalog_history.add_catalog_change("example", "remove", db_file, str(e.get("q") or ""),
+                                               user=user, before=catalog.strip_lock(e), source="cleanup")
 
 
 def _jobs_for(db_name: str, table: str | None) -> list[dict]:
@@ -10137,7 +10237,10 @@ def _friendly_llm_error(e: Exception) -> str:
     if isinstance(body, dict):
         err = body.get("error") if isinstance(body.get("error"), dict) else body
         detail = str((err or {}).get("message") or "")
-    return f"LLM呼び出しに失敗しました: {(detail or s)[:300]}"
+    text = (detail or s)[:300]
+    # API キーの断片（401 の文に末尾が入る）は伏せる。利用者が見ても直せず、管理者向けはログに出ている
+    text = re.sub(r"sk-[A-Za-z0-9_*\-]{4,}", "sk-****", text)
+    return f"LLM呼び出しに失敗しました: {text}"
 
 
 _EMPTY_MESSAGE = ("（モデルから空の応答が返り、書き直しもできませんでした。"
@@ -10560,11 +10663,19 @@ def _execute_with_status(chat: dict, call: dict, scope: list[dict], guard):
 
     threading.Thread(target=work, daemon=True, name="aiagent-tool").start()
     last = None
-    while not finished.wait(0.5):
-        text = holder.get("text")
-        if text and text != last:
-            last = text
-            yield _sse("status", {"text": text})
+    try:
+        while not finished.wait(0.5):
+            text = holder.get("text")
+            if text and text != last:
+                last = text
+                yield _sse("status", {"text": text})
+    except GeneratorExit:
+        # 利用者が画面を閉じた。作業スレッドはまだ chat を書き換えているので、終わるまで待ってから
+        # 抜ける（この後 generate() の finally が保存する。同期で動かしていた頃と同じ振る舞い）
+        finished.wait()
+        if holder.get("state"):
+            rag.rag_thread_restore(holder["state"])
+        raise
     if holder.get("state"):
         rag.rag_thread_restore(holder["state"])
     if err:
@@ -10694,6 +10805,21 @@ def stream():
     turn_id = results.current_turn()
 
     user = g.user
+    # 会話の鍵は、応答を流し終えて保存するまで自分で持つ。Flask は「ビューが返った時点」で要求の後始末
+    # （_release_chat）を一度通し、そのあとで応答を流す（stream_with_context は流し始めてから文脈を
+    # 積み直す。Flask 3.1 で実測）。g に置いたままだと流す前に鍵が返り、同じ会話への別の送信（別タブ）が
+    # 割り込んで、後から終わった方が先の分を丸ごと上書きしていた（点検 2026-11-03）
+    held = [getattr(g, "_chat_lock", None)]
+    g._chat_lock = None
+
+    def release():
+        """鍵を返す（何度呼ばれても1回だけ）。保存のあとに呼ぶ。"""
+        lk, held[0] = held[0], None
+        if lk is not None:
+            try:
+                lk.release()
+            except RuntimeError:
+                pass
 
     def generate():
         # 応答を流す処理が別のスレッドで回る構成でも設定を引けるようにする
@@ -10717,14 +10843,19 @@ def stream():
             _turn_clock().report(aborted=aborted)
             _persist(chat)
             _schedule_memory(user, chat)         # パーソナライズの抜き出し（別スレッド。end は待たない）
+            release()                            # 保存し終えたので、待っている送信に順番を渡す
             if not aborted:
                 yield _sse("end", {"chat_id": chat.get("id"),
                                    "title": chat.get("title", "")})
 
-    return Response(stream_with_context(generate()),
+    resp = Response(stream_with_context(generate()),
                     mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})   # nginx等でのバッファ抑止
+    # 1文字も流す前に応答が閉じられた（generate() が動かなかった）ときの保険。応答を閉じるときに必ず通る。
+    # 動いたときは上で返し終えているので何もしない。放し忘れると、その会話は再起動まで送信できなくなる
+    resp.call_on_close(release)
+    return resp
 
 
 @bp_chat.post("/api/chat/rewind")
@@ -15555,8 +15686,6 @@ def save_glossary():
             return jsonify({"error": bad, "locked": True}), 409
         plans.append((tname, before_gl, gl))
     for tname, before_gl, gl in plans:
-        # 誰が何を変えたかを残す（チャットからの登録と同じ記録に揃える）
-        _log_glossary_diff(path.name, tname, before_gl, gl)
         if tname:
             catalog.set_table_glossary(meta, tname, gl)
         elif gl:
@@ -15564,6 +15693,10 @@ def save_glossary():
         else:
             meta.pop("glossary", None)
     catalog.save_meta(path, meta)
+    # 誰が何を変えたかを残す（チャットからの登録と同じ記録に揃える）。本体を書けてから残す。先に残すと、
+    # 保存に失敗したとき「変えた」記録だけが履歴に出て、戻せない版が並ぶ（点検 2026-11-03）
+    for tname, before_gl, gl in plans:
+        _log_glossary_diff(path.name, tname, before_gl, gl)
     # 続けて保存できるよう、新しい印を返す（画面は次の保存でこれを送る）。
     # 保存した中身（ロックの誰が・いつを含む）も返し、画面がそのまま表示に使う
     return jsonify({"ok": True, "stamp": catalog.section_stamp(meta, "glossary"),
@@ -16148,36 +16281,75 @@ def save_examples():
     over = max(0, len(deduped) - catalog.EXAMPLES_MAX)
     new = deduped[:catalog.EXAMPLES_MAX]
 
-    # 差分をSQLをキーに取り、誰が何を変えたかを残す（SQL は空白・大文字小文字の違いを無視して比べる）
+    # 差分は「質問文＋SQL（空白・大文字小文字を無視）」の組で取る。同じSQLで質問文が違う例文は正当に
+    # 共存する（重複整理の鍵も同じ）ので、SQL だけで束ねるとロックが片方しか見えない。
+    # 質問文や説明だけ変わった例文は、同じSQLの残りと組にして「変更」として履歴に残す
     user = getattr(g.user, "username", None)
-    key_of = lambda e: catalog._norm_sql(str(e.get("sql") or ""))
-    old_by_sql = {key_of(e): e for e in (meta.get("examples") or [])}
+    sql_of = lambda e: catalog._norm_sql(str(e.get("sql") or ""))
+    key_of = lambda e: (str(e.get("q") or "").strip(), sql_of(e))
+    old_items = list(meta.get("examples") or [])
+    old_by_key = {key_of(e): e for e in old_items}
+
+    def before_of(e):
+        """付け外しで誰が・いつを引き継ぐ元。同じ質問文＋SQL があればそれ、無ければ同じSQLが1件だけならそれ。"""
+        hit = old_by_key.get(key_of(e))
+        if hit is not None:
+            return hit
+        same = [o for o in old_items if sql_of(o) == sql_of(e)]
+        return same[0] if len(same) == 1 else None
+
     # ロックの印は画面の鍵マークの状態で付け外し（前から掛かっていれば誰が・いつは引き継ぐ）
-    new = [catalog.with_lock(e, bool(e.get("locked")), old_by_sql.get(key_of(e)), user or "")
-           for e in new]
-    new_by_sql = {key_of(e): e for e in new}
+    new = [catalog.with_lock(e, bool(e.get("locked")), before_of(e), user or "") for e in new]
+    new_by_key = {key_of(e): e for e in new}
+    came = [e for e in new if key_of(e) not in old_by_key]        # 増えた組（質問文を直した分も含む）
     # ロック中の例文を変える・消す保存は断る（SQL を変えると別の例文になるので「消した」扱い）
-    for k_, old_ in old_by_sql.items():
+    for old_ in old_items:
         if not catalog.is_locked(old_):
             continue
-        new_ = new_by_sql.get(k_)
+        new_ = new_by_key.get(key_of(old_))
         if new_ is None:
-            return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので削除できません"
-                                     "（SQL を変えるのも削除の扱いです）。先にロックを解除してください。",
-                            "locked": True}), 409
+            mate = next((e for e in came if sql_of(e) == sql_of(old_)), None)
+            if mate is None:
+                return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので削除できません"
+                                         "（SQL を変えるのも削除の扱いです）。先にロックを解除してください。",
+                                "locked": True}), 409
+            if catalog.is_locked(mate):
+                return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので変更できません。"
+                                         "先にロックを解除してください。", "locked": True}), 409
+            continue                                   # 解除して質問文を直した（同じ保存で可）
         if catalog.is_locked(new_) and catalog.strip_lock(new_) != catalog.strip_lock(old_):
             return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので変更できません。"
                                      "先にロックを解除してください。", "locked": True}), 409
-    for s_, e_ in new_by_sql.items():
-        if s_ not in old_by_sql:
-            catalog_history.add_catalog_change("example", "add", path.name, e_.get("q", ""),
-                                user=user, after=catalog.strip_lock(e_), source="catalog")
-            if catalog.is_locked(e_):
-                catalog_history.add_catalog_change("example", "lock", path.name, e_.get("q", ""),
-                                    user=user, after=catalog.strip_lock(e_), source="catalog")
+    # 本体を先に書く（履歴を先に残すと、保存に失敗したとき「変えた」記録だけが履歴に出る。点検 2026-11-03）
+    meta["examples"] = new
+    catalog.save_meta(path, meta)
+    # 履歴: 無くなった組と増えた組のうち、同じSQLどうしは「変更」。残りは削除・新規
+    gone = [e for e in old_items if key_of(e) not in new_by_key]
+    for old_ in gone:
+        mate = next((e for e in came if sql_of(e) == sql_of(old_)), None)
+        if mate is not None:
+            came.remove(mate)
+            catalog_history.add_catalog_change("example", "update", path.name, mate.get("q", ""),
+                                user=user, before=catalog.strip_lock(old_),
+                                after=catalog.strip_lock(mate), source="catalog")
+            if catalog.is_locked(old_) != catalog.is_locked(mate):
+                catalog_history.add_catalog_change(
+                    "example", "lock" if catalog.is_locked(mate) else "unlock", path.name, mate.get("q", ""),
+                    user=user, after=catalog.strip_lock(mate), source="catalog")
             continue
-        old_ = old_by_sql[s_]
-        if catalog.strip_lock(old_) != catalog.strip_lock(e_):
+        catalog_history.add_catalog_change("example", "remove", path.name, old_.get("q", ""),
+                            user=user, before=catalog.strip_lock(old_), source="catalog")
+    for e_ in came:
+        catalog_history.add_catalog_change("example", "add", path.name, e_.get("q", ""),
+                            user=user, after=catalog.strip_lock(e_), source="catalog")
+        if catalog.is_locked(e_):
+            catalog_history.add_catalog_change("example", "lock", path.name, e_.get("q", ""),
+                                user=user, after=catalog.strip_lock(e_), source="catalog")
+    for e_ in new:
+        old_ = old_by_key.get(key_of(e_))
+        if old_ is None:
+            continue
+        if catalog.strip_lock(old_) != catalog.strip_lock(e_):          # 説明だけ変わった
             catalog_history.add_catalog_change("example", "update", path.name, e_.get("q", ""),
                                 user=user, before=catalog.strip_lock(old_),
                                 after=catalog.strip_lock(e_), source="catalog")
@@ -16185,13 +16357,7 @@ def save_examples():
             catalog_history.add_catalog_change(
                 "example", "lock" if catalog.is_locked(e_) else "unlock", path.name, e_.get("q", ""),
                 user=user, after=catalog.strip_lock(e_), source="catalog")
-    for s_, e_ in old_by_sql.items():
-        if s_ not in new_by_sql:
-            catalog_history.add_catalog_change("example", "remove", path.name, e_.get("q", ""),
-                                user=user, before=catalog.strip_lock(e_), source="catalog")
 
-    meta["examples"] = new
-    catalog.save_meta(path, meta)
     dropped = len(incoming) - len(deduped)          # 純粋な重複だけを数える
     # 続けて保存できるよう、新しい印を返す（画面は次の保存でこれを送る）
     return jsonify({"ok": True, "dropped": dropped,
