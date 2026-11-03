@@ -2336,6 +2336,8 @@ def _schedule_memory(user, chat: dict) -> None:
         return
 
     def _run():
+        # 別スレッドなので、利用者をこのスレッドにも置く（トークンの記録に誰の分かを残すため）
+        rag.set_current_user(user)
         try:
             memory_after_turn(user, chat.get("id") or "", q, a, model)
         finally:
@@ -9961,7 +9963,8 @@ def _append_final_answer(chat: dict) -> dict | None:
                            "憶測で埋めず「うまく処理できませんでした。もう一度質問して"
                            "ください」とだけ伝えること。内部の仕組み（ツール名・"
                            "データベースの構成・システムの状態）を説明してはいけない。",
-            }], [], model=models.current(g.user))   # [] ＝ ツールを渡さない
+            }], [], model=models.current(g.user),
+            purpose="回答のまとめ")                   # [] ＝ ツールを渡さない
     except Exception as e:
         print(f"[chat] 最後の回答をまとめられませんでした: {e}")
         return None
@@ -16996,6 +16999,9 @@ USAGE_VIEWS = [
     {"key": "tools",     "label": "使われた機能"},
     {"key": "databases", "label": "使われたデータ"},
     {"key": "errors",    "label": "失敗"},
+    # AI への呼び出しで使ったトークン（入力・うちキャッシュ・出力）。記録は brain._create が
+    # 月ごとの data/token_usage/YYYY-MM.jsonl に書く。社内文書の検索（LightRAG）側の分は見えない
+    {"key": "tokens",    "label": "トークン"},
     # 取り込みの記録はカタログ画面の「更新履歴」で見られるので、ここには出さない
     # （集計そのものは残してあり、チャットの analyze_usage からは今も呼べる）。
     # 質問は「チャット履歴」と1つのタブにまとめている（質問→その会話を開く）。
@@ -17038,6 +17044,8 @@ def _usage_result(method: str, days, user):
         res = premises_report(user=user or None)
     elif method == "requests":
         res = requests_report(days=days or None, user=user or None)
+    elif method == "tokens":
+        res = usage.tokens_report(days=days or None, user=user or None)
     else:
         res = usage.analyze(method, days=days or None, user=user or None)
     # 失敗タブは「止まった失敗」だけを拾う。動いたのに違っていた方を足す

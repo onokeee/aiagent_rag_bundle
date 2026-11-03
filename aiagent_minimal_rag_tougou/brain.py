@@ -2737,6 +2737,159 @@ def feedback_read(days: int | None = None, user: str | None = None) -> list[dict
     return out
 
 
+# --- トークンの記録 ---------------------------------------------------------------------
+# AI への呼び出し1回ごとに1行（入力・うちキャッシュ・出力のトークン数、用途、利用者、モデル、秒数）。
+# 書くのは brain._create（すべての呼び出しがそこを通るので漏れない）。読むのは利用状況の
+# 「トークン」タブ（tokens_report）。置き場は config.TOKEN_USAGE_DIR の月ごとのファイル
+# （YYYY-MM.jsonl）。会話ファイルとは別に持つのは評価の記録と同じ理由（会話を消しても
+# 使った量は残す）。統合.db には入れない。
+
+_TOKEN_LOCK = threading.Lock()
+
+
+def token_log_path(when: datetime | None = None) -> Path:
+    d = when or datetime.now()
+    return Path(config.TOKEN_USAGE_DIR) / f"{d:%Y-%m}.jsonl"
+
+
+def token_log_add(rec: dict) -> bool:
+    """1行足す。書けなくても呼び出し元は止めない（記録のために回答を止めない）。"""
+    try:
+        path = token_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False)
+        with _TOKEN_LOCK:
+            with io.open(str(path), "a", encoding="utf-8", newline="\n") as f:
+                f.write(line + "\n")
+        return True
+    except Exception as e:                      # 書けない理由は環境側。黙らせない
+        print(f"[tokens] 記録できませんでした: {e}")
+        return False
+
+
+def tokens_read(days: int | None = None, user: str | None = None) -> list[dict]:
+    """記録を読む（古い順）。壊れた行は飛ばす。期間があれば、その月以降のファイルだけ開く。"""
+    root = Path(config.TOKEN_USAGE_DIR)
+    if not root.exists():
+        return []
+    limit = datetime.now() - timedelta(days=days) if days else None
+    files = sorted(root.glob("????-??.jsonl"))
+    if limit:
+        first = f"{limit:%Y-%m}.jsonl"
+        files = [f for f in files if f.name >= first]
+    out: list[dict] = []
+    for f in files:
+        try:
+            with io.open(str(f), encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if user and str(rec.get("user") or "").lower() != str(user).lower():
+                continue
+            if limit:
+                at = _usage_dt(rec.get("at"))
+                if at and at < limit:
+                    continue
+            out.append(rec)
+    return out
+
+
+def _tok_int(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def tokens_report(days: int | None = None, user: str | None = None) -> dict:
+    """利用状況の「トークン」タブ。合計・用途別・モデル別・利用者別・推移・明細。
+
+    数字は API が返した usage そのもの（円には直さない）。トークン数が返らなかった呼び出し
+    （途中で切れた・失敗した・usage を返さない接続先）は回数だけ別に数え、合計には入れない。
+    社内文書の検索（LightRAG）側のトークンは、このアプリからは見えないので含まない。
+    """
+    recs = tokens_read(days, user)
+    title = "トークン"
+    head = [f"対象: {user} のみ"] if user else []
+    if not recs:
+        span = f"直近{days}日には" if days else ""
+        return _usage_out(title, [], head + [
+            f"{span}AIの呼び出しの記録がありませんでした。"
+            "記録はこの機能を入れた版から始まるので、それより前の分はありません。"])
+
+    known = [r for r in recs if _tok_int(r.get("input")) is not None]
+    unknown = len(recs) - len(known)
+    failed = sum(1 for r in recs if r.get("ok") is False)
+    inp = sum(r["input"] for r in known)
+    cached = sum(_tok_int(r.get("cached")) or 0 for r in known)
+    out = sum(_tok_int(r.get("output")) or 0 for r in known)
+    pct = (cached / inp * 100) if inp else 0.0
+
+    def grouped(key_of) -> list[tuple]:
+        agg: dict = {}
+        for r in recs:
+            a = agg.setdefault(key_of(r), [0, 0, 0, 0])      # 入力・キャッシュ・出力・回数
+            a[3] += 1
+            if _tok_int(r.get("input")) is not None:
+                a[0] += r["input"]
+                a[1] += _tok_int(r.get("cached")) or 0
+                a[2] += _tok_int(r.get("output")) or 0
+        return [(k, a[0], a[1], a[2], a[3]) for k, a in agg.items()]
+
+    cols = ["入力トークン", "うちキャッシュ", "出力トークン", "回数"]
+    by_purpose = sorted(grouped(lambda r: str(r.get("purpose") or "（不明）")), key=lambda x: -x[1])
+    by_model = sorted(grouped(lambda r: str(r.get("model") or "（不明）")), key=lambda x: -x[1])
+    by_user = sorted(grouped(lambda r: str(r.get("user") or "（不明）")), key=lambda x: -x[1])
+    # 推移: 期間が短ければ日ごと（画面は折れ線にする）、長ければ月ごと
+    daily = bool(days) and days <= 93
+    width = 10 if daily else 7
+    by_time = sorted(grouped(lambda r: str(r.get("at") or "")[:width] or "（不明）"))
+    detail = [(str(r.get("at") or "")[:19].replace("T", " "), str(r.get("user") or ""),
+               str(r.get("purpose") or ""), str(r.get("model") or ""),
+               r.get("input"), r.get("cached"), r.get("output"), r.get("sec"),
+               "OK" if r.get("ok", True) else f"失敗（{r.get('error') or ''}）")
+              for r in sorted(recs, key=lambda r: str(r.get("at") or ""), reverse=True)[:500]]
+    total_rows = [("AIの呼び出し（回）", len(recs)),
+                  ("入力トークン", inp),
+                  ("うちキャッシュが効いた分", cached),
+                  ("出力トークン", out),
+                  ("キャッシュが効いた割合", f"{pct:.0f}%"),
+                  ("トークン数が返らなかった呼び出し（回）", unknown),
+                  ("失敗した呼び出し（回）", failed)]
+
+    ats = [a for a in (_usage_dt(r.get("at")) for r in recs) if a]
+    notes = head + [
+        (f"期間: {min(ats):%Y-%m-%d} 〜 {max(ats):%Y-%m-%d}" if ats else "期間: 不明"),
+        f"AIの呼び出し {len(recs):,} 回。入力 {inp:,} トークン（うちキャッシュ {cached:,}・{pct:.0f}%）、"
+        f"出力 {out:,} トークン。",
+        "キャッシュ: 同じ書き出しのプロンプトを短い間隔で送ると、先頭の共通部分の処理が API 側で"
+        "省かれる分。割合が高いほど速く・安い。",
+    ]
+    if unknown:
+        notes.append(f"トークン数が返らなかった呼び出しが {unknown} 回あります"
+                     "（途中で切れた・失敗した・usage を返さない接続先）。上の合計には入っていません。")
+    notes.append("社内文書の検索（LightRAG）側で使うトークンは、このアプリからは見えないので含みません。")
+    tables = [
+        _usage_table("合計", ["項目", "値"], total_rows, chart=False),
+        _usage_table("用途別", ["用途", *cols], by_purpose),
+        _usage_table("モデル別", ["モデル", *cols], by_model),
+        _usage_table("利用者別", ["利用者", *cols], by_user),
+        _usage_table("推移（日ごと）" if daily else "推移（月ごと）",
+                     ["日" if daily else "月", *cols], by_time),
+        _usage_table("明細（新しい順・最大500件）",
+                     ["日時", "利用者", "用途", "モデル", "入力", "うちキャッシュ", "出力", "秒", "結果"],
+                     detail, chart=False),
+    ]
+    return _usage_out(title, tables, notes)
+
+
 def _usage_dt(value) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value))
@@ -13644,8 +13797,78 @@ def _create(**kwargs):
     モデルが受け付けない引数を、エラーの内容を見て直しながら投げ直す。
     直し方が分からないエラーはそのまま投げる（画面にそのまま出す）。
     戻りは常に chat.completions の形（choices[0].message、stream ならチャンクの列）。
+
+    purpose は「何のための呼び出しか」（回答／回答のまとめ／パーソナライズの書き直し／
+    表の振り分け／下書き…）。API には送らず、トークンの記録（token_log_add）に残すだけ。
+    すべての呼び出しがここを通るので、使ったトークンはここで漏れなく数えられる
+    （利用状況の「トークン」タブ）。
     """
+    purpose = str(kwargs.pop("purpose", "") or "AIの応答")
     model = str(kwargs.get("model") or "")
+    rec = _token_begin(purpose, model)
+    try:
+        res = _create_retrying(model, kwargs)
+    except Exception as e:
+        _token_done(rec, None, error=e)
+        raise
+    if kwargs.get("stream"):
+        return _token_stream(res, rec)          # usage は最後のチャンクに付いてくる
+    _token_done(rec, getattr(res, "usage", None))
+    return res
+
+
+def _token_begin(purpose: str, model: str) -> dict:
+    return {"at": datetime.now().isoformat(timespec="seconds"), "user": _token_user(),
+            "purpose": purpose, "model": model, "t0": time.perf_counter()}
+
+
+def _token_user() -> str:
+    """いまの利用者名。質問の処理中はスレッドに置かれた利用者（set_current_user）、
+    管理者の画面からの下書きなどは Flask のリクエストの g.user。どちらも無ければ空。"""
+    u = _current_user()
+    name = getattr(u, "username", None) if u is not None else None
+    if not name:
+        try:
+            from flask import g, has_request_context
+            if has_request_context():
+                name = getattr(getattr(g, "user", None), "username", None)
+        except Exception:
+            name = None
+    return str(name or "")
+
+
+def _token_done(rec: dict, usage, error=None) -> None:
+    """呼び出しが終わった（成功・失敗・途中で切れた）ので1行書く。"""
+    u = _usage_of(usage) or {}
+    line = {"at": rec["at"], "user": rec["user"], "purpose": rec["purpose"], "model": rec["model"],
+            "api": _api_for(rec["model"]),
+            "input": u.get("input"), "cached": u.get("cached"), "output": u.get("output"),
+            "sec": round(time.perf_counter() - rec["t0"], 1), "ok": error is None}
+    if error is not None:
+        line["error"] = error if isinstance(error, str) else type(error).__name__
+    token_log_add(line)
+
+
+def _token_stream(chunks, rec: dict):
+    """stream の返りを包み、最後のチャンクの usage を見て記録する。途中で切れても1行残す。"""
+    usage = None
+    try:
+        for ch in chunks:
+            u = getattr(ch, "usage", None)
+            if u is not None:
+                usage = u
+            yield ch
+    except GeneratorExit:
+        _token_done(rec, usage, error="切断")   # 利用者が画面を閉じた等
+        raise
+    except Exception as e:
+        _token_done(rec, usage, error=e)
+        raise
+    _token_done(rec, usage)
+
+
+def _create_retrying(model: str, kwargs: dict):
+    """_create の本体: モデルが受け付けない引数を直しながら投げ直す。"""
     attempt = _apply_quirks(kwargs)
     fixes = waits = 0
     waited_total = 0.0
@@ -13776,6 +13999,7 @@ def route_tables(question: str, scope: list[dict],
     ask.append(f"今回の質問: {question}")
     try:
         resp = _create(
+            purpose="表の振り分け",
             # 振り分けに使うモデルは、管理者が「モデル設定」で決めた既定
             # （config.OPENAI_MODEL は、その画面で保存していないときの初期値）。
             # 直書きだと、管理者が別のモデルに揃えても振り分けだけ古いモデルに残り、
@@ -14321,7 +14545,7 @@ def history_for_llm(messages: list, model: str | None = None,
 
 
 def chat(messages: list[dict], tool_defs: list[dict] | None = None,
-         model: str | None = None):
+         model: str | None = None, purpose: str = "回答"):
     """messages を渡して1回の補完を取得。tools 付き。message オブジェクトを返す。
 
     tool_defs の意味は3通り:
@@ -14346,7 +14570,7 @@ def chat(messages: list[dict], tool_defs: list[dict] | None = None,
         kwargs["top_p"] = config.OPENAI_TOP_P
     if config.OPENAI_MAX_TOKENS is not None:
         kwargs["max_tokens"] = config.OPENAI_MAX_TOKENS
-    resp = _create(**kwargs)
+    resp = _create(purpose=purpose, **kwargs)     # purpose はトークンの記録に残す用途
     msg = resp.choices[0].message
     # 出力が上限で切れたか（"length"）と、トークン数（[turn] ログ用）を呼び出し側が
     # 見られるようにしておく。
@@ -14394,7 +14618,7 @@ class StreamedMessage:
 
 
 def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
-                model: str | None = None):
+                model: str | None = None, purpose: str = "回答"):
     """1回の補完をストリーミングで受け取る。
 
     文字が届くたびに ("text", 差分) を yield し、
@@ -14422,31 +14646,39 @@ def chat_stream(messages: list[dict], tool_defs: list[dict] | None = None,
 
     out = StreamedMessage()
     t0 = time.perf_counter()
-    for chunk in _create(**kwargs):
-        if out.first_at is None:
-            out.first_at = time.perf_counter() - t0
-        usage = getattr(chunk, "usage", None)
-        if usage is not None:              # 最後のチャンク（choices は空）に付いてくる
-            out.usage = _usage_of(usage)
-        if not chunk.choices:
-            continue
-        if chunk.choices[0].finish_reason:
-            out.finish_reason = chunk.choices[0].finish_reason
-        delta = chunk.choices[0].delta
-        if getattr(delta, "content", None):
-            out.content += delta.content
-            yield ("text", delta.content)
-        for tc in (getattr(delta, "tool_calls", None) or []):
-            # 同じツール呼び出しが複数のチャンクに分かれて届くので、index で束ねる
-            part = out._parts.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
-            if tc.id:
-                part["id"] = tc.id
-            fn = getattr(tc, "function", None)
-            if fn is not None:
-                if getattr(fn, "name", None):
-                    part["name"] += fn.name
-                if getattr(fn, "arguments", None):
-                    part["arguments"] += fn.arguments
+    stream = _create(purpose=purpose, **kwargs)   # purpose はトークンの記録に残す用途
+    try:
+        for chunk in stream:
+            if out.first_at is None:
+                out.first_at = time.perf_counter() - t0
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:          # 最後のチャンク（choices は空）に付いてくる
+                out.usage = _usage_of(usage)
+            if not chunk.choices:
+                continue
+            if chunk.choices[0].finish_reason:
+                out.finish_reason = chunk.choices[0].finish_reason
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                out.content += delta.content
+                yield ("text", delta.content)
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                # 同じツール呼び出しが複数のチャンクに分かれて届くので、index で束ねる
+                part = out._parts.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                if tc.id:
+                    part["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        part["name"] += fn.name
+                    if getattr(fn, "arguments", None):
+                        part["arguments"] += fn.arguments
+    finally:
+        # 利用者が画面を閉じて途中で切れたときも、記録側（_token_stream）を閉じて1行残させる。
+        # 流し終えたあとなら何も起きない
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
     out._finish()
     yield ("done", out)
 
@@ -14462,6 +14694,7 @@ def _ask_json(system: str, user: str, what: str = "AIの応答", model: str | No
     what はエラー文に出す呼び名（どの下書きで失敗したかが分かるように）。
     """
     resp = _create(
+        purpose=what,                       # トークンの記録に残す用途（呼び名そのまま）
         model=model or config.OPENAI_MODEL,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
