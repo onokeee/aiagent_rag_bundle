@@ -9983,6 +9983,25 @@ class _TurnClock:
         parts.append(f"合計 {total:.1f}秒" + ("（途中で切断）" if aborted else ""))
         return " / ".join(parts)
 
+    def record(self, who: str, aborted: bool = False) -> dict:
+        """ファイルに残す1行ぶん。秒は小数1桁、トークンは往復の合計（usage が無ければ null）。"""
+        rs = self.rounds
+
+        def tok(key):
+            vals = [(r["usage"] or {}).get(key) for r in rs if r["usage"]]
+            return sum(v for v in vals if isinstance(v, int)) if vals else None
+
+        first = rs[0]["first"] if rs and rs[0]["first"] is not None else None
+        return {"at": datetime.now().isoformat(timespec="seconds"), "user": who, "model": self.model or "",
+                "pre": round(self.pre, 1) if self.pre is not None else None,
+                "rounds": len(rs),
+                "first": round(first, 1) if first is not None else None,
+                "llm": round(sum(r["llm"] or 0.0 for r in rs), 1),
+                "tools": round(sum(r["tools"] for r in rs), 1),
+                "total": round(time.perf_counter() - self.t0, 1),
+                "input": tok("input"), "cached": tok("cached"), "output": tok("output"),
+                "ok": not any(r["error"] for r in rs), "aborted": bool(aborted)}
+
     def report(self, aborted: bool = False) -> None:
         if self.reported or (self.pre is None and not self.rounds):
             return
@@ -9992,6 +10011,11 @@ class _TurnClock:
         except Exception:
             who = "?"
         print(f"[turn] {who}（{self.model or '?'}）: {self.line(aborted)}")
+        # 同じ内訳を月ごとのファイルにも残す（利用状況の「トークン」タブの「質問ごとの所要時間」が読む）
+        try:
+            llm.turn_log_add(self.record(who, aborted))
+        except Exception as e:                   # 記録のために回答を止めない
+            print(f"[turn] 記録できませんでした: {e}")
 
 
 def _turn_clock() -> "_TurnClock":

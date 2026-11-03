@@ -2818,8 +2818,11 @@ def tokens_report(days: int | None = None, user: str | None = None) -> dict:
     recs = tokens_read(days, user)
     title = "トークン"
     head = [f"対象: {user} のみ"] if user else []
+    turn_tabs, turn_notes = turn_tables(days, user)      # 送信ごとの所要時間（[turn] の内訳）
     if not recs:
         span = f"直近{days}日には" if days else ""
+        if turn_tabs:
+            return _usage_out(title, turn_tabs, head + turn_notes)
         return _usage_out(title, [], head + [
             f"{span}AIの呼び出しの記録がありませんでした。"
             "記録はこの機能を入れた版から始まるので、それより前の分はありません。"])
@@ -2887,7 +2890,135 @@ def tokens_report(days: int | None = None, user: str | None = None) -> dict:
                      ["日時", "利用者", "用途", "モデル", "入力", "うちキャッシュ", "出力", "秒", "結果"],
                      detail, chart=False),
     ]
+    tables += turn_tabs
+    notes += turn_notes
     return _usage_out(title, tables, notes)
+
+
+# --- 送信ごとの所要時間の記録 ---------------------------------------------------------
+# core._TurnClock.report が、サーバのログに出す [turn] と同じ内訳を1行ずつ残す。
+# 置き場は TOKEN_USAGE_DIR の turns_YYYY-MM.jsonl（トークンの記録 YYYY-MM.jsonl と同じフォルダ。
+# 名前が違うので tokens_read には混ざらない）。「考えています…」が長いとき、前処理・AIの往復・道具の
+# どこで待ったかを、ログを開かずに利用状況の画面で見るためのもの。
+
+_TURN_LOCK = threading.Lock()
+
+
+def turn_log_path(when: datetime | None = None) -> Path:
+    d = when or datetime.now()
+    return Path(config.TOKEN_USAGE_DIR) / f"turns_{d:%Y-%m}.jsonl"
+
+
+def turn_log_add(rec: dict) -> bool:
+    """1行足す。書けなくても呼び出し元は止めない。"""
+    try:
+        path = turn_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False)
+        with _TURN_LOCK:
+            with io.open(str(path), "a", encoding="utf-8", newline="\n") as f:
+                f.write(line + "\n")
+        return True
+    except Exception as e:
+        print(f"[turn] 記録できませんでした: {e}")
+        return False
+
+
+def turns_read(days: int | None = None, user: str | None = None) -> list[dict]:
+    """送信ごとの記録を読む（古い順）。壊れた行は飛ばす。期間があれば、その月以降のファイルだけ開く。"""
+    root = Path(config.TOKEN_USAGE_DIR)
+    if not root.exists():
+        return []
+    limit = datetime.now() - timedelta(days=days) if days else None
+    files = sorted(root.glob("turns_????-??.jsonl"))
+    if limit:
+        first = f"turns_{limit:%Y-%m}.jsonl"
+        files = [f for f in files if f.name >= first]
+    out: list[dict] = []
+    for f in files:
+        try:
+            with io.open(str(f), encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if user and str(rec.get("user") or "").lower() != str(user).lower():
+                continue
+            if limit:
+                at = _usage_dt(rec.get("at"))
+                if at and at < limit:
+                    continue
+            out.append(rec)
+    return out
+
+
+def _median(xs: list) -> float:
+    xs = sorted(x for x in xs if isinstance(x, (int, float)))
+    if not xs:
+        return 0.0
+    n = len(xs)
+    return float(xs[n // 2]) if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+
+def turn_tables(days: int | None = None, user: str | None = None) -> tuple[list, list]:
+    """「トークン」タブに足す、送信ごとの所要時間の表と所見。記録が無ければ ([], [])。
+
+    前処理＝対象の決定・取り込み直し・プロンプトの組み立て、最初の応答まで＝往復1で最初のチャンクが
+    届くまで、AI＝往復の合計、道具＝SQL・グラフ・文書検索などの実行の合計。合計は送信から終わりまで。
+    """
+    recs = turns_read(days, user)
+    if not recs:
+        return [], []
+    totals = [r.get("total") for r in recs if isinstance(r.get("total"), (int, float))]
+    med, mx = _median(totals), (max(totals) if totals else 0)
+    slow = sum(1 for t in totals if t >= 60)
+    notes = [f"質問 {len(recs):,} 件の回答までの時間: 中央値 {med:.0f} 秒・最長 {mx:.0f} 秒。60秒以上が {slow} 件。"
+             "内訳は下の「質問ごとの所要時間」（前処理＝対象の決定・取り込み直し・プロンプト作成、"
+             "最初の応答まで＝往復1でAIが返し始めるまで、道具＝SQL・グラフ・文書検索）。"]
+    by_day: dict = {}
+    for r in recs:
+        by_day.setdefault(str(r.get("at") or "")[:10] or "（不明）", []).append(r)
+    day_rows = []
+    for d in sorted(by_day):
+        rs = by_day[d]
+        tots = [x.get("total") for x in rs if isinstance(x.get("total"), (int, float))]
+        day_rows.append((d, len(rs), round(_median(tots)), round(max(tots)) if tots else 0,
+                         round(_median([x.get("pre") for x in rs]), 1),
+                         round(_median([x.get("first") for x in rs]), 1),
+                         round(_median([x.get("tools") for x in rs]), 1)))
+
+    def result(r):
+        if r.get("aborted"):
+            return "切断"
+        return "OK" if r.get("ok", True) else "失敗"
+
+    def pct(r):
+        i, c = r.get("input"), r.get("cached")
+        return f"{c / i * 100:.0f}%" if isinstance(i, int) and i and isinstance(c, int) else ""
+
+    detail = [(str(r.get("at") or "")[:19].replace("T", " "), str(r.get("user") or ""), str(r.get("model") or ""),
+               r.get("pre"), r.get("rounds"), r.get("first"), r.get("llm"), r.get("tools"), r.get("total"),
+               r.get("input"), pct(r), result(r))
+              for r in sorted(recs, key=lambda r: str(r.get("at") or ""), reverse=True)[:500]]
+    tables = [
+        _usage_table("推移（回答までの時間・日ごと）",
+                     ["日", "質問数", "中央値（秒）", "最長（秒）", "前処理の中央値（秒）",
+                      "最初の応答までの中央値（秒）", "道具の中央値（秒）"], day_rows),
+        _usage_table("質問ごとの所要時間（新しい順・最大500件）",
+                     ["日時", "利用者", "モデル", "前処理（秒）", "往復", "最初の応答まで（秒）", "AI（秒）",
+                      "道具（秒）", "合計（秒）", "入力トークン", "うちキャッシュ", "結果"],
+                     detail, chart=False),
+    ]
+    return tables, notes
 
 
 def _usage_dt(value) -> datetime | None:
