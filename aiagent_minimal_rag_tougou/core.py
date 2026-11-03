@@ -1669,7 +1669,7 @@ import config
 _catalog_history_lock = threading.Lock()
 
 #: 表示用のラベル
-OPS = {"add": "新規", "update": "変更", "remove": "削除"}
+OPS = {"add": "新規", "update": "変更", "remove": "削除", "lock": "ロック", "unlock": "ロック解除"}
 
 
 def _catalog_history_path() -> Path:
@@ -1703,6 +1703,55 @@ def _trim(p: Path) -> None:
     if len(lines) > config.CATALOG_HISTORY_MAX * 1.2:
         keep = lines[-config.CATALOG_HISTORY_MAX:]
         config.write_text_atomic(p, "\n".join(keep) + "\n")
+
+
+def read_changes(db_file: str = "", kind: str = "", *, name: str | None = None,
+                 table: str | None = None, sql: str | None = None,
+                 limit: int = 200) -> list[dict]:
+    """履歴を新しい順に返す。壊れた行は飛ばす。
+
+    name（用語名・例文の質問文）と table（置き場所。"" は全体）で1件ぶんの版の並びに絞る。
+    例文は質問文が変わっても同じ例文を辿れるよう、sql（空白・大文字小文字を無視して比べる）でも拾う。
+    どれも無ければ、その種類の最近の変更をそのまま返す。カタログ画面の「履歴」「最近の変更」が読む。
+    """
+    p = _catalog_history_path()
+    if not p.exists():
+        return []
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    key_sql = _norm_sql(sql) if sql else None
+    out: list[dict] = []
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if db_file and str(rec.get("db") or "") != db_file:
+            continue
+        if kind and str(rec.get("kind") or "") != kind:
+            continue
+        if table is not None and str(rec.get("table") or "") != str(table or ""):
+            continue
+        if name is not None or key_sql:
+            hit = name is not None and str(rec.get("name") or "") == name
+            if not hit and key_sql:
+                for side in (rec.get("before"), rec.get("after")):
+                    if isinstance(side, dict) and _norm_sql(str(side.get("sql") or "")) == key_sql:
+                        hit = True
+                        break
+            if not hit:
+                continue
+        out.append(rec)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ==========================================================================
@@ -2763,12 +2812,71 @@ def normalize_glossary(gl) -> dict:
         if isinstance(val, dict):
             desc = str(val.get("description") or "").strip()
             sql = str(val.get("sql") or "").strip()
+            lock = lock_fields(val)                  # ロック（確定）の印は落とさない
         else:
             print(f"[catalog] 用語 '{term}' が古い書き方です。説明として扱います。")
             desc, sql = str(val or "").strip(), ""
+            lock = {}
         if desc or sql:
-            out[term] = {"description": desc, "sql": sql}
+            out[term] = {"description": desc, "sql": sql, **lock}
     return out
+
+
+# --- ロック（確定した用語・例文を変えさせない） ------------------------------------------
+# 用語・例文の項目に locked / locked_by / locked_at を持たせる。AIへのプロンプトには出さない。
+# ロック中の項目は、カタログ画面の保存・チャットの登録カード・AIの提案ツールのどこからも
+# 変更・削除できない。解除はカタログ画面の鍵マーク（管理者）だけ。
+
+LOCK_KEYS = ("locked", "locked_by", "locked_at")
+
+
+def is_locked(entry) -> bool:
+    """用語・例文がロック（確定）されているか。"""
+    return bool(isinstance(entry, dict) and entry.get("locked"))
+
+
+def lock_fields(entry) -> dict:
+    """ロックの印（掛かっているか・誰が・いつ）だけを取り出す。掛かっていなければ空。"""
+    if not is_locked(entry):
+        return {}
+    return {"locked": True, "locked_by": str(entry.get("locked_by") or ""),
+            "locked_at": str(entry.get("locked_at") or "")}
+
+
+def strip_lock(entry) -> dict:
+    """ロックの印を除いた中身（説明・SQL・質問文）。変わったかどうかの比較と履歴に使う。"""
+    return {k: v for k, v in (entry or {}).items() if k not in LOCK_KEYS}
+
+
+def with_lock(entry: dict, locked: bool, before, user: str) -> dict:
+    """項目にロックの印を付け外しした写しを返す。
+
+    前から掛かっていれば「誰が・いつ」は引き継ぐ（保存のたびに記録が新しくならないように）。
+    新しく掛けるときは、いまの利用者と時刻を記す。
+    """
+    out = strip_lock(entry)
+    if locked:
+        out.update(lock_fields(before) or {
+            "locked": True, "locked_by": str(user or ""),
+            "locked_at": datetime.now().isoformat(timespec="seconds")})
+    return out
+
+
+def lock_violation(before: dict, after: dict, what: str) -> str:
+    """ロック中の項目を変える・消す保存になっていないか。問題があれば利用者向けの文、無ければ空。
+
+    解除（locked を外す）は同じ保存の中で認める。画面では解除の操作を挟まないと欄が開かないので、
+    解除して保存した時点で本人は意識して変えている。
+    """
+    for key, old in (before or {}).items():
+        if not is_locked(old):
+            continue
+        new = (after or {}).get(key)
+        if new is None:
+            return f"{what}「{key}」はロック中なので削除できません。先にロックを解除してください。"
+        if is_locked(new) and strip_lock(new) != strip_lock(old):
+            return f"{what}「{key}」はロック中なので変更できません。先にロックを解除してください。"
+    return ""
 
 
 def table_glossary(meta: dict, tname: str) -> dict:
@@ -3520,7 +3628,8 @@ def dedupe_examples(examples: list[dict]) -> list[dict]:
             continue
         desc = str(ex.get("description") or "").strip()
         by_key[(q, _norm_sql(sql))] = {
-            "q": q, **({"description": desc} if desc else {}), "sql": sql}
+            "q": q, **({"description": desc} if desc else {}), "sql": sql,
+            **lock_fields(ex)}                       # ロック（確定）の印は落とさない
     return list(by_key.values())
 
 
@@ -10585,15 +10694,16 @@ def glossary_save():
 
     meta = catalog.load_meta_for_edit(path)
     entry = {"description": desc, "sql": sql}
+    gl = catalog.table_glossary(meta, table) if table else catalog.db_glossary(meta)
+    old = gl.get(term)
+    if catalog.is_locked(old):
+        # 管理者が確定（ロック）した用語は、チャットからは上書きできない
+        return jsonify({"error": f"「{term}」は確定済み（ロック中）の用語です。"
+                                 "変更が必要なら、管理者がデータカタログでロックを解除してから行います。"}), 403
+    gl[term] = entry                                     # 既存の用語を消さずに足す
     if table:
-        gl = catalog.table_glossary(meta, table)      # 既存の用語を消さずに足す
-        old = gl.get(term)
-        gl[term] = entry
         catalog.set_table_glossary(meta, table, gl)
     else:
-        gl = catalog.db_glossary(meta)
-        old = gl.get(term)
-        gl[term] = entry
         meta["glossary"] = gl
     catalog.save_meta(path, meta)
     catalog_history.add_catalog_change("glossary", "update" if old else "add", path.name, term,
@@ -10648,6 +10758,9 @@ def save_example():
     # 例文は毎回プロンプトに載るので、言い回し違いで同じSQLが並ぶと
     # トークンを食うだけで精度は上がらない。
     same = catalog.find_example(examples, sql)
+    if catalog.is_locked(same):
+        return jsonify({"error": "この例文は確定済み（ロック中）です。"
+                                 "変更が必要なら、管理者がデータカタログでロックを解除してから行います。"}), 403
     if same is not None:
         before = dict(same)
         same["q"] = q
@@ -15124,6 +15237,35 @@ def _stale(body: dict, meta: dict, kind: str, label: str):
         "stale": True}), 409
 
 
+@bp_catalog.get("/api/catalog/history")
+@admin_required
+def catalog_changes():
+    """用語集・例文の変更履歴（新しい順）。
+
+    name（用語名／例文の質問文）を付ければその1件の版の並び、付けなければその種類の最近の変更。
+    用語は table（置き場所。空は全体）でも絞る。例文は質問文が変わっても同じ例文を辿れるよう
+    sql でも拾う。カタログ画面の「履歴」「最近の変更」が読む。
+    """
+    kind = str(request.args.get("kind") or "").strip()
+    if kind not in ("glossary", "example"):
+        return jsonify({"error": "kind は glossary か example を指定してください。"}), 400
+    try:
+        path = db.path_for(request.args.get("db"))
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 400
+    name = request.args.get("name")
+    table = request.args.get("table") if (kind == "glossary" and name is not None) else None
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 200), 1000))
+    except ValueError:
+        limit = 200
+    recs = catalog_history.read_changes(path.name, kind, name=name, table=table,
+                                        sql=request.args.get("sql") or None, limit=limit)
+    for r in recs:
+        r["op_label"] = catalog_history.OPS.get(str(r.get("op") or ""), str(r.get("op") or ""))
+    return jsonify({"changes": recs})
+
+
 @bp_catalog.post("/api/catalog/glossary")
 @admin_required
 def save_glossary():
@@ -15163,17 +15305,27 @@ def save_glossary():
                                      "画面を読み直してください。", "stale": True}), 409
         groups = [(str(tname) if tname else None, rows)]
 
+    user = getattr(g.user, "username", None) or ""
+    plans = []
     for tname, rows in groups:
+        before_gl = (catalog.table_glossary(meta, tname) if tname
+                     else catalog.db_glossary(meta))
         gl = {}
         for row in rows:
             term = (row.get("term") or "").strip()
             desc = (row.get("description") or "").strip()
             sql = (row.get("sql") or "").strip()
             if term and (desc or sql):
-                gl[term] = {"description": desc, "sql": sql}
+                # ロックの印は画面の鍵マークの状態で付け外し（前から掛かっていれば誰が・いつは引き継ぐ）
+                gl[term] = catalog.with_lock({"description": desc, "sql": sql},
+                                             bool(row.get("locked")), before_gl.get(term), user)
+        # ロック中の用語を変える・消す保存は、全部をやめて断る（半分だけ保存しない）
+        bad = catalog.lock_violation(before_gl, gl, "用語")
+        if bad:
+            return jsonify({"error": bad, "locked": True}), 409
+        plans.append((tname, before_gl, gl))
+    for tname, before_gl, gl in plans:
         # 誰が何を変えたかを残す（チャットからの登録と同じ記録に揃える）
-        before_gl = (catalog.table_glossary(meta, tname) if tname
-                     else catalog.db_glossary(meta))
         _log_glossary_diff(path.name, tname, before_gl, gl)
         if tname:
             catalog.set_table_glossary(meta, tname, gl)
@@ -15182,8 +15334,10 @@ def save_glossary():
         else:
             meta.pop("glossary", None)
     catalog.save_meta(path, meta)
-    # 続けて保存できるよう、新しい印を返す（画面は次の保存でこれを送る）
-    return jsonify({"ok": True, "stamp": catalog.section_stamp(meta, "glossary")})
+    # 続けて保存できるよう、新しい印を返す（画面は次の保存でこれを送る）。
+    # 保存した中身（ロックの誰が・いつを含む）も返し、画面がそのまま表示に使う
+    return jsonify({"ok": True, "stamp": catalog.section_stamp(meta, "glossary"),
+                    "saved": {(tname or ""): gl for tname, _b, gl in plans}})
 
 
 def _sql_scope(sql: str, path: Path) -> list[dict]:
@@ -15725,15 +15879,24 @@ def _log_glossary_diff(db_file: str, table, before: dict, after: dict) -> None:
     for term in after:
         if term not in before:
             catalog_history.add_catalog_change("glossary", "add", db_file, term, user=user,
-                                table=table, after=after[term], source="catalog")
-        elif before[term] != after[term]:
+                                table=table, after=catalog.strip_lock(after[term]), source="catalog")
+            if catalog.is_locked(after[term]):
+                catalog_history.add_catalog_change("glossary", "lock", db_file, term, user=user,
+                                    table=table, after=catalog.strip_lock(after[term]), source="catalog")
+            continue
+        if catalog.strip_lock(before[term]) != catalog.strip_lock(after[term]):
             catalog_history.add_catalog_change("glossary", "update", db_file, term, user=user,
-                                table=table, before=before[term],
-                                after=after[term], source="catalog")
+                                table=table, before=catalog.strip_lock(before[term]),
+                                after=catalog.strip_lock(after[term]), source="catalog")
+        # ロックの付け外しも残す（誰がいつ確定した・解除したかが後から分かる）
+        if catalog.is_locked(before[term]) != catalog.is_locked(after[term]):
+            catalog_history.add_catalog_change(
+                "glossary", "lock" if catalog.is_locked(after[term]) else "unlock", db_file, term,
+                user=user, table=table, after=catalog.strip_lock(after[term]), source="catalog")
     for term in before:
         if term not in after:
             catalog_history.add_catalog_change("glossary", "remove", db_file, term, user=user,
-                                table=table, before=before[term], source="catalog")
+                                table=table, before=catalog.strip_lock(before[term]), source="catalog")
 
 
 @bp_catalog.post("/api/catalog/examples")
@@ -15755,22 +15918,47 @@ def save_examples():
     over = max(0, len(deduped) - catalog.EXAMPLES_MAX)
     new = deduped[:catalog.EXAMPLES_MAX]
 
-    # 差分をSQLをキーに取り、誰が何を変えたかを残す
+    # 差分をSQLをキーに取り、誰が何を変えたかを残す（SQL は空白・大文字小文字の違いを無視して比べる）
     user = getattr(g.user, "username", None)
-    old_by_sql = {e.get("sql"): e for e in (meta.get("examples") or [])}
-    new_by_sql = {e.get("sql"): e for e in new}
+    key_of = lambda e: catalog._norm_sql(str(e.get("sql") or ""))
+    old_by_sql = {key_of(e): e for e in (meta.get("examples") or [])}
+    # ロックの印は画面の鍵マークの状態で付け外し（前から掛かっていれば誰が・いつは引き継ぐ）
+    new = [catalog.with_lock(e, bool(e.get("locked")), old_by_sql.get(key_of(e)), user or "")
+           for e in new]
+    new_by_sql = {key_of(e): e for e in new}
+    # ロック中の例文を変える・消す保存は断る（SQL を変えると別の例文になるので「消した」扱い）
+    for k_, old_ in old_by_sql.items():
+        if not catalog.is_locked(old_):
+            continue
+        new_ = new_by_sql.get(k_)
+        if new_ is None:
+            return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので削除できません"
+                                     "（SQL を変えるのも削除の扱いです）。先にロックを解除してください。",
+                            "locked": True}), 409
+        if catalog.is_locked(new_) and catalog.strip_lock(new_) != catalog.strip_lock(old_):
+            return jsonify({"error": f"例文「{old_.get('q', '')}」はロック中なので変更できません。"
+                                     "先にロックを解除してください。", "locked": True}), 409
     for s_, e_ in new_by_sql.items():
         if s_ not in old_by_sql:
             catalog_history.add_catalog_change("example", "add", path.name, e_.get("q", ""),
-                                user=user, after=e_, source="catalog")
-        elif old_by_sql[s_] != e_:
+                                user=user, after=catalog.strip_lock(e_), source="catalog")
+            if catalog.is_locked(e_):
+                catalog_history.add_catalog_change("example", "lock", path.name, e_.get("q", ""),
+                                    user=user, after=catalog.strip_lock(e_), source="catalog")
+            continue
+        old_ = old_by_sql[s_]
+        if catalog.strip_lock(old_) != catalog.strip_lock(e_):
             catalog_history.add_catalog_change("example", "update", path.name, e_.get("q", ""),
-                                user=user, before=old_by_sql[s_], after=e_,
-                                source="catalog")
+                                user=user, before=catalog.strip_lock(old_),
+                                after=catalog.strip_lock(e_), source="catalog")
+        if catalog.is_locked(old_) != catalog.is_locked(e_):
+            catalog_history.add_catalog_change(
+                "example", "lock" if catalog.is_locked(e_) else "unlock", path.name, e_.get("q", ""),
+                user=user, after=catalog.strip_lock(e_), source="catalog")
     for s_, e_ in old_by_sql.items():
         if s_ not in new_by_sql:
             catalog_history.add_catalog_change("example", "remove", path.name, e_.get("q", ""),
-                                user=user, before=e_, source="catalog")
+                                user=user, before=catalog.strip_lock(e_), source="catalog")
 
     meta["examples"] = new
     catalog.save_meta(path, meta)

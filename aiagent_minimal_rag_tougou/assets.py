@@ -538,6 +538,8 @@ TEMPLATES = {
         <div class="md">
           <div class="md__side">
             <button class="btn btn--sm" id="glAdd" style="width:100%">＋ 用語を追加</button>
+            <button class="btn btn--sm" id="glRecent" style="width:100%;margin-top:6px"
+                    title="用語集の変更履歴（新しい順）。消した用語もここから戻せます">最近の変更</button>
             <div class="mlist" id="glList"></div>
           </div>
           <div class="md__main" id="glEditor"></div>
@@ -590,6 +592,8 @@ TEMPLATES = {
         <div class="md">
           <div class="md__side">
             <button class="btn btn--sm" id="exAdd" style="width:100%">＋ 例文を追加</button>
+            <button class="btn btn--sm" id="exRecent" style="width:100%;margin-top:6px"
+                    title="例文の変更履歴（新しい順）。消した例文もここから戻せます">最近の変更</button>
             <div class="mlist" id="exList"></div>
           </div>
           <div class="md__main" id="exEditor"></div>
@@ -2618,6 +2622,11 @@ table.data tr.is-hit > td { background: var(--accent-weak); }
                font-size: 13px; color: var(--text); cursor: pointer; }
 .mlist__item:hover { background: var(--surface-2); }
 .mlist__item.is-active { background: var(--accent-weak); color: var(--accent); }
+.mlist__lock { flex: none; font-size: 11px; opacity: .8; }
+.histpanel .hist__row { padding: 6px 0; border-top: 1px solid rgba(128,128,128,.25); }
+.histpanel .hist__row:first-child { border-top: 0; }
+.hist__meta { font-size: 12px; opacity: .75; }
+.hist__body { white-space: pre-wrap; font-size: 13px; margin: 2px 0 4px; word-break: break-all; }
 .mlist__term { flex: 0 1 auto; min-width: 44px; font-weight: 550;
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mlist__desc { flex: 1 1 0; min-width: 0; color: var(--muted); font-size: 12px;
@@ -9045,10 +9054,12 @@ function loadGlossaryAll() {
     Object.entries(CAT.dbGlossary || {}).forEach(([term, v]) => glItems.push({
         id: ++idSeq, term, scope: SCOPE_DB,
         description: v.description || '', sql: v.sql || '',
+        locked: !!v.locked, lockedBy: v.locked_by || '', lockedAt: v.locked_at || '',
         verdict: null, detail: '', dirty: false }));
     CAT.tables.forEach(t => Object.entries(t.glossary || {}).forEach(([term, v]) => glItems.push({
         id: ++idSeq, term, scope: t.name,
         description: v.description || '', sql: v.sql || '',
+        locked: !!v.locked, lockedBy: v.locked_by || '', lockedAt: v.locked_at || '',
         verdict: null, detail: '', dirty: false })));
     glInitialScopes = new Set(glItems.map(r => r.scope));
     glSelId = glItems[0]?.id ?? null;
@@ -9075,6 +9086,7 @@ function glRenderList() {
                 onclick: () => glSelect(it.id),
             },
                 statusDot(it),
+                it.locked ? el('span', { class: 'mlist__lock', title: 'ロック中（確定）' }, '🔒') : null,
                 el('span', { class: 'mlist__term' }, it.term || '（無題）'),
                 el('span', { class: 'mlist__desc' }, it.description || it.sql || ''),
                 dirtyDot(it)));
@@ -9104,7 +9116,8 @@ function glAdd() {
     const cur = glById(glSelId);
     const it = { id: ++idSeq, term: '',
                  scope: cur ? cur.scope : (CAT.tables[0]?.name ?? SCOPE_DB),
-                 description: '', sql: '', verdict: null, detail: '', dirty: true };
+                 description: '', sql: '', locked: false, lockedBy: '', lockedAt: '',
+                 verdict: null, detail: '', dirty: true };
     glItems.push(it);
     glSelect(it.id);
     $('#glEditor .ed-term')?.focus();
@@ -9135,15 +9148,17 @@ function glRenderEditor() {
         return;
     }
 
+    const ro = it.locked ? { disabled: 'disabled' } : {};     // ロック中は欄を開かない（解除してから）
     const term = el('input', { type: 'text', class: 'ed-term', value: it.term,
-        placeholder: '用語（例: 有効な受注）' });
-    const scopeSel = el('select', { title: 'この用語の置き場所' },
+        placeholder: '用語（例: 有効な受注）', ...ro });
+    const scopeSel = el('select', { title: 'この用語の置き場所', ...ro },
         el('option', { value: SCOPE_DB, ...(it.scope === SCOPE_DB ? { selected: 'selected' } : {}) },
             '全体（複数テーブル）'),
         ...scopeOptionGroups(it.scope));
     const desc = el('input', { type: 'text', value: it.description,
-        placeholder: '説明（自然言語でOK。例: キャンセル以外の、実際に売上になる受注）' });
+        placeholder: '説明（自然言語でOK。例: キャンセル以外の、実際に売上になる受注）', ...ro });
     const sql = growingSql('ed-sql', it.sql, "SQL条件・計算式（任意。例: status != '9'）");
+    if (it.locked) sql.disabled = true;
     const dup = el('div', { class: 'small ed-dup hidden' });
     const status = el('div', { class: 'vstatus' });
     setStatus(status, it);
@@ -9179,7 +9194,7 @@ function glRenderEditor() {
 
     const draftBtn = el('button', {
         class: 'btn btn--sm', type: 'button',
-        ...(CAT.llmReady ? {} : { disabled: 'disabled' }),
+        ...((CAT.llmReady && !it.locked) ? {} : { disabled: 'disabled' }),
         title: '説明をもとに、AIがこの用語のSQL式を下書きします',
         onclick: async () => {
             if (!it.term.trim() || !it.description.trim()) {
@@ -9218,7 +9233,8 @@ function glRenderEditor() {
         title: 'SQL式を実データに当てて確かめる',
         onclick: () => glVerify([it]) }, '検証');
 
-    const delBtn = el('button', { class: 'btn btn--sm btn--danger', type: 'button',
+    const delBtn = el('button', { class: 'btn btn--sm btn--danger', type: 'button', ...ro,
+        title: it.locked ? 'ロック中は削除できません（先に解除）' : '',
         onclick: () => {
             if (!confirm(`用語「${it.term || '（無題）'}」を削除しますか？（「保存」までは確定しません）`)) return;
             const i = glItems.indexOf(it);
@@ -9228,12 +9244,24 @@ function glRenderEditor() {
             glRenderList(); glRenderEditor();
         } }, '削除');
 
+    const histBox = el('div', { class: 'histpanel' });
+    const lockBtn = lockButton(it, () => { markGlDirty(it); glRenderList(); glRenderEditor(); },
+                               `用語「${it.term || '（無題）'}」`);
+    const histBtn = el('button', { class: 'btn btn--sm', type: 'button',
+        title: 'この用語の変更履歴（新しい順）。過去の内容を欄に戻せます',
+        onclick: () => showHistory(histBox, { kind: 'glossary', name: it.term, table: it.scope || '' }, v => {
+            if (it.locked) { toast('ロック中は戻せません。先にロックを解除してください。', 'warn'); return; }
+            it.description = v.description || ''; it.sql = v.sql || '';
+            it.verdict = null; it.detail = ''; markGlDirty(it); glRenderList(); glRenderEditor();
+            toast('過去の内容を欄に入れました。「保存」で確定します。');
+        }) }, '履歴');
     box.replaceChildren(el('div', { class: 'editcard' },
         el('div', { class: 'row' },
             el('div', { class: 'grow' }, el('label', { class: 'field' }, '用語'), term),
             el('div', { style: 'width:230px' },
                 el('label', { class: 'field' }, '置き場所'), scopeSel),
-            delBtn),
+            histBtn, lockBtn, delBtn),
+        lockNote(it),
         dup,
         el('div', { class: 'mt' },
             el('label', { class: 'field' }, '説明（自然言語で構いません）'), desc),
@@ -9246,6 +9274,7 @@ function glRenderEditor() {
             sqlNote(sql)),
         glDraftNote(it),
         status,
+        histBox,
         refPanel(it.scope, sql)));
 }
 
@@ -9302,15 +9331,24 @@ async function saveGlossary() {
     const scopes = {};
     for (const scope of new Set([...glInitialScopes, ...byScope.keys()])) {
         scopes[scope || ''] = (byScope.get(scope) || []).map(r =>
-            ({ term: r.term.trim(), description: r.description.trim(), sql: r.sql.trim() }));
+            ({ term: r.term.trim(), description: r.description.trim(), sql: r.sql.trim(),
+               locked: !!r.locked }));
     }
     try {
         const gr = await api('/api/catalog/glossary',
             { db: CAT.db, scopes, stamp: CAT.stamps?.glossary });
         if (gr.stamp) CAT.stamps.glossary = gr.stamp;
+        // サーバが確定したロックの「誰が・いつ」を画面の行に戻す
+        Object.entries(gr.saved || {}).forEach(([scope, gl]) => {
+            Object.entries(gl || {}).forEach(([term, v]) => {
+                const it = glItems.find(x => (x.scope || '') === scope && x.term.trim() === term);
+                if (it) { it.locked = !!v.locked; it.lockedBy = v.locked_by || ''; it.lockedAt = v.locked_at || ''; }
+            });
+        });
         Object.entries(scopes).forEach(([scope, terms]) => {
             const obj = {};
-            terms.forEach(t => { obj[t.term] = { description: t.description, sql: t.sql }; });
+            terms.forEach(t => { obj[t.term] = { description: t.description, sql: t.sql,
+                ...(((gr.saved || {})[scope] || {})[t.term] || {}) }; });
             if (scope) {
                 const t = CAT.tables.find(x => x.name === scope);
                 if (t) t.glossary = obj;
@@ -9371,9 +9409,106 @@ async function draftGlossary(btn) {
     btn.textContent = '説明からSQL式を下書き';
 }
 
+/* --- 履歴とロック（用語集・例文で共通） -----------------------------------------------
+   履歴の記録は data/catalog_history.jsonl（追記型）。ここでは読んで並べ、「戻す」は欄に入れるだけ。
+   実際の書き込みはいつもの「保存」なので、戻した操作も新しい版として履歴に残る。
+   ロックは鍵マークで付け外しし、やはり「保存」で確定する。ロック中は欄が開かない。 */
+function fmtAt(s) { return String(s || '').slice(0, 16).replace('T', ' '); }
+
+function qsOf(obj) {
+    return Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+}
+
+function lockButton(it, rerender, label) {
+    return el('button', { class: 'btn btn--sm', type: 'button',
+        title: it.locked ? 'ロックを解除する（解除すると変更・削除できる。「保存」で確定）'
+                         : '確定してロックする（解除するまで、画面からもマイエージェントからも変更・削除できない。「保存」で確定）',
+        onclick: () => {
+            if (it.locked && !confirm(`${label}のロックを解除しますか？（「保存」までは確定しません）`)) return;
+            it.locked = !it.locked;
+            it.lockedBy = ''; it.lockedAt = '';          // 誰が・いつは保存時にサーバが記す
+            rerender();
+        } }, it.locked ? '🔒 ロック中（解除）' : '🔓 ロック');
+}
+
+function lockNote(it) {
+    if (!it.locked) return null;
+    const who = it.lockedBy ? `${it.lockedBy}${it.lockedAt ? '（' + fmtAt(it.lockedAt) + '）' : ''}` : '（保存時に記録されます）';
+    return el('div', { class: 'small muted mt' },
+        `ロック中: ${who}。変更・削除するにはロックを解除してから保存します。マイエージェントの登録カードからも変わりません。`);
+}
+
+function histContent(rec) {
+    const v = rec.op === 'remove' ? rec.before : (rec.after || rec.before);
+    return v && typeof v === 'object' ? v : null;
+}
+
+function histRow(rec, onRestore, restoreLabel) {
+    const v = histContent(rec);
+    const body = v ? ('q' in v
+        ? [v.q || '', v.description ? `（${v.description}）` : '', v.sql ? `\n${v.sql}` : ''].join('')
+        : [v.description || '', v.sql ? `\nSQL式: ${v.sql}` : ''].join('')) : '';
+    const where = rec.kind === 'glossary' ? `［${rec.table || '全体'}］` : '';
+    return el('div', { class: 'hist__row' },
+        el('div', { class: 'hist__meta' },
+            `${fmtAt(rec.at)}　${rec.op_label || rec.op}　${rec.user || '不明'}（${rec.source === 'chat' ? 'マイエージェント' : '画面'}）${where}`),
+        el('div', { class: 'hist__body' }, body || '（内容なし）'),
+        v && onRestore ? el('button', { class: 'btn btn--sm', type: 'button',
+                               onclick: () => onRestore(v, rec) }, restoreLabel) : null);
+}
+
+async function showHistory(box, params, onRestore) {
+    box.replaceChildren(el('div', { class: 'small muted mt' }, '履歴を読んでいます…'));
+    let r;
+    try {
+        r = await api('/api/catalog/history?' + qsOf({ db: CAT.db, ...params }), undefined, 'GET');
+    } catch (e) { box.replaceChildren(el('div', { class: 'alert alert--warn mt' }, e.message)); return; }
+    const recs = r.changes || [];
+    box.replaceChildren(el('div', { class: 'card mt' },
+        el('div', { class: 'card__title' }, `変更履歴（新しい順・${recs.length}件）`),
+        recs.length
+            ? el('div', {}, ...recs.map(rec => histRow(rec, rec.op === 'lock' || rec.op === 'unlock' ? null : onRestore,
+                                                    'この内容に戻す')))
+            : el('div', { class: 'small muted' }, '履歴はまだありません（記録を始めた後の変更だけが残ります）。')));
+}
+
+/* その種類（用語集／例文）の最近の変更。消したものは「復活」で行に戻す（「保存」で確定）。 */
+async function showRecent(kind) {
+    const box = $(kind === 'glossary' ? '#glEditor' : '#exEditor');
+    box.replaceChildren(el('div', { class: 'small muted' }, '最近の変更を読んでいます…'));
+    let r;
+    try {
+        r = await api('/api/catalog/history?' + qsOf({ db: CAT.db, kind, limit: 100 }), undefined, 'GET');
+    } catch (e) { box.replaceChildren(el('div', { class: 'alert alert--warn' }, e.message)); return; }
+    const recs = r.changes || [];
+    const restore = (v, rec) => {
+        if (kind === 'glossary') {
+            const it = { id: ++idSeq, term: rec.name || '', scope: rec.table || SCOPE_DB,
+                         description: v.description || '', sql: v.sql || '',
+                         locked: false, lockedBy: '', lockedAt: '', verdict: null, detail: '', dirty: true };
+            glItems.push(it); setDirty('glossary'); glSelect(it.id);
+        } else {
+            const it = { id: ++idSeq, q: v.q || rec.name || '', description: v.description || '', sql: v.sql || '',
+                         locked: false, lockedBy: '', lockedAt: '', verdict: null, detail: '', dirty: true };
+            exItems.push(it); setDirty('examples'); exSelect(it.id);
+        }
+        toast('消えていた内容を行として戻しました。「保存」で確定します。');
+    };
+    box.replaceChildren(el('div', { class: 'editcard' },
+        el('div', { class: 'card__title' }, `${kind === 'glossary' ? '用語集' : '例文'}の最近の変更（新しい順・最大100件）`),
+        el('div', { class: 'small muted mb' },
+            '消した用語・例文は「復活」で行に戻せます（同じ名前の行が既にあれば、戻す前に見直してください）。'
+            + '1件ごとの版の並びは、その行を開いて「履歴」から。'),
+        recs.length
+            ? el('div', { class: 'histpanel' }, ...recs.map(rec => histRow(rec, rec.op === 'remove' ? restore : null, '復活')))
+            : el('div', { class: 'small muted' }, '履歴はまだありません。')));
+}
+
 function wireGlossary() {
     $('#glFilter').addEventListener('input', glRenderList);
     $('#glAdd').addEventListener('click', glAdd);
+    $('#glRecent').addEventListener('click', () => showRecent('glossary'));
     $('#glDraft').addEventListener('click', ev => draftGlossary(ev.currentTarget));
     $('#glVerifyAll').addEventListener('click', ev => glVerify(glItems, ev.currentTarget));
     $('#glSave').addEventListener('click', saveGlossary);
@@ -9390,6 +9525,7 @@ function markExDirty(it) { it.dirty = true; setDirty('examples'); }
 function loadExamples() {
     exItems = (CAT.examples || []).map(e => ({ id: ++idSeq, q: e.q || '',
         description: e.description || '', sql: e.sql || '',
+        locked: !!e.locked, lockedBy: e.locked_by || '', lockedAt: e.locked_at || '',
         verdict: null, detail: '', dirty: false }));
     exSelId = exItems[0]?.id ?? null;
     exRenderList();
@@ -9409,6 +9545,7 @@ function exRenderList() {
             onclick: () => exSelect(it.id),
         },
             statusDot(it),
+            it.locked ? el('span', { class: 'mlist__lock', title: 'ロック中（確定）' }, '🔒') : null,
             el('span', { class: 'mlist__q' }, it.q || '（質問未入力）'),
             it.description ? el('span', { class: 'mlist__desc' }, it.description) : null,
             dirtyDot(it)));
@@ -9441,7 +9578,7 @@ function exAdd() {
     const exMax = CAT.examplesMax || 200;
     if (exItems.length >= exMax) { toast(`例文は${exMax}件までです。`, 'warn'); return; }
     const it = { id: ++idSeq, q: '', description: '', sql: '',
-                 verdict: null, detail: '', dirty: true };
+                 locked: false, lockedBy: '', lockedAt: '', verdict: null, detail: '', dirty: true };
     exItems.push(it);
     exSelect(it.id);
     $('#exEditor .ed-q')?.focus();
@@ -9461,11 +9598,13 @@ function exRenderEditor() {
         return;
     }
 
+    const ro = it.locked ? { disabled: 'disabled' } : {};     // ロック中は欄を開かない（解除してから）
     const q = el('input', { type: 'text', class: 'ed-q', value: it.q,
-        placeholder: '質問（例: 部門別の平均残業時間を教えて）' });
+        placeholder: '質問（例: 部門別の平均残業時間を教えて）', ...ro });
     const desc = el('input', { type: 'text', value: it.description,
-        placeholder: '説明（任意。例: 残業は分で入っているので60で割る。休職者は含めない）' });
+        placeholder: '説明（任意。例: 残業は分で入っているので60で割る。休職者は含めない）', ...ro });
     const sql = growingSql('ed-sql', it.sql, 'SELECT ...');
+    if (it.locked) sql.disabled = true;
     const status = el('div', { class: 'vstatus' });
     setStatus(status, it);
 
@@ -9498,7 +9637,8 @@ function exRenderEditor() {
                 ? `${it.q}（${it.description}）` : it.q, sql: it.sql });
         } }, 'ツールにする');
 
-    const delBtn = el('button', { class: 'btn btn--sm btn--danger', type: 'button',
+    const delBtn = el('button', { class: 'btn btn--sm btn--danger', type: 'button', ...ro,
+        title: it.locked ? 'ロック中は削除できません（先に解除）' : '',
         onclick: () => {
             if (!confirm('この例文を削除しますか？（「保存」までは確定しません）')) return;
             const i = exItems.indexOf(it);
@@ -9508,10 +9648,21 @@ function exRenderEditor() {
             exRenderList(); exRenderEditor();
         } }, '削除');
 
+    const histBox = el('div', { class: 'histpanel' });
+    const lockBtn = lockButton(it, () => { markExDirty(it); exRenderList(); exRenderEditor(); }, 'この例文');
+    const histBtn = el('button', { class: 'btn btn--sm', type: 'button',
+        title: 'この例文の変更履歴（新しい順）。過去の内容を欄に戻せます',
+        onclick: () => showHistory(histBox, { kind: 'example', name: it.q, sql: it.sql }, v => {
+            if (it.locked) { toast('ロック中は戻せません。先にロックを解除してください。', 'warn'); return; }
+            it.q = v.q || it.q; it.description = v.description || ''; it.sql = v.sql || it.sql;
+            it.verdict = null; it.detail = ''; markExDirty(it); exRenderList(); exRenderEditor();
+            toast('過去の内容を欄に入れました。「保存」で確定します。');
+        }) }, '履歴');
     box.replaceChildren(el('div', { class: 'editcard' },
         el('div', { class: 'row' },
             el('div', { class: 'grow' }, el('label', { class: 'field' }, '質問'), q),
-            delBtn),
+            histBtn, lockBtn, delBtn),
+        lockNote(it),
         el('div', { class: 'mt' },
             el('label', { class: 'field' },
                 '説明（任意。この例をどう読めばよいかをAIに伝える）'), desc),
@@ -9523,6 +9674,7 @@ function exRenderEditor() {
             sql,
             sqlNote(sql)),
         status,
+        histBox,
         refPanel(SCOPE_DB, sql)));
 }
 
@@ -9554,7 +9706,7 @@ async function saveExamples() {
         r = await api('/api/catalog/examples',
             { db: CAT.db, stamp: CAT.stamps?.examples,
               examples: exItems.map(x => ({ q: x.q.trim(),
-                description: x.description.trim(), sql: x.sql.trim() })) });
+                description: x.description.trim(), sql: x.sql.trim(), locked: !!x.locked })) });
     } catch (e) { toast(e.message, 'err', e.data?.stale ? 12000 : 5000); return; }
     CAT.examples = r.examples || [];
     if (r.stamp) CAT.stamps.examples = r.stamp;   // 続けて保存できるように
@@ -9566,6 +9718,7 @@ async function saveExamples() {
     const kept = CAT.examples.map(e => {
         const o = old.get(`${e.q}\u0000${e.sql}`);
         return { id: ++idSeq, q: e.q, description: e.description || '', sql: e.sql,
+                 locked: !!e.locked, lockedBy: e.locked_by || '', lockedAt: e.locked_at || '',
                  verdict: o?.verdict ?? null, detail: o?.detail ?? '', dirty: false };
     });
     // 質問とSQLが揃っていない行は保存されないので、書きかけを消さずに残す
@@ -9592,6 +9745,7 @@ function wireExamples() {
     loadExamples();
     $('#exFilter').addEventListener('input', exRenderList);
     $('#exAdd').addEventListener('click', exAdd);
+    $('#exRecent').addEventListener('click', () => showRecent('example'));
     $('#exVerifyAll').addEventListener('click', ev => exVerify(exItems, ev.currentTarget));
     $('#exSave').addEventListener('click', saveExamples);
     $('#exList').addEventListener('keydown', ev => listArrowNav(ev, '#exList', exSelect));

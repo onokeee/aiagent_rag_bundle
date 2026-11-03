@@ -178,7 +178,8 @@ IMPORT_SAMPLE_ROWS = int(os.getenv("IMPORT_SAMPLE_ROWS", "20") or 20)
 # 用語集・例文を誰がいつ変えたかの記録（チャットからの登録・カタログ画面の編集の両方）。
 CATALOG_HISTORY_FILE = Path(os.getenv("CATALOG_HISTORY_FILE",
                                       str(DATA_DIR / "catalog_history.jsonl"))).expanduser()
-CATALOG_HISTORY_MAX = int(os.getenv("CATALOG_HISTORY_MAX", "2000") or 2000)
+# 用語・例文の「履歴を見て戻す」の材料なので多めに残す（2026-11-03 に 2,000 → 20,000）
+CATALOG_HISTORY_MAX = int(os.getenv("CATALOG_HISTORY_MAX", "20000") or 20000)
 
 # チャットの登録カード（用語・例文）から、一般利用者もカタログを書けるようにするか。
 #

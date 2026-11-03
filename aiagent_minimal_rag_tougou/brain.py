@@ -10760,6 +10760,14 @@ def _propose_glossary_term(args: dict, scope: list[dict]) -> dict:
     meta_now = catalog.load_meta(target)
     current = (catalog.table_glossary(meta_now, table) if table
                else catalog.db_glossary(meta_now)).get(term)
+    if catalog.is_locked(current):
+        # 管理者が確定（ロック）した用語。カードは出さず、AIにはいまの定義に従わせる
+        return {"ok": True, "llm_content": _json({
+            "status": "locked", "db": target.name, "table": table or "(DB全体)", "term": term,
+            "current": catalog.strip_lock(current),
+            "note": "この用語は管理者が確定（ロック）しているので、登録カードは出していません。"
+                    "利用者には「この用語は確定済みで、変更は管理者がデータカタログで行います」と伝え、"
+                    "回答はいまの定義に従うこと。"})}
     return {
         "ok": True,
         "llm_content": _json({
@@ -10817,6 +10825,13 @@ def _propose_example(args: dict, scope: list[dict]) -> dict:
                     "テーブル名を『DB名.テーブル名』の形で書いたSQLを渡してください。")
 
     same = catalog.find_example(catalog.load_meta(home).get("examples") or [], sql)
+    if catalog.is_locked(same):
+        # 同じSQLの例文を管理者が確定（ロック）している。カードは出さない
+        return {"ok": True, "llm_content": _json({
+            "status": "locked", "db": home.name, "question": q,
+            "current": catalog.strip_lock(same),
+            "note": "同じSQLの例文を管理者が確定（ロック）しているので、登録カードは出していません。"
+                    "利用者には「この例文は確定済みで、変更は管理者がデータカタログで行います」と伝えること。"})}
     return {
         "ok": True,
         "llm_content": _json({
