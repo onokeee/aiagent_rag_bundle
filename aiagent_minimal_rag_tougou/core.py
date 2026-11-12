@@ -12257,8 +12257,9 @@ def _robot_folder_defaults(steps: list[dict]) -> dict:
             "folder_overwrite": bool((first or {}).get("folder_overwrite"))}
 
 
+#: set_at … 定期実行を登録した（並びを数え直した）時刻。まだ一度も動いていないロボットの次回はここから数える
 _SCHEDULE_KEYS = ("kind", "hours", "time", "weekday", "day", "nth",
-                  "start_at", "enabled", "values", "last_run", "last_status", "last_message")
+                  "start_at", "set_at", "enabled", "values", "last_run", "last_status", "last_message")
 #: 定期実行の型。画面のプルダウンはこの順で出す
 ROBOT_SCHEDULE_KINDS = {
     "manual": "手動のみ",
@@ -12335,6 +12336,7 @@ def _robot_schedule_norm(robot: dict) -> dict:
     out = {"kind": kind, "hours": hours, "time": _robot_hhmm(sch.get("time")),
            "weekday": weekday, "day": day, "nth": nth,
            "start_at": str(sch.get("start_at") or ""),
+           "set_at": str(sch.get("set_at") or ""),
            "enabled": sch.get("enabled") is not False,
            "values": {str(k): str(v) for k, v in values.items()},
            "last_run": str(sch.get("last_run") or ""),
@@ -12428,22 +12430,35 @@ def robot_next_scheduled(robot: dict, now: datetime | None = None):
     """定期実行の次の時刻（datetime）。手動のみ・止めているなら None。
 
     決めた時刻の並び（毎日8:00、毎週火曜9:00…）を守る。手動で動かしても並びはずれない。
-    まだ一度も動いていなければ、いまより後の最初の時刻（開始日時が未来ならその時刻）。
+    まだ一度も動いていなければ、定期実行を登録した時刻（set_at）より後の最初の時刻
+    （開始日時が未来ならその時刻）。この時刻は「いま」によって動かないので、過ぎたら次の周回で動く。
     サーバが止まっていて何回か過ぎていたら、次の周回で1回だけ動く。
+
+    2026-11-12 まで、まだ一度も動いていないときは「いまより後の最初の時刻」を返していた。周回のたびに
+    「いま」が進むので、時刻を過ぎた瞬間に次回が先へずれ、新しく登録したロボットが永久に動かなかった
+    （検証は前回の実行時刻を手で過去にしてから動かしていたので、この経路を通っていなかった）。
     """
     sch = _robot_schedule_norm(robot)
     if sch["kind"] == "manual" or not sch["enabled"]:
         return None
     from datetime import timedelta
     now = now or datetime.now()
-    start = parse_dt(sch["start_at"]) or parse_dt(robot.get("created_at")) or now
+    set_at = parse_dt(sch["set_at"])
+    # 開始日時が空なら、定期実行を登録した時刻から（画面の説明「空なら登録した時刻から」のとおり）。
+    # 登録した時刻を持たない古い保存は、ロボットを作った時刻から
+    start = parse_dt(sch["start_at"]) or set_at or parse_dt(robot.get("created_at")) or now
     last = parse_dt(sch["last_run"])
-    if last is None or last < start:
-        # まだ動いていない（または開始日時を後ろにずらした）。開始日時ちょうどの回から数える
-        nxt = _robot_next_occurrence(sch, start - timedelta(microseconds=1), start)
-        if last is not None:
-            return nxt                     # 開始前に動いていた → 開始日時ちょうどの回を待つ
-        return nxt if (nxt and nxt > now) else _robot_next_occurrence(sch, now, start)
+    if last is None:
+        # まだ動いていない。登録した時刻より後の最初の回（開始日時が先なら、開始日時ちょうどの回から）。
+        # 登録した時刻を持たない古い保存は、開始日時（無ければ作った時刻）からの最初の回。
+        # どちらも過ぎていれば、次の周回で1回だけ動く
+        after = start - timedelta(microseconds=1)
+        if set_at is not None and set_at > after:
+            after = set_at
+        return _robot_next_occurrence(sch, after, start)
+    if last < start:
+        # 開始前に動いていた（開始日時を後ろにずらした）→ 開始日時ちょうどの回を待つ
+        return _robot_next_occurrence(sch, start - timedelta(microseconds=1), start)
     return _robot_next_occurrence(sch, last, start)
 
 
@@ -12501,7 +12516,7 @@ def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
         raise ValueError("定期実行の間隔は、管理者が決めた最低間隔"
                          f"（{_hours_label(settings['min_interval_hours'])}）より短くはできません。")
     # 空で送られてきても、いまの開始日時は消さない（欄を消しただけで刻みが動かないように）。
-    # 登録のときは cur が空なので、そのまま「作った時刻から」になる。
+    # 登録のときは cur が空なので、そのまま「登録した時刻から」になる（下で残す set_at から数える）。
     start_raw = raw.get("start_at") or cur["start_at"]
     start_at = ""
     if str(start_raw or "").strip():
@@ -12525,9 +12540,11 @@ def _robot_schedule_from_body(body: dict, robot: dict, settings: dict) -> dict:
            "enabled": True if enabled is None else bool(enabled), "values": vals}
     same = all(out[k] == cur[k] for k in ("kind", "hours", "time", "weekday", "day", "nth"))
     if not same or start_at != cur["start_at"]:
-        out.update({"last_run": "", "last_status": "", "last_message": ""})   # 並びを数え直す
+        # 並びを数え直す。数え直しの起点（登録した時刻）を残す。残さないと、まだ一度も動いていない
+        # ロボットの次回を「いま」から数えることになり、時刻を過ぎるたびに次回が先へずれて永久に動かない
+        out.update({"last_run": "", "last_status": "", "last_message": "", "set_at": chats.now()})
     else:
-        out.update({k: cur[k] for k in ("last_run", "last_status", "last_message")})
+        out.update({k: cur[k] for k in ("last_run", "last_status", "last_message", "set_at")})
     return out
 
 
