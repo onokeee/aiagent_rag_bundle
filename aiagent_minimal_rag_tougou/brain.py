@@ -13596,7 +13596,9 @@ def reset_llm_client() -> None:
 #: モデル名 -> 学習した調整 {"set": {引数: 値}, "drop": {引数, ...}}
 _QUIRKS: dict[str, dict] = {}
 #: 1回の呼び出しで引数を直しにいく上限。無限に投げ続けないための歯止め。
-_MAX_FIX = 4
+#: GPT-6 系は temperature・top_p・max_tokens・道具・'none'（→ Responses API へ切り替え）と直しが長く続く
+#: ことがあるので 6。400 は推論前に弾かれるので、回数が増えても費用はかからない（2026-11-12 に 4 から上げた）
+_MAX_FIX = 6
 
 
 def _apply_quirks(kwargs: dict) -> dict:
@@ -13645,9 +13647,39 @@ def _pick_effort(message_low: str, current) -> str:
     return "none"
 
 
-def _fix_for(message: str, kwargs: dict) -> tuple | None:
-    """エラー文から、次に試す直し方を決める。戻り値: (set_, drop) か None。"""
+#: エラーの文字列に入っている「どの引数が悪いか」（OpenAI のエラー本文の param）
+_ERR_PARAM = re.compile(r"""['"]param['"]\s*:\s*['"]([A-Za-z_.]+)['"]""")
+
+
+def _err_param(e) -> str:
+    """API のエラーが指している引数名（無ければ空）。
+
+    OpenAI の SDK は例外の .param に入れる。入っていなければ本文（.body）、それも無ければエラーの文字列から拾う
+    （ゲートウェイや偽のクライアントでも同じに読めるように）。
+    """
+    p = getattr(e, "param", None)
+    if not p:
+        body = getattr(e, "body", None)
+        if isinstance(body, dict):
+            inner = body.get("error") if isinstance(body.get("error"), dict) else body
+            p = inner.get("param")
+    if not p:
+        m = _ERR_PARAM.search(str(e))
+        p = m.group(1) if m else ""
+    return str(p or "").strip().lower()
+
+
+def _fix_for(message: str, kwargs: dict, param: str = "") -> tuple | None:
+    """エラー文から、次に試す直し方を決める。戻り値: (set_, drop) か None。
+
+    param はエラーが指している引数名（_err_param）。言い回しはモデルや API で変わるので、
+    temperature・top_p は param で決め、言い回しは param が取れないときの手がかりにする。
+    """
     low = message.lower()
+    # エラーが temperature・top_p を指していれば、言い回しは問わず落とす（推論の作法の判定より先に見る。
+    # 文面に reasoning_effort が出てきても、悪いのはこの引数なので、推論の値をいじっても直らない）
+    if param in ("temperature", "top_p"):
+        return (None, param)
 
     # ツールと推論モードを同時に使えない → 推論を切る（'none'）か、モデルが受け付ける
     # いちばん軽い値にすれば chat/completions で通る
@@ -13661,11 +13693,14 @@ def _fix_for(message: str, kwargs: dict) -> tuple | None:
     # そもそもこの引数を知らないモデル → 落とす
     if "reasoning_effort" in low and "unrecognized" in low:
         return (None, "reasoning_effort")
-    # temperature / top_p が既定値しか許されないモデル → 落として既定に任せる
+    # temperature / top_p を受け付けない（既定値しか許さない）モデル → 落として既定に任せる。
+    # エラーが引数名を示さないときは言い回しで見る（指していれば上で落としている）。2026-11-12 まで決まった言い回し
+    # （is not supported / does not support / only the default）しか見ておらず、本番の GPT-6 で外せずに
+    # エラーになった（利用者が temperature をすべてコメントアウトして避けた）
     for name in ("temperature", "top_p"):
-        if f"'{name}'" in low and ("does not support" in low
-                                   or "is not supported" in low
-                                   or "only the default" in low):
+        if (f"'{name}'" in low and any(w in low for w in (
+                "does not support", "is not supported", "not supported", "only the default",
+                "unsupported", "cannot be used", "not compatible", "not allowed"))):
             return (None, name)
     # 新しいモデルは max_tokens ではなく max_completion_tokens を使う
     if "max_tokens" in low and "max_completion_tokens" in low:
@@ -13752,8 +13787,10 @@ class RateLimited(Exception):
 # プロセスの寿命だけ持つ。
 #
 # 送るもの: instructions（system）、input（user / assistant / function_call / function_call_output）、
-# tools（平らな形）、temperature・top_p、max_output_tokens、store=False（会話を保存しない）。
+# tools（平らな形）、max_output_tokens、store=False（会話を保存しない）。
 # 推論（reasoning）は送らずモデルの既定に任せ、推論アイテムは履歴に含めない。
+# temperature・top_p は送らない。ここへ切り替わるのは道具のために 'none' を断った＝推論を必ず行うモデルで、
+# 推論するモデルはこの2つを受け付けない（2026-11-12 本番の GPT-6 で断られた）。
 from types import SimpleNamespace as _NS
 
 
@@ -13844,9 +13881,7 @@ def _responses_request(attempt: dict) -> dict:
                         for t in tools_ if t.get("type") == "function"]
         if attempt.get("tool_choice"):
             req["tool_choice"] = attempt["tool_choice"]
-    for k in ("temperature", "top_p"):
-        if k in attempt:
-            req[k] = attempt[k]
+    # temperature・top_p は送らない（上の説明。推論を必ず行うモデルは受け付けず、断られると回答が止まる）
     mx = attempt.get("max_completion_tokens", attempt.get("max_tokens"))
     if mx is not None:
         req["max_output_tokens"] = mx
@@ -14122,7 +14157,7 @@ def _create_retrying(model: str, kwargs: dict):
                 _learn(model, api="responses", drop="reasoning_effort")
                 attempt = _apply_quirks(kwargs)
                 continue
-            fix = _fix_for(str(e), attempt)
+            fix = _fix_for(str(e), attempt, _err_param(e))
             if fix is None:
                 print(f"[llm] {model}: 呼び出しに失敗しました（直し方が分からない）: {str(e)[:600]}")
                 raise

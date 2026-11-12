@@ -294,6 +294,8 @@ IMAGE_MAX_MB = float(os.getenv("IMAGE_MAX_MB", "8") or 8)
 IMAGE_MAX_COUNT = int(os.getenv("IMAGE_MAX_COUNT", "4") or 4)
 
 # 生成パラメータ（いずれも任意）。SQL生成の安定のため temperature は既定0。
+# 推論を行うモデル（gpt-5.6-sol・GPT-6 系）は temperature・top_p を受け付けない。断られたら自動で外して投げ直し
+# （brain._fix_for）、Responses API で呼ぶモデル（GPT-6 系）には最初から送らない。コードを直す必要はない。
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0") or 0)
 _top_p = os.getenv("OPENAI_TOP_P")
 OPENAI_TOP_P = float(_top_p) if _top_p else None
