@@ -12887,13 +12887,22 @@ function valuesRow(r) {
         return [...groups.values()];
     };
     const syncSummary = () => {
-        const parts = [...(r.holes || []).map(h => `${h.label}＝${h.value ?? h.sample}`),
+        const parts = [...(r.holes || []).map(h => `${h.label}＝${h.value ?? h.sample}`
+                           + ({ contains: '（含む）', pattern: '（パターン）' }[h.match] || '')),
                        ...dateGroups().map(ds => `${ds[0].label}（今日なら ${[...new Set(ds.map(d => d.now))].join('・')}）`)];
         summary.textContent = `変えられる値: ${parts.join('、')}`;
     };
     const save = async (body, okText, revert) => {
         try {
-            const res = await api('/api/robots/update', { id: r.id, ...body, stamp: r.updated_at });
+            let res;
+            try {
+                res = await api('/api/robots/update', { id: r.id, ...body, stamp: r.updated_at });
+            } catch (e) {
+                // いまのデータに1件も無い値は、保存の前に確かめる（打ち間違いで次の実行が0件になるのを防ぐ）
+                if (!(e.data && e.data.confirm)) throw e;
+                if (!confirm(e.message)) { revert(); return; }
+                res = await api('/api/robots/update', { id: r.id, ...body, confirm: true, stamp: r.updated_at });
+            }
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) Object.assign(r, fresh);
             build();
@@ -12908,22 +12917,58 @@ function valuesRow(r) {
         (r.holes || []).forEach(h => {
             const listId = `robotval_${r.id}_${h.key}`;
             const choices = h.choices || [];
+            // 候補: 種類の少ない列は控えの全部、多い列は打った文字でデータを探す（多い順に20件）
+            const live = !choices.length && h.search;
+            const dl = (choices.length || live)
+                ? el('datalist', { id: listId }, ...choices.map(c => el('option', { value: c }))) : null;
             const inp = el('input', { type: 'text', value: String(h.value ?? h.sample ?? ''), style: 'max-width:260px',
                                       'aria-label': h.label, ...(h.kind === 'number' ? { inputmode: 'decimal' } : {}),
-                                      ...(choices.length ? { list: listId } : {}) });
+                                      ...(dl ? { list: listId } : {}) });
+            if (live) {
+                let timer = null, last = null;
+                const look = () => {
+                    clearTimeout(timer);
+                    timer = setTimeout(async () => {
+                        const q = inp.value.trim();
+                        if (q === last) return;
+                        last = q;
+                        try {
+                            const res = await api('/api/robots/choices', { id: r.id, key: h.key, q });
+                            dl.replaceChildren(...(res.choices || []).map(c => el('option', { value: c })));
+                        } catch (_) { /* 候補が出ないだけ。入力はそのままできる */ }
+                    }, 300);
+                };
+                inp.addEventListener('input', look);
+                inp.addEventListener('focus', look);
+            }
             inp.addEventListener('change', () => {
                 const v = inp.value.trim();
                 if (v === String(h.value ?? '')) return;
                 save({ values: { [h.key]: v } }, `「${h.label}」を ${v} にしました。次の実行からこの値で動きます。`,
                      () => { inp.value = String(h.value ?? h.sample ?? ''); });
             });
+            // 一致のしかた（「=」の条件の文字だけ）。含む・パターンは実行のときに条件を LIKE にする
+            const how = h.can_match ? el('select', { style: 'max-width:200px', 'aria-label': `${h.label} の一致のしかた` },
+                ...[['exact', '完全に一致'], ['contains', '含む'], ['pattern', 'パターン（% と _）']].map(([v, label]) =>
+                    el('option', { value: v, ...((h.match || 'exact') === v ? { selected: 'selected' } : {}) }, label))) : null;
+            if (how) {
+                how.addEventListener('change', () => {
+                    const label = how.options[how.selectedIndex].textContent;
+                    save({ matches: { [h.key]: how.value } }, `「${h.label}」を「${label}」で探します。次の実行から効きます。`,
+                         () => { how.value = h.match || 'exact'; });
+                });
+            }
             const unit = { day: '日', month: 'か月', year: '年', hour: '時間', minute: '分' }[h.unit] || '';
-            const hint = [unit, String(h.value ?? '') !== String(h.sample ?? '') ? `登録時 ${h.sample}` : '',
-                          choices.length ? '入力すると候補が出ます' : ''].filter(Boolean).join('・');
+            const pattern = h.match === 'pattern' || ['LIKE', 'NOT LIKE'].includes(h.op);
+            // 単位は入力欄のすぐ横、補足（登録時の値・使える記号・候補）は下の行に（横に並べると折り返して読みにくい）
+            const hint = [String(h.value ?? '') !== String(h.sample ?? '') ? `登録時 ${h.sample}` : '',
+                          ['LIKE', 'NOT LIKE'].includes(h.op) ? '部分一致' : '',
+                          pattern ? '% は何文字でも・_ は1文字' : '',
+                          dl ? '入力すると候補が出ます' : ''].filter(Boolean).join('・');
             grid.append(el('span', { class: 'small' }, h.label),
-                el('div', {}, inp,
-                   choices.length ? el('datalist', { id: listId }, ...choices.map(c => el('option', { value: c }))) : null,
-                   hint ? el('span', { class: 'small muted', style: 'margin-left:6px' }, hint) : null));
+                el('div', {}, inp, unit ? el('span', { class: 'small muted', style: 'margin-left:6px' }, unit) : null,
+                   how ? ' ' : null, how, dl,
+                   hint ? el('div', { class: 'small muted', style: 'margin-top:2px' }, hint) : null));
         });
         dateGroups().forEach(ds => {
             const d = ds[0];

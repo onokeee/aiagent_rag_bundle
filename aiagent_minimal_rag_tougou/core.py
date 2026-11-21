@@ -11940,6 +11940,88 @@ def _robot_check_value(h: dict, value) -> str:
     return v
 
 
+#: 一致のしかた（「=」の条件の文字の値だけ。含む・パターンは実行のときだけ LIKE に書き換える）
+ROBOT_MATCHES = {"exact": "完全に一致", "contains": "含む", "pattern": "パターン（% と _ が使える）"}
+_ROBOT_EQ_OPS = ("=", "==", "<>", "!=")
+_ROBOT_LIKE_OPS = ("LIKE", "NOT LIKE", "GLOB", "NOT GLOB")
+#: 実行のときだけ使う印。{{hN:like}} は「含む／パターン」にした値を LIKE の中へ差し込む所
+_ROBOT_HOLE_FILL = re.compile(r"\{\{([hd]\d+)(:like)?\}\}")
+
+
+def _robot_like_escape(v: str) -> str:
+    """LIKE の中で、%・_・バックスラッシュを文字どおりに扱わせる（ESCAPE のバックスラッシュと組で使う）。"""
+    return v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _robot_sql_to_like(sql: str, holes: list[dict]) -> str:
+    """「含む／パターン」にした値の条件（= '{{hN}}'）を LIKE に書き換える。実行のときだけで、保存した手順は変えない。
+
+    <> と != は NOT LIKE に。<= や >= は書き換えない（前の文字を見て除く）。
+    """
+    for h in holes:
+        if (h.get("kind") != "text" or h.get("match") not in ("contains", "pattern")
+                or h.get("op") not in _ROBOT_EQ_OPS):
+            continue
+        key = h["key"]
+        sql = re.sub(r"(?<![<>!=])(==|=|<>|!=)(\s*)'\{\{" + re.escape(key) + r"\}\}'",
+                     lambda m: (("NOT LIKE" if m.group(1) in ("<>", "!=") else "LIKE") + m.group(2)
+                                + "'{{" + key + ":like}}' ESCAPE '\\'"), sql)
+    return sql
+
+
+def _robot_value_scope() -> list[dict]:
+    """あとで変えられる値を確かめる・探すときに読む表（マイロボットの実行と同じく全部の表）。"""
+    return build_scope({f.name: [] for f in db.list_db_files()})
+
+
+def _robot_value_hits(h: dict, value: str) -> int | None:
+    """文字の値が、いまのデータに当たるか（0＝1件も無い、1＝ある）。確かめられない値は None。
+
+    「=」・IN（と、含む／パターンにしたもの）・LIKE の条件だけを見る。<> は0件でも困らないので見ない。
+    """
+    if h.get("kind") != "text" or not h.get("table") or not h.get("column"):
+        return None
+    op, match = h.get("op"), h.get("match") or "exact"
+    if op in ("=", "==", "IN") and match == "exact":
+        cond, param = "= :v", value
+    elif op in ("=", "==") and match == "contains":
+        cond, param = "LIKE :v ESCAPE '\\'", "%" + _robot_like_escape(value) + "%"
+    elif op in ("=", "==") and match == "pattern":
+        cond, param = "LIKE :v ESCAPE '\\'", value
+    elif op == "LIKE":
+        cond, param = "LIKE :v", "%" + value + "%"
+    else:
+        return None
+    sql = f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {_qi(h['table'])} WHERE {_qi(h['column'])} {cond} LIMIT 1)"
+    try:
+        _cols, rows, _t = db.run_select(sql, _robot_value_scope(), max_rows=1, timeout_s=5, params={"v": param})
+        return int(rows[0][0]) if rows else 0
+    except Exception as e:
+        print(f"[robot] 値がいまのデータに当たるか確かめられませんでした（続行）: {e}")
+        return None
+
+
+def _robot_search_choices(h: dict, q: str, limit: int = 20) -> list[str]:
+    """文字の値の候補を、データから探す（打った文字を含む値を多い順に limit 件。空なら多い順）。
+
+    控えに値の一覧が無い列（種類が20を超える・大きな表）でも候補を出すため。部分一致の言葉（LIKE）には出さない。
+    """
+    if (h.get("kind") != "text" or not h.get("table") or not h.get("column")
+            or h.get("op") in _ROBOT_LIKE_OPS):
+        return []
+    col = _qi(h["column"])
+    where = f"{col} IS NOT NULL" + (f" AND {col} LIKE :q ESCAPE '\\'" if q else "")
+    sql = (f"SELECT {col} AS v, COUNT(*) AS n FROM {_qi(h['table'])} WHERE {where} "
+           f"GROUP BY 1 ORDER BY n DESC LIMIT {int(limit)}")
+    try:
+        _cols, rows, _t = db.run_select(sql, _robot_value_scope(), max_rows=limit, timeout_s=5,
+                                        params={"q": "%" + _robot_like_escape(q) + "%"} if q else None)
+    except Exception as e:
+        print(f"[robot] 候補をデータから探せませんでした（続行）: {e}")
+        return []
+    return [str(r[0]) for r in rows if r and r[0] is not None]
+
+
 def _robot_current_values(robot: dict) -> dict:
     """あとで変えられる値（昔の穴も）の、いまの値 {hN: 値}。カードで決めた値 → 昔の定期実行の値 → 登録時の値。"""
     sch_vals = _robot_schedule_norm(robot)["values"]
@@ -12701,7 +12783,7 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
     by_key = {h["key"]: h for h in holes}
     now = now or datetime.now()
 
-    def value_of(key: str, in_sql: bool):
+    def value_of(key: str, in_sql: bool, like: bool = False):
         h = by_key.get(key)
         if h is None:
             raise ValueError(f"穴 {key} の定義がありません。作り直してください。")
@@ -12715,6 +12797,8 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
         v = _robot_check_value(h, v)
         if h.get("kind") == "number":
             return v
+        if like:                               # 「含む」は前後に %（中の % と _ は文字どおり）、「パターン」はそのまま
+            v = v if h.get("match") == "pattern" else "%" + _robot_like_escape(v) + "%"
         return v.replace("'", "''") if in_sql else v
 
     def walk(v, arg=None):
@@ -12725,7 +12809,9 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
             if m and (by_key.get(m.group(1)) or {}).get("kind") == "number" and arg != "sql":
                 text = value_of(m.group(1), False)
                 return float(text) if "." in text else int(text)
-            return _ROBOT_HOLE.sub(lambda mm: value_of(mm.group(1), arg == "sql"), v)
+            if arg == "sql":
+                v = _robot_sql_to_like(v, holes)
+            return _ROBOT_HOLE_FILL.sub(lambda mm: value_of(mm.group(1), arg == "sql", bool(mm.group(2))), v)
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, dict):
@@ -12845,7 +12931,9 @@ def _robots_rename_table(old: str, new: str, others=()) -> int:
 def _robot_filled_note(h: dict, values: dict, now: datetime, prev: datetime | None) -> str:
     """会話の先頭に残す「先月＝2026-08」の1つ分。「前回の実行」で前回がまだ無ければ、登録時の値で動いたことも書く。"""
     if h.get("kind") != "date":
-        return f"{h['label']}＝{values.get(h['key'], '') or h.get('value') or h.get('sample', '')}"
+        v = values.get(h['key'], '') or h.get('value') or h.get('sample', '')
+        how = {"contains": "（含む）", "pattern": "（パターン）"}.get(h.get("match") or "", "")
+        return f"{h['label']}＝{v}{how}"
     text = f"{h['label']}＝{_robot_date_text_safe(h, now, prev)}"
     if h.get("mode") == "last_run" and prev is None:
         text += "（初回のため登録時の値）"
@@ -13810,7 +13898,12 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "holes": [{"key": h.get("key"), "label": h.get("label"), "kind": h.get("kind"), "sample": h.get("sample"),
                        "value": cur_vals.get(h.get("key"), h.get("sample")), "unit": h.get("unit") or "",
                        "int": bool(h.get("int")), "min": h.get("min"), "edit": bool(h.get("edit")),
-                       "choices": _robot_value_choices(h)}
+                       "choices": _robot_value_choices(h),
+                       # 一致のしかた（「=」の条件の文字だけ変えられる）と、データから候補を探せるか（種類の多い列）
+                       "op": h.get("op") or "", "match": h.get("match") or "exact",
+                       "can_match": h.get("kind") == "text" and h.get("op") in _ROBOT_EQ_OPS,
+                       "search": bool(h.get("kind") == "text" and h.get("table") and h.get("column")
+                                      and h.get("op") not in _ROBOT_LIKE_OPS)}
                       for h in holes if h.get("kind") != "date"],
             "tables": list(r.get("tables") or []),
             "from_title": r.get("from_title") or "",
@@ -14114,6 +14207,7 @@ def robots_update():
             return jsonify({"error": str(e)}), 400
         changed = True
     holes = [h for h in (robot.get("holes") or []) if isinstance(h, dict)]
+    touched: set = set()          # 値か一致のしかたを変えた文字の値（0件の確認の対象）
     if "values" in body:
         # あとで変えられる値（昔の穴も）。ここで決めた値が、次の実行（いま試す・定期実行）から効く
         vals = body.get("values")
@@ -14131,7 +14225,34 @@ def robots_update():
                 return jsonify({"error": str(e)}), 400
             if isinstance(sch_vals, dict):
                 sch_vals.pop(h["key"], None)     # 昔の「定期実行のたびに使う値」より、ここで決めた値を使う
+            touched.add(h["key"])
         changed = True
+    if "matches" in body:
+        # 一致のしかた（完全に一致／含む／パターン）。「=」（<>・!=）の条件の文字の値だけ
+        ms = body.get("matches")
+        if not isinstance(ms, dict) or not ms:
+            return jsonify({"error": "一致のしかたの形が正しくありません。"}), 400
+        by = {h.get("key"): h for h in holes if h.get("kind") == "text"}
+        for k, m in ms.items():
+            h = by.get(str(k))
+            if h is None or h.get("op") not in _ROBOT_EQ_OPS:
+                return jsonify({"error": "この値は一致のしかたを変えられません。"}), 400
+            if m not in ROBOT_MATCHES:
+                return jsonify({"error": "一致のしかたは「完全に一致」「含む」「パターン」から選んでください。"}), 400
+            if m == "exact":
+                h.pop("match", None)
+            else:
+                h["match"] = m
+            touched.add(h["key"])
+        changed = True
+    if touched and not body.get("confirm"):
+        # いまのデータに1件も当たらない値なら、保存する前に確かめる（打ち間違いで次の実行が0件になるのを防ぐ）
+        cur = _robot_current_values(robot)
+        for h in holes:
+            if h.get("key") in touched and _robot_value_hits(h, cur.get(h["key"], "")) == 0:
+                return jsonify({"error": f"「{h.get('label')}」の「{cur.get(h['key'], '')}」は、いまのデータには1件もありません"
+                                         "（このまま保存すると、次の実行で0件になります）。このまま保存しますか？",
+                                "confirm": True, "key": h["key"]}), 409
     if "dates" in body:
         # 実行日で変わる値の扱い（先月・44日前・固定のまま…）。数を持つ扱いは "days_ago:44" の形
         ds = body.get("dates")
@@ -14173,6 +14294,21 @@ def robots_update():
     except ValueError as e:
         return jsonify({"error": str(e)}), 409
     return jsonify({"ok": True, "robots": _robot_rows(g.user)})
+
+
+@bp_chat.post("/api/robots/choices")
+@login_required
+def robots_choices():
+    """あとで変えられる文字の値の候補を、データから探す（カードの入力欄。打った文字を含む値を多い順に20件）。"""
+    body = _body()
+    robot = robot_get(g.user, str(body.get("id") or ""))
+    if robot is None:
+        return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    h = next((x for x in (robot.get("holes") or []) if isinstance(x, dict)
+              and x.get("key") == str(body.get("key") or "") and x.get("kind") == "text"), None)
+    if h is None:
+        return jsonify({"error": "その値は見つかりません。"}), 404
+    return jsonify({"ok": True, "choices": _robot_search_choices(h, str(body.get("q") or "").strip()[:100])})
 
 
 @bp_chat.post("/api/robots/delete")
