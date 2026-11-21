@@ -11619,21 +11619,59 @@ def _robot_apply_holes(steps: list[dict], chosen: list[dict]) -> list[dict]:
 # 実行日から計算して差し込む。利用者は date('now','-1 month') のようなSQLを書かなくてよい。
 # 値の形（2026-08 / 2026/08/01 / 2026年8月 …）は元の書き方のまま保つ。
 
-#: 扱い → (画面の言い方, 使える値の種類)。month=年月 / day=年月日 / year=年だけ（SQLの数値）
+#: 扱い → (画面の言い方, 使える値の種類)。month=年月 / day=年月日 / year=年だけ（SQLの数値）/ datetime=日時（時刻つき）
+#: 日時の値に日の扱い（前日など）を付けると、日付だけ動かして時刻は元のまま保つ（「前日 8:00〜今日 8:00」のような区切り）
+_ROBOT_DAYISH = ("day", "datetime")
 ROBOT_DATE_MODES = {
     "last_month": ("先月", ("month", "year")),
     "this_month": ("今月", ("month", "year")),
-    "last_month_start": ("先月の初日", ("day",)),
-    "last_month_end": ("先月の末日", ("day",)),
-    "this_month_start": ("今月の初日", ("day",)),
-    "this_month_end": ("今月の末日", ("day",)),
-    "yesterday": ("前日", ("day", "year")),
-    "today": ("今日", ("day", "year")),
-    "last_week_start": ("先週の初日（月曜）", ("day",)),
-    "last_week_end": ("先週の末日（日曜）", ("day",)),
+    "last_month_start": ("先月の初日", _ROBOT_DAYISH),
+    "last_month_end": ("先月の末日", _ROBOT_DAYISH),
+    "this_month_start": ("今月の初日", _ROBOT_DAYISH),
+    "this_month_end": ("今月の末日", _ROBOT_DAYISH),
+    "yesterday": ("前日", ("day", "year", "datetime")),
+    "today": ("今日", ("day", "year", "datetime")),
+    "last_week_start": ("先週の初日（月曜）", _ROBOT_DAYISH),
+    "last_week_end": ("先週の末日（日曜）", _ROBOT_DAYISH),
+    # 2026-11-21 に足した扱い（直近N日・前回の実行・四半期・年度・前年同月）
+    "this_week_start": ("今週の初日（月曜）", _ROBOT_DAYISH),
+    "this_q_start": ("今四半期の初日", _ROBOT_DAYISH),
+    "this_q_end": ("今四半期の末日", _ROBOT_DAYISH),
+    "last_q_start": ("前四半期の初日", _ROBOT_DAYISH),
+    "last_q_end": ("前四半期の末日", _ROBOT_DAYISH),
+    "this_fy_start": ("今年度の初日", _ROBOT_DAYISH),
+    "this_fy_end": ("今年度の末日", _ROBOT_DAYISH),
+    "last_fy_start": ("前年度の初日", _ROBOT_DAYISH),
+    "last_fy_end": ("前年度の末日", _ROBOT_DAYISH),
+    "this_q_first": ("今四半期の最初の月", ("month",)),
+    "this_q_last": ("今四半期の最後の月", ("month",)),
+    "last_q_first": ("前四半期の最初の月", ("month",)),
+    "last_q_last": ("前四半期の最後の月", ("month",)),
+    "this_fy_first": ("今年度の最初の月", ("month",)),
+    "this_fy_last": ("今年度の最後の月", ("month",)),
+    "last_fy_first": ("前年度の最初の月", ("month",)),
+    "last_fy_last": ("前年度の最後の月", ("month",)),
+    "this_fy": ("今年度", ("year",)),
+    "last_fy": ("前年度", ("year",)),
+    # 数を持つ扱い（穴の n）。画面では、登録時の値から数えた数で「44日前」のように1つの扱いとして出す
+    "days_ago": ("日前", _ROBOT_DAYISH),
+    "months_ago": ("か月前", ("month",)),
+    "years_ago": ("年前", ("year",)),
+    "hours_ago": ("時間前", ("datetime",)),
+    "now": ("実行した時刻", ("datetime",)),
+    # 前回うまく動いた実行の開始時刻（日の値ならその日）。まだ一度も動いていなければ登録時の値のまま
+    "last_run": ("前回の実行", _ROBOT_DAYISH),
 }
+#: 数を持つ扱いと、その数の上限
+ROBOT_DATE_N_MAX = {"days_ago": 3660, "months_ago": 1200, "years_ago": 100, "hours_ago": 8760}
 #: 候補の見つけ方。(種類, 正規表現, 書式の作り方)。書式は {Y}=年 {M}=月2桁 {m}=月 {D}=日2桁 {d}=日
 _ROBOT_DATE_RES = [
+    # 日時（時刻つき）。日付の形より先に見る（中の年月日を、別の値として拾わないように）
+    ("datetime", re.compile(r"(?<![0-9])(20[0-9]{2})([-/.])(0?[1-9]|1[0-2])\2(0?[1-9]|[12][0-9]|3[01])([ T])"
+                            r"([01]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?(?![0-9])"),
+     lambda m: ("{Y}" + m.group(2) + ("{M}" if len(m.group(3)) == 2 else "{m}") + m.group(2)
+                + ("{D}" if len(m.group(4)) == 2 else "{d}") + m.group(5)
+                + ("{H}" if len(m.group(6)) == 2 else "{h}") + ":{I}" + (":{S}" if m.group(8) else ""))),
     ("day", re.compile(r"(?<![0-9])(20[0-9]{2})([-/.])(0?[1-9]|1[0-2])\2(0?[1-9]|[12][0-9]|3[01])(?![0-9])"),
      lambda m: "{Y}" + m.group(2) + ("{M}" if len(m.group(3)) == 2 else "{m}") + m.group(2) + ("{D}" if len(m.group(4)) == 2 else "{d}")),
     ("day", re.compile(r"(?<![0-9])(20[0-9]{2})(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])(?![0-9])"),
@@ -11656,14 +11694,40 @@ _ROBOT_PLACE_NAMES = {"sql": "SQL", "subject": "件名", "body": "本文", "file
                       "title": "題名", "name": "名前"}
 
 
-def _robot_mode_label(mode: str, cls: str) -> str:
-    """扱いの言い方。年だけの値には「先月の年」のように付ける。"""
+def _robot_mode_label(mode: str, cls: str, n=None) -> str:
+    """扱いの言い方。年だけの値には「先月の年」のように付ける。数を持つ扱いは「44日前」の形。"""
+    if mode in ROBOT_DATE_N_MAX:
+        label = f"{n}{ROBOT_DATE_MODES[mode][0]}"
+        if mode == "months_ago" and str(n) in ("12", "13"):
+            label += "（今月の前年同月）" if str(n) == "12" else "（先月の前年同月）"
+        return label
+    if mode == "last_run":
+        return "前回の実行時刻" if cls == "datetime" else "前回の実行日"
     label = ROBOT_DATE_MODES[mode][0]
-    return label + "の年" if cls == "year" else label
+    return label + "の年" if cls == "year" and mode not in ("this_fy", "last_fy") else label
 
 
-def _robot_date_resolve(mode: str, now: datetime):
-    """扱い → その日（date）。month/year の扱いでは年と月だけ使う。"""
+def _robot_fiscal_start() -> int:
+    """年度・四半期の始まりの月（config.ROBOT_FISCAL_START_MONTH。おかしな値なら4月）。"""
+    try:
+        m = int(getattr(config, "ROBOT_FISCAL_START_MONTH", 4))
+    except (TypeError, ValueError):
+        m = 4
+    return m if 1 <= m <= 12 else 4
+
+
+def _robot_add_months(d, k: int):
+    """月の初日 d から k か月ずらした月の初日。"""
+    from datetime import date
+    y, m = divmod(d.year * 12 + (d.month - 1) + int(k), 12)
+    return date(y, m + 1, 1)
+
+
+def _robot_date_resolve(mode: str, now: datetime, n=None):
+    """扱い → その日（date）。month/year の扱いでは年と月だけ使う。n は数を持つ扱い（◯日前など）の数。
+
+    時刻を使う扱い（◯時間前・実行した時刻・前回の実行）は _robot_when が受け持つ。
+    """
     import calendar
     from datetime import date, timedelta
     d = now.date() if isinstance(now, datetime) else now
@@ -11684,25 +11748,120 @@ def _robot_date_resolve(mode: str, now: datetime):
         return d - timedelta(days=d.weekday() + 7)
     if mode == "last_week_end":
         return d - timedelta(days=d.weekday() + 1)
+    if mode == "this_week_start":
+        return d - timedelta(days=d.weekday())
+    if mode == "days_ago":
+        return d - timedelta(days=int(n))
+    if mode == "months_ago":
+        return _robot_add_months(first, -int(n))
+    if mode == "years_ago":
+        return date(d.year - int(n), 1, 1)
+    # 四半期・年度は、年度の始まりの月から3か月ずつ区切る（4月始まりなら 4〜6月が第1四半期）
+    fs = _robot_fiscal_start()
+    q0 = _robot_add_months(first, -(((d.month - fs) % 12) % 3))     # 今四半期の初日
+    fy0 = date(d.year if d.month >= fs else d.year - 1, fs, 1)      # 今年度の初日
+    if mode in ("this_q_start", "this_q_first"):
+        return q0
+    if mode in ("this_q_end", "this_q_last"):
+        return _robot_add_months(q0, 3) - timedelta(days=1)
+    if mode in ("last_q_start", "last_q_first"):
+        return _robot_add_months(q0, -3)
+    if mode in ("last_q_end", "last_q_last"):
+        return q0 - timedelta(days=1)
+    if mode in ("this_fy_start", "this_fy_first"):
+        return fy0
+    if mode in ("this_fy_end", "this_fy_last"):
+        return _robot_add_months(fy0, 12) - timedelta(days=1)
+    if mode in ("last_fy_start", "last_fy_first"):
+        return _robot_add_months(fy0, -12)
+    if mode in ("last_fy_end", "last_fy_last"):
+        return fy0 - timedelta(days=1)
+    if mode == "this_fy":
+        return date(fy0.year, 1, 1)          # 年度は始まった年で呼ぶ（2026年4月〜2027年3月 = 2026年度）
+    if mode == "last_fy":
+        return date(fy0.year - 1, 1, 1)
     raise ValueError(f"日付の扱い「{mode}」を知りません。")
 
 
 def _robot_fmt_date(fmt: str, d) -> str:
+    """書式に当てはめる。{Y}年 {M}月2桁 {m}月 {D}日2桁 {d}日、日時なら {H}時2桁 {h}時 {I}分2桁 {S}秒2桁。"""
+    hh, mi, ss = getattr(d, "hour", 0), getattr(d, "minute", 0), getattr(d, "second", 0)
     return (fmt.replace("{Y}", f"{d.year:04d}").replace("{M}", f"{d.month:02d}").replace("{m}", str(d.month))
-            .replace("{D}", f"{d.day:02d}").replace("{d}", str(d.day)))
+            .replace("{D}", f"{d.day:02d}").replace("{d}", str(d.day))
+            .replace("{H}", f"{hh:02d}").replace("{h}", str(hh)).replace("{I}", f"{mi:02d}").replace("{S}", f"{ss:02d}"))
 
 
-def _robot_date_text(h: dict, now: datetime) -> str:
-    """kind="date" の穴の、その日の値。扱いが壊れていれば ValueError。"""
-    return _robot_fmt_date(str(h.get("fmt") or "{Y}-{M}-{D}"), _robot_date_resolve(str(h.get("mode") or ""), now))
+def _robot_dt_parts(value) -> tuple:
+    """日時の値 → (年, 月, 日, 時, 分, 秒)。無い部分は 0。"""
+    nums = [int(x) for x in re.findall(r"[0-9]+", str(value or ""))][:6]
+    return tuple((nums + [0] * 6)[:6])
 
 
-def _robot_date_text_safe(h: dict, now: datetime) -> str:
+def _robot_mode_n(h: dict):
+    """数を持つ扱いの数（◯日前の日数など）。数でない・範囲の外なら ValueError。それ以外の扱いは None。"""
+    mode = str(h.get("mode") or "")
+    if mode not in ROBOT_DATE_N_MAX:
+        return None
+    try:
+        n = int(h.get("n"))
+    except (TypeError, ValueError):
+        n = 0
+    if not 1 <= n <= ROBOT_DATE_N_MAX[mode]:
+        raise ValueError(f"日付の扱い「{_robot_mode_label(mode, str(h.get('cls') or ''), '◯')}」の数が正しくありません。")
+    return n
+
+
+def _robot_when(h: dict, now: datetime, prev: datetime | None = None):
+    """kind="date" の穴の、その実行での日（date）か日時（datetime）。「前回の実行」で前回がまだ無ければ None。
+
+    prev … 前回うまく動いた実行の開始時刻（_robot_prev_run）。扱いが壊れていれば ValueError。
+    """
+    from datetime import timedelta
+    mode, cls = str(h.get("mode") or ""), str(h.get("cls") or "day")
+    if mode not in ROBOT_DATE_MODES:
+        raise ValueError(f"日付の扱い「{mode}」を知りません。")
+    n = _robot_mode_n(h)
+    if mode == "last_run":
+        if prev is None:
+            return None
+        return prev.replace(microsecond=0) if cls == "datetime" else prev.date()
+    if mode == "now":
+        return now.replace(microsecond=0)
+    if mode == "hours_ago":
+        return (now - timedelta(hours=n)).replace(microsecond=0)
+    d = _robot_date_resolve(mode, now, n)
+    if cls == "datetime":            # 日の扱い: 日付だけ動かし、時刻は登録時のまま
+        _y, _mo, _d, hh, mi, ss = _robot_dt_parts(h.get("sample"))
+        return datetime(d.year, d.month, d.day, min(hh, 23), min(mi, 59), min(ss, 59))
+    return d
+
+
+def _robot_date_text(h: dict, now: datetime, prev: datetime | None = None) -> str:
+    """kind="date" の穴の、その実行での値。前回がまだ無い「前回の実行」は登録時の値。扱いが壊れていれば ValueError。"""
+    v = _robot_when(h, now, prev)
+    if v is None:
+        return str(h.get("sample") or "")
+    return _robot_fmt_date(str(h.get("fmt") or "{Y}-{M}-{D}"), v)
+
+
+def _robot_date_text_safe(h: dict, now: datetime, prev: datetime | None = None) -> str:
     """画面に見せる用。robots.json を手で壊されていても一覧を止めない。"""
     try:
-        return _robot_date_text(h, now)
+        return _robot_date_text(h, now, prev)
     except (ValueError, TypeError):
         return "?"
+
+
+def _robot_prev_run(robot: dict) -> datetime | None:
+    """前回うまく動いた実行の開始時刻（手動・定期を問わない）。実行履歴から取る。無ければ None。
+
+    失敗した回は数えない（その回に届かなかった分を、次にうまく動いた回で拾うため）。
+    開始時刻（started）を持たない昔の履歴は、終わった時刻（at）で代える。
+    """
+    for h in reversed([x for x in (robot.get("history") or []) if isinstance(x, dict)]):
+        if h.get("ok"):
+            return parse_dt(h.get("started") or h.get("at"))
+    return None
 
 
 #: 比べている相手が「年・日付」らしいかの目印（列名・関数・日本語の列名）
@@ -11770,7 +11929,7 @@ def _robot_dates_in_text(text: str, sql: bool = False) -> list[tuple]:
                     continue                        # 年月日の中の年月など、先に見つけたものの内側
                 nums = [int(gp) for gp in m.groups() if gp and gp.isdigit()]
                 y, mo, dd = (nums + [0, 0])[:3]
-                if cls == "day":
+                if cls in ("day", "datetime"):
                     try:
                         date(y, mo, dd)
                     except ValueError:
@@ -11796,18 +11955,44 @@ def _robot_date_parts(value: str, cls: str) -> tuple:
     return (nums[0], nums[1], nums[2])
 
 
+#: 初期値を当てるときに見る順（先に当たったものにする）。よく使う扱いを先に
+_ROBOT_SUGGEST_ORDER = ["last_month_start", "last_month_end", "this_month_start", "this_month_end",
+                        "yesterday", "today", "last_week_start", "last_week_end", "last_month", "this_month",
+                        "this_week_start", "last_q_start", "last_q_end", "this_q_start", "this_q_end",
+                        "last_fy_start", "last_fy_end", "this_fy_start", "this_fy_end",
+                        "last_q_first", "last_q_last", "this_q_first", "this_q_last",
+                        "last_fy_first", "last_fy_last", "this_fy_first", "this_fy_last"]
+
+
 def _robot_date_suggest(value: str, cls: str, base: datetime) -> str:
-    """登録時の値が、質問した日から見て「先月」などに当たるなら、その扱いを初期値にする。"""
-    order = ["last_month_start", "last_month_end", "this_month_start", "this_month_end",
-             "yesterday", "today", "last_week_start", "last_week_end", "last_month", "this_month"]
+    """登録時の値が、質問した時刻から見て「先月」などに当たるなら、その扱いを初期値にする。
+
+    日時の値は、質問した時刻のちょうど◯時間前（前後3分）なら「◯時間前」（0時間なら「実行した時刻」）、
+    そうでなければ日付だけで見る（時刻は元のまま）。戻り値は扱いの名前で、数を持つ扱いは "hours_ago:3" の形。
+    当たらなければ "fixed"。
+    """
+    order = _ROBOT_SUGGEST_ORDER
     if cls == "year":
         order = ["this_month", "last_month"]          # 年だけなら「今年」「去年」に当たるもの
+    if cls == "datetime":
+        try:
+            v = datetime(*_robot_dt_parts(value))
+        except ValueError:
+            return "fixed"
+        hours = (base - v).total_seconds() / 3600
+        n = round(hours)
+        if abs(hours - n) * 60 <= 3:
+            if n == 0:
+                return "now"
+            if 1 <= n <= 168:
+                return f"hours_ago:{n}"
     parts = _robot_date_parts(value, cls)
     for mode in order:
         if cls not in ROBOT_DATE_MODES[mode][1]:
             continue
         d = _robot_date_resolve(mode, base)
-        got = (d.year, d.month, d.day) if cls == "day" else (d.year, d.month, 0) if cls == "month" else (d.year, 0, 0)
+        got = ((d.year, d.month, d.day) if cls in ("day", "datetime") else (d.year, d.month, 0) if cls == "month"
+               else (d.year, 0, 0))
         if got == parts:
             return mode
     return "fixed"
@@ -11819,6 +12004,18 @@ def _robot_path_get(root, path: list):
     for p in path[:-1]:
         node = node[p]
     return node, path[-1]
+
+
+#: 登録画面で、値の前後に見せる文字数
+_ROBOT_CTX = 40
+
+
+def _robot_ctx(text: str, cut: bool, left: bool) -> str:
+    """値の前後の文（改行や続く空白は1つの空白に）。途中で切ったほうに … を付ける。"""
+    t = re.sub(r"\s+", " ", text)
+    if not cut:
+        return t
+    return "…" + t if left else t + "…"
 
 
 def _robot_date_candidates(steps: list[dict]) -> list[dict]:
@@ -11835,7 +12032,10 @@ def _robot_date_candidates(steps: list[dict]) -> list[dict]:
                 key = next((p for p in reversed(path) if isinstance(p, str)), "")
                 for a, b, cls, fmt, val in _robot_dates_in_text(v, sql=(key == "sql")):
                     out.append({"step": i, "path": list(path), "a": a, "b": b, "cls": cls, "fmt": fmt,
-                                "value": val, "place": f"手順{i + 1} {_ROBOT_PLACE_NAMES.get(key, key)}"})
+                                "value": val, "place": f"手順{i + 1} {_ROBOT_PLACE_NAMES.get(key, key)}",
+                                # 登録画面で「どこの値か」を見せる前後の文
+                                "before": _robot_ctx(v[max(0, a - _ROBOT_CTX):a], a > _ROBOT_CTX, left=True),
+                                "after": _robot_ctx(v[b:b + _ROBOT_CTX], b + _ROBOT_CTX < len(v), left=False)})
             elif isinstance(v, list):
                 for k, x in enumerate(v):
                     walk(x, path + [k])
@@ -11846,25 +12046,161 @@ def _robot_date_candidates(steps: list[dict]) -> list[dict]:
     return out
 
 
-def _robot_date_groups(steps: list[dict], base: datetime | None = None) -> list[dict]:
-    """登録画面に出す形。同じ値はまとめて1行にし、扱いの候補と「今日ならこの値」を添える。"""
+def _robot_group_key(value: str, cls: str) -> str:
+    """同じ日付を指す値をまとめる鍵（2026-11 と 2026年11月 のように書き方が違っても、同じ年月なら同じ鍵）。"""
+    if cls == "datetime":
+        return "datetime:" + "-".join(str(x) for x in _robot_dt_parts(value))
+    y, m, d = _robot_date_parts(value, cls)
+    return f"{cls}:{y}-{m}-{d}"
+
+
+def _robot_date_title(value: str, cls: str) -> str:
+    """書き方によらない読み方（2026年11月 / 2026年11月21日（土） / 2026年11月21日（土） 08:00 / 2026年）。"""
+    from datetime import date
+    if cls == "year":
+        return f"{_robot_date_parts(value, cls)[0]}年"
+    if cls == "month":
+        y, m, _ = _robot_date_parts(value, cls)
+        return f"{y}年{m}月"
+    y, m, d, hh, mi, _s = _robot_dt_parts(value) if cls == "datetime" else (*_robot_date_parts(value, cls), 0, 0, 0)
+    try:
+        wd = "月火水木金土日"[date(y, m, d).weekday()]
+    except ValueError:
+        return value
+    return f"{y}年{m}月{d}日（{wd}）" + (f" {hh:02d}:{mi:02d}" if cls == "datetime" else "")
+
+
+#: 登録画面のプルダウンのまとまりと並び。ROBOT_DATE_MODES の扱いを全部、どれか1つに入れる
+_ROBOT_MODE_GROUPS = [
+    ("月・週・日", ["last_month", "this_month", "last_month_start", "last_month_end", "this_month_start",
+                   "this_month_end", "yesterday", "today", "last_week_start", "last_week_end", "this_week_start"]),
+    ("さかのぼる", ["days_ago", "hours_ago", "months_ago", "years_ago", "now"]),
+    ("四半期", ["last_q_start", "last_q_end", "this_q_start", "this_q_end",
+              "last_q_first", "last_q_last", "this_q_first", "this_q_last"]),
+    ("年度", ["last_fy_start", "last_fy_end", "this_fy_start", "this_fy_end",
+            "last_fy_first", "last_fy_last", "this_fy_first", "this_fy_last", "this_fy", "last_fy"]),
+    ("前回の実行から", ["last_run"]),
+]
+
+
+def _robot_n_for(mode: str, value: str, cls: str, base: datetime):
+    """数を持つ扱いの数を、登録時の値と質問した時刻から数える（44日前なら 44）。名前のある扱いと重なる数・数えられないときは None。"""
+    from datetime import date
+    try:
+        if mode == "days_ago":
+            y, m, d = _robot_date_parts(value, "day")
+            n = (base.date() - date(y, m, d)).days
+            return n if 2 <= n <= ROBOT_DATE_N_MAX[mode] else None       # 0=今日・1=前日 は名前のある扱いで
+        if mode == "hours_ago":
+            n = round((base - datetime(*_robot_dt_parts(value))).total_seconds() / 3600)
+            return n if 1 <= n <= ROBOT_DATE_N_MAX[mode] else None
+        if mode == "months_ago":
+            y, m, _ = _robot_date_parts(value, "month")
+            n = (base.year * 12 + base.month) - (y * 12 + m)
+            return n if 2 <= n <= ROBOT_DATE_N_MAX[mode] else None       # 0=今月・1=先月 は名前のある扱いで
+        if mode == "years_ago":
+            n = base.year - _robot_date_parts(value, "year")[0]
+            return n if 1 <= n <= ROBOT_DATE_N_MAX[mode] else None
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _robot_date_options(g: dict, now: datetime) -> list[dict]:
+    """1行の扱いの候補。各候補に、今日実行したときの値（preview）を、行の値の書き方ごと（previews）に付ける。
+
+    数を持つ扱い（◯日前など）は、登録時の値と質問した時刻から数えた数で1つの候補にする（44日前など）。
+    hint はプルダウンの横に出す一言（「今日なら 2026-10」。前回の実行は初回の値も書く）。
+    """
+    cls, base, values = g["cls"], g["base"], g["values"]
+    opts = [{"mode": "fixed", "label": "固定のまま", "group": "", "preview": g["value"],
+             "previews": {v: v for v in values}, "hint": "（変わりません）"}]
+    for group, modes in _ROBOT_MODE_GROUPS:
+        if cls == "datetime" and group == "月・週・日":
+            group = "日付だけ動かす（時刻はそのまま）"
+        for mode in modes:
+            if cls not in ROBOT_DATE_MODES[mode][1]:
+                continue
+            n = None
+            if mode in ROBOT_DATE_N_MAX:
+                n = _robot_n_for(mode, g["value"], cls, base)
+                if n is None:
+                    continue
+            previews = {v: _robot_date_text_safe({"mode": mode, "cls": cls, "n": n, "fmt": g["fmts"][v], "sample": v}, now)
+                        for v in values}
+            preview = previews[g["value"]]
+            hint = f"今日なら {preview}"
+            if mode == "last_run":
+                hint = f"初回は登録時の {preview}。2回目からは前回うまく動いた実行の{'時刻' if cls == 'datetime' else '日'}"
+            opts.append({"mode": f"{mode}:{n}" if n is not None else mode, "label": _robot_mode_label(mode, cls, n),
+                         "group": group, "preview": preview, "previews": previews, "hint": hint})
+    return opts
+
+
+def _robot_suggest_yoy(groups: list[dict]) -> None:
+    """前年同月の組を当てる。「先月」などにした年月の、ちょうど1年前の年月が固定のままなら「13か月前」などにする。
+
+    前年同月と比べる表を毎月出すロボットで、前年の側だけ固定のまま残ると、翌月から比べる月がずれる（気づきにくい）。
+    年だけの値（2026 と 2025）も同じに見る。
+    """
+    rel = set()
+    for g in groups:
+        if g["suggested"] == "fixed" or g["cls"] not in ("month", "year"):
+            continue
+        mode, _, n = g["suggested"].partition(":")
+        try:
+            d = _robot_date_resolve(mode, g["base"], int(n) if n else None)
+        except (ValueError, TypeError):
+            continue
+        rel.add((g["cls"], d.year * 12 + d.month - 1 if g["cls"] == "month" else d.year))
+    for g in groups:
+        if g["suggested"] != "fixed" or g["cls"] not in ("month", "year"):
+            continue
+        y, m, _ = _robot_date_parts(g["value"], g["cls"])
+        if g["cls"] == "month" and ("month", y * 12 + m - 1 + 12) in rel:
+            n = _robot_n_for("months_ago", g["value"], "month", g["base"])
+            if n is not None:
+                g["suggested"] = f"months_ago:{n}"
+        elif g["cls"] == "year" and ("year", y + 1) in rel:
+            n = _robot_n_for("years_ago", g["value"], "year", g["base"])
+            if n is not None:
+                g["suggested"] = f"years_ago:{n}"
+
+
+def _robot_date_groups(steps: list[dict], base: datetime | None = None, bases: dict | None = None) -> list[dict]:
+    """登録画面に出す形。同じ日付を指す値は書き方が違っても1行にまとめ、扱いの候補と「今日ならこの値」、
+    どの質問のどの手順のどこにあるか（前後の文つき。where）を添える。
+
+    bases … 手順の番号 → その手順の質問をした時刻。初期値（先月など）はこの時刻から見て当てる
+    （古い会話に今日足した質問の値を、会話を始めた日から見て外さないように。2026-11-21 まで base だけで見ていた）。
+    """
     now = datetime.now()
     base = base or now
     groups: dict = {}
     for c in _robot_date_candidates(steps):
-        g = groups.setdefault(c["value"], {"value": c["value"], "cls": c["cls"], "fmt": c["fmt"], "places": []})
+        key = _robot_group_key(c["value"], c["cls"])
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"key": key, "value": c["value"], "values": [], "fmts": {}, "cls": c["cls"],
+                               "fmt": c["fmt"], "title": _robot_date_title(c["value"], c["cls"]),
+                               "places": [], "where": [], "base": (bases or {}).get(c["step"]) or base}
+        if c["value"] not in g["values"]:
+            g["values"].append(c["value"])
+            g["fmts"][c["value"]] = c["fmt"]
         if c["place"] not in g["places"]:
             g["places"].append(c["place"])
-    out = []
-    for g in groups.values():
-        opts = [{"mode": "fixed", "label": "固定のまま", "preview": g["value"]}]
-        for mode, (label, classes) in ROBOT_DATE_MODES.items():
-            if g["cls"] in classes:
-                opts.append({"mode": mode, "label": _robot_mode_label(mode, g["cls"]),
-                             "preview": _robot_fmt_date(g["fmt"], _robot_date_resolve(mode, now))})
-        g["options"] = opts
-        g["suggested"] = _robot_date_suggest(g["value"], g["cls"], base)
-        out.append(g)
+        g["where"].append({"place": c["place"], "step": c["step"],
+                           "question": str(steps[c["step"]].get("question") or "")[:80],
+                           "value": c["value"], "before": c["before"], "after": c["after"]})
+    out = list(groups.values())
+    for g in out:
+        g["options"] = _robot_date_options(g, now)
+        g["suggested"] = _robot_date_suggest(g["value"], g["cls"], g["base"])
+        if g["suggested"] not in {o["mode"] for o in g["options"]}:
+            g["suggested"] = "fixed"
+    _robot_suggest_yoy(out)
+    for g in out:
+        g["base"] = g["base"].isoformat(timespec="seconds")
     return out
 
 
@@ -11880,25 +12216,34 @@ def _robot_apply_dates(steps: list[dict], chosen: list[dict]) -> list[dict]:
         value, mode = str(ch.get("value") or ""), str(ch.get("mode") or "fixed")
         if not value or mode == "fixed":
             continue
+        mode, _, n_text = mode.partition(":")            # 数を持つ扱いは "days_ago:44" の形で来る
         if mode not in ROBOT_DATE_MODES:
             raise ValueError(f"日付の扱い「{mode}」は選べません。")
-        modes[value] = mode
+        n = None
+        if mode in ROBOT_DATE_N_MAX:
+            n = _robot_mode_n({"mode": mode, "n": n_text})
+        elif n_text:
+            raise ValueError(f"日付の扱い「{mode}」に数は付けられません。")
+        modes[value] = (mode, n)
     if not modes:
         return []
     cands = _robot_date_candidates(steps)
     key_of: dict = {}
     holes, picks = [], []
     for c in cands:
-        mode = modes.get(c["value"])
-        if not mode:
+        if c["value"] not in modes:
             continue
-        label = _robot_mode_label(mode, c["cls"])
+        mode, n = modes[c["value"]]
+        label = _robot_mode_label(mode, c["cls"], n)
         if c["cls"] not in ROBOT_DATE_MODES[mode][1]:
             raise ValueError(f"「{c['value']}」に「{label}」の扱いは付けられません（年月日の値には「先月の初日」などを）。")
         if c["value"] not in key_of:
             key_of[c["value"]] = f"d{len(key_of) + 1}"
-            holes.append({"key": key_of[c["value"]], "kind": "date", "mode": mode, "fmt": c["fmt"],
-                          "cls": c["cls"], "sample": c["value"], "label": label})
+            hole = {"key": key_of[c["value"]], "kind": "date", "mode": mode, "fmt": c["fmt"],
+                    "cls": c["cls"], "sample": c["value"], "label": label}
+            if n is not None:
+                hole["n"] = n                           # ◯日前の日数など
+            holes.append(hole)
         picks.append((c, key_of[c["value"]]))
     # 選んだ値が手順の中に無ければ（本文を直して消えたなど）何もしない
     # 同じ文字列の中では後ろから置き換える（前を置き換えると位置がずれる）
@@ -11975,10 +12320,12 @@ def _robot_append_table(body: str, table: dict | None, has_attach: bool = True) 
 _ROBOT_NO_TABLE_TOOLS = {"find_mail_recipients", "compose_email"}
 
 
-def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: datetime | None = None):
+def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: datetime | None = None,
+                prev: datetime | None = None):
     """穴を埋め、前の手順の result_id を今回のものに付け替える。
 
-    kind="date" は実行日から計算する。昔の「穴」（聞く型）は、値が来ていればそれ、無ければ登録時の値。
+    kind="date" は実行日から計算する（「前回の実行」は prev＝前回うまく動いた実行の開始時刻。無ければ登録時の値）。
+    昔の「穴」（聞く型）は、値が来ていればそれ、無ければ登録時の値。
     """
     by_key = {h["key"]: h for h in holes}
     now = now or datetime.now()
@@ -11988,7 +12335,7 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
         if h is None:
             raise ValueError(f"穴 {key} の定義がありません。作り直してください。")
         if h.get("kind") == "date":
-            return _robot_date_text(h, now)          # 数字と区切りだけなので引用符の心配は無い
+            return _robot_date_text(h, now, prev)    # 数字と区切りだけなので引用符の心配は無い
         v = str(values.get(key, "")).strip() or str(h.get("sample") or "").strip()
         if not v:
             raise ValueError(f"「{h['label']}」の値がありません。作り直してください。")
@@ -12124,6 +12471,16 @@ def _robots_rename_table(old: str, new: str, others=()) -> int:
     return hit
 
 
+def _robot_filled_note(h: dict, values: dict, now: datetime, prev: datetime | None) -> str:
+    """会話の先頭に残す「先月＝2026-08」の1つ分。「前回の実行」で前回がまだ無ければ、登録時の値で動いたことも書く。"""
+    if h.get("kind") != "date":
+        return f"{h['label']}＝{values.get(h['key'], '') or h.get('sample', '')}"
+    text = f"{h['label']}＝{_robot_date_text_safe(h, now, prev)}"
+    if h.get("mode") == "last_run" and prev is None:
+        text += "（初回のため登録時の値）"
+    return text
+
+
 def _robot_run(robot: dict, values: dict, test: dict | None = None) -> tuple[dict, bool, str]:
     """新しい会話の中で手順を順に実行する。AIは呼ばない。戻り値は (会話, 成否, 一言)。
 
@@ -12135,9 +12492,9 @@ def _robot_run(robot: dict, values: dict, test: dict | None = None) -> tuple[dic
     scope = build_scope({f.name: [] for f in db.list_db_files()})
     holes = robot.get("holes") or []
     now = datetime.now()
+    prev = _robot_prev_run(robot)          # 「前回の実行」の扱いに使う（前回うまく動いた実行の開始時刻）
     # 会話の先頭に「先月＝2026-08 として動きました」を残す（何を見た結果かが後から分かる）
-    filled = "、".join(f"{h['label']}＝{_robot_date_text_safe(h, now)}" if h.get("kind") == "date"
-                      else f"{h['label']}＝{values.get(h['key'], '') or h.get('sample', '')}" for h in holes)
+    filled = "、".join(_robot_filled_note(h, values, now, prev) for h in holes)
     if test:
         text = (f"マイロボット「{robot.get('name')}」（{test.get('owner')} の登録）を管理者として試運転"
                 + (f"（{filled}）" if filled else ""))
@@ -12166,7 +12523,7 @@ def _robot_run(robot: dict, values: dict, test: dict | None = None) -> tuple[dic
     for i, step in enumerate(steps, 1):
         label = TOOL_LABELS.get(step.get("name"), step.get("name"))
         try:
-            args = _robot_fill(step.get("arguments") or {}, holes, values, idmap, now)
+            args = _robot_fill(step.get("arguments") or {}, holes, values, idmap, now, prev)
             shown_args = args                 # 会話に残す引数（表を付ける前）
             if step.get("name") == "compose_email" and robot.get("mail_table"):
                 # 本文の数字は登録時のままなので、結果の表を末尾に付けて毎回新しい数字を届ける。
@@ -12653,7 +13010,7 @@ def _robot_failed(user, robot: dict, message: str, source: str) -> str:
     return message
 
 
-def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> None:
+def _robot_write_back(user, rid: str, ok: bool, message: str, source: str, started: str = "") -> None:
     """実行結果をロボットに書き戻す。定期実行なら定期実行の欄にも（次の刻みの起点になる）。
 
     実行履歴（いつ・手動か定期か・成否・一言・結果の会話）も、ここで1件足す。
@@ -12666,8 +13023,11 @@ def _robot_write_back(user, rid: str, ok: bool, message: str, source: str) -> No
         now = chats.now()
         saved.update({"last_run": now, "last_status": "ok" if ok else "error", "last_message": message})
         hist = [h for h in (saved.get("history") or []) if isinstance(h, dict)]
-        hist.append({"at": now, "source": source, "ok": bool(ok), "message": str(message)[:400],
-                     "chat_id": str(saved.get("_last_chat_id") or "")})
+        entry = {"at": now, "source": source, "ok": bool(ok), "message": str(message)[:400],
+                 "chat_id": str(saved.get("_last_chat_id") or "")}
+        if started:
+            entry["started"] = started      # 始めた時刻（at は終わった時刻）。次の回の「前回の実行」の起点
+        hist.append(entry)
         saved["history"] = hist[-ROBOT_HISTORY_MAX:]
         saved.pop("_last_chat_id", None)
         if source == "schedule":
@@ -12763,6 +13123,7 @@ def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
             return None, False, "このマイロボットはいま実行中です。終わってから押してください。"
         _robots_running.add(key)
     try:
+        started = chats.now()               # 実行履歴に残し、次の回の「前回の実行」の起点にする
         chat, ok, message = _robot_run(robot, values)
         if ok and robot.get("mail_auto"):
             _sent, mail_msg = _robot_send_mails(chat, user)
@@ -12780,7 +13141,7 @@ def _robot_execute(user, robot: dict, values: dict, *, source: str = "manual"):
                     robot_save(user, saved, check_dup=False, touch=False)
                 except ValueError:
                     pass
-        _robot_write_back(user, robot["id"], ok, message, source)
+        _robot_write_back(user, robot["id"], ok, message, source, started=started)
         return chat, ok, message
     finally:
         with _robots_lock:
@@ -13033,6 +13394,7 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
     sch = _robot_schedule_norm(r)
     holes = [h for h in (r.get("holes") or []) if isinstance(h, dict)]
     now = datetime.now()
+    prev = _robot_prev_run(r)
     floor_min = float((settings or robot_settings()).get("min_interval_hours") or 0) * 60
     floor_blocked = bool(floor_min > 0 and 0 < sch["interval_minutes"] < floor_min)
     try:
@@ -13057,7 +13419,7 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "steps_detail": _robot_steps_detail(steps, holes),
             # 実行日で変わる値（扱いと、今日ならこの値）
             "dates": [{"key": h["key"], "label": h.get("label"), "mode": h.get("mode"), "sample": h.get("sample"),
-                       "now": _robot_date_text_safe(h, now)} for h in holes if h.get("kind") == "date"],
+                       "now": _robot_date_text_safe(h, now, prev)} for h in holes if h.get("kind") == "date"],
             "owner": str((r.get("owner") or {}).get("username") or ""),
             # 間隔の決めごとで、まだ実行できないならその時刻（画面はボタンを止めて理由を出す）
             "next_run": nxt.isoformat(timespec="seconds") if nxt else "",
@@ -13086,6 +13448,17 @@ def _robot_rows(user) -> list[dict]:
     except Exception:
         mail = None
     return [_robot_row(r, settings, mail) for r in robots_list(user)]
+
+
+def _robot_question_times(chat: dict, steps: list[dict]) -> dict:
+    """手順の番号 → その手順の質問をした時刻（画面の記録の at）。質問の数が合わなければ空（会話の作成日時で見る）。"""
+    times = [parse_dt(i.get("at")) for i in (chat.get("render_log") or [])
+             if isinstance(i, dict) and i.get("role") == "user" and i.get("kind") == "text"]
+    n_user = sum(1 for m in (chat.get("messages") or []) if isinstance(m, dict) and m.get("role") == "user")
+    if len(times) != n_user:
+        return {}
+    return {i: times[s["turn"]] for i, s in enumerate(steps)
+            if 0 <= s["turn"] < len(times) and times[s["turn"]] is not None}
 
 
 def _robot_turns(steps: list[dict]) -> list[dict]:
@@ -13123,12 +13496,18 @@ def robots_extract():
     except (TypeError, ValueError):
         return jsonify({"error": "発言の番号が正しくありません。"}), 400
     steps = [s for s in _robot_steps_from_chat(chat) if upto is None or s["turn"] <= upto]
-    base = parse_dt(chat.get("created_at")) or datetime.now()     # 「先月」などの初期値は質問した日から見る
+    base = parse_dt(chat.get("created_at")) or datetime.now()
+    # 「先月」などの初期値は、その手順の質問をした時刻から見る（古い会話に今日足した質問もあるので、
+    # 会話を始めた日では外れる）。メールの件名・本文を直したあとの取り直しも、その質問の時刻で
+    bases = _robot_question_times(chat, steps)
+    mail_steps = _robot_mail_steps(steps)
+    for ms in mail_steps:
+        ms["base"] = (bases.get(ms["i"]) or base).isoformat(timespec="seconds")
     return jsonify({"ok": True, "title": chat.get("title") or "",
                     "turns": _robot_turns(steps), "candidates": _robot_candidates(steps),
                     "base": base.isoformat(timespec="seconds"),
-                    "dates": _robot_date_groups(steps, base),
-                    "mail_steps": _robot_mail_steps(steps),
+                    "dates": _robot_date_groups(steps, base, bases),
+                    "mail_steps": mail_steps,
                     "result_numbers": _robot_result_numbers(chat),
                     "has_mail_steps": any(s["name"] == "compose_email" for s in steps),
                     **_robot_folder_defaults(steps)})
@@ -13139,11 +13518,21 @@ def robots_extract():
 def robots_detect():
     """文字列の中の日付らしい値を返す（登録画面で件名・本文を直したあとの候補の取り直し）。AIは呼ばない。"""
     body = _body()
-    text = str(body.get("text") or "")[:20000]
-    steps = [{"name": "compose_email", "arguments": {"body": text}, "produced": []}]
+    try:
+        step = max(0, int(body.get("step") or 0))       # どのメールの手順か（場所の「手順N」に使う）
+    except (TypeError, ValueError):
+        step = 0
+    if "subject" in body or "mail_body" in body:        # 件名と本文を分けて渡すと、場所が「件名」「本文」になる
+        args = {"subject": str(body.get("subject") or "")[:2000], "body": str(body.get("mail_body") or "")[:20000]}
+    else:
+        args = {"body": str(body.get("text") or "")[:20000]}
+    steps = [{"name": "compose_email", "arguments": args, "produced": [], "question": ""}]
     groups = _robot_date_groups(steps, parse_dt(body.get("base")) or datetime.now())
     for gr in groups:
         gr["places"] = []
+        for w in gr["where"]:
+            w["step"] = step
+            w["place"] = w["place"].replace("手順1 ", f"手順{step + 1} ", 1)
     return jsonify({"ok": True, "dates": groups})
 
 

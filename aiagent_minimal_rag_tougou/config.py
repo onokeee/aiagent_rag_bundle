@@ -97,6 +97,9 @@ ROBOT_MAX_PER_USER = int(os.getenv("ROBOT_MAX_PER_USER", "5") or 5)             
 ROBOT_MIN_INTERVAL_HOURS = float(os.getenv("ROBOT_MIN_INTERVAL_HOURS", "12") or 12)  # 定期実行の最短の間隔（時間）。「いま試す」には効かない
 ROBOT_MAX_STEPS = int(os.getenv("ROBOT_MAX_STEPS", "20") or 20)                  # 1つのロボットの手順数
 ROBOT_WORKERS = int(os.getenv("ROBOT_WORKERS", "4") or 4)                        # 定期実行で同時に動かすロボットの数（1 で1本ずつ）
+# マイロボットの「実行日で変わる値」の年度・四半期の区切り。年度の始まりの月（4 = 4月始まりで、4〜6月が第1四半期）。
+# 年度は始まった年で呼ぶ（2026年4月〜2027年3月 = 2026年度）。
+ROBOT_FISCAL_START_MONTH = 4
 ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
                                      str(DATA_DIR / "robot_settings.yaml"))).expanduser()
 

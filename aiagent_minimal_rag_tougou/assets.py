@@ -3232,6 +3232,17 @@ details.acc.is-target {
 .robotdetail dt { font-weight: 600; margin-top: 8px; }
 .robotdetail dd { margin: 2px 0 0 0; }
 .schedgrid { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; align-items: center; }
+/* 登録ダイアログ: 実行日で変わる値。同じ日付ごとに1つの囲いにし、値の場所を前後の文つきで見せる */
+.daterows { max-height: 380px; overflow: auto; }
+.daterow { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 8px; }
+.daterow__head { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+.daterow__title { font-weight: 600; }
+.daterow__ctl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.datewhere { margin-top: 6px; }
+.datewhere__ctx { white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.5;
+                  margin-top: 2px; padding: 3px 8px; background: var(--surface-2); border-radius: var(--radius-sm); }
+.datewhere__val { background: var(--warn-weak); color: var(--warn); border-radius: 4px; padding: 0 3px; font-weight: 600; }
+.datewhere__val--new { background: var(--accent-weak); color: var(--accent); }
 
 /* --- ER図キャンバス --------------------------------------------------------- */
 
@@ -6685,33 +6696,66 @@ async function registerRobot(upto) {
            `${r.turns.length} つの質問・${nSteps} 手順（開いて確認。チェックを外した質問は入れません）`),
         el('div', { class: 'acc__body' }, turnList));
 
-    // 3. 実行日で変わる値（日付らしい値ごとに1行。同じ値はまとめる）
-    const dateRows = new Map();                  // 値 → {g, sel, prev, place}
-    const dateBody = el('tbody');
+    // 3. 実行日で変わる値。同じ日付は書き方が違っても1つ（2026-11 と 2026年11月）。どの質問の・どの手順の
+    //    どこにある値かを前後の文つきで見せ、扱いを選ぶと、その場所の値が「今日ならこの値」に変わって見える
+    const dateRows = new Map();                  // 鍵（同じ日付）→ {g, sel, prev, list, items, node}
+    const keptModes = new Map();                 // メールを直して行を作り直すとき、選んでいた扱いを戻す
+    const dateBody = el('div');
     const dateNote = el('div', { class: 'small muted', style: 'margin-top:4px' });
+    const optionOf = (row) => row.g.options.find(o => o.mode === row.sel.value) || row.g.options[0];
+    function syncRow(row) {
+        const o = optionOf(row);
+        const fixed = row.sel.value === 'fixed';
+        row.prev.textContent = o.hint || (fixed ? '（変わりません）' : `今日なら ${o.preview}`);
+        row.items.forEach(it => {
+            it.mark.textContent = fixed ? it.value : ((o.previews || {})[it.value] || o.preview);
+            it.mark.classList.toggle('datewhere__val--new', !fixed);
+            it.mark.title = fixed ? '' : `登録時の値: ${it.value}`;
+        });
+    }
+    function addWhere(row, w) {
+        const mark = el('span', { class: 'datewhere__val' }, w.value);
+        const node = el('div', { class: 'datewhere' },
+            el('div', { class: 'small muted' }, w.place + (w.question ? `（質問「${w.question}」）` : '')),
+            el('div', { class: 'mono datewhere__ctx' }, w.before || '', mark, w.after || ''));
+        row.list.append(node);
+        row.items.push({ value: w.value, step: w.step, mark, node });
+    }
     function addDateRow(g) {
-        if (dateRows.has(g.value)) {
-            const row = dateRows.get(g.value);
-            (g.places || []).forEach(p => { if (row.g.places.indexOf(p) < 0) row.g.places.push(p); });
-            row.place.textContent = row.g.places.join('、');
-            return;
+        const key = g.key || g.value;
+        let row = dateRows.get(key);
+        if (!row) {
+            const kept = keptModes.get(key);
+            const want = kept && g.options.some(o => o.mode === kept) ? kept : g.suggested;
+            const sel = el('select', { style: 'max-width:280px' });
+            let group = null;
+            g.options.forEach(o => {
+                const opt = el('option', { value: o.mode, ...(o.mode === want ? { selected: 'selected' } : {}) }, o.label);
+                if (!o.group) { sel.append(opt); return; }
+                if (!group || group.label !== o.group) { group = el('optgroup', { label: o.group }); sel.append(group); }
+                group.append(opt);
+            });
+            row = { g, sel, prev: el('span', { class: 'mono small muted' }), list: el('div'), items: [] };
+            sel.addEventListener('change', () => { syncRow(row); syncDateNote(); });
+            row.node = el('div', { class: 'daterow' },
+                el('div', { class: 'daterow__head' },
+                    el('span', { class: 'daterow__title' }, g.title || g.value),
+                    el('span', { class: 'daterow__ctl' }, sel, row.prev)),
+                row.list);
+            dateBody.append(row.node);
+            dateRows.set(key, row);
         }
-        const sel = el('select', { style: 'max-width:200px' }, ...g.options.map(o =>
-            el('option', { value: o.mode, ...(o.mode === g.suggested ? { selected: 'selected' } : {}) }, o.label)));
-        const prev = el('span', { class: 'mono small' });
-        const syncPrev = () => {
-            const o = g.options.find(x => x.mode === sel.value) || g.options[0];
-            prev.textContent = sel.value === 'fixed' ? '（変わりません）' : `今日なら ${o.preview}`;
-        };
-        sel.addEventListener('change', syncPrev);
-        syncPrev();
-        const place = el('td', { class: 'small muted' }, (g.places || []).join('、'));
-        const tr = el('tr', {},
-            el('td', { class: 'mono small', style: 'white-space:nowrap' }, g.value),
-            place, el('td', {}, sel), el('td', {}, prev));
-        dateBody.append(tr);
-        dateRows.set(g.value, { g, sel, prev, place, tr });
+        (g.where || []).forEach(w => addWhere(row, w));
+        syncRow(row);
         syncDateNote();
+    }
+    function dropWhere(step) {
+        // メールの件名・本文を直したら、そのメールの手順の場所を取り直す（場所が無くなった行は消す）
+        [...dateRows.entries()].forEach(([key, row]) => {
+            row.items.filter(it => it.step === step).forEach(it => it.node.remove());
+            row.items = row.items.filter(it => it.step !== step);
+            if (!row.items.length) { keptModes.set(key, row.sel.value); row.node.remove(); dateRows.delete(key); }
+        });
     }
     function syncDateNote() {
         const n = [...dateRows.values()].filter(x => x.sel.value !== 'fixed').length;
@@ -6719,26 +6763,23 @@ async function registerRobot(upto) {
             ? `${n} 件を実行日に合わせます。実行のたびに「先月＝2026-08 として動きました」のように会話の先頭に残ります。`
             : '全部「固定のまま」です。毎回同じ期間の結果になります（定期実行なら、たいてい「先月」などにします）。';
     }
-    dateBody.addEventListener('change', syncDateNote);
     (r.dates || []).forEach(addDateRow);
     const datesSec = sec('実行日で変わる値',
         el('div', { class: 'small muted', style: 'margin-bottom:6px' },
-           '手順の中の日付らしい値です。「先月」などにすると、実行のたびに実行日から計算して差し込みます（AIは呼びません）。'),
-        el('div', { class: 'tablewrap', style: 'max-height:260px' },
-            el('table', { class: 'data' },
-                el('thead', {}, el('tr', {}, el('th', { style: 'width:150px' }, '値'), el('th', {}, 'どこに'),
-                                       el('th', { style: 'width:210px' }, '扱い'), el('th', { style: 'width:170px' }, '例'))),
-                dateBody)),
+           '手順の中の日付らしい値です。同じ日付は書き方が違っても1つにまとめ、どの質問・どの手順のどこにあるかを前後の文と一緒に出しています。'
+           + '「先月」などにすると、実行のたびに実行日から計算して差し込みます（AIは呼びません）。色の付いた値が、今日実行したときに入る値です。'),
+        el('div', { class: 'daterows' }, dateBody),
         dateNote);
     const syncDatesSec = () => datesSec.classList.toggle('hidden', !dateRows.size);
     syncDatesSec();
     syncDateNote();
 
     // 4. 定期実行。「先月」を使うなら毎月1日、「前日」なら毎日を初期値に
-    const modes = [...dateRows.values()].map(x => x.sel.value);
-    let sugSched = modes.some(m => m.startsWith('last_month')) ? { kind: 'monthly_day', day: 1, time: '08:00' }
-        : modes.some(m => m === 'yesterday' || m === 'today') ? { kind: 'daily', time: '08:00' }
-        : modes.some(m => m.startsWith('last_week')) ? { kind: 'weekly', weekday: 0, time: '08:00' }
+    const modes = [...dateRows.values()].map(x => x.sel.value.split(':')[0]);
+    let sugSched = modes.some(m => /^(last_month|last_q_|last_fy_|months_ago)/.test(m)) ? { kind: 'monthly_day', day: 1, time: '08:00' }
+        : modes.some(m => m === 'yesterday' || m === 'today' || m === 'days_ago') ? { kind: 'daily', time: '08:00' }
+        : modes.some(m => m.startsWith('last_week') || m === 'this_week_start') ? { kind: 'weekly', weekday: 0, time: '08:00' }
+        : modes.some(m => m === 'hours_ago' || m === 'now') ? { kind: 'hours', hours: 1 }
         : {};
     {   // 管理者の最低間隔より短い初期値は付けない（保存で断られるだけになる）
         const floorMin = Number(window.CHAT_INIT.robotMinIntervalHours || 0) * 60;
@@ -6760,7 +6801,9 @@ async function registerRobot(upto) {
     const numbersIn = (text) => {
         let t = String(text || '');
         // 長い値から除く（'2026-08' を先に除くと '2026-08-31' の '31' が数字として残る）
-        [...dateRows.keys()].sort((a, b) => b.length - a.length).forEach(value => { t = t.split(value).join(' '); });
+        const vals = new Set();
+        dateRows.forEach(x => { x.items.forEach(it => vals.add(it.value)); (x.g.values || [x.g.value]).forEach(v => vals.add(v)); });
+        [...vals].sort((a, b) => b.length - a.length).forEach(value => { t = t.split(value).join(' '); });
         return [...new Set((t.match(/[0-9][0-9,]*(?:\.[0-9]+)?/g) || []).map(x => x.replace(/,/g, '')))];
     };
     let detectTimer = null;
@@ -6781,15 +6824,11 @@ async function registerRobot(upto) {
             clearTimeout(detectTimer);
             detectTimer = setTimeout(async () => {
                 try {
-                    const text = subject.value + '\n' + body.value;
-                    const d = await api('/api/robots/detect', { text, base: r.base || '' });
-                    const place = `手順${ms.i + 1} メール`;
-                    (d.dates || []).forEach(g => addDateRow({ ...g, places: [place] }));
-                    // メールにしか無かった値が本文から消えたら、行も消す（数と保存の内容をいまの本文に合わせる）
-                    [...dateRows.entries()].forEach(([value, row]) => {
-                        const mailOnly = row.g.places.every(p => p === place);
-                        if (mailOnly && text.indexOf(value) < 0) { row.tr.remove(); dateRows.delete(value); }
-                    });
+                    const d = await api('/api/robots/detect', { subject: subject.value, mail_body: body.value,
+                                                                step: ms.i, base: ms.base || r.base || '' });
+                    // このメールの手順の場所を、直した件名・本文で取り直す（メールにしか無かった値の行は消える）
+                    dropWhere(ms.i);
+                    (d.dates || []).forEach(addDateRow);
                     syncDatesSec(); syncDateNote(); syncNums();
                 } catch (_) { /* 取り直せなくても保存時にサーバが見る */ }
             }, 500);
@@ -6838,7 +6877,10 @@ async function registerRobot(upto) {
         deliver);
     const save = el('button', { class: 'btn btn--primary', onclick: async () => {
         const turns = Object.entries(turnChecks).filter(([, cb]) => cb.checked).map(([t]) => Number(t));
-        const dates = [...dateRows.values()].map(x => ({ value: x.g.value, mode: x.sel.value }));
+        // 1つの行（同じ日付）の中の、書き方の違う値は全部同じ扱いで送る
+        const dates = [...dateRows.values()].flatMap(x =>
+            [...new Set(x.items.length ? x.items.map(it => it.value) : (x.g.values || [x.g.value]))]
+                .map(value => ({ value, mode: x.sel.value })));
         save.disabled = true;
         try {
             const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, dates,
