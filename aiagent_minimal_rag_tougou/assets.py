@@ -1986,7 +1986,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
               <dt>手順</dt>
               <dd>{% for sd in r.steps_detail %}<div><span class="badge">手順{{ sd.i }}</span> <b>{{ sd.label }}</b></div><pre class="mono">{{ sd.text }}</pre>{% if sd.explanation %}<div class="muted" style="margin:-4px 0 8px">{{ sd.explanation }}</div>{% endif %}{% endfor %}</dd>
               <dt>元の質問</dt><dd>{{ r.questions|join(' ／ ') or '—' }}</dd>
-              <dt>実行日で変わる値</dt><dd>{% if r.dates %}{% for d in r.dates %}{{ d.label }}（登録時 {{ d.sample }} → 今日なら {{ d.now }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}{% if r.holes %}／固定の値: {% for h in r.holes %}{{ h.label }}＝{{ h.sample }}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</dd>
+              <dt>実行日で変わる値</dt><dd>{% if r.dates %}{% for d in r.dates %}{{ d.label }}（登録時 {{ d.sample }} → 今日なら {{ d.now }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}{% if r.holes %}／変えられる値: {% for h in r.holes %}{{ h.label }}＝{{ h.value }}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</dd>
               <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
               <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
               <dt>定期実行</dt><dd>{% if r.schedule.kind != 'manual' %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
@@ -3243,6 +3243,7 @@ details.acc.is-target {
                   margin-top: 2px; padding: 3px 8px; background: var(--surface-2); border-radius: var(--radius-sm); }
 .datewhere__val { background: var(--warn-weak); color: var(--warn); border-radius: 4px; padding: 0 3px; font-weight: 600; }
 .datewhere__val--new { background: var(--accent-weak); color: var(--accent); }
+.daterow--on { border-color: var(--accent); }
 
 /* --- ER図キャンバス --------------------------------------------------------- */
 
@@ -6774,6 +6775,43 @@ async function registerRobot(upto) {
     syncDatesSec();
     syncDateNote();
 
+    // 3-2. あとで変えられる値。条件の中の数値や名前（装置・担当者・しきい値・上位の件数・さかのぼる日数）。
+    //      印を付けた値は、マイロボットの画面でいつでも書き換えられる（作り直し不要。次の実行から効く）
+    const valueRows = (r.values || []).map(g => {
+        const cb = el('input', { type: 'checkbox' });
+        const label = el('input', { type: 'text', value: g.label || '', style: 'width:200px',
+                                    placeholder: '名前（例: しきい値）', 'aria-label': 'あとで変える値の名前' });
+        const node = el('div', { class: 'daterow' },
+            el('div', { class: 'daterow__head' },
+                el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' }, cb,
+                   el('span', { class: 'daterow__title' }, g.title || g.value),
+                   el('span', { class: 'small muted' }, 'あとで変える')),
+                el('span', { class: 'daterow__ctl' }, el('span', { class: 'small muted' }, '名前'), label)),
+            ...(g.where || []).map(w => el('div', { class: 'datewhere' },
+                el('div', { class: 'small muted' }, w.place + (w.question ? `（質問「${w.question}」）` : '')
+                    + (w.spread ? '　いっしょに変わります' : '')),
+                el('div', { class: 'mono datewhere__ctx' }, w.before || '',
+                    el('span', { class: 'datewhere__val' }, w.value), w.after || ''))));
+        const sync = () => { label.disabled = !cb.checked; node.classList.toggle('daterow--on', cb.checked); };
+        cb.addEventListener('change', () => { sync(); syncValueNote(); });
+        sync();
+        return { g, cb, label, node };
+    });
+    const valueNote = el('div', { class: 'small muted', style: 'margin-top:4px' });
+    function syncValueNote() {
+        const n = valueRows.filter(x => x.cb.checked).length;
+        valueNote.textContent = n
+            ? `${n} 件を、あとでマイロボットの画面から変えられるようにします。`
+            : '印を付けない値は、登録したときのまま固定です。';
+    }
+    syncValueNote();
+    const valuesSec = valueRows.length ? sec('あとで変えられる値',
+        el('div', { class: 'small muted', style: 'margin-bottom:6px' },
+           '条件の中の数値や名前（装置・担当者・しきい値・上位の件数・さかのぼる日数など）です。「あとで変える」に印を付けると、'
+           + 'マイロボットの画面でいつでも書き換えられます（作り直し不要。次の実行から効きます）。同じ文字の件名・題名などもいっしょに変わります。'),
+        el('div', { class: 'daterows' }, ...valueRows.map(x => x.node)),
+        valueNote) : null;
+
     // 4. 定期実行。「先月」を使うなら毎月1日、「前日」なら毎日を初期値に
     const modes = [...dateRows.values()].map(x => x.sel.value.split(':')[0]);
     let sugSched = modes.some(m => /^(last_month|last_q_|last_fy_|months_ago)/.test(m)) ? { kind: 'monthly_day', day: 1, time: '08:00' }
@@ -6871,6 +6909,7 @@ async function registerRobot(upto) {
         el('label', { class: 'field' }, '名前'), name,
         sec('手順', stepsBox),
         datesSec,
+        valuesSec,
         sec('定期実行', el('div', { class: 'small muted', style: 'margin-bottom:4px' },
             '決めた時刻にサーバが自動で動かします。「手動のみ」なら、マイロボットの画面の「いま試す」を押したときだけ動きます。'),
             el('div', { class: 'robotturn' }, sched.node)),
@@ -6883,7 +6922,10 @@ async function registerRobot(upto) {
                 .map(value => ({ value, mode: x.sel.value })));
         save.disabled = true;
         try {
-            const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, dates,
+            // あとで変えられる値: 印を付けた行ごとに、その値の場所（候補の id）と名前
+            const holes = valueRows.filter(x => x.cb.checked)
+                .map(x => ({ ids: x.g.ids, label: x.label.value.trim() || x.g.label }));
+            const res = await api('/api/robots/save', { chat_id: chatId, upto, name: name.value, turns, dates, holes,
                                                        mail_edits: mailEdits, mail_table: mailTable.checked,
                                                        schedule: sched.value(), mail_auto: mailCb.checked,
                                                        notify_to: sched.value().kind === 'manual' ? '' : notify.value,
@@ -12533,7 +12575,7 @@ function folderOptions(r, onChange) {
 
 /** 定期実行の欄。{node, value()} を返す。onChange を渡すと変更のたびに呼ぶ。
  *  intervals は {表示名: 分}（定期取り込みと同じ一覧）。r.schedule と r.holes を見る。
- *  withValues=true なら、穴の値（定期実行のたびに使う値）と「止める」も出す（カード用）。 */
+ *  withValues=true なら「止める」も出す（カード用）。値はカードの「変えられる値」で変える（どの実行にも効く）。 */
 /** その設定で、実行と実行のあいだが最短で何分空くか（管理者の最低間隔と比べる用。サーバと同じ計算）。 */
 function scheduleGap(kind, hours) {
     if (kind === 'hours') return Number(hours || 1) * 60;
@@ -12575,7 +12617,6 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
         el('option', { value: k, ...(String(sch.nth || 1) === k ? { selected: 'selected' } : {}) }, label)));
     const start = el('input', { type: 'datetime-local', value: (sch.start_at || '').slice(0, 16), style: 'max-width:210px' });
     const on = el('input', { type: 'checkbox', ...(sch.enabled === false ? {} : { checked: 'checked' }) });
-    const holeInputs = {};
     // しかたに応じて出す欄
     const detail = el('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap;align-items:center' },
         hoursSel, nthSel, wdaySel, daySel, timeIn);
@@ -12597,12 +12638,6 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
     if (withValues) {
         rows.push(el('span', { class: 'small' }, '動かす'), el('label', { style: 'display:flex;align-items:center;gap:6px;cursor:pointer' },
             on, el('span', { class: 'small' }, '止めるとチェックを外す（設定は残ります）')));
-        (r.holes || []).forEach(h => {
-            const inp = el('input', { type: 'text', value: (sch.values || {})[h.key] ?? h.sample ?? '', style: 'max-width:260px' });
-            holeInputs[h.key] = inp;
-            rows.push(el('span', { class: 'small' }, `固定の値「${h.label}」`), el('div', {}, inp,
-                el('span', { class: 'small muted', style: 'margin-left:6px' }, '登録時の値。実行日で変える場合は登録し直してください')));
-        });
     }
     const grid = el('div', { class: 'schedgrid mt' }, ...rows);
     const note = el('div', { class: 'small muted mt' },
@@ -12627,8 +12662,7 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
                  `いまの最低間隔（${x.minIntervalHours} 時間）では、選べる間隔がありません（手動のみになります）。`)
             : null);
     const sync = () => { syncDetail(); if (onChange) onChange(); };
-    [kindSel, hoursSel, timeIn, wdaySel, daySel, nthSel, start, on,
-     ...Object.values(holeInputs)].forEach(i => i.addEventListener('change', sync));
+    [kindSel, hoursSel, timeIn, wdaySel, daySel, nthSel, start, on].forEach(i => i.addEventListener('change', sync));
     syncDetail();
     const node = el('div', {}, grid, note, warn, blocked);
     const value = () => {
@@ -12636,10 +12670,7 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
                       time: timeIn.value || '08:00', weekday: Number(wdaySel.value || 0),
                       day: Number(daySel.value || 1), nth: Number(nthSel.value || 1),
                       start_at: start.value || '' };
-        if (withValues) {
-            out.enabled = on.checked;
-            out.values = Object.fromEntries(Object.entries(holeInputs).map(([k, i]) => [k, i.value]));
-        }
+        if (withValues) out.enabled = on.checked;     // values は送らない（サーバはいまの値を残す）
         return out;
     };
     // 保存を断られたとき、いま保存されている値に戻す（断られた値が残ったままだと、次の変更も同じ理由で断られる）
@@ -12654,8 +12685,6 @@ function scheduleOptions(r, vocab, onChange, withValues, extra) {
         start.value = (s2.start_at || '').slice(0, 16);
         syncDetail();
         on.checked = s2.enabled !== false;
-        const sample = Object.fromEntries((r.holes || []).map(h => [h.key, h.sample ?? '']));
-        Object.entries(holeInputs).forEach(([k, i]) => { i.value = (s2.values || {})[k] ?? sample[k] ?? ''; });
     };
     return { node, value, reset };
 }
@@ -12742,7 +12771,7 @@ function cardMeta(r) {
     const wait = !!(r.next_run && new Date(r.next_run) > new Date());
     return `${r.n_steps}手順`
         + ((r.dates || []).length ? `・${[...new Set(r.dates.map(d => d.label))].join('、')}` : '')
-        + ((r.holes || []).length ? `・固定の値 ${r.holes.map(h => h.label).join('、')}` : '')
+        + ((r.holes || []).length ? `・${r.holes.map(h => `${h.label}＝${h.value ?? h.sample}`).join('、')}` : '')
         + (r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')}` : '・まだ実行していません')
         + (wait ? `・次に試せるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
         + (((r.schedule || {}).kind || 'manual') !== 'manual' ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
@@ -12779,6 +12808,7 @@ function card(r) {
         el('div', { class: 'small mt' }, el('span', { class: 'muted' }, '手順: '), r.tools.join(' → ')),
         r.questions.length
             ? el('div', { class: 'small muted' }, '元の質問: ' + r.questions.join(' ／ ')) : null,
+        valuesRow(r),
         r.has_file_steps ? folderRow(r) : null,
         scheduleRow(r),
         r.has_mail_steps ? mailRow(r) : null,
@@ -12838,6 +12868,105 @@ function scheduleRow(r) {
         el('div', { class: 'acc__body' }, opts.node, notifyBox,
             sch.last_run ? el('div', { class: `small mt ${sch.last_status === 'error' ? 'alert alert--err' : 'muted'}` },
                 `前回の定期実行: ${sch.last_run.slice(5, 16).replace('T', ' ')} ${sch.last_message || ''}`) : null));
+}
+
+/** あとで変えられる値（条件の数値・名前。昔の「穴」も）と、実行日で変わる値の扱い。
+ *  変えるとその場で保存し、次の実行（いま試す・定期実行）から効く。作り直しは要らない。 */
+function valuesRow(r) {
+    if (!(r.holes || []).length && !(r.dates || []).length) return null;
+    const summary = el('span', { class: 'small muted' });
+    const grid = el('div', { class: 'schedgrid' });
+    // 実行日で変わる値は、同じ日付（書き方が違う 2026-11 と 2026年11月 など）を1行にまとめ、いっしょに変える
+    const dateGroups = () => {
+        const groups = new Map();
+        (r.dates || []).forEach(d => {
+            const k = d.group || d.key;
+            if (!groups.has(k)) groups.set(k, []);
+            groups.get(k).push(d);
+        });
+        return [...groups.values()];
+    };
+    const syncSummary = () => {
+        const parts = [...(r.holes || []).map(h => `${h.label}＝${h.value ?? h.sample}`),
+                       ...dateGroups().map(ds => `${ds[0].label}（今日なら ${[...new Set(ds.map(d => d.now))].join('・')}）`)];
+        summary.textContent = `変えられる値: ${parts.join('、')}`;
+    };
+    const save = async (body, okText, revert) => {
+        try {
+            const res = await api('/api/robots/update', { id: r.id, ...body, stamp: r.updated_at });
+            const fresh = res.robots.find(x => x.id === r.id);
+            if (fresh) Object.assign(r, fresh);
+            build();
+            const meta = document.querySelector(`[data-meta="${r.id}"]`);
+            if (meta) meta.textContent = cardMeta(r);
+            toast(okText);
+        } catch (e) { revert(); toast(e.message, 'err', 9000); reloadRobotsIfStale(e); }
+    };
+    function build() {
+        syncSummary();
+        grid.replaceChildren();
+        (r.holes || []).forEach(h => {
+            const listId = `robotval_${r.id}_${h.key}`;
+            const choices = h.choices || [];
+            const inp = el('input', { type: 'text', value: String(h.value ?? h.sample ?? ''), style: 'max-width:260px',
+                                      'aria-label': h.label, ...(h.kind === 'number' ? { inputmode: 'decimal' } : {}),
+                                      ...(choices.length ? { list: listId } : {}) });
+            inp.addEventListener('change', () => {
+                const v = inp.value.trim();
+                if (v === String(h.value ?? '')) return;
+                save({ values: { [h.key]: v } }, `「${h.label}」を ${v} にしました。次の実行からこの値で動きます。`,
+                     () => { inp.value = String(h.value ?? h.sample ?? ''); });
+            });
+            const unit = { day: '日', month: 'か月', year: '年', hour: '時間', minute: '分' }[h.unit] || '';
+            const hint = [unit, String(h.value ?? '') !== String(h.sample ?? '') ? `登録時 ${h.sample}` : '',
+                          choices.length ? '入力すると候補が出ます' : ''].filter(Boolean).join('・');
+            grid.append(el('span', { class: 'small' }, h.label),
+                el('div', {}, inp,
+                   choices.length ? el('datalist', { id: listId }, ...choices.map(c => el('option', { value: c }))) : null,
+                   hint ? el('span', { class: 'small muted', style: 'margin-left:6px' }, hint) : null));
+        });
+        dateGroups().forEach(ds => {
+            const d = ds[0];
+            const same = ds.every(x => x.mode === d.mode && (x.n || '') === (d.n || ''));
+            const sel = el('select', { style: 'max-width:240px', 'aria-label': `${d.title} の扱い` });
+            let group = null;
+            (d.modes || []).forEach(m => {
+                const opt = el('option', { value: m.mode, ...(m.mode === d.mode ? { selected: 'selected' } : {}) }, m.label);
+                if (!m.group) { sel.append(opt); return; }
+                if (!group || group.label !== m.group) { group = el('optgroup', { label: m.group }); sel.append(group); }
+                group.append(opt);
+            });
+            const nIn = el('input', { type: 'number', min: '1', step: '1', value: d.n || '', style: 'width:80px',
+                                      placeholder: '数', 'aria-label': `${d.title} の数` });
+            const isParam = () => !!((d.modes || []).find(m => m.mode === sel.value) || {}).param;
+            const syncN = () => nIn.classList.toggle('hidden', !isParam());
+            const send = () => {
+                if (isParam() && !nIn.value) { nIn.focus(); return; }       // 数を入れてから保存する
+                const mode = isParam() ? `${sel.value}:${nIn.value}` : sel.value;
+                if (same && mode === (d.n ? `${d.mode}:${d.n}` : d.mode)) return;
+                save({ dates: Object.fromEntries(ds.map(x => [x.key, mode])) },
+                     `「${d.title}」の扱いを変えました。次の実行から効きます。`,
+                     () => { sel.value = d.mode; nIn.value = d.n || ''; syncN(); });
+            };
+            sel.addEventListener('change', () => { syncN(); send(); });
+            nIn.addEventListener('change', send);
+            syncN();
+            grid.append(el('span', { class: 'small' }, d.title || d.sample),
+                el('div', {}, sel, ' ', nIn,
+                   el('span', { class: 'small muted', style: 'margin-left:6px' },
+                      `今日なら ${[...new Set(ds.map(x => x.now))].join('・')}`
+                      + (ds.length > 1 ? `（${ds.length} か所いっしょに変わります）` : '')),
+                   same ? null : el('div', { class: 'small', style: 'color:var(--warn)' },
+                                    'この中で扱いがそろっていません。選び直すと全部そろいます。')));
+        });
+    }
+    build();
+    return el('details', { class: 'acc', style: 'margin-top:8px' },
+        el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
+        el('div', { class: 'acc__body' },
+            el('div', { class: 'small muted', style: 'margin-bottom:6px' },
+               '変えるとその場で保存し、次の実行（いま試す・定期実行）からこの値で動きます。作り直しは要りません。'),
+            grid));
 }
 
 /** メールの自動送信（下書きを作る手順があるロボットだけ）。 */
@@ -12916,8 +13045,10 @@ function detailRow(r) {
         el('dd', {}, (r.dates || []).length
             ? r.dates.map(d => `${d.label}（登録時 ${d.sample} → 今日なら ${d.now}）`).join('、')
             : 'なし（毎回同じ期間の結果になります）'),
-        ...(r.holes.length ? [el('dt', {}, '固定の値（昔の「穴」）'),
-                              el('dd', {}, r.holes.map(h => `${h.label}＝${h.sample}`).join('、') + '。実行日で変える場合は登録し直してください')] : []),
+        ...(r.holes.length ? [el('dt', {}, 'あとで変えられる値'),
+                              el('dd', {}, r.holes.map(h => `${h.label}＝${h.value ?? h.sample}`
+                                  + (String(h.value ?? '') !== String(h.sample ?? '') ? `（登録時 ${h.sample}）` : '')).join('、')
+                                  + '。上の「変えられる値」で変えられます')] : []),
         el('dt', {}, '使う表'), el('dd', {}, (r.tables || []).join('、') || 'なし'),
         el('dt', {}, 'フォルダ出力'), el('dd', {}, r.has_file_steps ? window.ROBOT.folderLabel(r).replace('フォルダ: ', '') : 'ファイルを作る手順はありません'),
         el('dt', {}, '定期実行'), el('dd', {}, window.ROBOT.scheduleLabel(r).replace('定期実行: ', '')
@@ -12955,7 +13086,7 @@ function folderRow(r) {
 
 async function run(r) {
     if (running) return;
-    const values = {};                       // 昔の「穴」は登録時の値で動く（聞かない）
+    const values = {};                       // あとで変えられる値は、サーバがいまの値で埋める（聞かない）
     running = true;
     // 待ち（次に実行できる時刻まで）で止めてあるボタンは、失敗のあとも止めたままにする
     const buttons = [...document.querySelectorAll('#robotCards button')].filter(b => !b.disabled);

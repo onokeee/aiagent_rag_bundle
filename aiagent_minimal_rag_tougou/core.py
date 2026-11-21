@@ -11591,27 +11591,396 @@ def _robot_candidates(steps: list[dict]) -> list[dict]:
 
 
 def _robot_apply_holes(steps: list[dict], chosen: list[dict]) -> list[dict]:
-    """選ばれた値を {{hN}} に置き換える（steps はその場で書き換える）。穴の定義を返す。"""
+    """選ばれた値を {{hN}} に置き換える（steps はその場で書き換える）。穴の定義を返す。
+
+    chosen は {"ids": [候補の id…], "label"}（あとで変えられる値。2026-11-21 から）か、昔の {"id", "label"}。
+    あとで変えられる値の文字は、条件ではない所の同じ文字（件名・題名・SELECT の 'EQ-A01' など）もいっしょに置き換える。
+    """
+    if not chosen:
+        return []
     cands = {c["id"]: c for c in _robot_candidates(steps)}
-    holes, picks = [], []
+    cands.update({c["id"]: c for c in _robot_value_candidates(steps)})
+    holes, picks, taken = [], [], set()
+    scope = None
     for n, ch in enumerate(chosen, 1):
-        c = cands.get(str((ch or {}).get("id")))
-        if c is None:
-            raise ValueError("穴にする値が見つかりません（会話が変わった可能性）。作り直してください。")
-        label = str(ch.get("label") or "").strip() or f"値{n}"
+        ch = ch or {}
+        ids = [str(x) for x in (ch.get("ids") if isinstance(ch.get("ids"), list) else [ch.get("id")]) if x]
+        cs = [cands.get(x) for x in ids]
+        if not ids or any(c is None for c in cs):
+            raise ValueError("あとで変える値が見つかりません（会話が変わった可能性）。作り直してください。")
+        first = cs[0]
+        label = str(ch.get("label") or "").strip() or first.get("label") or f"値{n}"
         key = f"h{n}"
-        holes.append({"key": key, "label": label[:40], "kind": c["kind"], "sample": c["value"]})
-        picks.append((c, key))
-    # 同じ引数の中では後ろから置き換える（前を置き換えると位置がずれる）
-    for c, key in sorted(picks, key=lambda t: (t[0]["step"], t[0]["arg"],
-                                                 -int(t[0]["id"].split(":")[2]))):
-        step = steps[c["step"]]
-        val = step["arguments"][c["arg"]]
-        a, b = (int(x) for x in c["id"].split(":")[2:4])
+        hole = {"key": key, "label": label[:40], "kind": first["kind"], "sample": first["value"]}
+        if isinstance(ch.get("ids"), list):
+            hole["edit"] = True                 # カードで変えられる値（あとで変えられる値の欄に出す）
+            for k in ("int", "min", "unit", "column", "op"):
+                if first.get(k) not in (None, "", False):
+                    hole[k] = first[k]
+            if first["kind"] == "text" and first.get("column"):
+                if scope is None:
+                    scope = build_scope({f.name: [] for f in db.list_db_files()})
+                sql = (steps[first["step"]].get("arguments") or {}).get("sql")
+                table = _robot_value_meta(first, tables_in_sql(sql, scope, limit=50) if isinstance(sql, str) else [])[1]
+                if table:
+                    hole["table"] = table       # 入力の候補（その列に入っている値）を引くため
+        holes.append(hole)
+        for c in cs:
+            a, b = (int(x) for x in c["id"].split(":")[-2:])     # 昔の候補は位置を id にだけ持つ
+            picks.append((c["step"], c["arg"], a, b, key))
+            taken.add(c["id"])
+        if hole.get("edit") and _robot_spreadable(first):
+            for sp in _robot_spread_spans(steps, first["value"], taken):
+                picks.append((*sp, key))
+                taken.add(f"{sp[0]}:{sp[1]}:{sp[2]}:{sp[3]}")
+    # 同じ引数の中では後ろから置き換える（前を置き換えると位置がずれる）。重なる所は飛ばす
+    picks.sort(key=lambda t: (t[0], str(t[1]), -t[2]))
+    right: dict = {}
+    for step_i, arg, a, b, key in picks:
+        if (step_i, arg) in right and b > right[(step_i, arg)]:
+            continue
+        val = steps[step_i]["arguments"][arg]
         token = "{{" + key + "}}"
-        step["arguments"][c["arg"]] = (val[:a] + token + val[b:]
-                                       if c["arg"] == "sql" and isinstance(val, str) else token)
+        steps[step_i]["arguments"][arg] = (val[:a] + token + val[b:]) if isinstance(val, str) else token
+        right[(step_i, arg)] = a
     return holes
+
+
+# --- あとで変えられる値（2026-11-21） ---------------------------------------------------
+# 条件の中の数値や名前（装置・担当者・しきい値・上位の件数・さかのぼる日数）に「あとで変える」の印を付けると、
+# 値を {{hN}} の印にし、いまの値を穴（hole["value"]）に持つ。マイロボットのカードでいつでも書き換えられ、
+# 手動・定期のどちらの実行もいまの値で動く（作り直し不要）。昔の「穴」（聞く型）と同じ仕組みに乗せる。
+
+#: 値の直前が「比べる記号・LIKE・GLOB」
+_ROBOT_CMP_OP = re.compile(r"(?is)(==|=|<>|!=|<=|>=|<|>|\bNOT\s+LIKE|\bLIKE|\bNOT\s+GLOB|\bGLOB)\s*\Z")
+_ROBOT_LIMIT_TAIL = re.compile(r"(?i)\bLIMIT\s*\Z")
+_ROBOT_BETWEEN_TAIL = re.compile(r"(?is)\bBETWEEN\s*\Z|\bBETWEEN\s+(?:'(?:[^']|'')*'|[-\w.]+)\s+AND\s*\Z")
+#: 比べる相手の列名（別名つき・"…"・`…`・[…] も）
+_ROBOT_COL_TAIL = re.compile(r'(?:[^\s()=<>!,\'"`\[\].]+\.)?("(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|[^\s()=<>!,\'"`\[\].]+)\s*\Z')
+#: SQLite の日付の修飾（'-44 days' など）。数だけを変えられる値にする
+_ROBOT_DATE_MOD = re.compile(r"(?i)^\s*([+-]?)\s*([0-9]+)\s*(day|month|year|hour|minute)s?\s*$")
+_ROBOT_MOD_UNITS = {"day": ("日数", "日"), "month": ("月数", "か月"), "year": ("年数", "年"),
+                    "hour": ("時間", "時間"), "minute": ("分", "分")}
+
+
+def _robot_col_before(text: str) -> str:
+    """比べる記号の左の列名（別名と引用符を外す）。式（SUM(x) など）なら式のまま。分からなければ空。"""
+    t = text.rstrip()
+    if t.endswith(")"):
+        depth, i = 0, len(t) - 1
+        while i >= 0:
+            if t[i] == ")":
+                depth += 1
+            elif t[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            i -= 1
+        if i < 0:
+            return ""
+        m = re.search(r"([A-Za-z_]\w*)\s*\Z", t[:i])
+        return ((m.group(1) if m else "") + t[i:])[:40]
+    m = _ROBOT_COL_TAIL.search(t)
+    if not m:
+        return ""
+    name = m.group(1)
+    if name[:1] in '"`[':
+        name = name[1:-1].replace('""', '"')
+    return "" if name.upper() in ("WHERE", "AND", "OR", "NOT", "ON", "HAVING", "WHEN", "THEN", "ELSE", "SELECT") else name
+
+
+def _robot_cond_of(sql: str, a: int) -> dict | None:
+    """SQL の a の位置で始まる値（文字列なら開きの '）が、条件の値なら {op, column}。そうでなければ None。
+
+    条件の値 = 比べる相手（= < > LIKE など）・IN (…) の中・BETWEEN の両端・LIMIT の件数。
+    SELECT の列や関数の引数（strftime('%Y', …)・'start of month'）は条件ではないので拾わない。
+    """
+    left = sql[:a].rstrip()
+    if _ROBOT_LIMIT_TAIL.search(left):
+        return {"op": "LIMIT", "column": ""}
+    m = _ROBOT_CMP_OP.search(left)
+    if m:
+        return {"op": re.sub(r"\s+", " ", m.group(1).upper()), "column": _robot_col_before(left[:m.start()])}
+    if _ROBOT_BETWEEN_TAIL.search(left):
+        k = list(re.finditer(r"(?is)\bBETWEEN\b", left))
+        return {"op": "BETWEEN", "column": _robot_col_before(left[:k[-1].start()]) if k else ""}
+    if left.endswith("(") or left.endswith(","):
+        # IN ( の中か。閉じていない開きかっこまで戻って、その前が IN（NOT IN）かを見る
+        depth, i = 0, len(left) - 1
+        while i >= 0:
+            if left[i] == ")":
+                depth += 1
+            elif left[i] == "(":
+                if depth == 0:
+                    break
+                depth -= 1
+            i -= 1
+        if i >= 0:
+            before = left[:i].rstrip()
+            mi = re.search(r"(?is)\bIN\s*\Z", before)
+            if mi:
+                col_text = re.sub(r"(?is)\bNOT\s*\Z", "", before[:mi.start()].rstrip()).rstrip()
+                return {"op": "IN", "column": _robot_col_before(col_text)}
+    return None
+
+
+def _robot_vcand(i: int, arg: str, text: str, a: int, b: int, kind: str, value: str, op: str = "",
+                 column: str = "", unit: str = "", int_: bool = False, min_=None, label: str = "") -> dict:
+    """あとで変えられる値の候補1つ。id は _robot_candidates と同じ「手順:引数:開始:終了」。"""
+    return {"id": f"{i}:{arg}:{a}:{b}", "step": i, "arg": arg, "a": a, "b": b, "kind": kind, "value": value,
+            "op": op, "column": column, "unit": unit, "int": int_, "min": min_, "label": label,
+            "place": f"手順{i + 1} {_ROBOT_PLACE_NAMES.get(arg, arg)}",
+            "before": _robot_ctx(text[max(0, a - _ROBOT_CTX):a], a > _ROBOT_CTX, left=True),
+            "after": _robot_ctx(text[b:b + _ROBOT_CTX], b + _ROBOT_CTX < len(text), left=False)}
+
+
+def _robot_sql_value_cands(i: int, sql: str) -> list[dict]:
+    """1つの SQL の中の、あとで変えられる値の候補。日付らしい値（実行日で変わる値の側）は除く。"""
+    dates = [(a, b) for a, b, *_ in _robot_dates_in_text(sql, sql=True)]
+
+    def is_date(a, b):
+        return any(not (b <= da or a >= db_) for da, db_ in dates)
+
+    out = []
+    strs = list(_ROBOT_SQL_STR.finditer(sql))
+    for m in strs:
+        a, b, content = m.start(1), m.end(1), m.group(1)
+        mm = _ROBOT_DATE_MOD.match(content)
+        if mm:                                   # date(今日, '-44 days') の 44（さかのぼる日数）
+            unit = mm.group(3).lower()
+            out.append(_robot_vcand(i, "sql", sql, a + mm.start(2), a + mm.end(2), "number", mm.group(2),
+                                    op="MOD", unit=unit, int_=True, min_=0,
+                                    label=("さかのぼる" if mm.group(1) == "-" else "ずらす") + _ROBOT_MOD_UNITS[unit][0]))
+            continue
+        if not content.strip() or is_date(a, b):
+            continue
+        cond = _robot_cond_of(sql, m.start())
+        if not cond:
+            continue
+        va, vb = a, b
+        if cond["op"] in ("LIKE", "NOT LIKE", "GLOB", "NOT GLOB"):
+            inner = content.strip("%*")          # LIKE の % は外し、中の言葉だけを変える
+            if not inner:
+                continue
+            va = a + (len(content) - len(content.lstrip("%*")))
+            vb = va + len(inner)
+        out.append(_robot_vcand(i, "sql", sql, va, vb, "text", sql[va:vb].replace("''", "'"),
+                                op=cond["op"], column=cond["column"]))
+    skip = [(m.start(), m.end()) for m in strs]
+    skip += [(m.start(), m.end()) for m in _ROBOT_SQL_IDENT.finditer(sql)]
+    skip += [(m.start(), m.end()) for m in _ROBOT_SQL_IDENT2.finditer(sql)]
+    for m in _ROBOT_SQL_NUM.finditer(sql):
+        if any(x <= m.start() < y for x, y in skip) or is_date(m.start(), m.end()):
+            continue
+        cond = _robot_cond_of(sql, m.start())
+        if not cond:
+            continue
+        lim = cond["op"] == "LIMIT"
+        out.append(_robot_vcand(i, "sql", sql, m.start(), m.end(), "number", m.group(0), op=cond["op"],
+                                column=cond["column"], int_=lim, min_=1 if lim else None,
+                                label="上位の件数" if lim else ""))
+    return out
+
+
+def _robot_value_candidates(steps: list[dict]) -> list[dict]:
+    """あとで変えられる値の候補（条件の値・LIMIT・日付の修飾の数・ユーザー定義ツールの引数）。
+
+    id は _robot_candidates と同じ「手順:引数:開始:終了」で、保存のときに同じ抜き出しをやり直して突き合わせる。
+    """
+    try:
+        custom = {t.get("name"): t for t in custom_tools.collect_everywhere(include_disabled=True)}
+    except Exception:
+        custom = {}
+    ids = {rid for s in steps for rid in _as_ids(s.get("produced"))}
+    out = []
+    for i, s in enumerate(steps):
+        args = s.get("arguments") or {}
+        if isinstance(args.get("sql"), str):
+            out.extend(_robot_sql_value_cands(i, args["sql"]))
+        tool = custom.get(s.get("name"))
+        if not tool:
+            continue
+        params = {str(p.get("name") or ""): p for p in (tool.get("parameters") or []) if isinstance(p, dict)}
+        for key, val in args.items():
+            if key not in params or key == "sql" or isinstance(val, bool):
+                continue
+            label = str(params[key].get("description") or key).strip()[:24]
+            if isinstance(val, (int, float)):
+                out.append(_robot_vcand(i, key, "", 0, 0, "number", str(val), op="ARG", label=label))
+            elif (isinstance(val, str) and val.strip() and len(val) <= 200 and val not in ids
+                  and not _robot_dates_in_text(val)):
+                kind = "number" if str(params[key].get("type")) in ("integer", "number") else "text"
+                out.append(_robot_vcand(i, key, val, 0, len(val), kind, val, op="ARG", label=label))
+    return out
+
+
+def _robot_spreadable(c: dict) -> bool:
+    """同じ文字の件名・題名などもいっしょに変えてよい値か（2文字以上の文字。数だけの値は他の数と取り違える）。"""
+    v = str(c.get("value") or "")
+    return c.get("kind") == "text" and len(v) >= 2 and not re.fullmatch(r"[0-9.,+\-]+", v)
+
+
+def _robot_spread_spans(steps: list[dict], value: str, taken: set) -> list[tuple]:
+    """条件ではない所にある同じ文字（いっしょに変わる場所）。(手順, 引数, 開始, 終了) の並び。
+
+    SQL は文字列の中身がその値と同じもの（SELECT 'EQ-A01' AS 装置 など）、それ以外の引数（件名・本文・題名・
+    ファイル名…）は部分一致。前の手順の結果を指す印・AIの解説・宛先は見ない。
+    """
+    out = []
+    for i, s in enumerate(steps):
+        for key, val in (s.get("arguments") or {}).items():
+            if not isinstance(val, str) or key in _ROBOT_DATE_SKIP_KEYS:
+                continue
+            if key == "sql":
+                for m in _ROBOT_SQL_STR.finditer(val):
+                    if (m.group(1).replace("''", "'") == value
+                            and f"{i}:sql:{m.start(1)}:{m.end(1)}" not in taken):
+                        out.append((i, "sql", m.start(1), m.end(1)))
+                continue
+            start = 0
+            while True:
+                k = val.find(value, start)
+                if k < 0:
+                    break
+                if f"{i}:{key}:{k}:{k + len(value)}" not in taken:
+                    out.append((i, key, k, k + len(value)))
+                start = k + len(value)
+    return out
+
+
+def _robot_value_meta(c: dict, tables: list[dict]) -> tuple:
+    """(名前の初期値, 表, 入力の候補)。名前は列の説明（データカタログ）の頭、無ければ列名。候補はその列に入っている値。"""
+    label, table, choices = c.get("label") or "", "", []
+    col = c.get("column") or ""
+    if col and "(" not in col:
+        for t in tables:
+            try:
+                path = db.path_for(t["db"])
+                prof_t = (catalog.profile_db(path).get("tables") or {}).get(t["table"]) or {}
+                meta_cols = ((catalog.load_meta(path).get("tables") or {}).get(t["table"]) or {}).get("columns") or {}
+            except Exception:
+                continue
+            names = {cc.get("name") for cc in (prof_t.get("columns") or []) if isinstance(cc, dict)}
+            if col not in names and col not in meta_cols:
+                continue
+            table = t["table"]
+            desc = str((meta_cols.get(col) or {}).get("description") or "").strip()
+            if not label and desc:
+                label = re.split(r"[（(：:、。]", desc)[0].strip()[:24]
+            if c.get("kind") == "text" and c.get("op") not in ("LIKE", "NOT LIKE", "GLOB", "NOT GLOB"):
+                vals = ((prof_t.get("col_stats") or {}).get(col) or {}).get("values") or []
+                choices = [str(v[0]) for v in vals if isinstance(v, (list, tuple)) and v and v[0] is not None][:50]
+            break
+    return (label or col or "値")[:40], table, choices
+
+
+def _robot_value_title(c: dict) -> str:
+    """登録画面の1行の見出し（EQ-A01（equip_code）／上位 10 件／44 日（さかのぼる日数））。"""
+    v = c["value"]
+    if c.get("op") == "LIMIT":
+        return f"上位 {v} 件"
+    if c.get("op") == "MOD":
+        return f"{v} {_ROBOT_MOD_UNITS[c['unit']][1]}（{c.get('label')}）"
+    col = c.get("column")
+    return f"{v}（{col}）" if col else v
+
+
+def _robot_value_groups(steps: list[dict]) -> list[dict]:
+    """登録画面の「あとで変えられる値」。同じ値（数は同じ列の同じ値）をまとめて1行にし、名前の初期値（列の説明）・
+    場所（前後の文つき）・いっしょに変わる場所（同じ文字の件名など）・入力の候補（列に入っている値）を添える。"""
+    cands = _robot_value_candidates(steps)
+    if not cands:
+        return []
+    scope = build_scope({f.name: [] for f in db.list_db_files()})
+    tables_of: dict = {}
+    groups: dict = {}
+    for c in cands:
+        key = ("text:" + c["value"] if c["kind"] == "text"
+               else f"number:{c['value']}:{c['op']}:{c['column']}:{c['unit']}:{c['arg'] if c['op'] == 'ARG' else ''}")
+        g = groups.get(key)
+        if g is None:
+            if c["step"] not in tables_of:
+                sql = (steps[c["step"]].get("arguments") or {}).get("sql")
+                tables_of[c["step"]] = tables_in_sql(sql, scope, limit=50) if isinstance(sql, str) else []
+            label, table, choices = _robot_value_meta(c, tables_of[c["step"]])
+            g = groups[key] = {"key": key, "kind": c["kind"], "value": c["value"], "label": label,
+                               "title": _robot_value_title(c), "ids": [], "where": [], "int": c["int"],
+                               "min": c["min"], "unit": c["unit"], "column": c["column"], "table": table,
+                               "choices": choices, "spread": _robot_spreadable(c)}
+        g["ids"].append(c["id"])
+        g["where"].append({"place": c["place"], "step": c["step"], "question": str(steps[c["step"]].get("question") or "")[:80],
+                           "value": c["value"], "before": c["before"], "after": c["after"]})
+    for g in groups.values():
+        if g.pop("spread"):
+            for i, arg, a, b in _robot_spread_spans(steps, g["value"], set(g["ids"])):
+                text = steps[i]["arguments"][arg]
+                g["where"].append({"place": f"手順{i + 1} {_ROBOT_PLACE_NAMES.get(arg, arg)}", "step": i,
+                                   "question": str(steps[i].get("question") or "")[:80], "value": g["value"], "spread": True,
+                                   "before": _robot_ctx(text[max(0, a - _ROBOT_CTX):a], a > _ROBOT_CTX, left=True),
+                                   "after": _robot_ctx(text[b:b + _ROBOT_CTX], b + _ROBOT_CTX < len(text), left=False)})
+    return list(groups.values())
+
+
+def _robot_check_value(h: dict, value) -> str:
+    """あとで変えられる値（昔の穴も）の入力を確かめて整える。おかしければ ValueError（画面にそのまま出す）。"""
+    v = str(value if value is not None else "").strip()
+    label = h.get("label") or h.get("key")
+    if not v:
+        raise ValueError(f"「{label}」の値を入れてください。")
+    if len(v) > 200:
+        raise ValueError(f"「{label}」は200文字以内にしてください。")
+    if h.get("kind") == "number":
+        v = unicodedata.normalize("NFKC", v)       # 全角の１２３を半角に
+        if not _ROBOT_NUMBER.fullmatch(v):
+            raise ValueError(f"「{label}」は数値で入力してください（入力: {v}）。")
+        if h.get("int") and not re.fullmatch(r"[0-9]+", v):
+            raise ValueError(f"「{label}」は 0 以上の整数で入力してください（入力: {v}）。")
+        if h.get("min") is not None and float(v) < float(h["min"]):
+            raise ValueError(f"「{label}」は {h['min']} 以上にしてください（入力: {v}）。")
+    return v
+
+
+def _robot_current_values(robot: dict) -> dict:
+    """あとで変えられる値（昔の穴も）の、いまの値 {hN: 値}。カードで決めた値 → 昔の定期実行の値 → 登録時の値。"""
+    sch_vals = _robot_schedule_norm(robot)["values"]
+    out = {}
+    for h in robot.get("holes") or []:
+        if not isinstance(h, dict) or h.get("kind") == "date" or not h.get("key"):
+            continue
+        v = h.get("value")
+        if v in (None, ""):
+            v = sch_vals.get(h["key"]) or h.get("sample") or ""
+        out[h["key"]] = str(v)
+    return out
+
+
+def _robot_value_choices(h: dict) -> list[str]:
+    """文字の値の入力の候補（その列に入っている値。表の一覧の控えから）。"""
+    if (h.get("kind") != "text" or not h.get("table") or not h.get("column")
+            or h.get("op") in ("LIKE", "NOT LIKE", "GLOB", "NOT GLOB")):     # 部分一致の言葉には候補を出さない
+        return []
+    try:
+        for p in db.list_db_files():
+            prof_t = (catalog.profile_db(p).get("tables") or {}).get(h["table"])
+            if prof_t:
+                vals = ((prof_t.get("col_stats") or {}).get(h["column"]) or {}).get("values") or []
+                return [str(v[0]) for v in vals if isinstance(v, (list, tuple)) and v and v[0] is not None][:50]
+    except Exception:
+        return []
+    return []
+
+
+def _robot_card_modes(cls: str) -> list[dict]:
+    """カードで選べる「実行日で変わる値」の扱い（その値の種類に合うもの）。数を持つ扱いは数を別の欄で入れる（param）。"""
+    out = [{"mode": "fixed", "label": "固定のまま（登録時の値）", "group": "", "param": False}]
+    for group, modes in _ROBOT_MODE_GROUPS:
+        gname = "日付だけ動かす（時刻はそのまま）" if cls == "datetime" and group == "月・週・日" else group
+        for mode in modes:
+            if cls in ROBOT_DATE_MODES[mode][1]:
+                param = mode in ROBOT_DATE_N_MAX
+                out.append({"mode": mode, "label": ("◯" + ROBOT_DATE_MODES[mode][0]) if param else _robot_mode_label(mode, cls),
+                            "group": gname, "param": param})
+    return out
 
 
 # --- 実行日で変わる値 ---------------------------------------------------------------
@@ -11838,6 +12207,8 @@ def _robot_when(h: dict, now: datetime, prev: datetime | None = None):
 
 def _robot_date_text(h: dict, now: datetime, prev: datetime | None = None) -> str:
     """kind="date" の穴の、その実行での値。前回がまだ無い「前回の実行」は登録時の値。扱いが壊れていれば ValueError。"""
+    if h.get("mode") == "fixed":            # カードで「固定のまま」にした値
+        return str(h.get("sample") or "")
     v = _robot_when(h, now, prev)
     if v is None:
         return str(h.get("sample") or "")
@@ -12336,13 +12707,13 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
             raise ValueError(f"穴 {key} の定義がありません。作り直してください。")
         if h.get("kind") == "date":
             return _robot_date_text(h, now, prev)    # 数字と区切りだけなので引用符の心配は無い
-        v = str(values.get(key, "")).strip() or str(h.get("sample") or "").strip()
+        # 実行のときに来た値 → カードで決めた値（あとで変えられる値）→ 登録時の値
+        v = (str(values.get(key, "")).strip() or str(h.get("value") or "").strip()
+             or str(h.get("sample") or "").strip())
         if not v:
             raise ValueError(f"「{h['label']}」の値がありません。作り直してください。")
+        v = _robot_check_value(h, v)
         if h.get("kind") == "number":
-            v = unicodedata.normalize("NFKC", v)       # 全角の１２３を半角に
-            if not _ROBOT_NUMBER.fullmatch(v):
-                raise ValueError(f"「{h['label']}」は数値で入力してください（入力: {v}）。")
             return v
         return v.replace("'", "''") if in_sql else v
 
@@ -12474,7 +12845,7 @@ def _robots_rename_table(old: str, new: str, others=()) -> int:
 def _robot_filled_note(h: dict, values: dict, now: datetime, prev: datetime | None) -> str:
     """会話の先頭に残す「先月＝2026-08」の1つ分。「前回の実行」で前回がまだ無ければ、登録時の値で動いたことも書く。"""
     if h.get("kind") != "date":
-        return f"{h['label']}＝{values.get(h['key'], '') or h.get('sample', '')}"
+        return f"{h['label']}＝{values.get(h['key'], '') or h.get('value') or h.get('sample', '')}"
     text = f"{h['label']}＝{_robot_date_text_safe(h, now, prev)}"
     if h.get("mode") == "last_run" and prev is None:
         text += "（初回のため登録時の値）"
@@ -13171,7 +13542,8 @@ def _robot_admin_test(admin, owner_dir: str, robot: dict, mail_to: list[str]):
         _robots_running.add(key)
         _robot_admin_tests[key] = datetime.now()
     try:
-        chat, ok, message = _robot_run(robot, {}, test={"mail_to": list(mail_to), "owner": owner_dir})
+        chat, ok, message = _robot_run(robot, _robot_current_values(robot),
+                                       test={"mail_to": list(mail_to), "owner": owner_dir})
         if ok and mail_to and any(s.get("name") == "compose_email" for s in robot.get("steps") or []):
             _sent, mail_msg = _robot_send_mails(chat, admin)      # 宛先は管理者自身なので、自動送信の設定に関係なく送る
             if mail_msg:
@@ -13261,9 +13633,7 @@ def _run_scheduled_robot(app, user, robot: dict, now: datetime | None = None) ->
               f" {robot.get('name')}")
         return {"user": user.username, "name": robot.get("name") or "（無題）",
                 "ok": False, "message": message, "at": chats.now()}
-    values = dict(_robot_schedule_norm(robot)["values"])
-    for h in robot.get("holes") or []:
-        values.setdefault(h["key"], str(h.get("sample") or ""))
+    values = _robot_current_values(robot)          # あとで変えられる値は、いまの値で
     ok, message = False, ""
     try:
         with app.test_request_context("/robots/scheduled"):
@@ -13395,6 +13765,7 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
     holes = [h for h in (r.get("holes") or []) if isinstance(h, dict)]
     now = datetime.now()
     prev = _robot_prev_run(r)
+    cur_vals = _robot_current_values(r)
     floor_min = float((settings or robot_settings()).get("min_interval_hours") or 0) * 60
     floor_blocked = bool(floor_min > 0 and 0 < sch["interval_minutes"] < floor_min)
     try:
@@ -13419,7 +13790,13 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "steps_detail": _robot_steps_detail(steps, holes),
             # 実行日で変わる値（扱いと、今日ならこの値）
             "dates": [{"key": h["key"], "label": h.get("label"), "mode": h.get("mode"), "sample": h.get("sample"),
-                       "now": _robot_date_text_safe(h, now, prev)} for h in holes if h.get("kind") == "date"],
+                       "now": _robot_date_text_safe(h, now, prev), "n": h.get("n"), "cls": h.get("cls") or "day",
+                       # カードで扱いを変えるための読み方と、選べる扱い
+                       "title": _robot_date_title(str(h.get("sample") or ""), str(h.get("cls") or "day")),
+                       "modes": _robot_card_modes(str(h.get("cls") or "day")),
+                       # 同じ日付（書き方が違っても）をカードで1行にまとめる鍵（登録画面と同じ）
+                       "group": _robot_group_key(str(h.get("sample") or ""), str(h.get("cls") or "day"))}
+                      for h in holes if h.get("kind") == "date"],
             "owner": str((r.get("owner") or {}).get("username") or ""),
             # 間隔の決めごとで、まだ実行できないならその時刻（画面はボタンを止めて理由を出す）
             "next_run": nxt.isoformat(timespec="seconds") if nxt else "",
@@ -13429,8 +13806,11 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "folder_overwrite": bool(r.get("folder_overwrite")),
             "tools": [TOOL_LABELS.get(s.get("name"), s.get("name")) for s in steps],
             "questions": list(r.get("questions") or []),
-            # 昔の「穴」（聞く型）。登録時の値で固定して動く。画面では「固定の値」として見せる
-            "holes": [{k: h.get(k) for k in ("key", "label", "kind", "sample")}
+            # あとで変えられる値（昔の「穴」も）。value がいまの値（カードで決めた値。無ければ登録時の値）
+            "holes": [{"key": h.get("key"), "label": h.get("label"), "kind": h.get("kind"), "sample": h.get("sample"),
+                       "value": cur_vals.get(h.get("key"), h.get("sample")), "unit": h.get("unit") or "",
+                       "int": bool(h.get("int")), "min": h.get("min"), "edit": bool(h.get("edit")),
+                       "choices": _robot_value_choices(h)}
                       for h in holes if h.get("kind") != "date"],
             "tables": list(r.get("tables") or []),
             "from_title": r.get("from_title") or "",
@@ -13507,6 +13887,7 @@ def robots_extract():
                     "turns": _robot_turns(steps), "candidates": _robot_candidates(steps),
                     "base": base.isoformat(timespec="seconds"),
                     "dates": _robot_date_groups(steps, base, bases),
+                    "values": _robot_value_groups(steps),       # あとで変えられる値の候補
                     "mail_steps": mail_steps,
                     "result_numbers": _robot_result_numbers(chat),
                     "has_mail_steps": any(s["name"] == "compose_email" for s in steps),
@@ -13653,8 +14034,9 @@ def robots_run():
     robot = robot_get(g.user, str(body.get("id") or ""))
     if robot is None:
         return jsonify({"error": "マイロボットが見つかりません。"}), 404
-    # 昔の「穴」（聞く型）の値。来なければ登録時の値で動く
+    # あとで変えられる値（昔の穴も）は、いまの値で動く。値が来ていれば（昔の「穴」の口）その回だけそれで
     values = body.get("values") if isinstance(body.get("values"), dict) else {}
+    values = {**_robot_current_values(robot), **{str(k): v for k, v in values.items() if str(v or "").strip()}}
     missing = _robot_missing_tables(robot)
     if missing:
         return jsonify({"error": f"表 {'、'.join(missing)} が見つかりません"
@@ -13730,6 +14112,57 @@ def robots_update():
             robot["notify_to"] = _robot_notify_check(body.get("notify_to"))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        changed = True
+    holes = [h for h in (robot.get("holes") or []) if isinstance(h, dict)]
+    if "values" in body:
+        # あとで変えられる値（昔の穴も）。ここで決めた値が、次の実行（いま試す・定期実行）から効く
+        vals = body.get("values")
+        if not isinstance(vals, dict) or not vals:
+            return jsonify({"error": "変える値の形が正しくありません。"}), 400
+        by = {h.get("key"): h for h in holes if h.get("kind") != "date"}
+        sch_vals = robot["schedule"].get("values") if isinstance(robot.get("schedule"), dict) else None
+        for k, v in vals.items():
+            h = by.get(str(k))
+            if h is None:
+                return jsonify({"error": "変える値が見つかりません。画面を開き直してください。"}), 400
+            try:
+                h["value"] = _robot_check_value(h, v)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            if isinstance(sch_vals, dict):
+                sch_vals.pop(h["key"], None)     # 昔の「定期実行のたびに使う値」より、ここで決めた値を使う
+        changed = True
+    if "dates" in body:
+        # 実行日で変わる値の扱い（先月・44日前・固定のまま…）。数を持つ扱いは "days_ago:44" の形
+        ds = body.get("dates")
+        if not isinstance(ds, dict) or not ds:
+            return jsonify({"error": "変える扱いの形が正しくありません。"}), 400
+        by = {h.get("key"): h for h in holes if h.get("kind") == "date"}
+        for k, ms in ds.items():
+            h = by.get(str(k))
+            if h is None:
+                return jsonify({"error": "変える値が見つかりません。画面を開き直してください。"}), 400
+            mode, _, n_text = str(ms or "").partition(":")
+            cls = str(h.get("cls") or "day")
+            try:
+                if mode == "fixed":
+                    h.update({"mode": "fixed", "label": "固定のまま"})
+                    h.pop("n", None)
+                    continue
+                if mode not in ROBOT_DATE_MODES:
+                    raise ValueError(f"日付の扱い「{mode}」は選べません。")
+                if cls not in ROBOT_DATE_MODES[mode][1]:
+                    raise ValueError(f"「{h.get('sample')}」に「{_robot_mode_label(mode, cls, n_text or '◯')}」の扱いは付けられません。")
+                n = _robot_mode_n({"mode": mode, "n": n_text, "cls": cls}) if mode in ROBOT_DATE_N_MAX else None
+                if n is None and n_text:
+                    raise ValueError(f"日付の扱い「{mode}」に数は付けられません。")
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            h["mode"], h["label"] = mode, _robot_mode_label(mode, cls, n)
+            if n is None:
+                h.pop("n", None)
+            else:
+                h["n"] = n
         changed = True
     if changed:
         robot["owner"] = _owner_snapshot(g.user)   # いまの権限の写しにする（定期実行で名乗るため）
