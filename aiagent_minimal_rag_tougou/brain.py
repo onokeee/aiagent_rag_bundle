@@ -15384,6 +15384,34 @@ def build_usage_report(material: str, model: str | None = None) -> dict:
         out[key] = [str(x).strip() for x in v if str(x).strip()][:8] if isinstance(v, list) else []
     return out
 
+_ROBOT_SUMMARY_SYSTEM = """あなたは、社内データ分析アプリの「マイロボット」（AIを使わずに、記録した手順をそのままくり返す処理の流れ）が
+何をするのかを、非IT部門の利用者に一言で伝える係です。渡された材料（名前・元の質問・手順・結果の行き先）だけを根拠に、
+日本語で書いてください。
+
+書き方:
+- 1〜2文、全体で100字以内。です・ます調で、「〜します。」で終える。
+- 何のデータから何を作り、結果がどこに出るか（会話に残る・ファイル・メール）が分かるように書く。
+- あとで変わる値は書かない: 具体的な日付・期間の日数・件数・人名・メールアドレス・区分などの値
+  （「今月」「直近の期間」「指定した区分」のように書く）。実行する時刻や曜日も書かない。
+- 表名・列名・SQL・道具の名前などの専門用語は使わない。
+- 材料に無いことは足さない。
+
+出力形式（JSON以外の文字を含めないこと）:
+{"summary": "説明の文"}"""
+
+
+def describe_robot(material: str, model: str | None = None) -> str:
+    """マイロボットが何をするかの一言を書かせる（登録したときと、カードの「AIで説明を作る」で1回ずつ）。
+
+    使うモデルは呼び元（core.robot_summary_start）が決める（その人がいま使っているモデル）。
+    """
+    data = _ask_json(_ROBOT_SUMMARY_SYSTEM, material, "マイロボットの説明", model=model or None)
+    text = re.sub(r"\s+", " ", str(data.get("summary") or "")).strip()
+    if not text:
+        raise ValueError("AIの説明が空で返ってきました。")
+    return text[:300]
+
+
 def extract_memory(existing_text: str, question: str, answer: str,
                    model: str | None = None):
     """直近のやり取りを踏まえてパーソナライズの本文を書き直させる（回答のあとに1回呼ぶ）。

@@ -14063,6 +14063,132 @@ def _robot_does_safe(r: dict, holes: list[dict], cur_vals: dict, now: datetime, 
         return {"rows": [], "result": ""}
 
 
+#: 何をするロボットかの一言（説明）の長さの上限（本人が直すとき）
+ROBOT_SUMMARY_MAX = 300
+#: 一言を AI が書いている最中のロボットの id。画面は「AIが説明を書いています」と出す（アプリを止めると消える）
+_robot_summary_running: set = set()
+_robot_summary_mutex = threading.Lock()
+_robot_summary_slots = threading.Semaphore(config.ROBOT_SUMMARY_MAX_PARALLEL)
+#: 検証用。True なら裏のスレッドを立てずに、その場で書く
+ROBOT_SUMMARY_SYNC = False
+
+
+def _robot_summary_row(r: dict) -> dict:
+    """一覧に載せる一言の説明。state は running（AI が書いている）/ ok / error（書けなかった）/ none（まだ無い）。"""
+    sm = r.get("summary") if isinstance(r.get("summary"), dict) else {}
+    text = str(sm.get("text") or "")
+    state = ("running" if r.get("id") in _robot_summary_running
+             else "ok" if text else "error" if sm.get("error") else "none")
+    return {"text": text, "by": str(sm.get("by") or ""), "at": str(sm.get("at") or ""),
+            "error": str(sm.get("error") or ""), "state": state}
+
+
+def _robot_summary_material(robot: dict) -> str:
+    """AI に渡す材料（名前・元の質問・手順の行・会話のときの手順の説明・結果の行き先・変えられる値の名前）。
+
+    宛先のメールアドレス・値そのもの・実行する時刻は渡さない（一言に書かせない。あとで変わるため）。
+    """
+    holes = [h for h in (robot.get("holes") or []) if isinstance(h, dict)]
+    d = _robot_does_safe(robot, holes, _robot_current_values(robot), datetime.now(), _robot_prev_run(robot))
+    lines = [f"名前: {robot.get('name') or ''}"]
+    questions = [str(q) for q in (robot.get("questions") or []) if q]
+    if questions:
+        lines.append("元の質問: " + " ／ ".join(questions))
+    steps = [s for s in (robot.get("steps") or []) if isinstance(s, dict)]
+    if d["rows"]:
+        lines.append("手順（このロボットがすること）:")
+        for i, row in enumerate(d["rows"], 1):
+            text = re.sub(r"（宛先 [^）]*）", "", row["text"])
+            lines.append(f"{i}. {text}（できあがるもの: {'・'.join(row['outputs'])}）")
+    else:
+        lines.append("手順: " + " → ".join(TOOL_LABELS.get(s.get("name"), str(s.get("name"))) for s in steps))
+    notes = [str((s.get("arguments") or {}).get("explanation") or "").strip()
+             for s in steps if isinstance(s.get("arguments"), dict)]
+    notes = [n for n in notes if n]
+    if notes:
+        lines.append("会話のときの AI による手順の説明（参考。日付や数はそのとき時点のもの）:")
+        lines += [f"- {n[:300]}" for n in notes[:8]]
+    if d["result"]:
+        lines.append(f"結果: {d['result']}")
+    labels = list(dict.fromkeys(str(h.get("label")) for h in holes if h.get("label")))
+    if labels:
+        lines.append("あとで変えられる値（名前だけ）: " + "、".join(labels))
+    return "\n".join(lines)
+
+
+def _robot_set_summary(user, rid: str, summary: dict | None) -> bool:
+    """一言の説明だけを書き込む（「更新」は動かさない。開いている画面の版がずれて、保存が断られないように）。"""
+    with _robots_lock:
+        saved = robot_get(user, rid)
+        if saved is None:                          # 書いている間に削除された。書くと消したはずのものが戻る
+            return False
+        if summary:
+            saved["summary"] = summary
+        else:
+            saved.pop("summary", None)
+        robot_save(user, saved, check_dup=False, touch=False)
+        return True
+
+
+def robot_summary_start(user, rid: str) -> str:
+    """何をするロボットかの一言を、AI に書かせる（裏のスレッドで。保存も画面も待たせない）。
+
+    戻り値: started（書き始めた）/ running（もう書いている）/ busy（混んでいる）/ off（AI が未設定）。
+    書き上がったら summary {text, by: "ai", at} に入れる。書けなければ error を残す（前の文があれば残したまま）。
+    書いている間に本人が直していたら、上書きしない。
+    """
+    if not llm.is_configured():
+        return "off"
+    with _robot_summary_mutex:
+        if rid in _robot_summary_running:
+            return "running"
+        if not _robot_summary_slots.acquire(blocking=False):
+            return "busy"
+        _robot_summary_running.add(rid)
+    try:
+        model = models.current(user)               # スレッドの外で決める（パーソナライズの書き直しと同じ）
+    except Exception:
+        model = None                               # モデルの一覧が取れないときは既定のモデル
+    started = chats.now()
+
+    def _run():
+        rag.set_current_user(user)                 # トークンの記録に、誰の分かを残す
+        try:
+            robot = robot_get(user, rid)
+            if robot is None:
+                return
+            try:
+                text, error = llm.describe_robot(_robot_summary_material(robot), model=model), ""
+            except Exception as e:
+                text, error = "", str(e)[:200]
+                print(f"[robot] 説明を書けませんでした（{getattr(user, 'username', user)}・{rid}）: {e}")
+            with _robots_lock:
+                latest = robot_get(user, rid)
+                if latest is None:
+                    return
+                cur = latest.get("summary") if isinstance(latest.get("summary"), dict) else {}
+                if cur.get("by") == "user" and str(cur.get("at") or "") >= started:
+                    return                         # 書いている間に本人が直した。そちらを残す
+                if error:
+                    new = ({**cur, "error": error} if cur.get("text")
+                           else {"text": "", "by": "ai", "at": chats.now(), "error": error})
+                else:
+                    new = {"text": text, "by": "ai", "at": chats.now()}
+                _robot_set_summary(user, rid, new)
+        except Exception as e:
+            print(f"[robot] 説明を書き込めませんでした（{rid}）: {e}")
+        finally:
+            with _robot_summary_mutex:
+                _robot_summary_running.discard(rid)
+            _robot_summary_slots.release()
+
+    if ROBOT_SUMMARY_SYNC:
+        _run()
+    else:
+        threading.Thread(target=_run, daemon=True, name="aiagent-robot-summary").start()
+    return "started"
+
+
 def _robot_steps_detail(steps: list[dict], holes: list[dict] | None = None) -> list[dict]:
     """詳細表示用: 手順ごとの中身（SQLはそのまま、他の道具は引数）。{{d1}} は〔先月〕のように見せる。"""
     out = []
@@ -14144,6 +14270,8 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "tools": [TOOL_LABELS.get(s.get("name"), s.get("name")) for s in steps],
             # このロボットがすること（手順を日本語の行に。行ごとの変えられる値の鍵と、結果の行き先の一言）
             "does": _robot_does_safe(r, holes, cur_vals, now, prev),
+            # 何をするロボットかの一言（AI が手順から書く・本人が直せる）と、いま書いているか
+            "summary": _robot_summary_row(r),
             "questions": list(r.get("questions") or []),
             # あとで変えられる値（昔の「穴」も）。value がいまの値（カードで決めた値。無ければ登録時の値）
             "holes": [{"key": h.get("key"), "label": h.get("label"), "kind": h.get("kind"), "sample": h.get("sample"),
@@ -14373,7 +14501,9 @@ def robots_save():
     except ValueError as e:
         return jsonify({"error": str(e)}), (409 if str(e) == _ROBOTS_BROKEN else 400)
     print(f"[robot] 登録: 「{name}」{len(kept)}手順・変わる値{len(holes)}（{g.user.username}）")
-    return jsonify({"ok": True, "robot": _robot_row(saved),
+    robot_summary_start(g.user, saved["id"])     # 何をするロボットかの一言を、AI に裏で書かせる（保存は待たせない）
+    # 返す行は読み直したものから（書き上がっていれば一言、書いている最中なら「書いています」が載る）
+    return jsonify({"ok": True, "robot": _robot_row(robot_get(g.user, saved["id"]) or saved),
                     "robots": _robot_rows(g.user)})
 
 
@@ -14463,6 +14593,16 @@ def robots_update():
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         changed = True
+    if "summary" in body:
+        # 何をするロボットかの一言を本人が直す（空なら消す）。直したものは「自分で書いた説明」になる
+        text = re.sub(r"\s+", " ", str(body.get("summary") or "")).strip()
+        if len(text) > ROBOT_SUMMARY_MAX:
+            return jsonify({"error": f"説明は {ROBOT_SUMMARY_MAX} 文字以内にしてください。"}), 400
+        if text:
+            robot["summary"] = {"text": text, "by": "user", "at": chats.now()}
+        else:
+            robot.pop("summary", None)
+        changed = True
     holes = [h for h in (robot.get("holes") or []) if isinstance(h, dict)]
     touched: set = set()          # 値か一致のしかたを変えた文字の値（0件の確認の対象）
     if "values" in body:
@@ -14548,6 +14688,14 @@ def robots_update():
         robot["owner"] = _owner_snapshot(g.user)   # いまの権限の写しにする（定期実行で名乗るため）
     if not changed:
         return jsonify({"error": "変える内容がありません。"}), 400
+    if "summary" not in body:
+        # 画面を開いている間に AI が書き上げた一言を、ここで最初に読んだ古い写しで消さない
+        latest = robot_get(g.user, robot["id"])
+        if latest is not None:
+            if isinstance(latest.get("summary"), dict):
+                robot["summary"] = latest["summary"]
+            else:
+                robot.pop("summary", None)
     try:
         robot_save(g.user, robot, check_dup=("name" if "name" in body else False))
     except ValueError as e:
@@ -14590,6 +14738,22 @@ def robots_hits():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "hits": _robot_value_preview(h, value, match, _robot_like_shape(robot, h["key"]))})
+
+
+@bp_chat.post("/api/robots/describe")
+@login_required
+def robots_describe():
+    """何をするロボットかの一言を AI に書かせる（カードの「AIで説明を作る」「AIで書き直す」）。裏で書くので待たせない。"""
+    rid = str(_body().get("id") or "")
+    if robot_get(g.user, rid) is None:
+        return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    state = robot_summary_start(g.user, rid)
+    if state == "off":
+        return jsonify({"error": "AIが未設定のため、説明を作れません（管理者が「モデル設定」で接続先を設定すると使えます）。"
+                                 "「自分で書く」で書くことはできます。"}), 400
+    if state == "busy":
+        return jsonify({"error": "いま説明を書いているロボットが多いので、少し待ってからもう一度押してください。"}), 409
+    return jsonify({"ok": True, "state": state, "robots": _robot_rows(g.user)})
 
 
 @bp_chat.post("/api/robots/delete")

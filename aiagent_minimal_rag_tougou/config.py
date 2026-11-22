@@ -100,6 +100,9 @@ ROBOT_WORKERS = int(os.getenv("ROBOT_WORKERS", "4") or 4)                       
 # マイロボットの「実行日で変わる値」の年度・四半期の区切り。年度の始まりの月（4 = 4月始まりで、4〜6月が第1四半期）。
 # 年度は始まった年で呼ぶ（2026年4月〜2027年3月 = 2026年度）。
 ROBOT_FISCAL_START_MONTH = 4
+# マイロボットの「何をするロボットかの一言」を AI に書かせるとき、同時に頼む数の上限。登録やカードの
+# 「AIで説明を作る」が重なっても AI に一度に頼みすぎない（溢れた分は「混んでいます」と断り、あとで押し直してもらう）。
+ROBOT_SUMMARY_MAX_PARALLEL = 2
 ROBOT_SETTINGS_FILE = Path(os.getenv("ROBOT_SETTINGS_FILE",
                                      str(DATA_DIR / "robot_settings.yaml"))).expanduser()
 

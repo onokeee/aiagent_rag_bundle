@@ -3230,6 +3230,15 @@ details.acc.is-target {
                    padding: 1px 9px; font: inherit; font-size: 12px; cursor: pointer; margin: 4px 4px 0 0; }
 .robotdoes__chip:hover { text-decoration: underline; }
 .robotdoes__result { font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 6px; }
+/* 何をするロボットかの一言（AI が手順から書く・自分で直せる） */
+.robotdoes__sum { font-size: 14px; line-height: 1.6; margin: 2px 0; }
+.robotdoes__sum--wait { color: var(--muted); display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.robotdoes__summeta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center;
+                      gap: 2px 10px; margin-bottom: 6px; }
+.robotdoes__link { border: none; background: none; padding: 0; font: inherit; font-size: 12px; color: var(--accent); cursor: pointer; }
+.robotdoes__link:hover { text-decoration: underline; }
+.robotdoes__edit { display: grid; gap: 6px; margin: 4px 0 8px; }
+.robotdoes__edit textarea { width: 100%; font: inherit; font-size: 14px; }
 /* 宛先の候補（許可されたアドレス）。押すと入力欄に足す */
 .mailpick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .mailpick__item {
@@ -12778,6 +12787,7 @@ function render() {
         return;
     }
     robots.forEach(r => box.append(card(r)));
+    watchSummaries();       // AI が説明を書いている最中のものがあれば、書き上がるのを待って出す
 }
 
 /** カードの見出しの下の一言: いつ動くか（定期実行・次回・前回の結果）。設定を変えたら作り直す。 */
@@ -12829,6 +12839,7 @@ function doesBlock(r) {
     };
     return el('div', { class: 'robotdoes', 'data-does': r.id },
         el('div', { class: 'robotdoes__head' }, 'このロボットがすること'),
+        summaryBox(r),
         el('ol', { class: 'robotdoes__list' }, ...d.rows.map((row, i) => {
             const cs = chips(row.keys || []);
             return el('li', { class: 'robotdoes__row' },
@@ -12837,6 +12848,74 @@ function doesBlock(r) {
                 el('div', { class: 'robotdoes__outs' }, ...(row.outputs || []).map(o => el('span', { class: 'badge' }, o))));
         })),
         d.result ? el('div', { class: 'robotdoes__result' }, `結果: ${d.result}`) : null);
+}
+
+/** 何をするロボットかの一言（AI が手順から書く・自分で直せる）。書いている間は待ちの印、書けなければ理由を出す。 */
+function summaryBox(r) {
+    const sm = r.summary || {};
+    if (sm.state === 'running') {
+        return el('div', { class: 'robotdoes__sum robotdoes__sum--wait' }, el('span', { class: 'spinner' }),
+                  'AIが説明を書いています（数十秒〜数分かかることがあります）…');
+    }
+    const link = (label, onclick, title) => el('button', { type: 'button', class: 'robotdoes__link', title: title || '', onclick }, label);
+    const describe = async () => {
+        try {
+            const res = await api('/api/robots/describe', { id: r.id });
+            const fresh = (res.robots || []).find(x => x.id === r.id);
+            if (fresh) Object.assign(r, fresh);
+            refreshHead(r);
+            watchSummaries();
+        } catch (e) { toast(e.message, 'err', 9000); }
+    };
+    const box = el('div', {},
+        sm.text ? el('div', { class: 'robotdoes__sum' }, sm.text) : null,
+        el('div', { class: 'robotdoes__summeta' },
+            el('span', {}, sm.text ? (sm.by === 'user' ? '自分で書いた説明' : 'AIが手順から書いた説明') : '一言の説明はまだありません'),
+            link(sm.text ? '直す' : '自分で書く', () => edit()),
+            link(sm.text ? 'AIで書き直す' : 'AIで説明を作る', describe, 'AIが手順を読んで一言の説明を書きます（数十秒〜数分）')),
+        sm.error ? el('div', { class: 'small', style: 'color:var(--err)' },
+                      `説明を${sm.text ? '書き直せ' : '作れ'}ませんでした: ${sm.error}`) : null);
+    const edit = () => {
+        const ta = el('textarea', { rows: '3', maxlength: '300', 'aria-label': 'このロボットの説明' });
+        ta.value = sm.text || '';
+        const save = async () => {
+            const text = ta.value.trim();
+            try {
+                const res = await api('/api/robots/update', { id: r.id, summary: text, stamp: r.updated_at });
+                const fresh = res.robots.find(x => x.id === r.id);
+                if (fresh) Object.assign(r, fresh);
+                refreshHead(r);
+                toast(text ? '説明を保存しました。' : '説明を消しました。');
+            } catch (e) { toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
+        };
+        box.replaceWith(el('div', { class: 'robotdoes__edit' }, ta,
+            el('div', { class: 'row', style: 'gap:6px;align-items:center' },
+                el('button', { type: 'button', class: 'btn btn--sm btn--primary', onclick: save }, '保存'),
+                el('button', { type: 'button', class: 'btn btn--sm', onclick: () => refreshHead(r) }, 'やめる'),
+                el('span', { class: 'small muted' }, '空にして保存すると消えます（AIで作り直せます）'))));
+        ta.focus();
+    };
+    return box;
+}
+
+/** AI が説明を書いている最中のロボットがあれば、5秒ごとに一覧を読み直し、書き上がったらその説明だけを出し直す（最長5分）。 */
+let summaryTimer = null;
+function watchSummaries(tries = 0) {
+    clearTimeout(summaryTimer);
+    if (!robots.some(x => (x.summary || {}).state === 'running') || tries >= 60) return;
+    summaryTimer = setTimeout(async () => {
+        try {
+            const res = await api('/api/robots', undefined, 'GET');
+            (res.robots || []).forEach(fresh => {
+                const r = robots.find(x => x.id === fresh.id);
+                if (r && JSON.stringify(r.summary || {}) !== JSON.stringify(fresh.summary || {})) {
+                    r.summary = fresh.summary;
+                    refreshHead(r);
+                }
+            });
+        } catch (_) { /* 次の回に読み直す */ }
+        watchSummaries(tries + 1);
+    }, 5000);
 }
 
 /** 見出しの一言（いつ動くか）と「このロボットがすること」を、いまの設定で出し直す（カードで保存したあと）。 */
