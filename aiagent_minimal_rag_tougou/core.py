@@ -14119,7 +14119,10 @@ def _robot_token_meaning(h: dict) -> str:
     if op == "LIMIT":
         return "上位この件数まで"
     if op == "MOD":
-        return "日付をこの数だけずらす（さかのぼる）"
+        tok = "{{" + str(h.get("key")) + "}}"
+        if str(h.get("label") or "").startswith("さかのぼる"):
+            return f"日付を実行した日からこの数だけさかのぼる。「{tok}前から今日まで」のように書く。{tok}には単位まで入る"
+        return f"日付をこの数だけずらす。{tok}には単位まで入る"
     if op == "ARG":
         return "道具に渡す値"
     word = _ROBOT_OP_WORDS.get(op, "")
@@ -14162,10 +14165,15 @@ def _robot_summary_parts(text: str, holes: list[dict], cur_vals: dict) -> list[d
         if m.start() > pos:
             parts.append({"t": text[pos:m.start()]})
         h = by.get(m.group(1))
+        end = m.end()
         if h is not None:
             parts.append({"k": h["key"], "v": _robot_date_phrase(h) if h.get("kind") == "date"
                           else _robot_value_phrase(h, cur_vals)})
-        pos = m.end()
+            # 値には単位まで入るので、後ろに同じ単位が書いてあれば1つにまとめる（44日日 → 44日）
+            unit = _ROBOT_MOD_UNITS.get(str(h.get("unit") or ""), ("", ""))[1] if h.get("kind") == "number" else ""
+            if unit and text.startswith(unit, end):
+                end += len(unit)
+        pos = end
     if pos < len(text):
         parts.append({"t": text[pos:]})
     return parts
