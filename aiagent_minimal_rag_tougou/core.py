@@ -14195,6 +14195,18 @@ def _robot_summary_from_edit(text: str, holes: list[dict]) -> str:
     return _robot_summary_clean(text, holes)
 
 
+def _robot_summary_complete(text: str, holes: list[dict]) -> str:
+    """AI が入れなかった値の印（区分・日数・件数など。日付は除く）を、文の終わりに「（区分: {{h2}}）」の形で足す。
+
+    どの値でデータを絞っているかが説明から抜けないように（2026-11-22、AI が区分を入れずに書いた）。
+    """
+    missing = [h for h in holes if h.get("kind") != "date" and h.get("key") and "{{" + h["key"] + "}}" not in text]
+    if not missing:
+        return text
+    add = "（" + "、".join(f"{h.get('label') or h['key']}: " + "{{" + h["key"] + "}}" for h in missing) + "）"
+    return text[:-1] + add + "。" if text.endswith("。") else text + add
+
+
 def _robot_summary_row(r: dict, holes: list[dict] | None = None, cur_vals: dict | None = None) -> dict:
     """一覧に載せる一言の説明。
 
@@ -14204,6 +14216,8 @@ def _robot_summary_row(r: dict, holes: list[dict] | None = None, cur_vals: dict 
     sm = r.get("summary") if isinstance(r.get("summary"), dict) else {}
     raw = str(sm.get("text") or "")
     holes = holes if holes is not None else [h for h in (r.get("holes") or []) if isinstance(h, dict)]
+    if raw and sm.get("by") == "ai":
+        raw = _robot_summary_complete(raw, holes)    # AI が入れなかった値（区分など）は文の終わりに足して見せる
     parts = (_robot_summary_parts(raw, holes, cur_vals if cur_vals is not None else _robot_current_values(r))
              if raw else [])
     by = {h.get("key"): h for h in holes if h.get("key")}
