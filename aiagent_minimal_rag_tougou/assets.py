@@ -3216,6 +3216,20 @@ details.acc.is-target {
 .robotturn { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
              margin-bottom: 8px; }
 .robotcard + .robotcard { margin-top: 10px; }
+/* マイロボット: カードの「このロボットがすること」。手順を日本語の行で、行で使う変えられる値は押せる印で */
+.robotdoes { margin-top: 10px; }
+.robotdoes__head { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.robotdoes__list { list-style: none; margin: 0; padding: 0; }
+.robotdoes__row { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: start;
+                  padding: 6px 0; border-top: 1px solid var(--border); }
+.robotdoes__num { width: 20px; height: 20px; border-radius: 50%; background: var(--surface-2); color: var(--muted);
+                  font-size: 12px; display: flex; align-items: center; justify-content: center; margin-top: 1px; }
+.robotdoes__text { font-size: 13.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.robotdoes__outs { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
+.robotdoes__chip { border: none; background: var(--accent-weak); color: var(--accent); border-radius: 999px;
+                   padding: 1px 9px; font: inherit; font-size: 12px; cursor: pointer; margin: 4px 4px 0 0; }
+.robotdoes__chip:hover { text-decoration: underline; }
+.robotdoes__result { font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 6px; }
 /* 宛先の候補（許可されたアドレス）。押すと入力欄に足す */
 .mailpick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .mailpick__item {
@@ -12766,17 +12780,72 @@ function render() {
     robots.forEach(r => box.append(card(r)));
 }
 
-/** カードの見出しの一言（設定を変えたら作り直す）。 */
+/** カードの見出しの下の一言: いつ動くか（定期実行・次回・前回の結果）。設定を変えたら作り直す。 */
 function cardMeta(r) {
+    const sch = r.schedule || {};
     const wait = !!(r.next_run && new Date(r.next_run) > new Date());
-    return `${r.n_steps}手順`
-        + ((r.dates || []).length ? `・${[...new Set(r.dates.map(d => d.label))].join('、')}` : '')
-        + ((r.holes || []).length ? `・${r.holes.map(h => `${h.label}＝${h.value ?? h.sample}`).join('、')}` : '')
-        + (r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')}` : '・まだ実行していません')
-        + (wait ? `・次に試せるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '')
-        + (((r.schedule || {}).kind || 'manual') !== 'manual' ? `・${window.ROBOT.scheduleLabel(r).replace('定期実行: ', '定期 ')}` : '')
-        + (r.mail_auto ? '・メール自動送信' : '')
-        + (r.from_title ? `・元の会話「${r.from_title}」` : '');
+    const label = sch.interval_label || '';
+    const when = (sch.kind || 'manual') === 'manual' ? '手動で実行（「いま試す」）'
+        : sch.enabled === false ? `${label}の予定（止めています）`
+        : `${label}${/ごと$/.test(label) ? '' : ' '}に自動で実行` + (sch.next_at ? `・次回 ${sch.next_at.slice(5, 16).replace('T', ' ')}` : '');
+    const status = { error: '失敗', running: '実行中' }[r.last_status] || '成功';
+    const last = r.last_run ? `・前回 ${r.last_run.slice(5, 16).replace('T', ' ')} ${status}` : '・まだ実行していません';
+    return when + last + (wait ? `・次に試せるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '');
+}
+
+/** 「このロボットがすること」。手順を日本語の行で並べ、行で使う変えられる値を押せる印で出す。
+ *  文は会話のときに AI が手順ごとに書いた目的（AI を新しく呼ばない）。文の中の数字は会話のときのままなので、
+ *  いまの値は印のほうで見せる。印を押すと「変えられる値」を開いて、その値の欄へ移る。 */
+function doesBlock(r) {
+    const d = r.does || {};
+    if (!(d.rows || []).length) return null;
+    const dates = new Map((r.dates || []).map(x => [x.key, x]));
+    const holes = new Map((r.holes || []).map(x => [x.key, x]));
+    const units = { day: '日', month: 'か月', year: '年', hour: '時間', minute: '分' };
+    const jump = (key) => {
+        const acc = document.querySelector(`details[data-values="${r.id}"]`);
+        if (!acc) return;
+        acc.open = true;
+        const target = acc.querySelector(`[data-key="${key}"]`)
+            || [...acc.querySelectorAll('[data-keys]')].find(x => x.dataset.keys.split(' ').includes(key));
+        if (target) { target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
+    };
+    const chips = (keys) => {
+        const seen = new Set();          // 同じ日付（書き方が違う 2026-11 と 2026年11月）は1つ
+        return keys.map(k => {
+            const dt = dates.get(k), h = holes.get(k);
+            let text = '';
+            if (dt) {
+                const g = dt.group || dt.key;
+                if (seen.has(g)) return null;
+                seen.add(g);
+                text = `${dt.label} ${dt.now}`;
+            } else if (h) {
+                text = `${h.label} ${h.value ?? h.sample}${units[h.unit] || ''}` + (h.match_label ? `（${h.match_label}）` : '');
+            } else return null;
+            return el('button', { type: 'button', class: 'robotdoes__chip', title: '「変えられる値」で変えられます',
+                                  onclick: () => jump(k) }, text);
+        }).filter(Boolean);
+    };
+    return el('div', { class: 'robotdoes', 'data-does': r.id },
+        el('div', { class: 'robotdoes__head' }, 'このロボットがすること'),
+        el('ol', { class: 'robotdoes__list' }, ...d.rows.map((row, i) => {
+            const cs = chips(row.keys || []);
+            return el('li', { class: 'robotdoes__row' },
+                el('span', { class: 'robotdoes__num' }, String(i + 1)),
+                el('div', { class: 'robotdoes__text' }, row.text, cs.length ? el('div', {}, ...cs) : null),
+                el('div', { class: 'robotdoes__outs' }, ...(row.outputs || []).map(o => el('span', { class: 'badge' }, o))));
+        })),
+        d.result ? el('div', { class: 'robotdoes__result' }, `結果: ${d.result}`) : null);
+}
+
+/** 見出しの一言（いつ動くか）と「このロボットがすること」を、いまの設定で出し直す（カードで保存したあと）。 */
+function refreshHead(r) {
+    const meta = document.querySelector(`[data-meta="${r.id}"]`);
+    if (meta) meta.textContent = cardMeta(r);
+    const old = document.querySelector(`[data-does="${r.id}"]`);
+    const fresh = doesBlock(r);
+    if (old && fresh) old.replaceWith(fresh);
 }
 
 let waitTimer = null;
@@ -12805,9 +12874,8 @@ function card(r) {
                'いま試す'),
             el('button', { class: 'btn btn--sm', title: '名前を変える', onclick: () => rename(r) }, '名前'),
             el('button', { class: 'btn btn--sm btn--danger', title: '削除', onclick: () => remove(r) }, '削除')),
-        el('div', { class: 'small mt' }, el('span', { class: 'muted' }, '手順: '), r.tools.join(' → ')),
-        r.questions.length
-            ? el('div', { class: 'small muted' }, '元の質問: ' + r.questions.join(' ／ ')) : null,
+        // 何をするロボットか（手順を日本語の行で）。手順の道具名と元の質問は「詳細」に
+        doesBlock(r) || el('div', { class: 'small mt' }, el('span', { class: 'muted' }, '手順: '), r.tools.join(' → ')),
         valuesRow(r),
         r.has_file_steps ? folderRow(r) : null,
         scheduleRow(r),
@@ -12829,8 +12897,7 @@ function scheduleRow(r) {
             if (fresh) {
                 Object.assign(r, fresh);
                 summary.textContent = window.ROBOT.scheduleLabel(r);
-                const meta = document.querySelector(`[data-meta="${r.id}"]`);
-                if (meta) meta.textContent = cardMeta(r);       // 見出しも新しい設定に合わせる
+                refreshHead(r);       // 見出し（いつ動くか）も新しい設定に合わせる
             }
             toast('定期実行の設定を保存しました。' + (r.schedule && r.schedule.next_at
                 ? ` 次回は ${r.schedule.next_at.slice(5, 16).replace('T', ' ')} です。` : ''));
@@ -12918,8 +12985,7 @@ function valuesRow(r) {
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) Object.assign(r, fresh);
             build();
-            const meta = document.querySelector(`[data-meta="${r.id}"]`);
-            if (meta) meta.textContent = cardMeta(r);
+            refreshHead(r);       // 「このロボットがすること」の印（いまの値）も合わせる
             toast(okText);
         } catch (e) { revert(); toast(e.message, 'err', 9000); reloadRobotsIfStale(e); }
     };
@@ -12935,7 +13001,8 @@ function valuesRow(r) {
             const dl = (choices.length || live)
                 ? el('datalist', { id: listId }, ...choices.map(c => el('option', { value: c }))) : null;
             const inp = el('input', { type: 'text', value: String(h.value ?? h.sample ?? ''), style: 'max-width:260px',
-                                      'aria-label': h.label, ...(h.kind === 'number' ? { inputmode: 'decimal' } : {}),
+                                      'aria-label': h.label, 'data-key': h.key,
+                                      ...(h.kind === 'number' ? { inputmode: 'decimal' } : {}),
                                       ...(dl ? { list: listId } : {}) });
             if (live) {
                 let timer = null, last = null;
@@ -13013,7 +13080,8 @@ function valuesRow(r) {
         dateGroups().forEach(ds => {
             const d = ds[0];
             const same = ds.every(x => x.mode === d.mode && (x.n || '') === (d.n || ''));
-            const sel = el('select', { style: 'max-width:240px', 'aria-label': `${d.title} の扱い` });
+            const sel = el('select', { style: 'max-width:240px', 'aria-label': `${d.title} の扱い`,
+                                       'data-keys': ds.map(x => x.key).join(' ') });
             let group = null;
             (d.modes || []).forEach(m => {
                 const opt = el('option', { value: m.mode, ...(m.mode === d.mode ? { selected: 'selected' } : {}) }, m.label);
@@ -13046,7 +13114,7 @@ function valuesRow(r) {
         });
         if (acc.open) lookers.forEach(f => f());     // 保存して作り直したら、いま当たる値も出し直す
     }
-    const acc = el('details', { class: 'acc', style: 'margin-top:8px' },
+    const acc = el('details', { class: 'acc', style: 'margin-top:8px', 'data-values': r.id },
         el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
         el('div', { class: 'acc__body' },
             el('div', { class: 'small muted', style: 'margin-bottom:6px' },
@@ -13068,8 +13136,7 @@ function mailRow(r) {
             const fresh = res.robots.find(x => x.id === r.id);
             if (fresh) {
                 Object.assign(r, fresh);
-                const meta = document.querySelector(`[data-meta="${r.id}"]`);
-                if (meta) meta.textContent = cardMeta(r);
+                refreshHead(r);       // 「結果」の行（自動で送る／下書きまで）も合わせる
             }
             toast(cb.checked ? '実行のたびにメールを送ります（宛先の許可はメール設定のとおり）。' : 'メールは下書きのまま出します（送りません）。');
         } catch (e) { cb.checked = !cb.checked; toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
@@ -13149,11 +13216,12 @@ function detailRow(r) {
                     el('div', {}, el('b', {}, '件名: '), ms.subject || '（無題）'),
                     el('pre', { class: 'mono', style: 'white-space:pre-wrap' }, ms.body || ''))))
             : 'メールの手順はありません'),
+        el('dt', {}, '元の質問'), el('dd', {}, (r.questions || []).join(' ／ ') || '—'),
         el('dt', {}, '元の会話'), el('dd', {}, r.from_title || '—'),
         el('dt', {}, '作成・更新'), el('dd', {}, `${(r.created_at || '').replace('T', ' ')} ／ ${(r.updated_at || '').replace('T', ' ')}`),
         el('dt', {}, '前回の実行'), el('dd', {}, r.last_run ? `${r.last_run.replace('T', ' ')}（${r.last_status === 'ok' ? '成功' : '失敗'}）${r.last_message || ''}` : 'まだ実行していません'));
     return el('details', { class: 'acc', style: 'margin-top:8px' },
-        el('summary', { class: 'small', style: 'cursor:pointer' }, el('span', { class: 'muted' }, '詳細（手順の中身・変わる値・表・決めごと）')),
+        el('summary', { class: 'small', style: 'cursor:pointer' }, el('span', { class: 'muted' }, '詳細（手順の中身・元の質問・変わる値・表・決めごと）')),
         el('div', { class: 'acc__body' }, dl));
 }
 
@@ -13165,7 +13233,7 @@ function folderRow(r) {
             const res = await api('/api/robots/update',
                 { id: r.id, ...opts.value(), stamp: r.updated_at });
             const fresh = res.robots.find(x => x.id === r.id);
-            if (fresh) { Object.assign(r, fresh); summary.textContent = window.ROBOT.folderLabel(r); }
+            if (fresh) { Object.assign(r, fresh); summary.textContent = window.ROBOT.folderLabel(r); refreshHead(r); }
             toast('フォルダ出力の決めごとを保存しました。');
         } catch (e) { toast(e.message, 'err', 8000); reloadRobotsIfStale(e); }
     });

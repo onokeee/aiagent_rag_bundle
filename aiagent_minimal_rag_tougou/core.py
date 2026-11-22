@@ -13899,6 +13899,170 @@ def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
     return [r for r in out if r]
 
 
+#: 「このロボットがすること」で行にしない下ごしらえの手順（宛先を探す・自分が誰か）。値の鍵だけ次の行に付ける
+_ROBOT_DOES_HIDDEN = {"find_mail_recipients", "who_am_i"}
+#: できあがるものの呼び名（グラフはグラフの種類から作る）
+_ROBOT_DOES_OUT = {"run_sql_query": "表", "pivot_table": "クロス集計表", "export_excel": "Excel", "export_csv": "CSV",
+                   "export_text": "テキスト", "export_pptx": "PowerPoint", "export_docx": "Word",
+                   "build_report": "レポート", "compose_email": "メール", "show_er_diagram": "ER図",
+                   "plot_dual_axis": "2軸グラフ", "plot_kpi": "指標"}
+#: グラフの種類を書いていないグラフの手順の呼び名
+_ROBOT_PLOT_DEFAULT = {"plot_trend": "折れ線グラフ", "plot_comparison": "棒グラフ", "plot_composition": "円グラフ",
+                       "plot_distribution": "ヒストグラム", "plot_relationship": "散布図"}
+#: 「◯◯グラフ」より自然な呼び名があるグラフの種類
+_ROBOT_CHART_NAMES = {"scatter": "散布図", "scatter3d": "3D散布図", "box": "箱ひげ図", "violin": "バイオリン図",
+                      "strip": "ストリップ図", "network": "ネットワーク図", "sankey": "サンキー図"}
+
+
+def _robot_chart_label(chart_type: str) -> str:
+    """グラフの種類の呼び名（line → 折れ線グラフ、hbar → 横棒グラフ）。知らない種類は「グラフ」。"""
+    if chart_type in _ROBOT_CHART_NAMES:
+        return _ROBOT_CHART_NAMES[chart_type]
+    spec = charts.CHART_SPECS.get(chart_type)
+    if not spec:
+        return "グラフ"
+    name = spec[0].split("。")[0]
+    done = re.search(r"(図|行列|グラム|マップ|チャート|プロット|足|曲線|ゲージ|大写し|ピラミッド|グラフ)$", name)
+    return name if done else name + "グラフ"
+
+
+def _robot_out_label(s: dict) -> str:
+    """手順でできあがるものの呼び名（表・折れ線グラフ・Excel・メール…）。"""
+    name = str(s.get("name") or "")
+    if name in _ROBOT_DOES_OUT:
+        return _ROBOT_DOES_OUT[name]
+    if name.startswith("plot_"):
+        ct = str((s.get("arguments") or {}).get("chart_type") or "")
+        return _robot_chart_label(ct) if ct else _ROBOT_PLOT_DEFAULT.get(name, "グラフ")
+    return re.sub(r"\s*[（(][^）)]*[）)]", "", TOOL_LABELS.get(name, name)).strip() or name
+
+
+def _robot_arg_strings(v) -> list[str]:
+    """引数の中の文字を全部（前の手順の結果を指す result_id を探すため）。"""
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, dict):
+        v = list(v.values())
+    if isinstance(v, list):
+        return [x for item in v for x in _robot_arg_strings(item)]
+    return []
+
+
+def _robot_does_text(s: dict, fill, fill_dates) -> str:
+    """行の文。会話のときに AI が手順ごとに書いた目的（purpose）。無ければ件名・題名・ファイル名・道具名から。"""
+    name = str(s.get("name") or "")
+    args = s.get("arguments") or {}
+    purpose = str(args.get("purpose") or "").strip()
+    if purpose:
+        return fill_dates(purpose)[:200]
+    if name == "compose_email":
+        subject = fill(str(args.get("subject") or "")).strip() or "（件名なし）"
+        to = args.get("to")
+        to = [to] if isinstance(to, str) else [str(a) for a in (to or []) if a]
+        dest = f"（宛先 {to[0]}{' ほか' if len(to) > 1 else ''}）" if to else ""
+        return f"メール「{subject}」を作る{dest}"
+    title = fill(str(args.get("title") or args.get("filename") or "")).strip()
+    if title:
+        return f"{_robot_out_label(s)}「{title[:80]}」を作る"
+    return TOOL_LABELS.get(name, name)
+
+
+def _robot_does(r: dict, holes: list[dict], cur_vals: dict, now: datetime, prev: datetime | None) -> dict:
+    """カードの「このロボットがすること」。AI は呼ばない（文は会話のときに AI が手順ごとに書いた目的）。
+
+    手順を前から見て、前の手順の結果を指す手順が1つの行の結果だけを指していれば、その行の「できあがるもの」に足す
+    （SQL → グラフ・Excel・メール）。2つ以上の行を指す手順（3つの表をまとめる Excel）と、何も指さない手順は新しい行。
+    {rows: [{text, outputs: [呼び名], keys: [hN・dN（値を先・日付をあと）]}], result: 結果の行き先の一言}
+    """
+    by_key = {h.get("key"): h for h in holes if h.get("key")}
+
+    def fill(text: str) -> str:              # 件名・題名の {{dN}} は今日ならの値、{{hN}} はいまの値
+        def one(m):
+            h = by_key.get(m.group(1))
+            if h is None:
+                return m.group(0)
+            if h.get("kind") == "date":
+                return _robot_date_text_safe(h, now, prev)
+            return str(cur_vals.get(h["key"]) or h.get("sample") or "")
+        return _ROBOT_HOLE.sub(one, text)
+
+    # 目的の文にある会話した日の日付（実行日で変わる値の登録時の値）を、いまの値に置き換える。数字だけの年は除く
+    swap: dict = {}
+    for h in holes:
+        sample = str(h.get("sample") or "")
+        if h.get("kind") == "date" and sample and not sample.isdigit() and sample not in swap:
+            text = _robot_date_text_safe(h, now, prev)
+            if text != "?":
+                swap[sample] = text
+    swap_re = re.compile("|".join(re.escape(x) for x in sorted(swap, key=len, reverse=True))) if swap else None
+
+    def fill_dates(text: str) -> str:
+        return swap_re.sub(lambda m: swap[m.group(0)], text) if swap_re else text
+
+    rows: list[dict] = []
+    row_of: dict = {}                       # result_id → 行の番号
+    pending: list[str] = []                 # 行にしない手順の値の鍵（次の行に付ける）
+    counts = {"表": 0, "グラフ": 0}
+    files: list[str] = []
+    er = mail = False
+    for s in r.get("steps") or []:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "")
+        args = s.get("arguments") or {}
+        keys = [k for k in dict.fromkeys(_ROBOT_HOLE.findall(json.dumps(args, ensure_ascii=False))) if k in by_key]
+        if name in ("run_sql_query", "pivot_table"):
+            counts["表"] += 1
+        elif name.startswith("plot_"):
+            counts["グラフ"] += 1
+        er = er or name == "show_er_diagram"
+        mail = mail or name == "compose_email"
+        if name in tools.FOLDER_TOOLS:
+            files.append(_robot_out_label(s))
+        if name in _ROBOT_DOES_HIDDEN:
+            pending += keys
+            continue
+        refs = {row_of[x] for x in _robot_arg_strings(args) if x in row_of}
+        if len(refs) == 1:
+            idx = refs.pop()
+            rows[idx]["outputs"].append(_robot_out_label(s))
+        else:
+            idx = len(rows)
+            rows.append({"text": _robot_does_text(s, fill, fill_dates), "outputs": [], "keys": [],
+                         "base": _robot_out_label(s)})
+        row = rows[idx]
+        row["keys"] += [k for k in pending + keys if k not in row["keys"]]
+        pending = []
+        for rid in _as_ids(s.get("produced")):
+            row_of[rid] = idx
+    if pending and rows:
+        rows[-1]["keys"] += [k for k in pending if k not in rows[-1]["keys"]]
+    for row in rows:
+        base = row.pop("base")
+        row["outputs"] = row["outputs"] or [base]     # 結果からグラフなどを作った行は、その行の「表」を出さない
+        row["keys"].sort(key=lambda k: k[0] != "h")   # 値を先、日付をあと（それぞれは出てきた順）
+    made = [f"{k}{n}{'つ' if n < 10 else '個'}" for k, n in counts.items() if n] + (["ER図"] if er else [])
+    parts = ["実行するたびに、新しい会話に結果が残ります" + (f"（{'・'.join(made)}）" if made else "")]
+    if files:
+        kinds = "・".join(dict.fromkeys(files))
+        parts.append(f"{kinds}のファイルをフォルダに置きます" if r.get("folder_out")
+                     else f"{kinds}のファイルは会話から取り出せます（フォルダには置きません）")
+    if mail:
+        parts.append("メールを自動で送ります" if r.get("mail_auto") else "メールは下書きまで作ります（送るのは自分で）")
+    if not files and not mail:
+        parts.append("メールとファイルは出しません")
+    return {"rows": rows, "result": "。".join(parts)}
+
+
+def _robot_does_safe(r: dict, holes: list[dict], cur_vals: dict, now: datetime, prev: datetime | None) -> dict:
+    """一覧を止めない（robots.json を手で壊されていても、カードは手順の道具名の行で出る）。"""
+    try:
+        return _robot_does(r, holes, cur_vals, now, prev)
+    except Exception as e:
+        print(f"[robot] 「このロボットがすること」を作れませんでした（続行）: {r.get('id')}: {e}")
+        return {"rows": [], "result": ""}
+
+
 def _robot_steps_detail(steps: list[dict], holes: list[dict] | None = None) -> list[dict]:
     """詳細表示用: 手順ごとの中身（SQLはそのまま、他の道具は引数）。{{d1}} は〔先月〕のように見せる。"""
     out = []
@@ -13978,6 +14142,8 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             "folder_stamp": r.get("folder_stamp") is not False,
             "folder_overwrite": bool(r.get("folder_overwrite")),
             "tools": [TOOL_LABELS.get(s.get("name"), s.get("name")) for s in steps],
+            # このロボットがすること（手順を日本語の行に。行ごとの変えられる値の鍵と、結果の行き先の一言）
+            "does": _robot_does_safe(r, holes, cur_vals, now, prev),
             "questions": list(r.get("questions") or []),
             # あとで変えられる値（昔の「穴」も）。value がいまの値（カードで決めた値。無ければ登録時の値）
             "holes": [{"key": h.get("key"), "label": h.get("label"), "kind": h.get("kind"), "sample": h.get("sample"),
