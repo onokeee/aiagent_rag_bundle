@@ -13899,6 +13899,9 @@ def run_scheduled_robots(now: datetime | None = None) -> list[dict]:
     return [r for r in out if r]
 
 
+#: 目的の文で日付の前に付く、実行日から見た言い方（「今月（2026年11月）」の「今月」）。扱いを変えたら一緒に言い換える
+_ROBOT_REL_WORDS = ("今月", "先月", "前月", "来月", "今日", "本日", "前日", "昨日", "今週", "先週", "今年度", "前年度",
+                    "今年", "昨年", "前年", "今四半期", "前四半期")
 #: 「このロボットがすること」で行にしない下ごしらえの手順（宛先を探す・自分が誰か）。値の鍵だけ次の行に付ける
 _ROBOT_DOES_HIDDEN = {"find_mail_recipients", "who_am_i"}
 #: できあがるものの呼び名（グラフはグラフの種類から作る）
@@ -13986,18 +13989,29 @@ def _robot_does(r: dict, holes: list[dict], cur_vals: dict, now: datetime, prev:
             return str(cur_vals.get(h["key"]) or h.get("sample") or "")
         return _ROBOT_HOLE.sub(one, text)
 
-    # 目的の文にある会話した日の日付（実行日で変わる値の登録時の値）を、いまの値に置き換える。数字だけの年は除く
+    # 目的の文にある会話した日の日付（実行日で変わる値の登録時の値）を、いまの値に置き換える。数字だけの年は除く。
+    # 「今月（2026年11月）」のように日付の前に実行日から見た言い方があれば、扱いに合わせて言い換える
+    # （期間を先月に変えたのに「今月（2026年10月）」と食い違わないように）
     swap: dict = {}
     for h in holes:
         sample = str(h.get("sample") or "")
         if h.get("kind") == "date" and sample and not sample.isdigit() and sample not in swap:
             text = _robot_date_text_safe(h, now, prev)
             if text != "?":
-                swap[sample] = text
-    swap_re = re.compile("|".join(re.escape(x) for x in sorted(swap, key=len, reverse=True))) if swap else None
+                swap[sample] = (text, "" if str(h.get("mode") or "") in ("", "fixed") else _robot_date_phrase(h))
+    swap_re = None
+    if swap:
+        alts = "|".join(re.escape(x) for x in sorted(swap, key=len, reverse=True))
+        words = "|".join(sorted(_ROBOT_REL_WORDS, key=len, reverse=True))
+        swap_re = re.compile(f"(?:({words})（)?({alts})(）)?")
 
     def fill_dates(text: str) -> str:
-        return swap_re.sub(lambda m: swap[m.group(0)], text) if swap_re else text
+        def one(m):
+            new, phrase = swap[m.group(2)]
+            if m.group(1) and m.group(3) and phrase:
+                return f"{phrase}（{new}）"
+            return (m.group(1) + "（" if m.group(1) else "") + new + (m.group(3) or "")
+        return swap_re.sub(one, text) if swap_re else text
 
     rows: list[dict] = []
     row_of: dict = {}                       # result_id → 行の番号
@@ -14073,23 +14087,143 @@ _robot_summary_slots = threading.Semaphore(config.ROBOT_SUMMARY_MAX_PARALLEL)
 ROBOT_SUMMARY_SYNC = False
 
 
-def _robot_summary_row(r: dict) -> dict:
-    """一覧に載せる一言の説明。state は running（AI が書いている）/ ok / error（書けなかった）/ none（まだ無い）。"""
+#: 値の条件の言い方（AI に渡す「値の印」の意味。「区分がこの値と同じデータを使う」）
+_ROBOT_OP_WORDS = {"=": "と同じ", "==": "と同じ", "<>": "以外の", "!=": "以外の", ">": "より大きい", ">=": "以上の",
+                   "<": "より小さい", "<=": "以下の", "IN": "のどれかに当たる", "NOT IN": "以外の", "LIKE": "を含む",
+                   "NOT LIKE": "を含まない", "GLOB": "に合う", "NOT GLOB": "に合わない", "BETWEEN": "を端とする範囲の"}
+
+
+def _robot_date_phrase(h: dict) -> str:
+    """説明の文に入れる日付の言い方（今月・先月・44日前・前回の実行日）。固定のままなら登録したときの値。"""
+    mode = str(h.get("mode") or "")
+    if mode in ("", "fixed"):
+        return str(h.get("sample") or "")
+    try:
+        return _robot_mode_label(mode, str(h.get("cls") or "day"), _robot_mode_n(h))
+    except (KeyError, TypeError, ValueError):
+        return str(h.get("label") or h.get("sample") or "")
+
+
+def _robot_value_phrase(h: dict, cur_vals: dict) -> str:
+    """説明の文に入れる値の言い方（44日・欠勤・勤（含む）・10）。いまの値で。"""
+    v = str(cur_vals.get(h.get("key")) or h.get("value") or h.get("sample") or "")
+    if h.get("kind") == "number":
+        return v + _ROBOT_MOD_UNITS.get(str(h.get("unit") or ""), ("", ""))[1]
+    m = h.get("match")
+    return v + (f"（{ROBOT_MATCHES[m]}）" if m in _ROBOT_LIKE_MATCHES else "")
+
+
+def _robot_token_meaning(h: dict) -> str:
+    """値の印の意味（AI に渡す。「区分がこの値と同じデータを使う」「日付をこの数だけずらす」）。"""
+    op = str(h.get("op") or "")
+    if op == "LIMIT":
+        return "上位この件数まで"
+    if op == "MOD":
+        return "日付をこの数だけずらす（さかのぼる）"
+    if op == "ARG":
+        return "道具に渡す値"
+    word = _ROBOT_OP_WORDS.get(op, "")
+    m = h.get("match")
+    if m in ("contains", "prefix", "suffix") and op in _ROBOT_EQ_OPS:
+        neg = op in ("<>", "!=")
+        word = {"contains": ("を含む", "を含まない"), "prefix": ("で始まる", "で始まらない"),
+                "suffix": ("で終わる", "で終わらない")}[m][1 if neg else 0]
+    name = str(h.get("label") or h.get("column") or "値")
+    return f"{name}がこの値{word}データを使う" if word else "条件の値"
+
+
+def _robot_token_lines(holes: list[dict], cur_vals: dict, now: datetime, prev: datetime | None) -> list[str]:
+    """AI に渡す「値の印」の一覧（印・名前・いまの値・意味）。同じ日付（書き方が違うもの）は1つだけ。"""
+    lines, groups = [], set()
+    for h in holes:
+        key = h.get("key")
+        if not key:
+            continue
+        tok = "{{" + key + "}}"
+        if h.get("kind") == "date":
+            g = _robot_group_key(str(h.get("sample") or ""), str(h.get("cls") or "day"))
+            if g in groups:
+                continue
+            groups.add(g)
+            fixed = str(h.get("mode") or "") in ("", "fixed")
+            lines.append(f"- {tok} … 日付。いまは「{_robot_date_phrase(h)}」"
+                         + ("（固定）" if fixed else f"（実行した日なら {_robot_date_text_safe(h, now, prev)}）"))
+        else:
+            lines.append(f"- {tok} … {h.get('label') or key}。いまは「{_robot_value_phrase(h, cur_vals)}」"
+                         f"（{_robot_token_meaning(h)}）")
+    return lines
+
+
+def _robot_summary_parts(text: str, holes: list[dict], cur_vals: dict) -> list[dict]:
+    """説明の文を、文字（t）と値（k・v）の並びに。{{h2}} はいまの値に（画面は値を押せる印で出す）。知らない印は落とす。"""
+    by = {h.get("key"): h for h in holes if h.get("key")}
+    parts, pos = [], 0
+    for m in _ROBOT_HOLE.finditer(text):
+        if m.start() > pos:
+            parts.append({"t": text[pos:m.start()]})
+        h = by.get(m.group(1))
+        if h is not None:
+            parts.append({"k": h["key"], "v": _robot_date_phrase(h) if h.get("kind") == "date"
+                          else _robot_value_phrase(h, cur_vals)})
+        pos = m.end()
+    if pos < len(text):
+        parts.append({"t": text[pos:]})
+    return parts
+
+
+def _robot_token_name(h: dict) -> str:
+    """直す欄に出す印の名前（〔区分〕〔今月〕）。日付は扱いの言い方。"""
+    return _robot_date_phrase(h) if h.get("kind") == "date" else str(h.get("label") or h.get("key"))
+
+
+def _robot_summary_clean(text: str, holes: list[dict]) -> str:
+    """知らない印（{{h9}} など）を落とす。"""
+    keys = {h.get("key") for h in holes}
+    text = _ROBOT_HOLE.sub(lambda m: m.group(0) if m.group(1) in keys else "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _robot_summary_from_edit(text: str, holes: list[dict]) -> str:
+    """本人が直した文の〔区分〕〔今月〕を {{h2}} {{d1}} に戻す。名前の分からない〔…〕は文字のまま残す。"""
+    names: dict = {}
+    for h in sorted(holes, key=lambda x: x.get("kind") == "date"):      # 名前が重なったら、値を日付より先に
+        name = _robot_token_name(h)
+        if name and h.get("key"):
+            names.setdefault(name, h["key"])
+    text = re.sub(r"〔([^〔〕]{1,60})〕",
+                  lambda m: "{{" + names[m.group(1)] + "}}" if m.group(1) in names else m.group(0), text)
+    return _robot_summary_clean(text, holes)
+
+
+def _robot_summary_row(r: dict, holes: list[dict] | None = None, cur_vals: dict | None = None) -> dict:
+    """一覧に載せる一言の説明。
+
+    text は画面に出す文（値の印をいまの値に置き換えたもの）、parts は値を押せる印で出すための並び、
+    edit は直す欄の文（印は〔区分〕の形）。state は running（AI が書いている）/ ok / error（書けなかった）/ none（まだ無い）。
+    """
     sm = r.get("summary") if isinstance(r.get("summary"), dict) else {}
-    text = str(sm.get("text") or "")
+    raw = str(sm.get("text") or "")
+    holes = holes if holes is not None else [h for h in (r.get("holes") or []) if isinstance(h, dict)]
+    parts = (_robot_summary_parts(raw, holes, cur_vals if cur_vals is not None else _robot_current_values(r))
+             if raw else [])
+    by = {h.get("key"): h for h in holes if h.get("key")}
+    edit = _ROBOT_HOLE.sub(lambda m: f"〔{_robot_token_name(by[m.group(1)])}〕" if m.group(1) in by else "", raw)
     state = ("running" if r.get("id") in _robot_summary_running
-             else "ok" if text else "error" if sm.get("error") else "none")
-    return {"text": text, "by": str(sm.get("by") or ""), "at": str(sm.get("at") or ""),
+             else "ok" if raw else "error" if sm.get("error") else "none")
+    return {"text": "".join(p.get("t", p.get("v", "")) for p in parts), "parts": parts, "edit": edit,
+            "by": str(sm.get("by") or ""), "at": str(sm.get("at") or ""),
             "error": str(sm.get("error") or ""), "state": state}
 
 
 def _robot_summary_material(robot: dict) -> str:
-    """AI に渡す材料（名前・元の質問・手順の行・会話のときの手順の説明・結果の行き先・変えられる値の名前）。
+    """AI に渡す材料（名前・元の質問・手順の行・会話のときの手順の説明・結果の行き先・値の印）。
 
-    宛先のメールアドレス・値そのもの・実行する時刻は渡さない（一言に書かせない。あとで変わるため）。
+    値の印（{{h2}} など）は、いまの値と意味を添えて渡し、説明の中の値はこの印で書かせる（画面でいまの値に置き換わる）。
+    宛先のメールアドレスと実行する時刻は渡さない（一言に書かせない）。
     """
     holes = [h for h in (robot.get("holes") or []) if isinstance(h, dict)]
-    d = _robot_does_safe(robot, holes, _robot_current_values(robot), datetime.now(), _robot_prev_run(robot))
+    now, prev, cur = datetime.now(), _robot_prev_run(robot), _robot_current_values(robot)
+    d = _robot_does_safe(robot, holes, cur, now, prev)
     lines = [f"名前: {robot.get('name') or ''}"]
     questions = [str(q) for q in (robot.get("questions") or []) if q]
     if questions:
@@ -14106,13 +14240,14 @@ def _robot_summary_material(robot: dict) -> str:
              for s in steps if isinstance(s.get("arguments"), dict)]
     notes = [n for n in notes if n]
     if notes:
-        lines.append("会話のときの AI による手順の説明（参考。日付や数はそのとき時点のもの）:")
+        lines.append("会話のときの AI による手順の説明（参考。中の日付・日数・区分の値は、そのときの値）:")
         lines += [f"- {n[:300]}" for n in notes[:8]]
     if d["result"]:
         lines.append(f"結果: {d['result']}")
-    labels = list(dict.fromkeys(str(h.get("label")) for h in holes if h.get("label")))
-    if labels:
-        lines.append("あとで変えられる値（名前だけ）: " + "、".join(labels))
+    tokens = _robot_token_lines(holes, cur, now, prev)
+    if tokens:
+        lines.append("値の印（値はそのまま書かずに、この印で書く。画面ではいまの値に置き換わり、利用者が値を変えると説明も変わる）:")
+        lines += tokens
     return "\n".join(lines)
 
 
@@ -14158,7 +14293,12 @@ def robot_summary_start(user, rid: str) -> str:
             if robot is None:
                 return
             try:
-                text, error = llm.describe_robot(_robot_summary_material(robot), model=model), ""
+                text = llm.describe_robot(_robot_summary_material(robot), model=model)
+                # 材料に無い印（{{h9}} など）は落とす
+                text = _robot_summary_clean(text, [h for h in (robot.get("holes") or []) if isinstance(h, dict)])
+                if not text:
+                    raise ValueError("AIの説明が空で返ってきました。")
+                error = ""
             except Exception as e:
                 text, error = "", str(e)[:200]
                 print(f"[robot] 説明を書けませんでした（{getattr(user, 'username', user)}・{rid}）: {e}")
@@ -14271,7 +14411,7 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
             # このロボットがすること（手順を日本語の行に。行ごとの変えられる値の鍵と、結果の行き先の一言）
             "does": _robot_does_safe(r, holes, cur_vals, now, prev),
             # 何をするロボットかの一言（AI が手順から書く・本人が直せる）と、いま書いているか
-            "summary": _robot_summary_row(r),
+            "summary": _robot_summary_row(r, holes, cur_vals),
             "questions": list(r.get("questions") or []),
             # あとで変えられる値（昔の「穴」も）。value がいまの値（カードで決めた値。無ければ登録時の値）
             "holes": [{"key": h.get("key"), "label": h.get("label"), "kind": h.get("kind"), "sample": h.get("sample"),
@@ -14598,6 +14738,8 @@ def robots_update():
         text = re.sub(r"\s+", " ", str(body.get("summary") or "")).strip()
         if len(text) > ROBOT_SUMMARY_MAX:
             return jsonify({"error": f"説明は {ROBOT_SUMMARY_MAX} 文字以内にしてください。"}), 400
+        # 〔区分〕〔今月〕のように書いた所は値の印に戻す（画面ではいまの値が入る）
+        text = _robot_summary_from_edit(text, [h for h in (robot.get("holes") or []) if isinstance(h, dict)])
         if text:
             robot["summary"] = {"text": text, "by": "user", "at": chats.now()}
         else:

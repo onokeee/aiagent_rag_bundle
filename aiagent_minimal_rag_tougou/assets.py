@@ -3236,6 +3236,10 @@ details.acc.is-target {
 .robotdoes__summeta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center;
                       gap: 2px 10px; margin-bottom: 6px; }
 .robotdoes__link { border: none; background: none; padding: 0; font: inherit; font-size: 12px; color: var(--accent); cursor: pointer; }
+/* 説明の中の値（いまの値。押すと「変えられる値」を開く） */
+.robotdoes__val { border: none; background: var(--accent-weak); color: var(--accent); border-radius: 4px; padding: 0 4px;
+                  margin: 0 1px; font: inherit; cursor: pointer; }
+.robotdoes__val:hover { text-decoration: underline; }
 .robotdoes__link:hover { text-decoration: underline; }
 .robotdoes__edit { display: grid; gap: 6px; margin: 4px 0 8px; }
 .robotdoes__edit textarea { width: 100%; font: inherit; font-size: 14px; }
@@ -12803,6 +12807,16 @@ function cardMeta(r) {
     return when + last + (wait ? `・次に試せるのは ${r.next_run.slice(5, 16).replace('T', ' ')} 以降` : '');
 }
 
+/** 「変えられる値」を開いて、その値の欄へ移る（「このロボットがすること」の印や、説明の中の値を押したとき）。 */
+function openValue(r, key) {
+    const acc = document.querySelector(`details[data-values="${r.id}"]`);
+    if (!acc) return;
+    acc.open = true;
+    const target = acc.querySelector(`[data-key="${key}"]`)
+        || [...acc.querySelectorAll('[data-keys]')].find(x => x.dataset.keys.split(' ').includes(key));
+    if (target) { target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
+}
+
 /** 「このロボットがすること」。手順を日本語の行で並べ、行で使う変えられる値を押せる印で出す。
  *  文は会話のときに AI が手順ごとに書いた目的（AI を新しく呼ばない）。文の中の数字は会話のときのままなので、
  *  いまの値は印のほうで見せる。印を押すと「変えられる値」を開いて、その値の欄へ移る。 */
@@ -12812,14 +12826,7 @@ function doesBlock(r) {
     const dates = new Map((r.dates || []).map(x => [x.key, x]));
     const holes = new Map((r.holes || []).map(x => [x.key, x]));
     const units = { day: '日', month: 'か月', year: '年', hour: '時間', minute: '分' };
-    const jump = (key) => {
-        const acc = document.querySelector(`details[data-values="${r.id}"]`);
-        if (!acc) return;
-        acc.open = true;
-        const target = acc.querySelector(`[data-key="${key}"]`)
-            || [...acc.querySelectorAll('[data-keys]')].find(x => x.dataset.keys.split(' ').includes(key));
-        if (target) { target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
-    };
+    const jump = (key) => openValue(r, key);
     const chips = (keys) => {
         const seen = new Set();          // 同じ日付（書き方が違う 2026-11 と 2026年11月）は1つ
         return keys.map(k => {
@@ -12868,7 +12875,12 @@ function summaryBox(r) {
         } catch (e) { toast(e.message, 'err', 9000); }
     };
     const box = el('div', {},
-        sm.text ? el('div', { class: 'robotdoes__sum' }, sm.text) : null,
+        // 説明の中の値（日数・期間・区分など）はいまの値で出し、押すと「変えられる値」を開く
+        sm.text ? el('div', { class: 'robotdoes__sum' },
+            ...((sm.parts || []).length ? sm.parts : [{ t: sm.text }]).map(p => p.k
+                ? el('button', { type: 'button', class: 'robotdoes__val', title: '「変えられる値」で変えられます',
+                                 onclick: () => openValue(r, p.k) }, p.v)
+                : p.t)) : null,
         el('div', { class: 'robotdoes__summeta' },
             el('span', {}, sm.text ? (sm.by === 'user' ? '自分で書いた説明' : 'AIが手順から書いた説明') : '一言の説明はまだありません'),
             link(sm.text ? '直す' : '自分で書く', () => edit()),
@@ -12877,7 +12889,7 @@ function summaryBox(r) {
                       `説明を${sm.text ? '書き直せ' : '作れ'}ませんでした: ${sm.error}`) : null);
     const edit = () => {
         const ta = el('textarea', { rows: '3', maxlength: '300', 'aria-label': 'このロボットの説明' });
-        ta.value = sm.text || '';
+        ta.value = sm.edit || sm.text || '';       // 値の所は〔区分〕の形（保存するとまた値の印になる）
         const save = async () => {
             const text = ta.value.trim();
             try {
@@ -12892,7 +12904,8 @@ function summaryBox(r) {
             el('div', { class: 'row', style: 'gap:6px;align-items:center' },
                 el('button', { type: 'button', class: 'btn btn--sm btn--primary', onclick: save }, '保存'),
                 el('button', { type: 'button', class: 'btn btn--sm', onclick: () => refreshHead(r) }, 'やめる'),
-                el('span', { class: 'small muted' }, '空にして保存すると消えます（AIで作り直せます）'))));
+                el('span', { class: 'small muted' },
+                   '〔 〕で囲んだ名前の所には、いまの値が入ります。空にして保存すると消えます（AIで作り直せます）'))));
         ta.focus();
     };
     return box;
