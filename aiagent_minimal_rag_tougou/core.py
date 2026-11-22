@@ -11719,8 +11719,11 @@ def _robot_cond_of(sql: str, a: int) -> dict | None:
             before = left[:i].rstrip()
             mi = re.search(r"(?is)\bIN\s*\Z", before)
             if mi:
-                col_text = re.sub(r"(?is)\bNOT\s*\Z", "", before[:mi.start()].rstrip()).rstrip()
-                return {"op": "IN", "column": _robot_col_before(col_text)}
+                # NOT IN は除く条件（いま当たる値の見出しを変え、0件の確認はしない）。2026-11-22 まで IN と同じに扱っていた
+                head = before[:mi.start()].rstrip()
+                neg = re.search(r"(?is)\bNOT\s*\Z", head)
+                col_text = head[:neg.start()].rstrip() if neg else head
+                return {"op": "NOT IN" if neg else "IN", "column": _robot_col_before(col_text)}
     return None
 
 
@@ -11940,11 +11943,19 @@ def _robot_check_value(h: dict, value) -> str:
     return v
 
 
-#: 一致のしかた（「=」の条件の文字の値だけ。含む・パターンは実行のときだけ LIKE に書き換える）
-ROBOT_MATCHES = {"exact": "完全に一致", "contains": "含む", "pattern": "パターン（% と _ が使える）"}
+#: 一致のしかた（「=」の条件の文字の値だけ。完全に一致のほかは、実行のときだけ LIKE に書き換える）。
+#: カードで選べるのは完全に一致・含む・で始まる・で終わる。pattern（打った % と _ を記号として使う）は
+#: 2026-11-22 に選べなくした（記号は利用者に通じなかった）。前に選んだロボットはそのまま動く
+ROBOT_MATCHES = {"exact": "完全に一致", "contains": "含む", "prefix": "で始まる", "suffix": "で終わる",
+                 "pattern": "記号で指定"}
+_ROBOT_LIKE_MATCHES = ("contains", "prefix", "suffix", "pattern")
 _ROBOT_EQ_OPS = ("=", "==", "<>", "!=")
 _ROBOT_LIKE_OPS = ("LIKE", "NOT LIKE", "GLOB", "NOT GLOB")
-#: 実行のときだけ使う印。{{hN:like}} は「含む／パターン」にした値を LIKE の中へ差し込む所
+#: 除く条件（当たった値を外す）。カードのいま当たる値は「いま除かれる値」と出し、0件の確認はしない
+_ROBOT_NEG_OPS = ("<>", "!=", "NOT IN", "NOT LIKE", "NOT GLOB")
+#: いま当たる値を出せる条件（_robot_match_cond が形を知っているもの）
+_ROBOT_PREVIEW_OPS = _ROBOT_EQ_OPS + ("IN", "NOT IN") + _ROBOT_LIKE_OPS
+#: 実行のときだけ使う印。{{hN:like}} は「含む」などにした値を LIKE の中へ差し込む所
 _ROBOT_HOLE_FILL = re.compile(r"\{\{([hd]\d+)(:like)?\}\}")
 
 
@@ -11953,13 +11964,24 @@ def _robot_like_escape(v: str) -> str:
     return v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _robot_like_value(match: str | None, v: str) -> str:
+    """一致のしかたに合わせた LIKE の言葉（ESCAPE のバックスラッシュと組で使う）。打った % と _ は文字どおり。
+
+    含む＝前後に %、で始まる＝後ろに %、で終わる＝前に %。記号で指定（pattern。前に選んだもの）だけは打ったまま。
+    """
+    if match == "pattern":
+        return v
+    e = _robot_like_escape(v)
+    return {"prefix": e + "%", "suffix": "%" + e}.get(match or "", "%" + e + "%")
+
+
 def _robot_sql_to_like(sql: str, holes: list[dict]) -> str:
-    """「含む／パターン」にした値の条件（= '{{hN}}'）を LIKE に書き換える。実行のときだけで、保存した手順は変えない。
+    """完全に一致でない値の条件（= '{{hN}}'）を LIKE に書き換える。実行のときだけで、保存した手順は変えない。
 
     <> と != は NOT LIKE に。<= や >= は書き換えない（前の文字を見て除く）。
     """
     for h in holes:
-        if (h.get("kind") != "text" or h.get("match") not in ("contains", "pattern")
+        if (h.get("kind") != "text" or h.get("match") not in _ROBOT_LIKE_MATCHES
                 or h.get("op") not in _ROBOT_EQ_OPS):
             continue
         key = h["key"]
@@ -11974,24 +11996,61 @@ def _robot_value_scope() -> list[dict]:
     return build_scope({f.name: [] for f in db.list_db_files()})
 
 
-def _robot_value_hits(h: dict, value: str) -> int | None:
+def _robot_like_shape(robot: dict, key: str) -> tuple[str, str]:
+    """LIKE・GLOB の言葉の前後にある記号（'%山田%' なら ('%', '%')、'EQ-%' なら ('', '%')）。
+
+    保存した手順の SQL の LIKE（GLOB）の直後から読む（いっしょに変わる所の '{{hN}}' は見ない）。見つからなければ前後とも %。
+    """
+    pat = re.compile(r"(?is)\b(?:LIKE|GLOB)\s*'([%*]*)\{\{" + re.escape(key) + r"\}\}([%*]*)'")
+    for s in robot.get("steps") or []:
+        sql = (s.get("arguments") or {}).get("sql") if isinstance(s, dict) else None
+        m = pat.search(sql) if isinstance(sql, str) else None
+        if m:
+            return m.group(1), m.group(2)
+    return "%", "%"
+
+
+def _robot_shape_match(shape: tuple) -> str:
+    """LIKE の言葉の前後の記号を、一致のしかたの名前に（カードの「入れた文字を含むものを探します」）。"""
+    pre, post = shape
+    return "contains" if pre and post else "suffix" if pre else "prefix" if post else "exact"
+
+
+def _robot_match_cond(h: dict, value: str, match: str | None = None,
+                      shape: tuple = ("%", "%")) -> tuple[str, str] | None:
+    """入れた値が当たる条件（WHERE 列 ◯◯ の ◯◯）と、バインドする値。除く条件（<>・NOT IN・NOT LIKE）も当たる側を返す。
+
+    match を渡せば、まだ保存していない一致のしかたで見る（カードのいま当たる値）。shape は LIKE・GLOB の言葉の前後の記号。
+    形の分からない条件（> や BETWEEN など）は None。
+    """
+    op = h.get("op")
+    if op in _ROBOT_EQ_OPS:
+        m = match or h.get("match") or "exact"
+        if m in _ROBOT_LIKE_MATCHES:
+            return "LIKE :v ESCAPE '\\'", _robot_like_value(m, value)
+        return "= :v", value
+    if op in ("IN", "NOT IN"):
+        return "= :v", value
+    if op in ("LIKE", "NOT LIKE"):
+        return "LIKE :v", shape[0] + value + shape[1]
+    if op in ("GLOB", "NOT GLOB"):
+        return "GLOB :v", shape[0] + value + shape[1]
+    return None
+
+
+def _robot_value_hits(h: dict, value: str, shape: tuple = ("%", "%")) -> int | None:
     """文字の値が、いまのデータに当たるか（0＝1件も無い、1＝ある）。確かめられない値は None。
 
-    「=」・IN（と、含む／パターンにしたもの）・LIKE の条件だけを見る。<> は0件でも困らないので見ない。
+    当てる条件（=・IN・LIKE・GLOB と、含むなどにしたもの）だけを見る。除く条件（<>・NOT IN・NOT LIKE）は
+    0件でも困らないので見ない。shape は LIKE・GLOB の言葉の前後の記号（_robot_like_shape）。
     """
-    if h.get("kind") != "text" or not h.get("table") or not h.get("column"):
+    if (h.get("kind") != "text" or not h.get("table") or not h.get("column")
+            or h.get("op") in _ROBOT_NEG_OPS):
         return None
-    op, match = h.get("op"), h.get("match") or "exact"
-    if op in ("=", "==", "IN") and match == "exact":
-        cond, param = "= :v", value
-    elif op in ("=", "==") and match == "contains":
-        cond, param = "LIKE :v ESCAPE '\\'", "%" + _robot_like_escape(value) + "%"
-    elif op in ("=", "==") and match == "pattern":
-        cond, param = "LIKE :v ESCAPE '\\'", value
-    elif op == "LIKE":
-        cond, param = "LIKE :v", "%" + value + "%"
-    else:
+    cc = _robot_match_cond(h, value, shape=shape)
+    if cc is None:
         return None
+    cond, param = cc
     sql = f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {_qi(h['table'])} WHERE {_qi(h['column'])} {cond} LIMIT 1)"
     try:
         _cols, rows, _t = db.run_select(sql, _robot_value_scope(), max_rows=1, timeout_s=5, params={"v": param})
@@ -11999,6 +12058,31 @@ def _robot_value_hits(h: dict, value: str) -> int | None:
     except Exception as e:
         print(f"[robot] 値がいまのデータに当たるか確かめられませんでした（続行）: {e}")
         return None
+
+
+def _robot_value_preview(h: dict, value: str, match: str | None = None,
+                         shape: tuple = ("%", "%"), limit: int = 5) -> dict | None:
+    """いま当たる値（カードの入力欄の下）。保存する前の値と一致のしかたで、いまのデータの何に当たるか。
+
+    {values: [{v, n}]（多い順に limit 個）, kinds: 当たる値の種類の数, neg: 除く条件か}。
+    確かめられない値（数・表の分からない値・形の分からない条件）は None。読み取りだけ・5秒まで。
+    """
+    if h.get("kind") != "text" or not h.get("table") or not h.get("column"):
+        return None
+    cc = _robot_match_cond(h, value, match, shape)
+    if cc is None:
+        return None
+    cond, param = cc
+    col = _qi(h["column"])
+    sql = (f"SELECT v, n, COUNT(*) OVER () AS kinds FROM (SELECT {col} AS v, COUNT(*) AS n "
+           f"FROM {_qi(h['table'])} WHERE {col} {cond} GROUP BY 1) ORDER BY n DESC, v LIMIT {int(limit)}")
+    try:
+        _cols, rows, _t = db.run_select(sql, _robot_value_scope(), max_rows=limit, timeout_s=5, params={"v": param})
+    except Exception as e:
+        print(f"[robot] いま当たる値を調べられませんでした（続行）: {e}")
+        return None
+    return {"values": [{"v": "" if r[0] is None else str(r[0]), "n": int(r[1])} for r in rows],
+            "kinds": int(rows[0][2]) if rows else 0, "neg": h.get("op") in _ROBOT_NEG_OPS}
 
 
 def _robot_search_choices(h: dict, q: str, limit: int = 20) -> list[str]:
@@ -12797,8 +12881,8 @@ def _robot_fill(args: dict, holes: list[dict], values: dict, idmap: dict, now: d
         v = _robot_check_value(h, v)
         if h.get("kind") == "number":
             return v
-        if like:                               # 「含む」は前後に %（中の % と _ は文字どおり）、「パターン」はそのまま
-            v = v if h.get("match") == "pattern" else "%" + _robot_like_escape(v) + "%"
+        if like:                               # 含む・で始まる・で終わるは % を付ける（打った % と _ は文字どおり）
+            v = _robot_like_value(h.get("match"), v)
         return v.replace("'", "''") if in_sql else v
 
     def walk(v, arg=None):
@@ -12932,7 +13016,8 @@ def _robot_filled_note(h: dict, values: dict, now: datetime, prev: datetime | No
     """会話の先頭に残す「先月＝2026-08」の1つ分。「前回の実行」で前回がまだ無ければ、登録時の値で動いたことも書く。"""
     if h.get("kind") != "date":
         v = values.get(h['key'], '') or h.get('value') or h.get('sample', '')
-        how = {"contains": "（含む）", "pattern": "（パターン）"}.get(h.get("match") or "", "")
+        m = h.get("match") or ""
+        how = f"（{ROBOT_MATCHES[m]}）" if m in _ROBOT_LIKE_MATCHES else ""
         return f"{h['label']}＝{v}{how}"
     text = f"{h['label']}＝{_robot_date_text_safe(h, now, prev)}"
     if h.get("mode") == "last_run" and prev is None:
@@ -13901,9 +13986,15 @@ def _robot_row(r: dict, settings: dict | None = None, mail=None) -> dict:
                        "choices": _robot_value_choices(h),
                        # 一致のしかた（「=」の条件の文字だけ変えられる）と、データから候補を探せるか（種類の多い列）
                        "op": h.get("op") or "", "match": h.get("match") or "exact",
+                       "match_label": ROBOT_MATCHES[h["match"]] if h.get("match") in _ROBOT_LIKE_MATCHES else "",
                        "can_match": h.get("kind") == "text" and h.get("op") in _ROBOT_EQ_OPS,
                        "search": bool(h.get("kind") == "text" and h.get("table") and h.get("column")
-                                      and h.get("op") not in _ROBOT_LIKE_OPS)}
+                                      and h.get("op") not in _ROBOT_LIKE_OPS),
+                       # いま当たる値を出せるか（文字で、表と列と条件の形が分かるもの）と、LIKE の言葉の探し方
+                       "preview": bool(h.get("kind") == "text" and h.get("table") and h.get("column")
+                                       and h.get("op") in _ROBOT_PREVIEW_OPS),
+                       "like": (_robot_shape_match(_robot_like_shape(r, str(h.get("key") or "")))
+                                if h.get("op") in _ROBOT_LIKE_OPS else "")}
                       for h in holes if h.get("kind") != "date"],
             "tables": list(r.get("tables") or []),
             "from_title": r.get("from_title") or "",
@@ -14238,7 +14329,7 @@ def robots_update():
             if h is None or h.get("op") not in _ROBOT_EQ_OPS:
                 return jsonify({"error": "この値は一致のしかたを変えられません。"}), 400
             if m not in ROBOT_MATCHES:
-                return jsonify({"error": "一致のしかたは「完全に一致」「含む」「パターン」から選んでください。"}), 400
+                return jsonify({"error": "一致のしかたは「完全に一致」「含む」「で始まる」「で終わる」から選んでください。"}), 400
             if m == "exact":
                 h.pop("match", None)
             else:
@@ -14249,8 +14340,10 @@ def robots_update():
         # いまのデータに1件も当たらない値なら、保存する前に確かめる（打ち間違いで次の実行が0件になるのを防ぐ）
         cur = _robot_current_values(robot)
         for h in holes:
-            if h.get("key") in touched and _robot_value_hits(h, cur.get(h["key"], "")) == 0:
-                return jsonify({"error": f"「{h.get('label')}」の「{cur.get(h['key'], '')}」は、いまのデータには1件もありません"
+            if (h.get("key") in touched
+                    and _robot_value_hits(h, cur.get(h["key"], ""), _robot_like_shape(robot, h["key"])) == 0):
+                how = {"contains": "を含む値", "prefix": "で始まる値", "suffix": "で終わる値"}.get(h.get("match") or "", "")
+                return jsonify({"error": f"「{h.get('label')}」の「{cur.get(h['key'], '')}」{how}は、いまのデータには1件もありません"
                                          "（このまま保存すると、次の実行で0件になります）。このまま保存しますか？",
                                 "confirm": True, "key": h["key"]}), 409
     if "dates" in body:
@@ -14309,6 +14402,28 @@ def robots_choices():
     if h is None:
         return jsonify({"error": "その値は見つかりません。"}), 404
     return jsonify({"ok": True, "choices": _robot_search_choices(h, str(body.get("q") or "").strip()[:100])})
+
+
+@bp_chat.post("/api/robots/hits")
+@login_required
+def robots_hits():
+    """いま当たる値（カードの入力欄の下）。保存する前の値と一致のしかたで、いまのデータの何に当たるかを返す。"""
+    body = _body()
+    robot = robot_get(g.user, str(body.get("id") or ""))
+    if robot is None:
+        return jsonify({"error": "マイロボットが見つかりません。"}), 404
+    h = next((x for x in (robot.get("holes") or []) if isinstance(x, dict)
+              and x.get("key") == str(body.get("key") or "") and x.get("kind") == "text"), None)
+    if h is None:
+        return jsonify({"error": "その値は見つかりません。"}), 404
+    match = body.get("match")
+    if match is not None and match not in ROBOT_MATCHES:
+        return jsonify({"error": "一致のしかたは「完全に一致」「含む」「で始まる」「で終わる」から選んでください。"}), 400
+    try:
+        value = _robot_check_value(h, body.get("value"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "hits": _robot_value_preview(h, value, match, _robot_like_shape(robot, h["key"]))})
 
 
 @bp_chat.post("/api/robots/delete")

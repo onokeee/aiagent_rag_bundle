@@ -1986,7 +1986,7 @@ window.MEMORY_SETTINGS_INIT = { settings: {{ settings|tojson }} };
               <dt>手順</dt>
               <dd>{% for sd in r.steps_detail %}<div><span class="badge">手順{{ sd.i }}</span> <b>{{ sd.label }}</b></div><pre class="mono">{{ sd.text }}</pre>{% if sd.explanation %}<div class="muted" style="margin:-4px 0 8px">{{ sd.explanation }}</div>{% endif %}{% endfor %}</dd>
               <dt>元の質問</dt><dd>{{ r.questions|join(' ／ ') or '—' }}</dd>
-              <dt>実行日で変わる値</dt><dd>{% if r.dates %}{% for d in r.dates %}{{ d.label }}（登録時 {{ d.sample }} → 今日なら {{ d.now }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}{% if r.holes %}／変えられる値: {% for h in r.holes %}{{ h.label }}＝{{ h.value }}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</dd>
+              <dt>実行日で変わる値</dt><dd>{% if r.dates %}{% for d in r.dates %}{{ d.label }}（登録時 {{ d.sample }} → 今日なら {{ d.now }}）{% if not loop.last %}、{% endif %}{% endfor %}{% else %}なし{% endif %}{% if r.holes %}／変えられる値: {% for h in r.holes %}{{ h.label }}＝{{ h.value }}{% if h.match_label %}（{{ h.match_label }}）{% endif %}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</dd>
               <dt>使う表</dt><dd>{{ r.tables|join('、') or 'なし' }}</dd>
               <dt>フォルダ出力</dt><dd>{% if r.has_file_steps %}{{ '置く' if r.folder_out else '置かない' }}{% if r.folder_out %}（{{ '日時なし' if not r.folder_stamp else '日時あり' }}・{{ '置き換える' if r.folder_overwrite else '番号を付けて残す' }}）{% endif %}{% else %}ファイルを作る手順はありません{% endif %}</dd>
               <dt>定期実行</dt><dd>{% if r.schedule.kind != 'manual' %}{{ r.schedule.interval_label }}{% if r.schedule.start_at %}（開始 {{ r.schedule.start_at|replace('T', ' ') }}）{% endif %}{% if r.schedule.enabled is sameas false %}・止めています{% elif r.schedule.next_at %}・次回 {{ r.schedule.next_at|replace('T', ' ') }}{% endif %}{% if r.schedule.last_run %}・前回の定期実行 {{ r.schedule.last_run|replace('T', ' ') }}（{{ '成功' if r.schedule.last_status == 'ok' else ('実行中' if r.schedule.last_status == 'running' else '失敗') }}）{{ r.schedule.last_message }}{% endif %}{% else %}手動のみ{% endif %}</dd>
@@ -12876,6 +12876,18 @@ function valuesRow(r) {
     if (!(r.holes || []).length && !(r.dates || []).length) return null;
     const summary = el('span', { class: 'small muted' });
     const grid = el('div', { class: 'schedgrid' });
+    const lookers = [];     // いま当たる値を出し直す関数（値ごと）。開いたときと、保存して作り直したときに呼ぶ
+    // いま当たる値の1行（「いま当たる値: 出勤 6,953件・欠勤 94件」）。当てる条件で0件なら目立たせる
+    const hitsLine = (x) => {
+        if (!x) return '';
+        const head = x.neg ? 'いま除かれる値' : 'いま当たる値';
+        if (!x.values.length) {
+            return x.neg ? `${head}: なし`
+                : el('span', { style: 'color:var(--warn)' }, `${head}: なし（このままだと、この条件に当たるデータは0件です）`);
+        }
+        const more = x.kinds > x.values.length ? `・ほか ${x.kinds - x.values.length} 種類` : '';
+        return `${head}: ${x.values.map(o => `${o.v === '' ? '（空）' : o.v} ${o.n.toLocaleString()}件`).join('・')}${more}`;
+    };
     // 実行日で変わる値は、同じ日付（書き方が違う 2026-11 と 2026年11月 など）を1行にまとめ、いっしょに変える
     const dateGroups = () => {
         const groups = new Map();
@@ -12888,7 +12900,7 @@ function valuesRow(r) {
     };
     const syncSummary = () => {
         const parts = [...(r.holes || []).map(h => `${h.label}＝${h.value ?? h.sample}`
-                           + ({ contains: '（含む）', pattern: '（パターン）' }[h.match] || '')),
+                           + (h.match_label ? `（${h.match_label}）` : '')),
                        ...dateGroups().map(ds => `${ds[0].label}（今日なら ${[...new Set(ds.map(d => d.now))].join('・')}）`)];
         summary.textContent = `変えられる値: ${parts.join('、')}`;
     };
@@ -12914,6 +12926,7 @@ function valuesRow(r) {
     function build() {
         syncSummary();
         grid.replaceChildren();
+        lookers.length = 0;
         (r.holes || []).forEach(h => {
             const listId = `robotval_${r.id}_${h.key}`;
             const choices = h.choices || [];
@@ -12945,30 +12958,57 @@ function valuesRow(r) {
                 const v = inp.value.trim();
                 if (v === String(h.value ?? '')) return;
                 save({ values: { [h.key]: v } }, `「${h.label}」を ${v} にしました。次の実行からこの値で動きます。`,
-                     () => { inp.value = String(h.value ?? h.sample ?? ''); });
+                     () => { inp.value = String(h.value ?? h.sample ?? ''); inp.dispatchEvent(new Event('input')); });
             });
-            // 一致のしかた（「=」の条件の文字だけ）。含む・パターンは実行のときに条件を LIKE にする
+            // 一致のしかた（「=」の条件の文字だけ）。完全に一致のほかは、実行のときに条件を LIKE にする。
+            // 記号で指定（% と _）は 2026-11-22 に選べなくした。前に選んだロボットだけ、いまの設定として出す
+            const hows = [['exact', '完全に一致'], ['contains', '含む'], ['prefix', 'で始まる'], ['suffix', 'で終わる'],
+                          ...(h.match === 'pattern' ? [['pattern', '記号で指定（いまの設定）']] : [])];
             const how = h.can_match ? el('select', { style: 'max-width:200px', 'aria-label': `${h.label} の一致のしかた` },
-                ...[['exact', '完全に一致'], ['contains', '含む'], ['pattern', 'パターン（% と _）']].map(([v, label]) =>
+                ...hows.map(([v, label]) =>
                     el('option', { value: v, ...((h.match || 'exact') === v ? { selected: 'selected' } : {}) }, label))) : null;
             if (how) {
                 how.addEventListener('change', () => {
                     const label = how.options[how.selectedIndex].textContent;
-                    save({ matches: { [h.key]: how.value } }, `「${h.label}」を「${label}」で探します。次の実行から効きます。`,
+                    save({ matches: { [h.key]: how.value } }, `「${h.label}」の一致のしかたを「${label}」にしました。次の実行から効きます。`,
                          () => { how.value = h.match || 'exact'; });
                 });
             }
+            // いま当たる値（保存する前の入力で、いまのデータの何に当たるか）。開いているときだけ調べる
+            const hitsBox = h.preview ? el('div', { class: 'small muted', style: 'margin-top:2px' }) : null;
+            if (hitsBox) {
+                let timer = null, last = null;
+                const lookHits = (wait = 400) => {
+                    clearTimeout(timer);
+                    if (!acc.open) return;
+                    timer = setTimeout(async () => {
+                        const value = inp.value.trim();
+                        const match = how ? how.value : (h.match || 'exact');
+                        const sig = `${value}\n${match}`;
+                        if (sig === last) return;
+                        last = sig;
+                        if (!value) { hitsBox.replaceChildren(); return; }
+                        try {
+                            const res = await api('/api/robots/hits', { id: r.id, key: h.key, value, match });
+                            if (sig === last) hitsBox.replaceChildren(hitsLine(res.hits));
+                        } catch (_) { hitsBox.replaceChildren(); last = null; }   // 出せないだけ。入力と保存はそのままできる
+                    }, wait);
+                };
+                inp.addEventListener('input', () => lookHits());
+                lookers.push(() => lookHits(0));
+            }
             const unit = { day: '日', month: 'か月', year: '年', hour: '時間', minute: '分' }[h.unit] || '';
-            const pattern = h.match === 'pattern' || ['LIKE', 'NOT LIKE'].includes(h.op);
-            // 単位は入力欄のすぐ横、補足（登録時の値・使える記号・候補）は下の行に（横に並べると折り返して読みにくい）
-            const hint = [String(h.value ?? '') !== String(h.sample ?? '') ? `登録時 ${h.sample}` : '',
-                          ['LIKE', 'NOT LIKE'].includes(h.op) ? '部分一致' : '',
-                          pattern ? '% は何文字でも・_ は1文字' : '',
-                          dl ? '入力すると候補が出ます' : ''].filter(Boolean).join('・');
+            // LIKE の言葉（登録したときの探し方のまま）は、探し方を言葉で出す
+            const likeWord = { contains: 'を含む', prefix: 'で始まる', suffix: 'で終わる', exact: 'と同じ' }[h.like] || '';
+            // 単位は入力欄のすぐ横、補足（登録したときの値・探し方・候補）は下の行に（横に並べると折り返して読みにくい）
+            const hint = [String(h.value ?? '') !== String(h.sample ?? '') ? `登録したときの値「${h.sample}」` : '',
+                          likeWord ? `入れた文字${likeWord}ものを${['NOT LIKE', 'NOT GLOB'].includes(h.op) ? '除きます' : '探します'}` : '',
+                          h.match === 'pattern' ? '記号: % は何文字でも、_ は1文字の代わり' : '',
+                          dl ? '入力すると候補が出ます' : ''].filter(Boolean).join(' ／ ');
             grid.append(el('span', { class: 'small' }, h.label),
                 el('div', {}, inp, unit ? el('span', { class: 'small muted', style: 'margin-left:6px' }, unit) : null,
                    how ? ' ' : null, how, dl,
-                   hint ? el('div', { class: 'small muted', style: 'margin-top:2px' }, hint) : null));
+                   hint ? el('div', { class: 'small muted', style: 'margin-top:2px' }, hint) : null, hitsBox));
         });
         dateGroups().forEach(ds => {
             const d = ds[0];
@@ -13004,14 +13044,18 @@ function valuesRow(r) {
                    same ? null : el('div', { class: 'small', style: 'color:var(--warn)' },
                                     'この中で扱いがそろっていません。選び直すと全部そろいます。')));
         });
+        if (acc.open) lookers.forEach(f => f());     // 保存して作り直したら、いま当たる値も出し直す
     }
-    build();
-    return el('details', { class: 'acc', style: 'margin-top:8px' },
+    const acc = el('details', { class: 'acc', style: 'margin-top:8px' },
         el('summary', { class: 'small', style: 'cursor:pointer' }, summary),
         el('div', { class: 'acc__body' },
             el('div', { class: 'small muted', style: 'margin-bottom:6px' },
                '変えるとその場で保存し、次の実行（いま試す・定期実行）からこの値で動きます。作り直しは要りません。'),
             grid));
+    // いま当たる値は開いたときに調べる（一覧を開いただけで、全部のロボットの表を読まない）
+    acc.addEventListener('toggle', () => { if (acc.open) lookers.forEach(f => f()); });
+    build();
+    return acc;
 }
 
 /** メールの自動送信（下書きを作る手順があるロボットだけ）。 */
@@ -13092,6 +13136,7 @@ function detailRow(r) {
             : 'なし（毎回同じ期間の結果になります）'),
         ...(r.holes.length ? [el('dt', {}, 'あとで変えられる値'),
                               el('dd', {}, r.holes.map(h => `${h.label}＝${h.value ?? h.sample}`
+                                  + (h.match_label ? `（${h.match_label}）` : '')
                                   + (String(h.value ?? '') !== String(h.sample ?? '') ? `（登録時 ${h.sample}）` : '')).join('、')
                                   + '。上の「変えられる値」で変えられます')] : []),
         el('dt', {}, '使う表'), el('dd', {}, (r.tables || []).join('、') || 'なし'),
